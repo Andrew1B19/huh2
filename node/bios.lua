@@ -3,10 +3,10 @@
 -- Flash this directly onto a worker node's EEPROM (see README.md). It is
 -- the ENTIRE runtime for that node -- there is no OS, no filesystem, no
 -- `require`. It boots straight into an event loop that waits for jobs from
--- the arbiter and executes them.
+-- the kernal and executes them.
 --
 -- Wire format: see docs/PROTOCOL.md. The serializer below is duplicated in
--- arbiter/rackos.lua on purpose -- EEPROM code can't load other files, so
+-- kernal/muxos.lua on purpose -- EEPROM code can't load other files, so
 -- both sides keep their own copy in sync by hand.
 
 local PORT = 4477
@@ -61,7 +61,7 @@ local function send(msg)
   modem.broadcast(PORT, serialize(msg))
 end
 
--- Announce ourselves so the arbiter can pick us up without a separate
+-- Announce ourselves so the kernal can pick us up without a separate
 -- discovery pass if it happens to be listening already.
 send({type = "HELLO", from = nodeId})
 
@@ -85,7 +85,7 @@ while true do
           end
         end
       elseif msg.type == "LIST" then
-        -- Expose this node's own components to the arbiter, so it can
+        -- Expose this node's own components to the kernal, so it can
         -- address them without us having to write custom JOB code for it.
         local list = {}
         for addr, ctype in component.list() do
@@ -94,7 +94,7 @@ while true do
         send({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = list})
       elseif msg.type == "INVOKE" then
         -- Call a method on one of this node's own components on the
-        -- arbiter's behalf -- this is the "remote component" bridge:
+        -- kernal's behalf -- this is the "remote component" bridge:
         -- addressed like a local component.invoke(), but carried over the
         -- modem instead of being a direct in-process call.
         local packed = table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(msg.args or {})))

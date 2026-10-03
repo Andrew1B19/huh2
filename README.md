@@ -3,8 +3,8 @@
 Experimental custom OS stack for an OpenComputers rack running 4 Server
 blades on one shared component bus:
 
-- **Arbiter (1 node)** -- boots a normal OpenOS, is the bootstrap/arbiter
-  and the only node you actually interact with. Runs `arbiter/muxos.lua`.
+- **Kernal (1 node)** -- boots a normal OpenOS, is the bootstrap/kernal
+  and the only node you actually interact with. Runs `kernal/muxos.lua`.
 - **Workers (3 nodes)** -- no OS, no disk. `node/bios.lua` is flashed
   directly onto each one's EEPROM and *is* the entire firmware: boot,
   open a Network Card, wait for jobs, run them, reply.
@@ -19,7 +19,7 @@ that fork isn't in this repo.
 ## Layout
 
 ```
-arbiter/muxos.lua    arbiter program: discovery + round-robin job dispatch + REPL
+kernal/muxos.lua    kernal program: discovery + round-robin job dispatch + REPL
 node/bios.lua         worker firmware, meant to be flashed onto an EEPROM
 docs/PROTOCOL.md      shared wire format (kept in sync by hand, see why in the file)
 ```
@@ -36,9 +36,9 @@ eeprom node/bios.lua
 
 Then boot that node with no filesystem attached -- it never looks for one.
 
-## Running the arbiter
+## Running the kernal
 
-Copy `arbiter/muxos.lua` onto the arbiter's filesystem and run it from
+Copy `kernal/muxos.lua` onto the kernal's filesystem and run it from
 the OpenOS shell:
 
 ```

@@ -1,9 +1,9 @@
--- muxos arbiter program for huh2. Runs under a normal OpenOS boot on the
+-- muxos kernal program for huh2. Runs under a normal OpenOS boot on the
 -- main rack node (own CPU/RAM/EEPROM/HDD, same as any OC computer).
 -- Discovers worker nodes flashed with node/bios.lua over the rack's shared
 -- network segment and dispatches Lua jobs to them.
 --
--- Install: copy onto the arbiter's filesystem (e.g. /home/muxos.lua) and
+-- Install: copy onto the kernal's filesystem (e.g. /home/muxos.lua) and
 -- run it from the OpenOS shell.
 --
 -- Wire format: see docs/PROTOCOL.md. The serializer below is a deliberate
@@ -223,7 +223,7 @@ local function printComponents(addr)
 end
 
 local function repl()
-  print("muxos arbiter -- " .. selfAddr)
+  print("muxos kernal -- " .. selfAddr)
   print("commands:")
   print("  discover | nodes | ping <node> [count] | quit")
   print("  run <lua code> | runall <lua code>")
