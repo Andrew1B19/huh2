@@ -47,8 +47,17 @@ rackos> discover
 rackos> nodes
 rackos> run return 1 + 1
 rackos> runall return computer.address()
+rackos> components 1
+rackos> call 1 <component addr> getResolution
 rackos> quit
 ```
+
+`components`/`call` are a thin "remote component" layer: they let you
+address a worker's own hardware (`components 1` lists what's attached to
+node `[1]`, `call 1 <addr> <method> [args]` invokes a method on it) without
+writing one-off job code. It still only works because of the Network Card
+message-passing underneath -- see `docs/PROTOCOL.md` for why OpenComputers
+doesn't allow direct cross-machine component access at all, Rack or not.
 
 ## Status
 

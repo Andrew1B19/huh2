@@ -84,6 +84,27 @@ while true do
             send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = tostring(result)})
           end
         end
+      elseif msg.type == "LIST" then
+        -- Expose this node's own components to the arbiter, so it can
+        -- address them without us having to write custom JOB code for it.
+        local list = {}
+        for addr, ctype in component.list() do
+          list[addr] = ctype
+        end
+        send({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = list})
+      elseif msg.type == "INVOKE" then
+        -- Call a method on one of this node's own components on the
+        -- arbiter's behalf -- this is the "remote component" bridge:
+        -- addressed like a local component.invoke(), but carried over the
+        -- modem instead of being a direct in-process call.
+        local packed = table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(msg.args or {})))
+        if packed[1] then
+          local returns = {}
+          for i = 2, packed.n do returns[#returns + 1] = packed[i] end
+          send({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = returns})
+        else
+          send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = tostring(packed[2])})
+        end
       end
     end
   end

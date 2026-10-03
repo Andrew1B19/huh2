@@ -19,14 +19,16 @@ import. If you change the wire format, change both copies.
 
 ## Message types
 
-| type     | fields                                  | sent by  | meaning                                  |
-|----------|------------------------------------------|----------|-------------------------------------------|
-| `HELLO`  | `from`                                   | worker   | "I just booted, here's my address"       |
-| `PING`   | `from`                                   | arbiter  | "who's out there"                        |
-| `PONG`   | `from`, `to`                             | worker   | reply to `PING`                          |
-| `JOB`    | `from`, `to`, `id`, `code`, `args`       | arbiter  | run `code` (a Lua chunk) with `args`     |
-| `RESULT` | `from`, `to`, `id`, `result`             | worker   | `JOB` succeeded, here's the return value |
-| `ERROR`  | `from`, `to`, `id`, `error`              | worker   | `JOB` failed to load or raised           |
+| type      | fields                                                  | sent by  | meaning                                          |
+|-----------|-----------------------------------------------------------|----------|----------------------------------------------------|
+| `HELLO`   | `from`                                                    | worker   | "I just booted, here's my address"                |
+| `PING`    | `from`                                                    | arbiter  | "who's out there"                                  |
+| `PONG`    | `from`, `to`                                              | worker   | reply to `PING`                                    |
+| `JOB`     | `from`, `to`, `id`, `code`, `args`                        | arbiter  | run `code` (a Lua chunk) with `args`               |
+| `LIST`    | `from`, `to`, `id`                                        | arbiter  | "list the components attached to you"             |
+| `INVOKE`  | `from`, `to`, `id`, `address`, `method`, `args`           | arbiter  | call `component.invoke(address, method, args...)` on the worker's own component |
+| `RESULT`  | `from`, `to`, `id`, `result`                              | worker   | success -- `JOB`'s return value, `LIST`'s address→type table, or `INVOKE`'s list of return values |
+| `ERROR`   | `from`, `to`, `id`, `error`                               | worker   | failure -- load error, runtime error, or invoke error |
 
 `code` is compiled on the worker as `local args = ...` followed by your
 code, then called as `chunk(args)` inside a `pcall`, so a job can refer to
@@ -37,7 +39,27 @@ return args.x + args.y
 ```
 
 `id` is chosen by the arbiter per job and echoed back so the arbiter can
-match a `RESULT`/`ERROR` to the `submit()` call that's waiting on it.
+match a `RESULT`/`ERROR` to the `submit()`/`listComponents()`/`invoke()`
+call that's waiting on it.
+
+## Why there's a "remote component" layer at all
+
+OpenComputers does not let one computer's Lua sandbox see another
+computer's components -- each Server blade has its own isolated
+`component` graph, by design, even though all 4 blades sit in the same
+Rack (that isolation is literally what makes 4 independent computers fit
+in one block). The only bridge between two computers is message-passing
+over a Network Card, which is what `PING`/`PONG`/`JOB`/etc. already are.
+
+`LIST` and `INVOKE` don't change that; they just save you from writing a
+one-off `JOB` chunk every time you want to poke at a worker's hardware.
+`LIST` asks a worker for its own `component.list()`, and `INVOKE` asks it
+to run `component.invoke(address, method, ...)` on your behalf and ship
+the return values back. From the arbiter's REPL this reads like a single
+addressable bus (`components 1`, `call 1 <addr> getResolution`), but
+under the hood every call is still a round-trip message over that
+worker's Network Card -- there is no way to make it a direct, zero-hop
+component call across the machine boundary in this mod.
 
 ## Assumptions this depends on
 

@@ -93,24 +93,8 @@ local function discover(wait)
   end
 end
 
--- Submit `code` (compiled as a chunk and called with `args` as its only
--- argument) to one worker node and block for the result. Picks the next
--- node round-robin unless targetAddr is given.
-local function submit(code, args, targetAddr)
-  if #nodeOrder == 0 then
-    return nil, "no worker nodes discovered yet -- try 'discover'"
-  end
-
-  local addr = targetAddr
-  if not addr then
-    addr = nodeOrder[nextNode]
-    nextNode = (nextNode % #nodeOrder) + 1
-  end
-
-  local id = nextJobId
-  nextJobId = nextJobId + 1
-  send({type = "JOB", from = selfAddr, to = addr, id = id, code = code, args = args})
-
+-- Block until a RESULT/ERROR for `id` comes back from `addr`, or time out.
+local function awaitReply(id, addr)
   local deadline = computer.uptime() + TIMEOUT
   while computer.uptime() < deadline do
     local msg = pump()
@@ -125,19 +109,87 @@ local function submit(code, args, targetAddr)
   return nil, "timed out waiting for " .. addr
 end
 
+local function nextId()
+  local id = nextJobId
+  nextJobId = nextJobId + 1
+  return id
+end
+
+-- Submit `code` (compiled as a chunk and called with `args` as its only
+-- argument) to one worker node and block for the result. Picks the next
+-- node round-robin unless targetAddr is given.
+local function submit(code, args, targetAddr)
+  if #nodeOrder == 0 then
+    return nil, "no worker nodes discovered yet -- try 'discover'"
+  end
+
+  local addr = targetAddr
+  if not addr then
+    addr = nodeOrder[nextNode]
+    nextNode = (nextNode % #nodeOrder) + 1
+  end
+
+  local id = nextId()
+  send({type = "JOB", from = selfAddr, to = addr, id = id, code = code, args = args})
+  return awaitReply(id, addr)
+end
+
+-- List the components physically attached to a remote node: address -> type.
+local function listComponents(addr)
+  local id = nextId()
+  send({type = "LIST", from = selfAddr, to = addr, id = id})
+  return awaitReply(id, addr)
+end
+
+-- Call a method on a component attached to a remote node. This is the
+-- "remote component" bridge: addressed the same way component.invoke()
+-- would be locally, but carried over the modem. Returns a list of the
+-- remote call's return values (component methods can return more than
+-- one), or nil + an error string.
+local function invoke(addr, componentAddr, method, args)
+  local id = nextId()
+  send({type = "INVOKE", from = selfAddr, to = addr, id = id, address = componentAddr, method = method, args = args})
+  return awaitReply(id, addr)
+end
+
+-- Let REPL commands refer to a node by its position in `nodes`/`discover`
+-- output (easier to type than a full UUID) as well as by full address.
+local function resolveNode(token)
+  local index = tonumber(token)
+  if index and nodeOrder[index] then
+    return nodeOrder[index]
+  end
+  return token
+end
+
 local function listNodes()
   if #nodeOrder == 0 then
     print("no worker nodes known -- try 'discover'")
     return
   end
-  for _, addr in ipairs(nodeOrder) do
-    print(string.format("%s  (last seen %.1fs ago)", addr, computer.uptime() - nodes[addr].lastSeen))
+  for i, addr in ipairs(nodeOrder) do
+    print(string.format("[%d] %s  (last seen %.1fs ago)", i, addr, computer.uptime() - nodes[addr].lastSeen))
+  end
+end
+
+local function printComponents(addr)
+  local list, err = listComponents(addr)
+  if err then
+    print("error: " .. err)
+    return
+  end
+  for compAddr, ctype in pairs(list) do
+    print(string.format("%s  %s", compAddr, ctype))
   end
 end
 
 local function repl()
   print("rackos arbiter -- " .. selfAddr)
-  print("commands: discover | nodes | run <lua code> | runall <lua code> | quit")
+  print("commands:")
+  print("  discover | nodes | quit")
+  print("  run <lua code> | runall <lua code>")
+  print("  components <node> | call <node> <component addr> <method> [args table]")
+  print("(<node> is either a [n] index from 'nodes' or a full node address)")
   discover(1)
   listNodes()
   while true do
@@ -159,6 +211,26 @@ local function repl()
         local result, err = submit(code, nil, addr)
         if err then print(addr .. ": error: " .. err)
         else print(addr .. ": " .. tostring(result)) end
+      end
+    elseif line:match("^components%s") then
+      printComponents(resolveNode(line:match("^components%s+(%S+)")))
+    elseif line:match("^call%s") then
+      local node, compAddr, method, rest = line:match("^call%s+(%S+)%s+(%S+)%s+(%S+)%s*(.*)$")
+      if not node then
+        print("usage: call <node> <component addr> <method> [args table]")
+      else
+        local args, parseOk = nil, true
+        if rest ~= "" then
+          args = deserialize(rest)
+          if args == nil then
+            print("could not parse args table: " .. rest)
+            parseOk = false
+          end
+        end
+        if parseOk then
+          local result, err = invoke(resolveNode(node), compAddr, method, args)
+          if err then print("error: " .. err) else print(serialize(result)) end
+        end
       end
     elseif line ~= "" then
       print("unknown command")
