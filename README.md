@@ -11,10 +11,11 @@ blades on one shared component bus:
 
 See `docs/PROTOCOL.md` for the wire format between them.
 
-Planned: muxos will stack with a fork of gmux/smux to become OpenOS
-compatible and run multiple OpenOS programs concurrently as a
-multitasking back-end, the same way gmux does. Not integrated yet --
-that fork isn't in this repo.
+Planned: muxos will stack with `smux/` (vendored below, a fork of gmux's
+backend) to become OpenOS compatible and run multiple OpenOS programs
+concurrently as a multitasking back-end, the same way gmux does. Not
+wired into `kernal/muxos.lua` yet -- it's vendored but not yet called
+from anywhere in this repo.
 
 ## Layout
 
@@ -22,7 +23,18 @@ that fork isn't in this repo.
 kernal/muxos.lua    kernal program: discovery + round-robin job dispatch + REPL
 node/bios.lua         worker firmware, meant to be flashed onto an EEPROM
 docs/PROTOCOL.md      shared wire format (kept in sync by hand, see why in the file)
+smux/                 vendored: headless OpenOS multiplexer, forked from gmux's backend
+                       (process/filesystem isolation + a remote-console transport over GERTi).
+                       See smux/README.md and smux/docs/design.md. Not yet called from muxos.
 ```
+
+### smux's one external dependency
+
+`smux/gertinet.lua` (its GERTi transport) requires `hmi/proto.lua`, a
+shared wire codec from the monorepo smux was extracted from. That file
+isn't vendored here, so `smux/test/test_gertinet.lua` fails on `require`
+until it's added -- everything else (33 of smux's own tests: framing,
+session, job_console, serve, the installer) passes standalone.
 
 ## Flashing a worker
 
