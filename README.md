@@ -1,21 +1,32 @@
 # muxos
 
-Experimental custom OS stack for an OpenComputers rack running 4 Server
-blades on one shared component bus:
+A custom OS stack, built from the ground up, for an OpenComputers rack
+running 4 Server blades on one shared component bus. It's a multi-core
+system OS: the 3 worker nodes' custom firmware are its cores/threads, and
+the kernal is the scheduler/front-end.
 
-- **Kernal (1 node)** -- boots a normal OpenOS, is the bootstrap/kernal
+- **Kernal (1 node)** -- boots a normal OpenOS, is the bootstrap/scheduler
   and the only node you actually interact with. Runs `kernal/muxos.lua`.
-- **Workers (3 nodes)** -- no OS, no disk. `node/bios.lua` is flashed
-  directly onto each one's EEPROM and *is* the entire firmware: boot,
-  open a Network Card, wait for jobs, run them, reply.
+  Eventually hosts a local GUI front end; draw calls from jobs running on
+  worker nodes get forwarded to it to run against its real GPU.
+- **Workers (3 nodes)** -- no OS, no disk, on purpose: `node/bios.lua` is
+  flashed directly onto each one's EEPROM and *is* the entire firmware.
+  Boot, open a Network Card, wait for jobs, run them, reply. Each one is a
+  physically separate computer, so job isolation between them is free --
+  no software sandboxing needed the way a single-process multiplexer
+  requires.
 
 See `docs/PROTOCOL.md` for the wire format between them.
 
-Planned: muxos will stack with `smux/` (vendored below, a fork of gmux's
-backend) to become OpenOS compatible and run multiple OpenOS programs
-concurrently as a multitasking back-end, the same way gmux does. Not
-wired into `kernal/muxos.lua` yet -- it's vendored but not yet called
-from anywhere in this repo.
+`smux/` (vendored below) is **reference material, not a runtime
+dependency** -- it's a real, OpenOS-standalone server-side multiplexer
+(the "server version of gmux"), studied for its mechanisms (the
+metatable-swap isolation trick in `patch.lua`, the job-console/session/
+framing protocol for remote attach). muxos is its own implementation of
+equivalent capability, built for a different substrate: physically
+separate firmware nodes over a network, not coroutines multiplexed
+inside one OpenOS process table. Nothing in `smux/` runs on a worker
+node, and nothing here currently calls into it.
 
 ## Layout
 
@@ -23,9 +34,8 @@ from anywhere in this repo.
 kernal/muxos.lua    kernal program: discovery + round-robin job dispatch + REPL
 node/bios.lua         worker firmware, meant to be flashed onto an EEPROM
 docs/PROTOCOL.md      shared wire format (kept in sync by hand, see why in the file)
-smux/                 vendored: headless OpenOS multiplexer, forked from gmux's backend
-                       (process/filesystem isolation + a remote-console transport over GERTi).
-                       See smux/README.md and smux/docs/design.md. Not yet called from muxos.
+smux/                 reference only (see above): a real, standalone OpenOS multiplexer,
+                       forked from gmux's backend. Not run on any node in this project.
 ```
 
 ### smux's one external dependency
@@ -90,5 +100,6 @@ First working slice: discovery + synchronous round-robin job dispatch +
 a remote-component bridge + latency probing.
 Not yet built: a real scheduler (load balancing beyond round-robin, async
 futures/callbacks instead of blocking `submit()`), node health/failure
-handling, the gmux/smux multitasking back-end, and anything
-workload-specific.
+handling, a GPU-forwarding virtual component for the kernal's eventual
+GUI front end (multi-monitor support is explicitly out of scope until
+the single-GPU case works end to end), and anything workload-specific.
