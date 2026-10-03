@@ -1,9 +1,9 @@
--- Arbiter program for huh2. Runs under a normal OpenOS boot on the main
--- rack node (own CPU/RAM/EEPROM/HDD, same as any OC computer). Discovers
--- worker nodes flashed with node/bios.lua over the rack's shared network
--- segment and dispatches Lua jobs to them.
+-- muxos arbiter program for huh2. Runs under a normal OpenOS boot on the
+-- main rack node (own CPU/RAM/EEPROM/HDD, same as any OC computer).
+-- Discovers worker nodes flashed with node/bios.lua over the rack's shared
+-- network segment and dispatches Lua jobs to them.
 --
--- Install: copy onto the arbiter's filesystem (e.g. /home/rackos.lua) and
+-- Install: copy onto the arbiter's filesystem (e.g. /home/muxos.lua) and
 -- run it from the OpenOS shell.
 --
 -- Wire format: see docs/PROTOCOL.md. The serializer below is a deliberate
@@ -152,6 +152,45 @@ local function invoke(addr, componentAddr, method, args)
   return awaitReply(id, addr)
 end
 
+-- Round-trip latency probe: times a single targeted PING/PONG exchange.
+-- Unlike discover()'s broadcast PING, this one sets `to` so only the
+-- named node answers, and we measure wall time from send to the matching
+-- PONG. Exists to measure the rack's actual message latency empirically --
+-- see docs/PROTOCOL.md for why that number isn't otherwise documented.
+local function pingOnce(addr, id)
+  local sentAt = computer.uptime()
+  send({type = "PING", from = selfAddr, to = addr, id = id})
+  local deadline = sentAt + TIMEOUT
+  while computer.uptime() < deadline do
+    local msg = pump()
+    if type(msg) == "table" and msg.type == "PONG" and msg.id == id and msg.to == selfAddr then
+      return computer.uptime() - sentAt
+    end
+  end
+  return nil, "timed out waiting for " .. addr
+end
+
+local function pingReport(addr, count)
+  count = count or 3
+  local min, max, total, replies = nil, nil, 0, 0
+  for _ = 1, count do
+    local rtt, err = pingOnce(addr, nextId())
+    if rtt then
+      replies = replies + 1
+      total = total + rtt
+      min = (not min or rtt < min) and rtt or min
+      max = (not max or rtt > max) and rtt or max
+      print(string.format("  reply from %s: time=%.1fms", addr, rtt * 1000))
+    else
+      print(string.format("  no reply from %s (%s)", addr, err))
+    end
+  end
+  if replies > 0 then
+    print(string.format("%d/%d replies -- min/avg/max = %.1f/%.1f/%.1fms",
+      replies, count, min * 1000, (total / replies) * 1000, max * 1000))
+  end
+end
+
 -- Let REPL commands refer to a node by its position in `nodes`/`discover`
 -- output (easier to type than a full UUID) as well as by full address.
 local function resolveNode(token)
@@ -184,16 +223,16 @@ local function printComponents(addr)
 end
 
 local function repl()
-  print("rackos arbiter -- " .. selfAddr)
+  print("muxos arbiter -- " .. selfAddr)
   print("commands:")
-  print("  discover | nodes | quit")
+  print("  discover | nodes | ping <node> [count] | quit")
   print("  run <lua code> | runall <lua code>")
   print("  components <node> | call <node> <component addr> <method> [args table]")
   print("(<node> is either a [n] index from 'nodes' or a full node address)")
   discover(1)
   listNodes()
   while true do
-    io.write("rackos> ")
+    io.write("muxos> ")
     local line = io.read()
     if not line or line == "quit" or line == "exit" then
       break
@@ -202,6 +241,13 @@ local function repl()
       listNodes()
     elseif line == "nodes" then
       listNodes()
+    elseif line:match("^ping%s") then
+      local node, countStr = line:match("^ping%s+(%S+)%s*(%S*)$")
+      if not node then
+        print("usage: ping <node> [count]")
+      else
+        pingReport(resolveNode(node), tonumber(countStr))
+      end
     elseif line:match("^run%s") then
       local result, err = submit(line:sub(5), nil)
       if err then print("error: " .. err) else print(tostring(result)) end

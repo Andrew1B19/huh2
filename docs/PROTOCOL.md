@@ -1,6 +1,6 @@
 # Wire protocol
 
-Both sides (`node/bios.lua` and `arbiter/rackos.lua`) talk over a Network
+Both sides (`node/bios.lua` and `arbiter/muxos.lua`) talk over a Network
 Card, broadcasting on a fixed port:
 
 ```
@@ -70,5 +70,16 @@ component call across the machine boundary in this mod.
   ports/broadcast), the networking code in both files needs to change.
 - Worker nodes have no filesystem and no OS; `node/bios.lua` *is* the
   entire firmware, flashed straight onto the EEPROM.
-- The arbiter boots a normal OpenOS and runs `rackos.lua` as a regular
+- The arbiter boots a normal OpenOS and runs `muxos.lua` as a regular
   program.
+
+## Measured vs. documented latency
+
+The config numbers in OC's `application.conf` (`maxNetworkPacketSize`,
+`maxSignalQueueSize`, a Switch's `defaultRelayDelay`/`defaultMaxQueueSize`)
+are documented and confirmed. What is *not* confirmed from available docs
+is whether a Rack's internal bus between its 4 Server slots applies that
+same Switch-style relay delay, or is instantaneous. Rather than guess,
+`muxos.lua`'s `ping <node> [count]` REPL command times real PING/PONG
+round trips so this can be measured directly on actual hardware instead
+of assumed from source.
