@@ -93,6 +93,10 @@ test/emu/              a 4-node (1 kernal + 3 workers) test environment, emulati
                        project's own verified native primitives -- not the community OCEmu
                        (needs LÖVE2D, not installable headless here). Boots the REAL,
                        unmodified repo files and drives the kernal's REPL like a human would.
+test/hardware/         verify.lua -- a bare-metal suite for REAL OpenComputers hardware,
+                       covering what test/emu's sandbox can't: real eris coroutine
+                       persistence (the proposed job-migration mechanism), the real Lua
+                       library profile, real GPU buffer operations.
 smux/                 reference only (see above): a real, standalone OpenOS multiplexer,
                        forked from gmux's backend. Not run on any node in this project.
 gmux/                 reference only (see above): the real graphical multiplexer, vendored
