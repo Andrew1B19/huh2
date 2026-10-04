@@ -344,4 +344,46 @@ emu:advance(3)
 assertScreenContains("count=0", "orphans are claimed once -- a second get_orphans call for the same name returns nothing")
 print("  OK -- orphan was claimed once; a second get_orphans call returns none")
 
+print("test 13: fan-out cap -- a job tree can't have more running jobs than there are worker nodes (3)")
+-- The parent job itself counts as "running" in its own tree while it's
+-- spawning children (it hasn't returned yet), so with 3 worker nodes
+-- the cap (#nodeOrder == 3) allows the parent plus only 2 children
+-- before a 3rd spawn attempt is rejected. Each child needs to still be
+-- "running" (not finished) through all three back-to-back spawn round
+-- trips below for that cap to actually bind.
+--
+-- Two earlier attempts at keeping a child "busy" long enough both
+-- turned out to misunderstand the emulator's own time model and got
+-- this wrong, confirmed by hand: a finite CPU-bound loop (even 2
+-- million iterations, yielding every 500 via the cooperative yield()
+-- global) finishes in effectively ZERO simulated time, because
+-- test/emu/emulator.lua's own Emulator:step() advances its simulated
+-- clock only for a REAL wait (a positive-timeout pullSignal), not for
+-- yield()'s always-zero-delay cooperative check -- so all 3 children
+-- had already run to completion, at the same instant, well before
+-- advance() exhausted its budget. Going to the opposite extreme,
+-- `while true do yield() end`, hung the test runner itself for the
+-- very same reason: infinitely many zero-delay steps, the simulated
+-- clock never moving, so advance()'s own "keep stepping until enough
+-- simulated time has passed" loop never ends. The actual fix: have
+-- the child block on a REAL timed wait -- `coroutine.yield(5)`
+-- directly (confirmed against node/runtime.lua's own `pullSignal`,
+-- which is nothing but `coroutine.yield(timeout)`; `computer` in
+-- THIS emulator, unlike real OpenComputers, has no `pullSignal`
+-- method of its own -- test/emu/emulator.lua's makeComputerAPI only
+-- gives it address/uptime/beep/pushSignal, confirmed the hard way:
+-- an earlier version of this child called `computer.pullSignal` and
+-- every instance past the first died instantly with "attempt to call
+-- a nil value", not a timing issue at all). A raw `coroutine.yield(n)`
+-- from job code reaches runJobCode's own dispatch loop exactly like a
+-- nested gmuxapi wait would, and IS a positive-timeout wait the
+-- emulator genuinely advances its clock for -- so the child is still
+-- truthfully "running" for the whole few-tick span the three spawns
+-- below take.
+typeLine('run local childCode="local deadline = computer.uptime() + 5 while computer.uptime() < deadline do coroutine.yield(deadline - computer.uptime()) end return 1" local ok1,e1=gmuxapi.create_headless_process({code=childCode,name="fanout"}) local ok2,e2=gmuxapi.create_headless_process({code=childCode,name="fanout"}) local ok3,e3=gmuxapi.create_headless_process({code=childCode,name="fanout"}) return "r1="..tostring(ok1~=nil).." r2="..tostring(ok2~=nil).." r3="..tostring(ok3~=nil).." e3="..tostring(e3)')
+emu:advance(3)
+assertScreenContains("r1=true r2=true r3=false", "first two children succeed, third is rejected")
+assertScreenContains("fan-out cap reached", "rejection names the real reason")
+print("  OK -- 1st and 2nd child spawns succeeded, 3rd was rejected once the tree hit the 3-node cap")
+
 print("ALL OK")

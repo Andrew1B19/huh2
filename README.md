@@ -366,14 +366,29 @@ orphans, claimed once. Building this surfaced and fixed a real bug in
 when it landed on its own parent's node -- see docs/PROTOCOL.md.
 Verified end to end in `test/emu/integration_test.lua` (test 12).
 
+A fan-out/depth cap is real too: a job tree (a top-level job plus every
+descendant it spawned, at any depth) can't have more than `#nodeOrder`
+jobs "running" at once -- as many as there are worker nodes. And an
+`orphan`-policy job that's never reclaimed doesn't just run forever
+unbounded any more: its cleanup timeout shrinks dynamically as
+scheduler load rises (`BASE_ORPHAN_TIMEOUT / (1 + schedulerStress())`),
+freeing its slot sooner precisely when capacity is actually scarce.
+Both verified end to end in `test/emu/integration_test.lua` (test 13
+for the fan-out cap; the dynamic-timeout formula itself is also
+cross-checked in isolation, since its 300s base timeout makes a true
+end-to-end test of the sweep impractical).
+
 **Still forward design, not yet built**: planned node draining as
-distinct from an unrecoverable node death, and "semi-live" job
-migration via `eris` coroutine persistence (the mechanism itself is
-confirmed for real against the genuine upstream `eris` library,
-including a full cross-process round trip -- see
-`test/hardware/verify.lua` -- but nothing in `kernal/muxos.lua`/
-`node/runtime.lua` uses it yet). See docs/PROTOCOL.md's "The `.mxe`
-process model" section for the full design and what's still genuinely
-undecided (fan-out caps, the exact job-environment and
-persistent-window-handle APIs, no cleanup timeout for an unreclaimed
-orphan).
+distinct from an unrecoverable node death, "semi-live" job migration
+via `eris` coroutine persistence (the mechanism itself is confirmed for
+real against the genuine upstream `eris` library, including a full
+cross-process round trip -- see `test/hardware/verify.lua` -- but
+nothing in `kernal/muxos.lua`/`node/runtime.lua` uses it yet), and the
+general `.mxe`-vs-legacy hardware access model (direct kernel calls for
+every subsystem, never virtualized hardware, for `.mxe` apps --
+networking and focus-based keyboard delivery are the two concrete
+examples on the table, but keyboard delivery needs window-focus
+tracking built first). See docs/PROTOCOL.md's "The `.mxe` process
+model" section for the full design and what's still genuinely
+undecided (the exact job-environment and persistent-window-handle
+APIs, "promote"'s unenforced self-dependence requirement).

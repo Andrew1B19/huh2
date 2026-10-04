@@ -949,13 +949,31 @@ an already-placed parent and child beyond what the existing protocol
 already does.
 
 A child can become a parent itself -- the relationship is just a field
-on a table entry, nothing stops it from recursing. **Still undecided:**
-whether there's a cap on depth or total fan-out per top-level job. With
-only 3 workers total, an unbounded spawner could starve everything
-else; some cap (e.g. "no more than N live descendants per top-level
-job") seems likely necessary but the exact number, and whether it's a
-hard limit or something the scheduler just weighs against, hasn't been
-decided -- no cap is enforced today.
+on a table entry, nothing stops it from recursing.
+
+### Fan-out/depth cap on recursive spawning -- BUILT
+
+With only 3 workers total, an unbounded spawner could starve everything
+else. The answer landed on: **a job tree (the top-level job plus every
+descendant it spawned, directly or through several levels) may not have
+more than `#nodeOrder` jobs counted as "running" at once** -- "as many
+nodes as there is," per the design decision this was built against.
+Depth and fan-out collapse into one check this way, rather than needing
+two separate limits: a grandchild spawning its own child counts against
+the same tree total as a direct child would.
+
+Mechanically: every job record gets a `rootId` field -- its own id for a
+top-level job, inherited in O(1) from its parent's own `rootId`
+otherwise (never a chain-walk, so this stays cheap no matter how deep a
+tree gets). `countRunningInTree(rootId)` counts every job sharing that
+`rootId` whose `status == "running"`; `handleSpawn` checks this against
+`#nodeOrder` before dispatching a child (never for a top-level job --
+only child spawns, where `msg.parent` is set, are capped) and replies
+with a clear `ERROR` naming the cap and the current count if it's
+already been reached. The parent itself counts toward its own tree's
+total while it's still running (mid-spawn, waiting on its own children),
+so with 3 nodes a parent can have at most 2 live children before the
+3rd spawn attempt is rejected.
 
 **The "what happens when every worker is busy" question turned out to
 already have an answer, implicitly, in the existing design**: a worker
@@ -1025,11 +1043,29 @@ child (default: `"orphan"`). Applied by
 `applyOrphanPolicyForChildrenOf`, called the instant the kernal records
 a job as no longer running, for every child of that job:
 
-- **`orphan`** -- the child keeps running untethered. Nothing happens
-  mechanically; it's already registered in `appsByName` for reclaim
-  (see above), and stays there until reclaimed. There's no timeout or
-  manual-kill cleanup built yet for an orphan nobody ever reclaims --
-  flagged, not hidden.
+- **`orphan`** -- the child keeps running untethered, registered in
+  `appsByName` for reclaim (see above), and marks `job.orphanedAt =
+  computer.uptime()` at the moment it's actually orphaned (when its
+  parent finishes) -- not when it was originally spawned, which could
+  have been long before. **Stale-orphan cleanup -- BUILT**:
+  `sweepStaleOrphans()`, called once per tick alongside the existing
+  `sweepStaleChunks()`, kills (same best-effort raw `KILL <id>`
+  broadcast as the `kill` policy below, same cooperative-yield-point
+  limitation) any `orphan`-policy job that's sat unreclaimed longer
+  than `orphanTimeoutSeconds()` -- re-broadcasting at most once per
+  `KILL_RETRY_INTERVAL` (10s) in case the first broadcast missed a job
+  that wasn't at a yield point yet. **The timeout is dynamic, per the
+  design decision it was built against ("dependent on scheduler
+  stress")**: `orphanTimeoutSeconds() = BASE_ORPHAN_TIMEOUT / (1 +
+  schedulerStress())`, where `BASE_ORPHAN_TIMEOUT = 300` and
+  `schedulerStress() = (count of every job across the whole system
+  with status "running") / #nodeOrder` -- a real backlog measure, not
+  just "is anything happening," since it can exceed 1 when jobs are
+  queued behind busy workers. An idle system gives an unreclaimed
+  orphan the full 300s; as load climbs, that shrinks, freeing a slot
+  sooner precisely when capacity is actually scarce. The exact curve
+  (simple inverse) is a judgment call, not measured against real
+  hardware or workloads.
 - **`kill`** -- the kernal broadcasts a raw, unchunked `"KILL <id>"`
   (same convention as boot's own `BOOT`/`CODE`, bypassing the generic
   `MSG` framing deliberately -- this needs to be checked cheaply at
@@ -1154,19 +1190,27 @@ designed yet.
 
 Collected in one place:
 
-- Depth/fan-out caps on recursive parent/child spawning (or whether
-  there's a cap at all) -- no cap is enforced today.
 - The exact shape of the "job environment abstraction" -- what's
   actually exposed to a dispatched `.mxe` app vs. a plain `JOB`, beyond
   the `jobId` global and `gmuxapi` every job already gets today.
 - The persistent-window-handle API's exact shape (semi-live migration
   and the compositor handle model are both still forward design, not
   implemented -- see their own sections above).
-- No timeout or manual-kill cleanup for an "orphan"-policy job that's
-  never reclaimed -- it just runs forever, registered in `appsByName`,
-  until something asks for it by name.
 - "promote"'s self-dependence requirement isn't enforced -- the kernal
   takes the declared policy at face value.
+- The general `.mxe`-vs-legacy hardware access model: `.mxe` apps make
+  direct kernel calls for every subsystem (the `gmuxapi` pattern
+  already built for windows/gpu, generalized) and never see
+  virtualized/emulated hardware components; legacy OpenOS/gmux-compat
+  apps DO get emulated hardware for compatibility (e.g. a virtual
+  modem component). Concrete examples given, not yet built: networking
+  should give `.mxe` a lightweight kernal modem kernel module
+  implementation plus eventual GERTi access, while legacy sees an
+  emulated modem; keyboard input should be delivered directly to
+  whichever `.mxe` job currently has focus, instead of via a virtual
+  keyboard component. Needs more scaffolding first -- no window-focus-
+  tracking mechanism exists yet, and that has to exist before
+  focus-based keyboard delivery can be built at all.
 
 **Resolved while building the rest of this section**: "what the kernal
 does when every worker is already busy" turned out to already have an

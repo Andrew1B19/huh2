@@ -421,14 +421,40 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
     nextNode = (nextNode % #nodeOrder) + 1
   end
   local id = nextId()
+  -- rootId is the ultimate ancestor of this job's tree -- itself, for
+  -- a top-level job; inherited in O(1) from the parent's own rootId
+  -- otherwise (never a chain-walk). This is what the fan-out cap below
+  -- counts against: "how many jobs in THIS tree are running right
+  -- now," not a global count, so one tree hitting its cap doesn't
+  -- block unrelated top-level work.
+  local rootId = parent and jobs[parent] and jobs[parent].rootId or id
   jobs[id] = {id = id, node = targetAddr, status = "running", code = code, startedAt = computer.uptime(),
-    parent = parent, appName = appName, orphanPolicy = parent and (orphanPolicy or "orphan") or nil}
+    parent = parent, appName = appName, orphanPolicy = parent and (orphanPolicy or "orphan") or nil,
+    rootId = rootId}
   jobOrder[#jobOrder + 1] = id
   if parent and jobs[id].orphanPolicy == "orphan" then
     registerOrphanCandidate(appName, id)
   end
   send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args})
   return id, targetAddr
+end
+
+-- Fan-out/depth cap on recursive spawning: "for as many nodes as
+-- there is" -- a job tree (the top-level job plus every descendant it
+-- spawned, directly or through several levels) may not have more than
+-- `#nodeOrder` jobs counted as "running" at once. Counts the WHOLE
+-- tree via each job's own rootId, not just direct children, so a
+-- grandchild spawning its own child is covered the same as a direct
+-- child -- "depth" and "fan-out" collapse into the same single check
+-- this way, rather than needing two separate limits.
+local function countRunningInTree(rootId)
+  local count = 0
+  for _, id in ipairs(jobOrder) do
+    if jobs[id].rootId == rootId and jobs[id].status == "running" then
+      count = count + 1
+    end
+  end
+  return count
 end
 
 -- Applies a job's declared orphan policy once its PARENT is no longer
@@ -459,8 +485,66 @@ local function applyOrphanPolicyForChildrenOf(parentId)
       elseif job.orphanPolicy == "kill" then
         modem.broadcast(PORT, "KILL " .. id)
         job.parent = nil
+      elseif job.orphanPolicy == "orphan" then
+        -- Marks WHEN this job actually became orphaned -- the clock
+        -- sweepStaleOrphans() (below) measures against, not when it
+        -- was originally spawned (which could have been long before
+        -- its parent actually finished).
+        job.orphanedAt = computer.uptime()
       end
-      -- "orphan" (or unset): nothing to do here.
+    end
+  end
+end
+
+-- How loaded the scheduler is right now: running jobs per worker node.
+-- Can exceed 1 -- "running" counts every job the kernal has dispatched
+-- and not yet seen finish, including ones still queued behind another
+-- job at the same busy worker (see dispatchJob's own comment on why a
+-- busy target just queues rather than being denied) -- so this is a
+-- real backlog measure, not just "is anything happening at all."
+local function schedulerStress()
+  if #nodeOrder == 0 then return 0 end
+  local running = 0
+  for _, id in ipairs(jobOrder) do
+    if jobs[id].status == "running" then running = running + 1 end
+  end
+  return running / #nodeOrder
+end
+
+-- "Timeout is dependent on scheduler stress": an orphan nobody's
+-- reclaimed sits for up to BASE_ORPHAN_TIMEOUT seconds while the
+-- system is idle, shrinking as load climbs -- freeing capacity sooner
+-- precisely when capacity is actually scarce, rather than holding an
+-- unreclaimed job's slot regardless of whether anything else needs it.
+-- The exact curve (simple inverse, BASE/(1+stress)) is a judgment
+-- call, not measured against real hardware or real workloads.
+local BASE_ORPHAN_TIMEOUT = 300
+
+local function orphanTimeoutSeconds()
+  return BASE_ORPHAN_TIMEOUT / (1 + schedulerStress())
+end
+
+-- Called once per tick (see the main loop below). Finds every
+-- "orphan"-policy job that's actually been orphaned (orphanedAt set)
+-- and still running, and kills it (same best-effort raw KILL broadcast
+-- as the "kill" policy, same cooperative-yield-point limitation) once
+-- it's been unclaimed longer than the current dynamic timeout.
+-- Re-broadcasts periodically (not just once) in case the first KILL
+-- never reached a job that wasn't yielding yet when it was sent.
+local KILL_RETRY_INTERVAL = 10
+
+local function sweepStaleOrphans()
+  local timeout = orphanTimeoutSeconds()
+  local now = computer.uptime()
+  for _, id in ipairs(jobOrder) do
+    local job = jobs[id]
+    if job.orphanPolicy == "orphan" and job.orphanedAt and job.status == "running"
+        and now - job.orphanedAt > timeout then
+      if not job.lastKillSentAt or now - job.lastKillSentAt > KILL_RETRY_INTERVAL then
+        modem.broadcast(PORT, "KILL " .. id)
+        job.lastKillSentAt = now
+        unregisterOrphanCandidate(job.appName, id)
+      end
     end
   end
 end
@@ -576,6 +660,16 @@ local function handleSpawn(msg)
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
       error = "orphanPolicy must be one of orphan/kill/promote, got " .. tostring(msg.orphanPolicy)})
     return
+  end
+  if msg.parent and jobs[msg.parent] then
+    local rootId = jobs[msg.parent].rootId or msg.parent
+    local running = countRunningInTree(rootId)
+    if running >= #nodeOrder then
+      send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+        error = "fan-out cap reached: this job tree already has " .. running ..
+          " running job(s), as many as there are worker nodes (" .. #nodeOrder .. ")"})
+      return
+    end
   end
   local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node, msg.parent, msg.appName, msg.orphanPolicy)
   if not jobId then
@@ -804,6 +898,7 @@ local function tick(timeout)
       handleModemMessage(a3, a4, a6)
     end
     sweepStaleChunks()
+    sweepStaleOrphans()
     compositor.flush()
   end)
   if not ok then
