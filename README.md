@@ -6,11 +6,15 @@ system OS: the 3 worker nodes' custom firmware are its cores/threads, and
 the kernal is the scheduler/front-end.
 
 - **Kernal (1 node)** -- boots a normal OpenOS, is the bootstrap/scheduler
-  and the only node you actually interact with. Runs `kernal/muxos.lua`.
-  Eventually hosts a local GUI front end; draw calls from jobs running on
-  worker nodes get forwarded to it to run against its real GPU. It also
-  holds `node/runtime.lua` on its own disk and serves it to workers at
-  boot (see below) -- it's the authoritative source for what a worker runs.
+  and the only node you actually interact with. Runs `kernal/muxos.lua`
+  plus `kernal/compositor.lua`, a sibling module it loads via `dofile`.
+  The compositor is the ONLY file in this whole project that makes a
+  real `gpu.*` call -- "only the display node actually needs to make
+  those budgeted calls for real" (every GPU method is a per-tick-budgeted
+  call in OC's own source, see docs/PROTOCOL.md), enforced structurally
+  rather than by convention. The kernal also holds `node/runtime.lua` on
+  its own disk and serves it to workers at boot (see below) -- it's the
+  authoritative source for what a worker runs.
 - **Workers (3 nodes)** -- no OS, no disk, on purpose. `node/bios.lua` is
   the only thing flashed onto each one's EEPROM, and it's tiny: open a
   Network Card, ask the kernal for `node/runtime.lua`'s source, `load()`
@@ -49,6 +53,9 @@ and what isn't yet.
 ```
 kernal/muxos.lua    kernal program: boot-serving + discovery + round-robin job dispatch +
                        job registry (jobs) + REPL
+kernal/compositor.lua  the only file that touches the real gpu: window registry, buffer
+                       allocation, draw-code execution, blit-to-screen. Loaded by muxos.lua
+                       via dofile() as a sibling file.
 node/bios.lua         worker EEPROM image: tiny network-boot stub, fetches node/runtime.lua
 node/runtime.lua       worker's real runtime, served by the kernal (installed as its sibling,
                        NOT flashed anywhere) -- job execution, remote-component bridge, gpu
@@ -85,10 +92,12 @@ answers; that's expected, not a hang.
 
 ## Running the kernal
 
-Copy `kernal/muxos.lua` **and** `node/runtime.lua` onto the kernal's
-filesystem as siblings (e.g. both in `/home/`) and run `muxos.lua` from
-the OpenOS shell. Workers fetch `runtime.lua`'s source from the kernal's
-disk at boot -- it is never installed on a worker itself.
+Copy `kernal/muxos.lua`, `kernal/compositor.lua`, **and**
+`node/runtime.lua` onto the kernal's filesystem as siblings (e.g. all
+three in `/home/`) and run `muxos.lua` from the OpenOS shell. Workers
+fetch `runtime.lua`'s source from the kernal's disk at boot -- it is
+never installed on a worker itself; `compositor.lua` likewise never
+leaves the kernal.
 
 ```
 muxos.lua
@@ -154,6 +163,18 @@ type (`gpu`). See docs/PROTOCOL.md for the one known gap (the kernal only
 services an incoming boot/remote request while something is actively
 polling, not while the REPL is blocked at its prompt).
 
+**One exception to that symmetry**: `INVOKE` targeting the kernal's real
+gpu or its bound screen is blocked -- those are the compositor's, and
+going around it defeats the point of having one. Calling `gpu.set(...)`
+etc. from a worker without a grant now fails with "direct gpu/screen
+access is blocked" instead of quietly drawing on the kernal's live
+screen; use `gmuxapi.create_window()` for ordinary output.
+`gmuxapi.request_fullscreen()`/`release_fullscreen()` are the one way
+through, for a fullscreen app that genuinely wants to own the display
+directly -- first-come-first-served, one holder at a time, NOT released
+automatically if its holder disappears. See docs/PROTOCOL.md's
+"The compositor" section.
+
 `node/runtime.lua`'s `gmuxapi` table is muxos's translation of gmux's
 actual *application* API (`component.gmuxapi.*` in gmux itself -- see
 `gmux/lib/gmux/frontend/api.lua`) for a networked substrate rather than
@@ -175,7 +196,13 @@ answer any of them from its own state alone:
   `create_window_buffer`: `options.code` (run ON the kernal, drawing
   into the allocated buffer) replaces gmux's `func(gpu)` callback, since
   a function value can't cross the network either.
-- `get_windows()` -- the kernal's window registry.
+- `get_windows()` -- the kernal's window registry (`kernal/compositor.lua`).
+- `request_fullscreen()` / `release_fullscreen()` -- not part of gmux's
+  real API (it never needs this; its apps already share the host
+  process's real gpu/screen directly). Added because direct gpu/screen
+  `INVOKE` is blocked by default now -- this is how a node gets let
+  through, for a fullscreen app that wants to bypass the compositor's
+  buffer/blit indirection on purpose.
 
 See docs/PROTOCOL.md for exactly what's NOT translated: this is not
 gmux's real desktop (no layering, dragging, resizing, or input routing
@@ -191,15 +218,18 @@ message's size budget) + discovery + synchronous round-robin job
 dispatch with a kernal-side job registry (shared by `submit()` and the
 fire-and-forget `SPAWN` path, completion recorded generically either
 way) + a symmetric remote-component bridge (kernal<->worker, used by
-workers to reach kernal hardware they don't have locally, e.g. `gpu`) +
-a minimal kernal-side window registry + five translated pieces of
-gmux's application API (`get_processes`, `create_headless_process`,
-`create_graphics_process`, `create_window`, `get_windows`) + latency
-probing.
+workers to reach kernal hardware they don't have locally, e.g. `gpu`),
+gated so direct gpu/screen access requires an exclusive fullscreen grant
++ a compositor module (`kernal/compositor.lua`) that's the sole real
+gpu-touching code in the project + five translated pieces of gmux's
+application API (`get_processes`, `create_headless_process`,
+`create_graphics_process`, `create_window`, `get_windows`) plus the
+fullscreen-grant pair + latency probing.
 Not yet built: a real scheduler (load balancing beyond round-robin, async
 futures/callbacks for `submit()` itself, not just `SPAWN`), node
 health/failure handling, a real multi-threading kernel API (the
-REPL-blocks-the-network gap still stands), broader OpenOS-library-shaped
+REPL-blocks-the-network gap still stands, and so does the fullscreen
+grant's no-automatic-release-on-crash gap), broader OpenOS-library-shaped
 coverage beyond `gpu`, a real windowing system (layering/dragging/
 resizing/input routing) rather than the current one-shot-blit registry,
 per-job isolated drawing surfaces (so `create_graphics_process`'s job and

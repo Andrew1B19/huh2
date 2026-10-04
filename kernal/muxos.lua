@@ -63,6 +63,19 @@ local nodeOrder = {}  -- address list, stable iteration/round-robin order
 local nextJobId = 1
 local nextNode = 1
 
+-- The compositor (compositor.lua) is the only code that's supposed to
+-- touch the real gpu/screen -- but INVOKE is a generic remote-component
+-- bridge, so without this check a worker's `gpu` face could reach the
+-- kernal's real display directly, bypassing the compositor entirely.
+-- Blocked by default; a node holding this exclusive grant (via
+-- gmuxapi.request_fullscreen()) is let through, for the one legitimate
+-- case where going around the compositor is the point -- a fullscreen
+-- app that wants to own the whole display and draw without buffer/blit
+-- overhead. Only one node may hold it at a time. Not released
+-- automatically if its holder disappears (reboots, crashes) -- a real
+-- gap, flagged rather than silently handled.
+local exclusiveFullscreenOwner = nil
+
 -- The kernal is the scheduler, so it's the one place that actually knows
 -- about every job dispatched to any node -- this is what lets
 -- get_processes() (the muxos equivalent of gmux's api.get_processes())
@@ -73,16 +86,6 @@ local nextNode = 1
 -- recognizable without claiming exact parity with its "waiting"/"dead".
 local jobs = {}
 local jobOrder = {}
-
--- Minimal window registry -- NOT a port of gmux's real desktop
--- (lib/gmux/frontend/windows.lua + graphics.lua: layering, dragging,
--- resizing, routing input by topmost-window-under-cursor). What this
--- gives: allocate a GPU buffer, let code draw into it, blit it onto the
--- kernal's own real screen at a fixed (x, y), and remember it existed.
--- Enough to make create_window/get_windows real without pretending
--- there's a desktop here. id -> {id, title, x, y, width, height, buffer}.
-local windows = {}
-local windowOrder = {}
 
 local function send(msg)
   modem.broadcast(PORT, serialize(msg))
@@ -132,6 +135,13 @@ local function scriptDir()
   return path:match("^(.*)/[^/]*$") or "."
 end
 
+-- The compositor is the only code in this whole project that makes a
+-- real gpu.* call -- see compositor.lua's own header for why that's
+-- worth enforcing structurally, not just by convention. Loaded as a
+-- sibling file via dofile(), not require(), for the same reason
+-- runtime.lua is read directly off disk below rather than required.
+local compositor = dofile(scriptDir() .. "/compositor.lua")
+
 local RUNTIME_PATH = scriptDir() .. "/runtime.lua"
 local runtimeSource = nil -- loaded lazily and cached, see loadRuntime()
 
@@ -180,7 +190,22 @@ local function handleList(msg)
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
 end
 
+-- True if `address` is the kernal's own real gpu or the screen it's
+-- bound to -- the two component types the compositor exists to own.
+-- Deliberately narrow: INVOKE on anything else (redstone, sensors, a
+-- second gpu, whatever) is unaffected by the fullscreen grant.
+local function isDisplayComponent(address)
+  if component.isAvailable("gpu") and component.gpu.address == address then return true end
+  if component.isAvailable("screen") and component.screen.address == address then return true end
+  return false
+end
+
 local function handleInvoke(msg)
+  if isDisplayComponent(msg.address) and msg.from ~= exclusiveFullscreenOwner then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+      error = "direct gpu/screen access is blocked -- use create_window, or gmuxapi.request_fullscreen() for exclusive access"})
+    return
+  end
   local packed = table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(msg.args or {})))
   if packed[1] then
     local returns = {}
@@ -189,6 +214,30 @@ local function handleInvoke(msg)
   else
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = tostring(packed[2])})
   end
+end
+
+-- gmuxapi.request_fullscreen()/release_fullscreen(): the one way around
+-- handleInvoke's block above. First-come-first-served -- a node already
+-- holding the grant re-requesting it is a no-op success, but a second,
+-- different node is refused outright rather than queued.
+local function handleRequestFullscreen(msg)
+  if exclusiveFullscreenOwner and exclusiveFullscreenOwner ~= msg.from then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+      error = "fullscreen already held by " .. exclusiveFullscreenOwner})
+    return
+  end
+  exclusiveFullscreenOwner = msg.from
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {granted = true}})
+end
+
+local function handleReleaseFullscreen(msg)
+  if exclusiveFullscreenOwner ~= msg.from then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+      error = "you do not hold the fullscreen grant"})
+    return
+  end
+  exclusiveFullscreenOwner = nil
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {released = true}})
 end
 
 -- Muxos-shaped create_headless_process/create_graphics_process: a
@@ -213,78 +262,12 @@ local function handleSpawn(msg)
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {id = jobId, node = targetAddr}})
 end
 
-local function kernalGpu()
-  if component.isAvailable("gpu") then return component.gpu end
-end
-
--- Runs `code` (compiled fresh, same convention as JOB/a job's `gpu`
--- face) with a `gpu` local already pointed at the given buffer, so
--- window-drawing code looks like ordinary gpu-face code -- it's just
--- executed directly on the kernal instead of forwarded there, since gmux's
--- own `func(gpu)` draw callback is a function value and can't cross the
--- network the way `gpu`-face JOB code already doesn't need to.
---
--- Every GPU method (set/fill/copy/bitblt/...) is a Callback(direct =
--- true) in OC's own source (confirmed in GraphicsCard.scala) -- meaning
--- it executes with NO yield, straight-line, against a per-tick call
--- budget (Machine.scala: resets once per tick, tier-scaled). `code` here
--- runs as one uninterrupted resume with no yields in between, so a
--- caller doing a big fill via many individual gpu.set() calls instead of
--- one gpu.fill()/bitblt() is exactly the shape that can exhaust that
--- budget mid-draw. Prefer fill/copy/bitblt over set-loops in window
--- draw code for this reason, not just speed.
-local function drawIntoBuffer(gpu, buffer, code)
-  gpu.setActiveBuffer(buffer)
-  local chunk, loadErr = load("local gpu = ...\n" .. code, "=window", "t")
-  local ok, err
-  if chunk then
-    ok, err = pcall(chunk, gpu)
-  else
-    ok, err = false, loadErr
-  end
-  gpu.setActiveBuffer(0)
-  if ok then return true end
-  return nil, err
-end
-
--- Muxos-shaped create_window (also standing in for gmux's separate
--- create_window_buffer -- see docs/PROTOCOL.md for why those two
--- collapse into one remote call here). Allocates a GPU buffer, runs
--- `code` against it if given, blits it onto the kernal's real screen at
--- (x, y) once, and remembers it as a window. NOT live -- unlike gmux's
--- create_window with a vgpu/vscreen source, this never redraws itself;
--- redrawing means calling it again (or a future update, not built).
-local function createWindow(options)
-  local gpu = kernalGpu()
-  if not gpu then return nil, "kernal has no gpu component" end
-  if not gpu.allocateBuffer then return nil, "kernal's gpu does not support buffers (tier 1?)" end
-
-  local width = options.width or 30
-  local height = options.height or 10
-  local buffer, allocErr = gpu.allocateBuffer(width, height)
-  if not buffer then return nil, "could not allocate a gpu buffer: " .. tostring(allocErr) end
-
-  if options.code then
-    local ok, drawErr = drawIntoBuffer(gpu, buffer, options.code)
-    if not ok then
-      gpu.freeBuffer(buffer)
-      return nil, "window draw code failed: " .. tostring(drawErr)
-    end
-  end
-
-  local x, y = options.x or 1, options.y or 1
-  gpu.bitblt(0, x, y, width, height, buffer, 1, 1)
-
-  local id = nextId()
-  local win = {id = id, title = options.title or ("window " .. id), x = x, y = y,
-    width = width, height = height, buffer = buffer}
-  windows[id] = win
-  windowOrder[#windowOrder + 1] = id
-  return win
-end
-
+-- Both of these just delegate to the compositor (compositor.lua) -- the
+-- one file in this project allowed to touch the real gpu. muxos.lua's
+-- job here is only wire plumbing: unwrap the request, call in, wrap the
+-- reply.
 local function handleCreateWindow(msg)
-  local win, err = createWindow(msg)
+  local win, err = compositor.createWindow(msg)
   if not win then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
     return
@@ -293,11 +276,7 @@ local function handleCreateWindow(msg)
 end
 
 local function handleGetWindows(msg)
-  local list = {}
-  for _, id in ipairs(windowOrder) do
-    list[#list + 1] = windows[id]
-  end
-  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = compositor.listWindows()})
 end
 
 -- First real slice of the gmux application API, muxos-shaped:
@@ -358,6 +337,12 @@ local function pump()
         return nil
       elseif msg.to == selfAddr and msg.type == "GETWINDOWS" then
         handleGetWindows(msg)
+        return nil
+      elseif msg.to == selfAddr and msg.type == "REQUESTFULLSCREEN" then
+        handleRequestFullscreen(msg)
+        return nil
+      elseif msg.to == selfAddr and msg.type == "RELEASEFULLSCREEN" then
+        handleReleaseFullscreen(msg)
         return nil
       elseif msg.to == selfAddr and (msg.type == "RESULT" or msg.type == "ERROR")
           and jobs[msg.id] and jobs[msg.id].status == "running" then
@@ -521,12 +506,12 @@ local function printProcesses()
 end
 
 local function printWindows()
-  if #windowOrder == 0 then
+  local list = compositor.listWindows()
+  if #list == 0 then
     print("no windows created yet")
     return
   end
-  for _, id in ipairs(windowOrder) do
-    local win = windows[id]
+  for _, win in ipairs(list) do
     print(string.format("[%d] %q  %dx%d at (%d,%d)", win.id, win.title, win.width, win.height, win.x, win.y))
   end
 end
@@ -584,7 +569,7 @@ local function repl()
       if not title then
         print("usage: window <title> <x> <y> <width> <height> <lua code drawing into `gpu`>")
       else
-        local win, err = createWindow({title = title, x = tonumber(x), y = tonumber(y),
+        local win, err = compositor.createWindow({title = title, x = tonumber(x), y = tonumber(y),
           width = tonumber(w), height = tonumber(h), code = code})
         if err then print("error: " .. err) else print("created window [" .. win.id .. "]") end
       end

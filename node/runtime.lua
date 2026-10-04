@@ -224,6 +224,25 @@ gmuxapi = {
   get_windows = function()
     return remoteRequest("GETWINDOWS")
   end,
+
+  -- Not part of gmux's real API at all -- gmux never needs this,
+  -- because its apps already share the host process's real gpu/screen
+  -- directly. Added here because `gpu`'s remote fallback (above) and
+  -- the kernal's generic INVOKE bridge both go through the compositor's
+  -- gatekeeping now (kernal/compositor.lua, kernal/muxos.lua's
+  -- handleInvoke): direct gpu/screen access from a worker is blocked by
+  -- default, and this is how a node gets let through it, for the one
+  -- legitimate case where bypassing the compositor's buffer/blit
+  -- indirection is the point -- a fullscreen app that wants to own the
+  -- whole display. First-come-first-served, one holder at a time; NOT
+  -- released automatically if the holder disappears (reboots, crashes).
+  request_fullscreen = function()
+    return remoteRequest("REQUESTFULLSCREEN")
+  end,
+
+  release_fullscreen = function()
+    return remoteRequest("RELEASEFULLSCREEN")
+  end,
 }
 
 while true do

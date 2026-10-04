@@ -71,8 +71,10 @@ for a worker to fall back to on its own.
 | `SPAWN`   | `from`, `to`, `id`, `code`, `args`, `node`                | worker  | "dispatch a new job" (gmux API's `create_headless_process`/`create_graphics_process`); replies immediately with a handle, doesn't wait for the job to finish |
 | `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code` | worker | "allocate a gpu buffer, optionally run `code` against it, blit it to your screen" (gmux API's `create_window`/`create_window_buffer`) |
 | `GETWINDOWS` | `from`, `to`, `id`                                      | worker  | "list every window you know about" (gmux API's `get_windows()`) |
-| `RESULT`  | `from`, `to`, `id`, `result`                              | either  | success -- `JOB`'s return value, `LIST`'s address→type table, `INVOKE`'s list of return values, `GETPROCESSES`'s job list, `SPAWN`'s `{id, node}` handle, `CREATEWINDOW`'s window record, or `GETWINDOWS`'s window list |
-| `ERROR`   | `from`, `to`, `id`, `error`                               | either  | failure -- load error, runtime error, invoke error, or (`SPAWN`/`CREATEWINDOW`) a bad request |
+| `REQUESTFULLSCREEN` | `from`, `to`, `id`                                | worker  | "let me bypass the compositor and INVOKE the real gpu/screen directly" |
+| `RELEASEFULLSCREEN` | `from`, `to`, `id`                                | worker  | give that grant back |
+| `RESULT`  | `from`, `to`, `id`, `result`                              | either  | success -- `JOB`'s return value, `LIST`'s address→type table, `INVOKE`'s list of return values, `GETPROCESSES`'s job list, `SPAWN`'s `{id, node}` handle, `CREATEWINDOW`'s window record, `GETWINDOWS`'s window list, or `REQUESTFULLSCREEN`/`RELEASEFULLSCREEN`'s `{granted/released = true}` |
+| `ERROR`   | `from`, `to`, `id`, `error`                               | either  | failure -- load error, runtime error, invoke error, a bad `SPAWN`/`CREATEWINDOW` request, a blocked display-component `INVOKE`, or a refused fullscreen request |
 
 `code` is compiled on the worker as `local args = ...` followed by your
 code, then called as `chunk(args)` inside a `pcall`, so a job can refer to
@@ -116,6 +118,50 @@ zero network hops if the node happens to have one -- and only sends a
 `LIST`/`INVOKE` to the kernal, caching the discovered address, when it
 doesn't. "Lowest overhead": local when local makes sense, one round trip
 to the kernal otherwise, never more than that.
+
+**With one exception, added once the compositor existed to make it
+matter (see "The compositor" below): `INVOKE` targeting the kernal's own
+real gpu or the screen it's bound to is blocked unless the sender holds
+the exclusive fullscreen grant.** Every other component, on either side,
+is unaffected -- this is narrowly about the two component types the
+compositor exists to own.
+
+## The compositor: only one file in this project touches the real gpu
+
+Every GPU method is a per-tick-budgeted `direct` call in OC's own source
+(see "Call budget" below) -- "only the display node actually needs to
+make those budgeted calls for real" is the actual design principle, and
+`kernal/compositor.lua` is what makes that true **structurally**, not
+just by convention: it's the only file, anywhere in this project, that
+calls a real `gpu.*` method. `kernal/muxos.lua`'s `handleCreateWindow`/
+`handleGetWindows` are thin wire plumbing around
+`compositor.createWindow()`/`compositor.listWindows()`; nothing else in
+`muxos.lua` touches `component.gpu` directly any more.
+
+That would be undermined by the generic `INVOKE` bridge, though: before
+this, a worker's `gpu` face could reach the kernal's real gpu directly
+through `INVOKE`, completely bypassing the compositor's window registry.
+`handleInvoke` now checks `isDisplayComponent(address)` (true for the
+kernal's own `component.gpu.address` or the screen it's bound to) and
+refuses the call unless the sender currently holds
+`exclusiveFullscreenOwner` -- a grant acquired via
+`gmuxapi.request_fullscreen()`/released via
+`gmuxapi.release_fullscreen()`, first-come-first-served, one holder at a
+time. This exists for the one legitimate reason to go around the
+compositor: a fullscreen app that wants to own the whole display and
+draw without the compositor's buffer/blit indirection, not for every job
+doing a stray `gpu.set()`. **Not released automatically if its holder
+disappears** (reboots, crashes, loses power) -- a real gap, flagged
+rather than silently handled; recovering from that today means
+restarting the kernal.
+
+`node/runtime.lua`'s `gpu` face is affected by this too: its remote
+fallback (used when a worker has no local gpu) goes through the exact
+same `INVOKE` path, so calling `gpu.set(...)` etc. from a worker without
+holding the fullscreen grant now fails with "direct gpu/screen access is
+blocked" instead of quietly drawing onto the kernal's live screen. Use
+`gmuxapi.create_window()` for ordinary output; reach for
+`request_fullscreen()` only when actually building a fullscreen app.
 
 ## The gmux application API, translated
 
@@ -220,7 +266,7 @@ from `application.conf`) is **4096**. This is why `node/bios.lua` and
 `node/runtime.lua` are split the way they are: `bios.lua` is the only
 thing actually bound by that limit, and at **2806 bytes** (grew a bit
 for chunk-reassembly logic, still comfortably clear) it has plenty of
-room. `runtime.lua` (**10765 bytes** as of the gmux API additions)
+room. `runtime.lua` (**11710 bytes** as of the fullscreen-grant API)
 carries everything that used to make the combined file blow past 4096 --
 it's fetched into RAM over the modem instead, so `eepromSize` doesn't
 apply to it.
@@ -286,7 +332,8 @@ rather than the network being used per individual primitive. That's
 right on both axes that matter -- fewer messages (fewer yield/dispatch
 round trips) *and* confining GPU calls to one local resume on the
 kernal instead of one network round trip per draw call. The one place
-this risk is actually reachable in our own code: `drawIntoBuffer` runs
+this risk is actually reachable in our own code:
+`compositor.lua`'s `drawIntoBuffer` runs
 `code` as one uninterrupted resume with no yields, so draw code doing a
 big fill via many individual `gpu.set` calls instead of one
 `gpu.fill`/`bitblt` is exactly the "many direct calls, same tick, no
