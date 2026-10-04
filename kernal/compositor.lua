@@ -218,7 +218,12 @@ end
 function M.createWindow(options)
   local gpu = kernalGpu()
   if not gpu then return nil, "kernal has no gpu component" end
-  if not gpu.allocateBuffer then return nil, "kernal's gpu does not support buffers (tier 1?)" end
+  -- muxos assumes a Tier 3 GPU + a minimum of 1 Tier 3 screen on the
+  -- kernal, always -- this isn't a guess at the installed tier, it's a
+  -- stated hardware requirement. Still checked cheaply at runtime so a
+  -- misconfigured kernal fails with a clear message instead of a
+  -- confusing one.
+  if not gpu.allocateBuffer then return nil, "kernal's gpu does not support buffers -- muxos requires Tier 3" end
   if not ensureFrameBuffer(gpu) then return nil, "could not allocate the frame buffer" end
 
   local width, height, cells, cellCols, cellRows

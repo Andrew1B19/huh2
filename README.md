@@ -79,10 +79,13 @@ gmux/                 reference only (see above): the real graphical multiplexer
 ### smux's one external dependency
 
 `smux/gertinet.lua` (its GERTi transport) requires `hmi/proto.lua`, a
-shared wire codec from the monorepo smux was extracted from. That file
-isn't vendored here, so `smux/test/test_gertinet.lua` fails on `require`
-until it's added -- everything else (33 of smux's own tests: framing,
-session, job_console, serve, the installer) passes standalone.
+shared wire codec from the monorepo smux was extracted from. `hmi` is
+its own separate program, not a dependency of muxos -- `smux/` itself
+is reference-only (see above), so this is just an inherited gap in the
+reference material's own test suite, not something muxos needs to
+resolve. `smux/test/test_gertinet.lua` fails on `require` as a result;
+everything else (33 of smux's own tests: framing, session, job_console,
+serve, the installer) passes standalone.
 
 ## Flashing a worker
 

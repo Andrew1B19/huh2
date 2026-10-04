@@ -61,8 +61,60 @@ modem.open(PORT)
 
 local nodeId = computer.address()
 
+-- Every message over the modem is chunked, not just boot's CODE --
+-- even a tiny PONG gets wrapped as one chunk, uniformly, rather than
+-- having two different wire shapes depending on size. "MSG <id> <i>/<n>
+-- <chunk>" frames the ALREADY-serialized Lua-table string; <id> is a
+-- per-sender counter, used together with the sending component's real
+-- network address (free from the modem_message signal itself, before
+-- any payload is parsed) to key reassembly.
+local CHUNK_SIZE = 7000
+local nextMsgId = 1
+
 local function send(msg)
-  modem.broadcast(PORT, serialize(msg))
+  local payload = serialize(msg)
+  local id = nextMsgId
+  nextMsgId = nextMsgId + 1
+  local total = math.ceil(#payload / CHUNK_SIZE)
+  for i = 1, total do
+    local chunk = payload:sub((i - 1) * CHUNK_SIZE + 1, i * CHUNK_SIZE)
+    modem.broadcast(PORT, "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk)
+  end
+end
+
+-- senderAddr:msgId -> {chunks = {[i] = chunkString}, total = n, startedAt}.
+-- Shared by the main dispatch loop AND remoteRequest()'s own nested wait
+-- loop below (that one bypasses the main loop entirely while waiting on
+-- a specific reply, so it needs its own reassembly, not just the main
+-- loop's). Swept for abandoned entries by the main loop -- see its
+-- pullSignal(10) timeout, below.
+local incomingChunks = {}
+
+local function reassemble(senderAddr, data)
+  local msgId, i, n, chunk = data:match("^MSG (%d+) (%d+)/(%d+) (.*)$")
+  if not msgId then return nil end
+  i, n = tonumber(i), tonumber(n)
+  local key = senderAddr .. ":" .. msgId
+  local entry = incomingChunks[key]
+  if not entry then
+    entry = {chunks = {}, total = n, startedAt = computer.uptime()}
+    incomingChunks[key] = entry
+  end
+  entry.chunks[i] = chunk
+  for j = 1, entry.total do
+    if not entry.chunks[j] then return nil end
+  end
+  incomingChunks[key] = nil
+  return table.concat(entry.chunks, "", 1, entry.total)
+end
+
+local function sweepStaleChunks()
+  local now = computer.uptime()
+  for key, entry in pairs(incomingChunks) do
+    if now - entry.startedAt > 10 then
+      incomingChunks[key] = nil
+    end
+  end
 end
 
 -- Announce ourselves so the kernal can pick us up without a separate
@@ -100,14 +152,17 @@ local function remoteRequest(msgType, extra)
 
   local deadline = computer.uptime() + RPC_TIMEOUT
   while computer.uptime() < deadline do
-    local name, _, _, port, _, data = computer.pullSignal(deadline - computer.uptime())
+    local name, _, from, port, _, data = computer.pullSignal(deadline - computer.uptime())
     if name == "modem_message" and port == PORT and type(data) == "string" then
-      local reply = deserialize(data)
-      if type(reply) == "table" and reply.id == id and reply.to == nodeId then
-        if reply.type == "RESULT" then
-          return reply.result
-        elseif reply.type == "ERROR" then
-          return nil, reply.error
+      local payload = reassemble(from, data)
+      if payload then
+        local reply = deserialize(payload)
+        if type(reply) == "table" and reply.id == id and reply.to == nodeId then
+          if reply.type == "RESULT" then
+            return reply.result
+          elseif reply.type == "ERROR" then
+            return nil, reply.error
+          end
         end
       end
     end
@@ -251,9 +306,14 @@ gmuxapi = {
 }
 
 while true do
-  local name, _, from, port, _, data = computer.pullSignal()
+  -- A bounded timeout (rather than blocking indefinitely) so stale,
+  -- abandoned partial reassemblies get swept out periodically even if
+  -- nothing else arrives for a while.
+  local name, _, from, port, _, data = computer.pullSignal(10)
+  sweepStaleChunks()
   if name == "modem_message" and port == PORT and type(data) == "string" then
-    local msg = deserialize(data)
+    local payload = reassemble(from, data)
+    local msg = payload and deserialize(payload)
     if type(msg) == "table" and (msg.to == nil or msg.to == nodeId) then
       kernalAddr = msg.from
       if msg.type == "PING" then

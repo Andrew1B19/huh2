@@ -20,6 +20,7 @@ local component = require("component")
 local event = require("event")
 local computer = require("computer")
 local thread = require("thread")
+local keyboard = require("keyboard")
 
 local PORT = 4477
 local TIMEOUT = 5 -- seconds to wait for a worker reply before giving up
@@ -72,10 +73,35 @@ local nextNode = 1
 -- gmuxapi.request_fullscreen()) is let through, for the one legitimate
 -- case where going around the compositor is the point -- a fullscreen
 -- app that wants to own the whole display and draw without buffer/blit
--- overhead. Only one node may hold it at a time. Not released
--- automatically if its holder disappears (reboots, crashes) -- a real
--- gap, flagged rather than silently handled.
+-- overhead. Only one node may hold it at a time.
 local exclusiveFullscreenOwner = nil
+
+-- Local escape hatch: Ctrl+Alt+C at the kernal force-releases the grant
+-- regardless of who holds it, so a crashed/disconnected holder doesn't
+-- require restarting the kernal.
+--
+-- REAL CONFLICT, not hidden: Ctrl+Alt+C is OpenOS's OWN built-in
+-- process-interrupt shortcut. Confirmed in OpenOS's own source
+-- (loot/openos/lib/event.lua): computer.pullSignal is monkey-patched
+-- there to check isControlDown()+isKeyDown('c')+isAltDown() on
+-- literally every signal pull and call
+-- `process.info().data.signal("interrupted", 0)` when all three are
+-- held -- the same mechanism as a terminal's Ctrl+C. This isn't
+-- avoidable by choosing a different listener mechanism; it's baked
+-- into computer.pullSignal itself, system-wide, unconditionally.
+-- Pressing this combo to exit fullscreen ALSO interrupts whatever
+-- OpenOS considers the kernal's "current process" at that moment --
+-- which could be muxos.lua's own REPL. If this combo should stay
+-- reserved for OpenOS's native interrupt instead, pick a different one
+-- for this.
+event.listen("key_down", function(_, _, char, code)
+  if code == keyboard.keys.c and keyboard.isControlDown() and keyboard.isAltDown() then
+    if exclusiveFullscreenOwner then
+      print("Ctrl+Alt+C: force-releasing fullscreen grant held by " .. exclusiveFullscreenOwner)
+      exclusiveFullscreenOwner = nil
+    end
+  end
+end)
 
 -- The kernal is the scheduler, so it's the one place that actually knows
 -- about every job dispatched to any node -- this is what lets
@@ -100,8 +126,65 @@ local jobOrder = {}
 -- starving the other -- so there must be exactly one.
 local replyBox = {}
 
+-- Every message over the modem is chunked, not just boot's CODE --
+-- even a tiny PING gets wrapped as one chunk, uniformly, rather than
+-- having two different wire shapes (chunked vs not) depending on size.
+-- "MSG <id> <i>/<n> <chunk>" frames the ALREADY-serialized Lua-table
+-- string; <id> is a per-sender counter, used together with the sending
+-- component's real network address (which the receiver gets for free
+-- from the modem_message signal itself, before any payload is even
+-- parsed) to key reassembly -- see reassemble() below.
+local CHUNK_SIZE = 7000
+local nextMsgId = 1
+
 local function send(msg)
-  modem.broadcast(PORT, serialize(msg))
+  local payload = serialize(msg)
+  local id = nextMsgId
+  nextMsgId = nextMsgId + 1
+  local total = math.ceil(#payload / CHUNK_SIZE)
+  for i = 1, total do
+    local chunk = payload:sub((i - 1) * CHUNK_SIZE + 1, i * CHUNK_SIZE)
+    modem.broadcast(PORT, "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk)
+  end
+end
+
+-- senderAddr:msgId -> {chunks = {[i] = chunkString}, total = n, startedAt}
+-- Swept for abandoned entries (a sender that sent some but not all
+-- chunks of a message, e.g. it rebooted mid-send) by sweepStaleChunks(),
+-- called once per background-loop iteration -- otherwise an abandoned
+-- partial reassembly would sit in this table forever.
+local incomingChunks = {}
+
+-- Feeds one "MSG ..." wire frame in; returns the fully reassembled,
+-- still-serialized payload once every chunk of that message has
+-- arrived, or nil if this was a partial chunk (still waiting on more)
+-- or not a MSG frame at all. Does NOT deserialize -- callers do that
+-- themselves once they have the complete string.
+local function reassemble(senderAddr, data)
+  local msgId, i, n, chunk = data:match("^MSG (%d+) (%d+)/(%d+) (.*)$")
+  if not msgId then return nil end
+  i, n = tonumber(i), tonumber(n)
+  local key = senderAddr .. ":" .. msgId
+  local entry = incomingChunks[key]
+  if not entry then
+    entry = {chunks = {}, total = n, startedAt = computer.uptime()}
+    incomingChunks[key] = entry
+  end
+  entry.chunks[i] = chunk
+  for j = 1, entry.total do
+    if not entry.chunks[j] then return nil end
+  end
+  incomingChunks[key] = nil
+  return table.concat(entry.chunks, "", 1, entry.total)
+end
+
+local function sweepStaleChunks()
+  local now = computer.uptime()
+  for key, entry in pairs(incomingChunks) do
+    if now - entry.startedAt > 10 then
+      incomingChunks[key] = nil
+    end
+  end
 end
 
 local function noteNode(addr)
@@ -338,7 +421,12 @@ local function pump()
     return true
   end
 
-  local msg = deserialize(data)
+  local payload = reassemble(from, data)
+  if not payload then
+    return true -- a partial chunk (more still coming), or not a MSG frame at all
+  end
+
+  local msg = deserialize(payload)
   if type(msg) ~= "table" or not msg.from or msg.from == selfAddr then
     return true
   end
@@ -679,6 +767,7 @@ thread.create(function()
   while true do
     local ok, err = pcall(function()
       while pump() do end
+      sweepStaleChunks()
       compositor.flush()
     end)
     if not ok then

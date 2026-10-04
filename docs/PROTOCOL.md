@@ -15,16 +15,44 @@ PORT = 4477
    Spoken by `node/runtime.lua` (what `bios.lua` fetches and runs) and
    `kernal/muxos.lua`. Every message is a Lua table, turned into text
    with a small serializer (`[key]=value` pairs good enough for
-   nil/boolean/number/string/table -- no functions, no userdata) and
-   sent as the single string payload of `modem.broadcast(PORT, text)`.
-   The receiver reconstructs it with `load("return " .. text)`.
+   nil/boolean/number/string/table -- no functions, no userdata) --
+   and, since every message over the modem is chunked now, not just
+   boot's `CODE`, that serialized string is itself wrapped as one or
+   more `MSG <id> <i>/<n> <chunk>` wire frames (`CHUNK_SIZE` = 7000
+   bytes/chunk, same convention as boot's `BOOT_CHUNK_SIZE`) rather than
+   sent as a single `modem.broadcast(PORT, text)` call. Even a message
+   that fits in one chunk still gets this framing (`i=1, n=1`) -- one
+   wire shape, always, rather than two depending on size. `<id>` is a
+   per-sender counter; reassembly is keyed by `(sender's real network
+   address, id)`, where the address comes free from the `modem_message`
+   signal itself (before any payload is even parsed), not from
+   anything inside the message -- this is what lets two different
+   senders reuse the same counter value without colliding. The receiver
+   reconstructs the original message with `load("return " .. text)`
+   only once every chunk of it has arrived.
 
-The runtime-protocol serializer is implemented twice, once per side, on
-purpose: neither `node/runtime.lua` nor `kernal/muxos.lua` can `require`
-another file (the former for the same EEPROM-era reasons as before, even
-though it now arrives over the network instead of being flashed; the
-latter to stay a single deployable file), so there is no shared module
-to import. If you change the wire format, change both copies.
+The runtime-protocol serializer (and the chunking/reassembly logic
+around it) is implemented twice, once per side, on purpose: neither
+`node/runtime.lua` nor `kernal/muxos.lua` can `require` another file
+(the former for the same EEPROM-era reasons as before, even though it
+now arrives over the network instead of being flashed; the latter to
+stay a single deployable file), so there is no shared module to
+import. If you change the wire format, change both copies.
+
+A partial reassembly whose sender never finishes sending (it rebooted
+mid-send, say) would sit forever otherwise, so both sides sweep entries
+older than 10 seconds -- the kernal from its background dispatcher loop
+(already running once per tick for other reasons), the worker from its
+main loop (changed from an unbounded `computer.pullSignal()` to
+`computer.pullSignal(10)` specifically so this sweep still happens
+periodically even with nothing else arriving).
+
+One place this needed its OWN copy of the reassembly logic, not just
+the main dispatch loop's: `node/runtime.lua`'s `remoteRequest()` runs
+its own nested wait loop (pulling signals directly while blocking on a
+specific reply), bypassing the main loop entirely -- so a chunked reply
+to an RPC call needs the identical `reassemble()` call inline there
+too, not just in the main loop's dispatch.
 
 ## Boot protocol
 
@@ -198,6 +226,116 @@ blocked" instead of quietly drawing onto the kernal's live screen. Use
 `gmuxapi.create_window()` for ordinary output; reach for
 `request_fullscreen()` only when actually building a fullscreen app.
 
+**Local escape hatch for a stuck grant**: `exclusiveFullscreenOwner` is
+not released automatically if its holder disappears (see the gap flagged
+just above), so `kernal/muxos.lua` also listens for Ctrl+Alt+C at the
+kernal itself and force-releases the grant, whoever holds it, the moment
+all three keys are down -- the "Ctrl+Alt+Del equivalent" for exiting a
+stuck fullscreen app without restarting the kernal. **This is a real,
+acknowledged conflict, not an oversight**: Ctrl+Alt+C is already
+OpenOS's own built-in process-interrupt shortcut. Confirmed from
+OpenOS's own source (`lib/event.lua`): `computer.pullSignal` is
+monkey-patched there to check
+`isControlDown()+isKeyDown('c')+isAltDown()` on *every* signal pull and
+call `process.info().data.signal("interrupted", 0)` when all three are
+held -- the same mechanism as a terminal's own Ctrl+C. This is baked
+into `computer.pullSignal` itself, unconditionally, so no choice of
+listener mechanism on muxos's side avoids it: pressing this combo to
+escape fullscreen also interrupts whatever OpenOS considers the kernal's
+current process at that moment (which could be `muxos.lua`'s own REPL).
+Implemented as specified anyway; if this combo needs to stay reserved
+for OpenOS's native interrupt instead, a different one should be picked.
+
+**GPU stays on the kernal -- a current hard requirement, not just the
+usual case**: today, every real `gpu.*` call anywhere in muxos happens
+on the kernal, full stop -- `kernal/compositor.lua` is the only file
+that touches one, and there is no code path, configuration, or plan to
+run it anywhere else right now. If the display component ever moves to
+a different physical node than the kernal, the design intent is that
+*that* node would run the compositor locally -- but the compositor must
+still never make a GPU call *over the network bus*; it would need its
+own local copy, not a remote one driving the kernal's. This is called
+out explicitly as a possible-only, maybe-never future feature, not a
+near-term plan -- for now, "GPU lives on the kernal" is a stated
+requirement of the system, the same way T3 hardware is (see "Hardware
+requirements" below), not an assumption that happens to hold today.
+
+**Closing a window does not end the program it belongs to.** This
+matches gmux's own behavior and is intentional: "close" is a compositor-
+level action (remove the window from the display) separate from
+"terminate" (kill the job). A closed window becomes an icon on the
+toolbar instead of disappearing outright, so the underlying job stays
+alive and reachable. The icon a toolbar entry uses, in priority order:
+the window's own bitmap, if it was a bit window (`options.pixels`); 
+otherwise the program's name, if the window was created via a `run`-
+style dispatch that already has a name to use; otherwise an icon
+supplied explicitly through the API when neither of those applies. None
+of this toolbar/icon compositing is built yet (see "Still not done" in
+the bitmap-windows section above) -- this is the intended semantics to
+build it against, recorded now so it isn't lost or reinvented
+differently later.
+
+## Scheduler
+
+**Direction, not yet built**: round-robin job dispatch across the
+worker nodes, with a "simple multi-core balancer" on top -- preferring
+whichever worker currently has the fewest active jobs rather than
+strictly rotating blind to load. Beyond that assignment policy, job
+handling otherwise follows the same shape gmux already uses (a process
+table, `SPAWN`/`JOB` dispatch-and-record as already implemented --
+see "The gmux application API, translated" above) for now; this may get
+reworked later but isn't a blocker to build against today.
+
+## OpenOS compatibility: how permissive "close to native" actually means
+
+muxos runs legacy OpenOS programs by making them see something that
+looks, as closely as practical, like gmux's own environment --
+"permissive" here means *in the legacy program's favor*: muxos does not
+make design sacrifices of its own to get closer to native OpenOS
+behavior. A legacy program invokes OpenOS APIs the same way it always
+has; muxos's job is to make those calls work as correctly as it
+reasonably can from underneath (effectively presenting itself as gmux to
+anything written against gmux's conventions), not to compromise how
+muxos itself is built in order to satisfy them. Programs written
+against muxos's own extended surface -- the `gmuxapi` translation layer
+above, plus whatever further kernel API muxos adds beyond gmux's -- get
+first-class access to the hardware and scheduling muxos actually
+provides (per-node dispatch, the compositor, multithreading awareness);
+legacy OpenOS programs get the best-effort compatibility shim, not equal
+footing.
+
+## `.mxe`: a native-app marker, not a security boundary
+
+muxos programs written to take advantage of its own API (rather than
+just making legacy OpenOS calls through the compatibility shim above)
+are distinguished from ordinary `.lua` OpenOS programs by their own file
+extension, `.mxe`. The kernal's loader uses this purely as a dispatch
+signal: a `.mxe` program is launched with lower GPU-call overhead, is
+assumed to be multithreading-aware, and otherwise gets treated close to
+how gmux treats a native app, unless/until muxos reimplements that part
+differently -- while a `.lua` program goes through the OpenOS-
+compatibility path described above. **This is a calling-convention
+switch, not an access-control mechanism**: nothing stops a program from
+lying about its own extension, and there's no adversarial trust model
+in this project that would need one. Permissible on that basis -- it's
+exactly the kind of "which code path do I run this through" decision a
+file extension is good for, as long as nothing security-relevant is ever
+gated on it.
+
+## Hardware requirements
+
+muxos always assumes a **Tier 3 GPU**, with a **minimum of one Tier 3
+screen**, on the kernal. This isn't a guess at commonly-installed
+hardware or a tier the code happens to degrade gracefully without --
+it's a stated requirement: `kernal/compositor.lua` checks for
+`gpu.allocateBuffer` (a T3-only capability, confirmed from OC's own
+tier-gated component API) at startup specifically so a kernal that
+doesn't meet this fails immediately with a clear error instead of a
+confusing one partway through compositing. The persistent frame buffer
+the compositor relies on (see "The compositor" above) is itself only
+possible because of this requirement -- there is no Tier 1/2 fallback
+path, by design.
+
 ## The gmux application API, translated
 
 `gmux/` (vendored, MIT, from `aawwaaa/OpenPrograms`) is a real OC
@@ -328,22 +466,20 @@ standard as everything else flagged in this doc.
 Stock `eepromSize` (the max bytes of code an EEPROM can hold, confirmed
 from `application.conf`) is **4096**. This is why `node/bios.lua` and
 `node/runtime.lua` are split the way they are: `bios.lua` is the only
-thing actually bound by that limit, and at **2806 bytes** (grew a bit
-for chunk-reassembly logic, still comfortably clear) it has plenty of
-room. `runtime.lua` (**12054 bytes** as of passing `pixels`/`mode`/`bg`
-through `gmuxapi.create_window`)
-carries everything that used to make the combined file blow past 4096 --
-it's fetched into RAM over the modem instead, so `eepromSize` doesn't
-apply to it.
+thing actually bound by that limit, and at **2806 bytes** it has plenty
+of room. `runtime.lua` (**14411 bytes** as of the generic chunking
+layer) carries everything that used to make the combined file blow past
+4096 -- it's fetched into RAM over the modem instead, so `eepromSize`
+doesn't apply to it.
 
-It already exceeds `maxNetworkPacketSize` (8192) as a single message,
-though -- this was hit for real once `gmuxapi` was added, not just a
-theoretical ceiling. `serveBoot()` now sends it as multiple `CODE
-<i>/<n> <chunk>` messages (`BOOT_CHUNK_SIZE` = 7000 bytes/chunk) instead
-of one `CODE <source>`, and `bios.lua`'s boot loop reassembles them by
-index regardless of arrival order (see "Boot protocol" above) -- this
-needed to actually be built, not just flagged, once `runtime.lua`
-crossed the line.
+It exceeds `maxNetworkPacketSize` (8192) as a single message by a wide
+margin now (needing 3 chunks at `CHUNK_SIZE` = 7000 bytes/chunk) -- this
+was hit for real once `gmuxapi` was added, not just a theoretical
+ceiling, which is exactly why "everything over the bus needs chunking"
+is now a blanket rule (see above) rather than boot's own one-off
+`CODE` handling plus hoping nothing else ever got this big. A large
+`CREATEWINDOW` `pixels` payload is covered by this same generic
+chunking now too -- no longer a separate unhandled case.
 
 ## Character cells, not pixels -- and what "bitmap windows" means given that
 
@@ -428,18 +564,17 @@ pipeline work without needing a real deployment yet.
 
 Still not done: no actual demonstrated use for a toolbar/icons/
 wallpaper (the encoder works, but nothing composites a desktop
-background or icon row yet), and per-job isolated bit-window surfaces
-have the same gap `create_graphics_process` already has for character
-windows (see above) -- a job can ask the kernal to create a bit window,
-but its own `gpu` face still isn't wired to draw into it.
+background or icon row yet -- wallpaper is planned to be just another,
+lowest-layer bit window through this same mechanism, no separate
+subsystem), and per-job isolated bit-window surfaces have the same gap
+`create_graphics_process` already has for character windows (see
+above) -- a job can ask the kernal to create a bit window, but its own
+`gpu` face still isn't wired to draw into it.
 
-One more thing not handled: unlike `CODE`, a `CREATEWINDOW` carrying a
-large `pixels` grid isn't chunked -- it's a single message, still
-subject to `maxNetworkPacketSize` (8192). A roughly 90x90-pixel
-half-block bitmap (or a correspondingly larger braille one) is already
-in that neighborhood once serialized; nothing here would chunk it the
-way `serveBoot()` does for the runtime image. Not hit in practice yet
-(the `bitdemo` pattern is 16x16), but real for anything desktop-wallpaper-sized.
+A large `CREATEWINDOW` `pixels` grid is no longer a special case now
+that every message over the modem is chunked generically (see above) --
+this used to be a real unhandled gap (a ~90x90-pixel bitmap would have
+exceeded `maxNetworkPacketSize` as a single message) but isn't any more.
 
 ## Call budget: what's actually rate-limited, and what isn't
 
