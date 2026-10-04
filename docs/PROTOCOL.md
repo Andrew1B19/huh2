@@ -886,6 +886,235 @@ reach, since each mock isolates the one function under test from
 everything else that would normally be running concurrently on real
 hardware.
 
+## The `.mxe` process model (forward design -- not yet built)
+
+Everything below is a design decided through discussion, not yet
+implemented. It's written down now, in this much detail, specifically
+so it doesn't get lost or reinvented differently later -- the same
+reason every other design decision in this document gets recorded
+here rather than left in chat. Treat every claim in this section as
+"this is what we decided to build," not "this is what `muxos.lua`
+currently does."
+
+### Why this exists
+
+A dispatched `JOB` today is a bare string of Lua source handed to
+`load()` -- no structure, no identity, no ability to ask for more
+resources, no relationship to anything else. That's fine for a one-shot
+calculation. It's not how an actual *app* -- something with a name,
+a lifecycle, a window, maybe children of its own -- is supposed to
+work. A worker is meant to act like another core on the same machine,
+not a separate computer you throw isolated scripts at; the kernal needs
+a real framework for that, not just a calling convention for
+`load()`.
+
+### Placement authority never moves
+
+The kernal is the only thing that ever decides *where* code runs. This
+doesn't change anywhere below -- an app asking for more compute is
+asking a question ("please run this somewhere"), never making the
+placement decision itself. Everything else in this section is about
+what happens around that one fixed point.
+
+### Parent/child jobs
+
+When a running job (the **parent**) wants more compute, it asks the
+kernal for it. The kernal places the new job exactly like it places
+any other (today: round-robin; later: the real load-aware balancer --
+see "Not yet built" in README.md) and hands the **parent** a persistent
+handle -- the same `{id, node}` shape `SPAWN`/`create_headless_process`
+already returns today, nothing new needed there.
+
+Once that handle exists, **parent and child talk to each other
+directly** -- addressed by that handle, over the same wire framing as
+everything else (the generic `MSG <id> <i>/<n> <chunk>` chunking
+already documented above; no second wire format for this). The kernal
+is not a mandatory relay for every message between an already-connected
+parent and child -- its role is placement and bookkeeping, not routing
+every byte between two nodes that already know how to reach each other.
+
+**The kernal never loses visibility, though.** Every job -- parent or
+child, top-level or ten levels deep -- lives in the SAME single global
+`jobs` table `kernal/muxos.lua` already has, with a new `parent` field
+on child entries pointing at the id of whatever asked for them. A
+separate per-parent table was considered and rejected: the scheduler
+needs one true view of total system load to ever do real balancing,
+and splitting job visibility by parent would fragment exactly that.
+
+A child can become a parent itself -- the relationship is just a field
+on a table entry, nothing stops it from recursing. **Still undecided:**
+whether there's a cap on depth or total fan-out per top-level job. With
+only 3 workers total, an unbounded spawner could starve everything
+else; some cap (e.g. "no more than N live descendants per top-level
+job") seems likely necessary but the exact number, and whether it's a
+hard limit or something the scheduler just weighs against, hasn't been
+decided.
+
+**Also still undecided:** what the kernal does when something asks for
+more compute and all 3 workers are already busy -- queue the request
+until one frees up, deny it outright, or preempt something
+lower-priority. This is the first real piece of "scheduler" rather than
+"placement," and it's open.
+
+### Job environment abstraction
+
+Not yet designed in detail, but the shape is clear from the above: a
+dispatched job needs more than `load("local args = ...\n" .. code)`
+gives it today. At minimum it needs a name (see "App identity" below),
+a way to ask the kernal for a child (which gets it the handle above),
+and -- for an `.mxe` app specifically, as opposed to a plain headless
+`JOB` -- a window handle (see "Compositor access" below). What exactly
+this environment looks like (what's exposed as globals, how it differs
+between a plain `JOB` and a named `.mxe` app) is the next real design
+question once the process model above is built.
+
+### App identity and orphan reclaim
+
+An `.mxe` app's identity is its own declared **name** -- not a raw job
+id (those don't survive a relaunch) and not a separately-chosen session
+id. The kernal keeps a **global map: app name -> the job(s) belonging to
+it**. When an app with that name launches again -- even much later,
+even after the kernal itself restarted in between, even if every
+internal id involved has changed -- the kernal can look up that name
+and hand its old orphans straight back to the new instance.
+
+### Orphan policy: declared at spawn time, not a system-wide rule
+
+What happens to a child whose parent died is **not** a single fixed
+policy -- it depends on what that specific app calls for, and the
+parent declares which policy it wants at the moment it asks the kernal
+to create the child:
+
+- **`orphan`** -- the child keeps running untethered. It's cleaned up
+  by a manual kill, by timing out, or by being reclaimed if the parent
+  (same declared name) relaunches, via the app-identity map above.
+- **`kill`** -- cascades. Parent dies, child dies with it.
+- **`promote`** -- the kernal takes direct ownership of the child, as
+  if it had been a top-level job all along. **Only valid if the child
+  is itself self-dependent** -- actually capable of talking to the
+  kernal and operating on its own, protocol-wise, without assuming a
+  parent is mediating for it. Promoting a child that was never meant to
+  be a standalone process (a plain headless number-crunching job, say)
+  would just be wasted cycles keeping something alive that has no way
+  to usefully report its own results or respond to anything on its
+  own -- `promote` is for children that were actually built to stand
+  alone if needed, not a safe default for everything.
+
+### Node death vs. planned draining -- two different things
+
+**A worker node dying is unrecoverable, and that's fine.** Whatever was
+running there is just gone -- no checkpointing, no job migration
+attempt, no special recovery machinery, and critically, **not a kernal
+panic**. The kernal marks whatever was running there as lost and keeps
+going. This was a deliberate simplification, not an oversight: trying
+to make arbitrary in-flight state survive an actual hardware failure is
+a much bigger problem than this system needs to solve.
+
+Nodes rejoining (or new ones joining) the live pool is mostly already
+free, and needs to *stay* true as the above gets built, not be
+reinvented: `noteNode()` already fires on any `HELLO`/`PONG` at any
+time, so a worker that boots after the kernal's been running a while
+already gets discovered live, with no kernal restart needed.
+
+**Planned draining is a different, deliberate action** -- taking a
+node out of rotation on purpose (maintenance, say), as opposed to it
+just dying. This is a real, distinct capability worth having, separate
+from crash handling.
+
+### Semi-live migration
+
+For planned draining (or any other reason to move a running job off its
+current node without losing its progress), the design is: **pause,
+serialize, ship, resume** -- and the job itself never knows the
+difference. Concretely:
+
+1. **Pause**: the kernal simply stops resuming that job's coroutine.
+   No special signal needed -- "paused" just means "not scheduled."
+2. **Serialize**: `eris.persist(perms, co)` turns the live, suspended
+   coroutine -- including its call stack and local variables -- into a
+   byte string.
+3. **Ship**: the bytes go over the same wire framing as everything
+   else (`MSG` chunking) to the target node.
+4. **Resume**: `eris.unpersist(uperms, bytes)` on the target
+   reconstitutes it as a live coroutine; resuming it continues exactly
+   where it left off.
+
+**This is confirmed, not speculative.** `eris` is a real native Lua
+global in OC's own sandbox (`LuaStateFactory.scala` opens the `ERIS`
+library in all three of OC's Lua profiles -- 5.2, 5.3, *and* 5.4, so it
+coexists with `kernal/bitmap.lua`'s `utf8.char` dependency on any
+5.3/5.4 build with no conflict). More than that: the actual mechanism
+was run for real, against the genuine upstream `fnuecke/eris` library
+(built from its own source, since it's a modified Lua distribution, not
+a loadable module) -- not OC's exact binding, but the same real
+implementation OC's own `PersistenceAPI.scala` is built on. Confirmed
+directly:
+
+- A coroutine persisted mid-loop, with real accumulated local state,
+  revives into a brand-new coroutine object that resumes and continues
+  correctly.
+- **The scenario that actually matters for migration**: persisting in
+  ONE process, writing the bytes to a file, and unpersisting in a
+  COMPLETELY SEPARATE process -- the revived job continued its exact
+  progress, and a native function reference marked permanent (the
+  stand-in for `component`/`computer` in a real migration) correctly
+  re-bound to the **receiving** process's own binding, not a stale
+  reference to the sender's.
+- Getting this right requires marking essentially everything reachable
+  from the persisted coroutine's `_ENV` as permanent in `eris`'s
+  `perms` table -- not just the one native function you think to mark
+  (found the hard way: an empty `perms` table fails the instant the
+  coroutine's closure reaches `coroutine.yield` itself via its
+  environment). The fix mirrors exactly what OC's own
+  `PersistenceAPI.scala` does: walk all of `_G` recursively.
+
+See `test/hardware/verify.lua` (checks 6-9) and its own README for the
+full account, including what still ISN'T confirmed: OC's own
+jnlua-bound `eris` integration specifically, and real OC
+`component`/`computer` behavior under an actual migration (as opposed
+to a stand-in native function) -- that's what running the suite on
+real hardware still needs to close.
+
+### Compositor access for `.mxe`
+
+An `.mxe` app gets a **window handle** from the compositor, not
+compositor authority -- the same kind of restriction in kind as the
+fullscreen grant today (see "The compositor" above): it can draw into
+its own handle, but it doesn't get to touch anyone else's window or any
+of the compositor's own bookkeeping (z-order, occlusion, dirty
+tracking, flush timing all stay the compositor's).
+
+This is a real shift from how `createWindow` works today, though:
+right now it's one-shot (`options.code` runs once against a freshly
+allocated buffer, and "updating" a window means calling `createWindow`
+again). The handle model implies a **persistent, redrawable** window --
+an app holds its handle for its whole lifetime and pushes new content
+into it whenever it wants, not once. The exact API for this (what a
+repeated draw call looks like, how dirty-tracking interacts with a
+handle that's drawn into intermittently rather than once) hasn't been
+designed yet.
+
+### Still open
+
+Collected in one place, from the discussion above:
+
+- Depth/fan-out caps on recursive parent/child spawning (or whether
+  there's a cap at all).
+- What the kernal does when something asks for more compute and every
+  worker is already busy (queue, deny, or preempt).
+- The exact shape of the "job environment abstraction" -- what's
+  actually exposed to a dispatched `.mxe` app vs. a plain `JOB`.
+- The persistent-window-handle API's exact shape.
+- A real, separate, and still-unfixed issue surfaced while reasoning
+  through direct parent/child messaging: `node/runtime.lua`'s main loop
+  currently does `kernalAddr = msg.from` on ANY valid incoming message
+  -- it blindly trusts whoever messages a worker is the kernal. Direct
+  peer-to-peer (parent/child) messaging breaks that the moment two
+  workers exchange a message. The proposed fix -- learn `kernalAddr`
+  once, from the `BOOT`/`CODE` exchange a worker already goes through
+  at boot, and never reassign it from an ordinary message again -- has
+  been discussed but not implemented or confirmed as final.
+
 ## Measured vs. documented latency
 
 The config numbers in OC's `application.conf` (`maxNetworkPacketSize`,

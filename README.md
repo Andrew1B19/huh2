@@ -349,3 +349,19 @@ semantics), the REPL's own line editor (append/backspace only -- no
 history, no cursor movement within a line), multi-monitor support
 (explicitly deferred until the single-GPU case works end to end), and
 anything workload-specific.
+
+**Designed but not yet built**: a real `.mxe` process model --
+parent/child jobs with direct node-to-node communication once spawned,
+a single global job table (kernal placement authority never moves, but
+every job and its parentage is visible in one place for the scheduler),
+per-spawn orphan policies (`orphan`/`kill`/`promote`, declared by the
+parent, not a system-wide rule), app identity by declared name with a
+global reclaim map so a relaunched app gets its old orphans back,
+planned node draining as distinct from an unrecoverable node death, and
+"semi-live" job migration via `eris` coroutine persistence -- confirmed
+for real against the genuine upstream `eris` library, including a full
+cross-process round trip, not just inferred from OC's own use of it.
+See docs/PROTOCOL.md's "The `.mxe` process model" section for the full
+design and what's still genuinely undecided within it (fan-out caps,
+contention policy when every worker's busy, the exact job-environment
+and persistent-window-handle APIs).
