@@ -1,0 +1,5 @@
+{
+    window_control = true,
+    keyboard_touch = true,
+    screen_keyboard = true,
+}
