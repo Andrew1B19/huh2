@@ -33,9 +33,10 @@
 -- the same call-minimization the call-budget investigation already
 -- called for elsewhere in this project.
 --
--- Loaded via dofile() by kernal/compositor.lua as a sibling file, same
--- reasoning as compositor.lua's own header: not require(), to keep the
--- "copy these files next to each other" install story consistent.
+-- Loaded via kernal/compositor.lua's loadSibling("bitmap.lua") (itself
+-- passed down from kernal/muxos.lua) rather than dofile()/require() --
+-- muxos replaces OpenOS on the kernal entirely, so neither exists; see
+-- compositor.lua's own header for the full reasoning.
 
 local M = {}
 

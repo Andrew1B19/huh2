@@ -1,29 +1,88 @@
--- muxos kernal program for huh2. Runs under a normal OpenOS boot on the
--- main rack node (own CPU/RAM/EEPROM/HDD, same as any OC computer).
--- Discovers worker nodes flashed with node/bios.lua over the rack's shared
--- network segment, serves them their actual runtime (node/runtime.lua) at
--- boot, and dispatches Lua jobs to them.
+-- muxos kernal "init" for huh2. This REPLACES OpenOS on the kernal --
+-- it is the entire resident environment, not a program that runs under
+-- one. kernal/bios.lua (this node's own tiny EEPROM image, mirroring
+-- the mod's own stock EEPROM bios almost line for line) loads and calls
+-- this file directly off the boot filesystem; there is no OpenOS
+-- /init.lua anywhere in this picture.
 --
--- Install: copy this AND node/runtime.lua onto the kernal's filesystem as
--- siblings (e.g. /home/muxos.lua and /home/runtime.lua) and run this from
--- the OpenOS shell. Workers only ever get bios.lua flashed to their
--- EEPROM -- this script reads runtime.lua's source off the kernal's own
--- disk and serves it to them over the modem (see serveBoot() below).
+-- Everything OpenOS would normally provide at this point --
+-- computer.pullSignal, event.pull/listen, thread.create, the keyboard
+-- library, io/print-to-screen, component.proxy/dot-shorthand access --
+-- is confirmed ABSENT from the mod's own native Lua sandbox surface,
+-- verified directly against its Scala source
+-- (li.cil.oc.server.machine.luac.{ComponentAPI,ComputerAPI,SystemAPI}):
+-- component's real surface is only list/type/slot/methods/invoke/doc;
+-- computer has no pullSignal at all (the real primitive is yielding the
+-- kernel coroutine, caught by NativeLuaArchitecture.runThreaded); and
+-- the native `print` only logs to the Java server console per its own
+-- source comment ("Until we get to ingame screens we log to Java's
+-- stdout"), never the in-game screen. So this file builds every one of
+-- those itself from the real primitives (component.list/component.invoke,
+-- coroutine.yield) instead of assuming OpenOS is there to provide them
+-- -- the same bare-metal discipline node/bios.lua and node/runtime.lua
+-- already had to follow, just applied here too now instead of resting
+-- on a normal OpenOS boot underneath.
 --
--- Wire format: see docs/PROTOCOL.md. The serializer below is a deliberate
--- duplicate of the one in node/runtime.lua, not a shared dependency --
--- that file can't `require` anything either, so keeping both sides
--- self-contained avoids a split-brain "shared lib" that only one side
--- can actually load.
-
-local component = require("component")
-local event = require("event")
-local computer = require("computer")
-local thread = require("thread")
-local keyboard = require("keyboard")
+-- Install: kernal/bios.lua (flashed to the EEPROM), this file,
+-- kernal/compositor.lua, kernal/bitmap.lua, and node/runtime.lua all
+-- need to sit together at the ROOT of the kernal's boot filesystem
+-- (/bios.lua, /muxos.lua, /compositor.lua, /bitmap.lua, /runtime.lua) --
+-- fixed, hardcoded root paths, not resolved relative to wherever this
+-- script happens to live the way a normal OpenOS install could:
+-- debug.getinfo's source path would just be the synthetic chunk name
+-- bios.lua loaded this under ("=muxos"), not a real filesystem path, so
+-- there is nothing to resolve a sibling directory from any more.
+--
+-- Wire format: see docs/PROTOCOL.md. The serializer below is a
+-- deliberate duplicate of the one in node/runtime.lua, not a shared
+-- dependency -- neither side can require() anything, so keeping both
+-- self-contained avoids a split-brain "shared lib" only one side could
+-- actually load.
 
 local PORT = 4477
 local TIMEOUT = 5 -- seconds to wait for a worker reply before giving up
+
+-- The real primitive behind every blocking wait in this file. Yielding
+-- the kernel coroutine with a timeout (in seconds) IS computer.pullSignal's
+-- actual underlying mechanism -- confirmed from NativeLuaArchitecture's
+-- runThreaded, which resumes a yielded coroutine with the next signal's
+-- name + args once one arrives (or with nothing, if the timeout simply
+-- elapses first).
+local function pullSignal(timeout)
+  return coroutine.yield(timeout)
+end
+
+-- Yielding a plain boolean is the real shutdown/reboot primitive
+-- (false = power off, true = reboot) -- OpenOS's own computer.shutdown()
+-- is just a wrapper over this. Falling off the end of this file instead
+-- (a normal Lua `return`) is NOT a clean shutdown -- the mod's own
+-- runThreaded treats that as "the kernel stopped unexpectedly" and logs
+-- a warning, so "quit"/"exit" at the REPL go through this instead.
+local function shutdown(reboot)
+  coroutine.yield(reboot and true or false)
+end
+
+-- Our OWN tiny component-proxy helper -- NOT OpenOS's
+-- component.proxy()/dot-shorthand sugar (confirmed absent from the
+-- native ComponentAPI.scala surface), but the same calling convention,
+-- built from the real primitive (component.invoke) so the rest of this
+-- file can keep writing modem.broadcast(...)/gpu.set(...) instead of
+-- component.invoke(addr, "broadcast", ...) everywhere. A duplicate of
+-- this same tiny helper lives in kernal/compositor.lua too -- no shared
+-- module either side could require().
+local function componentProxy(address)
+  return setmetatable({address = address}, {
+    __index = function(_, method)
+      return function(...) return component.invoke(address, method, ...) end
+    end,
+  })
+end
+
+local function primaryComponent(ctype)
+  local address = component.list(ctype)()
+  if not address then return nil end
+  return componentProxy(address), address
+end
 
 local function serialize(v, seen)
   seen = seen or {}
@@ -53,11 +112,56 @@ local function deserialize(s)
   return v
 end
 
-if not component.isAvailable("modem") then
+local modem, modemAddr = primaryComponent("modem")
+if not modem then
   error("no network/linked card found on this node")
 end
-local modem = component.modem
 modem.open(PORT)
+
+-- Re-derive the filesystem this kernal booted from, the same way
+-- kernal/bios.lua found it (the EEPROM's own stored boot address) --
+-- there's no OpenOS mount table to resolve a path like "/compositor.lua"
+-- through any more, so every sibling file this program needs is read
+-- directly off this ONE filesystem component instead.
+local eepromAddr = component.list("eeprom")()
+local function tryInvoke(address, method, ...)
+  local ok, a, b = pcall(component.invoke, address, method, ...)
+  if ok then return a, b end
+  return nil, a
+end
+local fsAddr = eepromAddr and tryInvoke(eepromAddr, "getData")
+if not fsAddr or fsAddr == "" then
+  fsAddr = component.list("filesystem")()
+end
+if not fsAddr then
+  error("no filesystem component found to read sibling files from")
+end
+
+local function readFile(path)
+  local handle, err = tryInvoke(fsAddr, "open", path, "r")
+  if not handle then return nil, err end
+  local parts = {}
+  while true do
+    local data = tryInvoke(fsAddr, "read", handle, math.huge)
+    if not data then break end
+    parts[#parts + 1] = data
+  end
+  tryInvoke(fsAddr, "close", handle)
+  return table.concat(parts)
+end
+
+-- Hands a sibling file's LOADED chunk back, not its source -- the
+-- caller decides whether/how to call it (compositor.lua is called with
+-- loadSibling itself as its own argument, so it can load bitmap.lua the
+-- same way; runtime.lua's source is served to workers as-is, never
+-- called here, so it goes through readFile() directly instead, below).
+local function loadSibling(name)
+  local source, err = readFile("/" .. name)
+  if not source then error("could not read /" .. name .. ": " .. tostring(err), 0) end
+  local chunk, loadErr = load(source, "=" .. name)
+  if not chunk then error("could not load /" .. name .. ": " .. tostring(loadErr), 0) end
+  return chunk
+end
 
 local selfAddr = computer.address()
 local nodes = {}      -- address -> {lastSeen = computer.uptime()}
@@ -76,55 +180,101 @@ local nextNode = 1
 -- overhead. Only one node may hold it at a time.
 local exclusiveFullscreenOwner = nil
 
--- Local escape hatch: Ctrl+Alt+C at the kernal force-releases the grant
--- regardless of who holds it, so a crashed/disconnected holder doesn't
--- require restarting the kernal.
---
--- REAL CONFLICT, not hidden: Ctrl+Alt+C is OpenOS's OWN built-in
--- process-interrupt shortcut. Confirmed in OpenOS's own source
--- (loot/openos/lib/event.lua): computer.pullSignal is monkey-patched
--- there to check isControlDown()+isKeyDown('c')+isAltDown() on
--- literally every signal pull and call
--- `process.info().data.signal("interrupted", 0)` when all three are
--- held -- the same mechanism as a terminal's Ctrl+C. This isn't
--- avoidable by choosing a different listener mechanism; it's baked
--- into computer.pullSignal itself, system-wide, unconditionally.
--- Pressing this combo to exit fullscreen ALSO interrupts whatever
--- OpenOS considers the kernal's "current process" at that moment --
--- which could be muxos.lua's own REPL. If this combo should stay
--- reserved for OpenOS's native interrupt instead, pick a different one
--- for this.
-event.listen("key_down", function(_, _, char, code)
-  if code == keyboard.keys.c and keyboard.isControlDown() and keyboard.isAltDown() then
-    if exclusiveFullscreenOwner then
-      print("Ctrl+Alt+C: force-releasing fullscreen grant held by " .. exclusiveFullscreenOwner)
-      exclusiveFullscreenOwner = nil
+-- The compositor is the only code in this whole project that makes a
+-- real gpu.* call for WINDOW content -- see compositor.lua's own header
+-- for why that's worth enforcing structurally, not just by convention.
+-- It's loaded with loadSibling itself as its chunk argument, so it can
+-- load bitmap.lua the same way this file loaded it.
+local compositor = loadSibling("compositor.lua")(loadSibling)
+
+-- The kernal's own gpu/screen, cached once -- used for isDisplayComponent
+-- (below) AND for the REPL's own minimal text console (see "Minimal
+-- built-in terminal" below): there is no OpenOS io/term to print through
+-- any more, so the REPL draws onto the SAME real screen the compositor
+-- owns, directly, the one other place in this project allowed to touch
+-- the real gpu (the compositor's own windows still composite on top of
+-- whatever the console drew, in z-order, same as any other screen content).
+local gpu, gpuAddr = primaryComponent("gpu")
+local _, screenAddr = primaryComponent("screen")
+if gpu and screenAddr then
+  tryInvoke(gpuAddr, "bind", screenAddr)
+end
+
+-- --- Minimal built-in terminal, replacing OpenOS's io/term entirely ---
+
+local termW, termH = 1, 1
+if gpu then
+  termW, termH = gpu.getResolution()
+end
+local cursorX, cursorY = 1, 1
+
+local function scrollUp()
+  gpu.copy(1, 2, termW, termH - 1, 0, -1)
+  gpu.fill(1, termH, termW, 1, " ")
+end
+
+local function newline()
+  cursorX = 1
+  cursorY = cursorY + 1
+  if cursorY > termH then
+    scrollUp()
+    cursorY = termH
+  end
+end
+
+-- No word-wrap, no scrollback, no resize handling -- a flat fixed-width
+-- console that scrolls one row at a time. A real gap against a proper
+-- terminal, flagged rather than hidden, same honesty-over-coverage
+-- standard as everything else in this project; good enough for a REPL
+-- whose output is mostly short status lines.
+local function termWrite(text)
+  if not gpu then return end
+  local pos = 1
+  local len = #text
+  while pos <= len do
+    local nl = text:find("\n", pos, true)
+    local lineEnd = (nl or len + 1) - 1
+    while pos <= lineEnd do
+      local available = termW - cursorX + 1
+      local take = math.min(available, lineEnd - pos + 1)
+      if take > 0 then
+        gpu.set(cursorX, cursorY, text:sub(pos, pos + take - 1))
+        cursorX = cursorX + take
+        pos = pos + take
+      end
+      if cursorX > termW then
+        newline()
+      end
+    end
+    if nl then
+      newline()
+      pos = nl + 1
     end
   end
-end)
+end
 
--- The kernal is the scheduler, so it's the one place that actually knows
--- about every job dispatched to any node -- this is what lets
--- get_processes() (the muxos equivalent of gmux's api.get_processes())
--- be a real answer instead of each worker only knowing about its own
--- single in-flight job. id -> {id, node, status, code, startedAt,
--- finishedAt, result, error}. status is "running", "done", or "error",
--- mirroring gmux's own process status values closely enough to be
--- recognizable without claiming exact parity with its "waiting"/"dead".
-local jobs = {}
-local jobOrder = {}
+-- Shadows the native `print` (which only logs to the Java server
+-- console, not the in-game screen -- see this file's header) for every
+-- call below this point in the same chunk.
+local function print(...)
+  local n = select("#", ...)
+  local parts = {}
+  for i = 1, n do parts[i] = tostring((select(i, ...))) end
+  termWrite(table.concat(parts, "\t") .. "\n")
+end
 
--- id -> the RESULT/ERROR/PONG message that answered it. Filled in ONLY
--- by pump() (see below), read and cleared by waitForReply(). This is
--- what lets pump() run exclusively inside the background dispatcher
--- thread (started near the bottom of this file) without a second,
--- independent poller: every synchronous wait (submit/listComponents/
--- invoke/pingOnce) checks this shared table and yields with os.sleep(0)
--- between checks, instead of calling event.pull itself. Two independent
--- `event.pull(0, "modem_message")` callers would race over the same
--- queue -- whichever drains a given reply first keeps it, silently
--- starving the other -- so there must be exactly one.
-local replyBox = {}
+-- --- Minimal keyboard modifier tracking, replacing OpenOS's keyboard library ---
+
+-- Same key-code constants OpenOS's own lib/keyboard.lua uses internally
+-- (verified against its source) -- just tracked by hand here since
+-- there's no keyboard.pressedCodes table to read without it.
+local KEY_BACK, KEY_ENTER = 0x0E, 0x1C
+local KEY_LCONTROL, KEY_RCONTROL = 0x1D, 0x9D
+local KEY_LMENU, KEY_RMENU = 0x38, 0xB8
+local KEY_C = 0x2E
+local heldKeys = {}
+local function isControlDown() return heldKeys[KEY_LCONTROL] or heldKeys[KEY_RCONTROL] end
+local function isAltDown() return heldKeys[KEY_LMENU] or heldKeys[KEY_RMENU] end
 
 -- Every message over the modem is chunked, not just boot's CODE --
 -- even a tiny PING gets wrapped as one chunk, uniformly, rather than
@@ -151,8 +301,8 @@ end
 -- senderAddr:msgId -> {chunks = {[i] = chunkString}, total = n, startedAt}
 -- Swept for abandoned entries (a sender that sent some but not all
 -- chunks of a message, e.g. it rebooted mid-send) by sweepStaleChunks(),
--- called once per background-loop iteration -- otherwise an abandoned
--- partial reassembly would sit in this table forever.
+-- called once per tick -- otherwise an abandoned partial reassembly
+-- would sit in this table forever.
 local incomingChunks = {}
 
 -- Feeds one "MSG ..." wire frame in; returns the fully reassembled,
@@ -201,13 +351,20 @@ local function nextId()
   return id
 end
 
+-- id -> {id, node, status, code, startedAt, finishedAt, result, error}
+-- status is "running", "done", or "error".
+local jobs = {}
+local jobOrder = {}
+
+-- id -> the RESULT/ERROR/PONG message that answered it. Filled in by
+-- handleModemMessage (see below), read and cleared by waitForReply.
+local replyBox = {}
+
 -- Record a job's dispatch and actually send it, WITHOUT waiting for the
 -- result -- shared by submit() (which then blocks on awaitReply itself)
 -- and handleSpawn() (which must return to the calling worker immediately,
 -- gmux's own create_headless_process/create_graphics_process being
 -- fire-and-forget: you get a handle back right away, not the result).
--- Completion is recorded generically in pump() below, so it's tracked
--- correctly either way.
 local function dispatchJob(code, args, targetAddr)
   if not targetAddr then
     if #nodeOrder == 0 then
@@ -223,30 +380,13 @@ local function dispatchJob(code, args, targetAddr)
   return id, targetAddr
 end
 
--- Resolve runtime.lua as a sibling of wherever this script is actually
--- running from, so installs aren't tied to a hardcoded /home/ path.
-local function scriptDir()
-  local info = debug.getinfo(1, "S")
-  local path = info.source:match("^@(.*)$") or info.source
-  return path:match("^(.*)/[^/]*$") or "."
-end
-
--- The compositor is the only code in this whole project that makes a
--- real gpu.* call -- see compositor.lua's own header for why that's
--- worth enforcing structurally, not just by convention. Loaded as a
--- sibling file via dofile(), not require(), for the same reason
--- runtime.lua is read directly off disk below rather than required.
-local compositor = dofile(scriptDir() .. "/compositor.lua")
-
-local RUNTIME_PATH = scriptDir() .. "/runtime.lua"
 local runtimeSource = nil -- loaded lazily and cached, see loadRuntime()
 
 local function loadRuntime()
   if runtimeSource then return runtimeSource end
-  local f, openErr = io.open(RUNTIME_PATH, "r")
-  if not f then return nil, "could not open " .. RUNTIME_PATH .. ": " .. tostring(openErr) end
-  runtimeSource = f:read("a")
-  f:close()
+  local source, err = readFile("/runtime.lua")
+  if not source then return nil, "could not read /runtime.lua: " .. tostring(err) end
+  runtimeSource = source
   return runtimeSource
 end
 
@@ -256,9 +396,6 @@ end
 -- identical payload. Not wrapped in the serialized-table protocol: BOOT
 -- happens before a worker has that runtime loaded at all, so it uses its
 -- own plain "WORD <payload>" convention (see node/bios.lua).
--- Stay comfortably under maxNetworkPacketSize (8192, confirmed from
--- application.conf -- see docs/PROTOCOL.md) even accounting for the
--- "CODE <i>/<n> " prefix on each chunk.
 local BOOT_CHUNK_SIZE = 7000
 
 local function serveBoot(workerAddr)
@@ -291,9 +428,7 @@ end
 -- Deliberately narrow: INVOKE on anything else (redstone, sensors, a
 -- second gpu, whatever) is unaffected by the fullscreen grant.
 local function isDisplayComponent(address)
-  if component.isAvailable("gpu") and component.gpu.address == address then return true end
-  if component.isAvailable("screen") and component.screen.address == address then return true end
-  return false
+  return address == gpuAddr or address == screenAddr
 end
 
 local function handleInvoke(msg)
@@ -359,9 +494,9 @@ local function handleSpawn(msg)
 end
 
 -- Both of these just delegate to the compositor (compositor.lua) -- the
--- one file in this project allowed to touch the real gpu. muxos.lua's
--- job here is only wire plumbing: unwrap the request, call in, wrap the
--- reply.
+-- one file in this project allowed to touch the real gpu for window
+-- content. muxos.lua's job here is only wire plumbing: unwrap the
+-- request, call in, wrap the reply.
 local function handleCreateWindow(msg)
   local win, err = compositor.createWindow(msg)
   if not win then
@@ -388,54 +523,35 @@ local function handleGetProcesses(msg)
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
 end
 
--- Pull and fully handle one pending modem message, if any; never
--- blocks. This is the ONLY function in the whole program allowed to
--- call event.pull(0, "modem_message") -- see replyBox's comment above
--- for why having a second independent poller would be a real bug, not
--- just a style issue. A request (BOOT/LIST/INVOKE/.../RELEASEFULLSCREEN)
--- is serviced immediately, right here. A reply (PONG/RESULT/ERROR) is
--- stashed into replyBox for whoever's waiting on that id (waitForReply,
--- below) to pick up -- never acted on directly here. Returns true if it
--- did anything (including "received something irrelevant"), false if
--- the queue was simply empty, so `while pump() do end` drains it.
---
--- Called exclusively from the background dispatcher thread started near
--- the bottom of this file -- which is what finally closes the old gap
--- here: the kernal now services requests and discovery continuously,
--- not just "whenever a REPL command happens to poll." Confirmed from
--- OpenOS's own source (lib/thread.lua, boot/02_os.lua) that this
--- actually works: threads are real coroutines cooperatively scheduled
--- through the same event.pull mechanism, and os.sleep always yields at
--- least once (`repeat event.pull(...) until deadline`) -- so the
--- background thread keeps running even while the REPL is blocked on
--- io.read() at the prompt.
-local function pump()
-  local name, _, from, port, _, data = event.pull(0, "modem_message")
-  if not (name and port == PORT and type(data) == "string") then
-    return false
-  end
+-- Fully handle one already-reassembled, deserialized message -- a
+-- request (BOOT/LIST/INVOKE/.../RELEASEFULLSCREEN) is serviced
+-- immediately, right here; a reply (PONG/RESULT/ERROR) is stashed into
+-- replyBox for whoever's waiting on that id (waitForReply, below) to
+-- pick up.
+local function handleModemMessage(from, port, data)
+  if not (port == PORT and type(data) == "string") then return end
 
   local bootFrom = data:match("^BOOT (.+)$")
   if bootFrom then
     serveBoot(bootFrom)
-    return true
+    return
   end
 
   local payload = reassemble(from, data)
   if not payload then
-    return true -- a partial chunk (more still coming), or not a MSG frame at all
+    return -- a partial chunk (more still coming), or not a MSG frame at all
   end
 
   local msg = deserialize(payload)
   if type(msg) ~= "table" or not msg.from or msg.from == selfAddr then
-    return true
+    return
   end
 
   if msg.type == "HELLO" or msg.type == "PONG" then
     noteNode(msg.from)
   end
   if msg.to ~= selfAddr then
-    return true
+    return
   end
 
   if msg.type == "LIST" then
@@ -473,22 +589,127 @@ local function pump()
       end
     end
   end
-  return true
 end
 
--- Broadcasts PING and just waits out `wait` seconds -- the background
--- thread's own pump() calls are what actually process the HELLO/PONG
--- replies into `nodes` (noteNode) during that window; this doesn't poll
--- the modem itself.
+-- Runs the command the REPL's line editor (below) just collected.
+-- Forward-declared; assigned once everything it calls exists.
+local runCommand
+
+-- The REPL's current input line, built up one key_down signal at a time
+-- (see "Minimal built-in terminal" and handleKeyDown below) since there
+-- is no io.read() to block on any more.
+local inputBuffer = ""
+
+local function promptLine()
+  termWrite("muxos> ")
+end
+
+local function handleKeyDown(char, code)
+  heldKeys[code] = true
+  -- Local escape hatch: Ctrl+Alt+C at the kernal force-releases the
+  -- fullscreen grant regardless of who holds it, so a crashed/
+  -- disconnected holder doesn't require restarting the kernal.
+  --
+  -- REAL CONFLICT, not hidden: Ctrl+Alt+C is OpenOS's OWN built-in
+  -- process-interrupt shortcut (see docs/PROTOCOL.md for the full
+  -- finding). That conflict no longer applies quite the same way now
+  -- that muxos doesn't run under OpenOS at all -- there is no OpenOS
+  -- process-interrupt mechanism here to collide with any more -- but
+  -- the combo is kept as specified rather than reclaimed for something
+  -- else, since it's still a reasonable "exit fullscreen" mnemonic on
+  -- its own.
+  if code == KEY_C and isControlDown() and isAltDown() then
+    if exclusiveFullscreenOwner then
+      print("Ctrl+Alt+C: force-releasing fullscreen grant held by " .. exclusiveFullscreenOwner)
+      exclusiveFullscreenOwner = nil
+    end
+    return
+  end
+  if code == KEY_ENTER then
+    termWrite("\n")
+    local line = inputBuffer
+    inputBuffer = ""
+    runCommand(line)
+    promptLine()
+  elseif code == KEY_BACK then
+    if #inputBuffer > 0 then
+      inputBuffer = inputBuffer:sub(1, -2)
+      if cursorX > 1 then
+        cursorX = cursorX - 1
+        gpu.set(cursorX, cursorY, " ")
+      end
+    end
+  elseif char and char >= 32 then
+    local ok, ch = pcall(utf8.char, char)
+    if ok then
+      inputBuffer = inputBuffer .. ch
+      termWrite(ch)
+    end
+  end
+  -- No arrow-key history, no cursor movement within the line, no paste
+  -- handling -- a flat append/backspace-only line editor. A real gap
+  -- against a proper shell, flagged rather than hidden, same standard
+  -- as the rest of this project.
+end
+
+local function handleKeyUp(code)
+  heldKeys[code] = nil
+end
+
+-- Pulls and fully handles exactly one signal, or times out -- the ONE
+-- place every wait in this program funnels through, whether that's the
+-- REPL idling at its prompt or something deep in a submit()/awaitReply()
+-- blocking on a specific network reply. This replaces BOTH the old
+-- "separate background thread polling pump()" design AND the old
+-- os.sleep(0.05)-paced maintenance loop: there is exactly one coroutine
+-- here (no OpenOS thread library to fake concurrency with any more), so
+-- servicing everything inline, on every signal, from wherever a wait
+-- happens to be nested, is the only correct shape now -- not a
+-- simplification taken for convenience, the actual consequence of there
+-- being no OpenOS underneath to schedule a second thread with.
+--
+-- pcall-wrapped around the dispatch + maintenance work for the same
+-- reason the old design's background thread was: without it, an
+-- uncaught error in any single handler (a bad INVOKE, a window draw-
+-- code bug, anything) would propagate all the way out of this, the
+-- kernal's ONLY coroutine now -- not just killing a background thread
+-- the REPL could still survive without, but the whole event loop.
+local function tick(timeout)
+  local name, a2, a3, a4, a5, a6 = pullSignal(timeout)
+  local ok, err = pcall(function()
+    if name == "key_down" then
+      handleKeyDown(a3, a4)
+    elseif name == "key_up" then
+      handleKeyUp(a4)
+    elseif name == "modem_message" then
+      handleModemMessage(a3, a4, a6)
+    end
+    sweepStaleChunks()
+    compositor.flush()
+  end)
+  if not ok then
+    print("tick error (continuing): " .. tostring(err))
+  end
+end
+
+local function waitSeconds(duration)
+  local deadline = computer.uptime() + duration
+  while computer.uptime() < deadline do
+    tick(deadline - computer.uptime())
+  end
+end
+
+-- Broadcasts PING and just waits out `wait` seconds -- tick() (called by
+-- waitSeconds) is what actually processes the HELLO/PONG replies into
+-- `nodes` (noteNode) during that window.
 local function discover(wait)
   send({type = "PING", from = selfAddr})
-  os.sleep(wait or 1)
+  waitSeconds(wait or 1)
 end
 
--- Block until pump() (running in the background thread) stashes a reply
--- for `id` into replyBox, or time out. The one shared wait primitive
--- behind submit()/listComponents()/invoke()/pingOnce() -- none of them
--- poll the modem themselves any more.
+-- Block until a reply for `id` lands in replyBox, or time out. The one
+-- shared wait primitive behind submit()/listComponents()/invoke()/
+-- pingOnce().
 local function waitForReply(id, addr, timeout)
   local deadline = computer.uptime() + (timeout or TIMEOUT)
   while computer.uptime() < deadline do
@@ -497,7 +718,7 @@ local function waitForReply(id, addr, timeout)
       replyBox[id] = nil
       return msg
     end
-    os.sleep(0)
+    tick(deadline - computer.uptime())
   end
   return nil, "timed out waiting for " .. tostring(addr)
 end
@@ -511,9 +732,7 @@ end
 
 -- Submit `code` (compiled as a chunk and called with `args` as its only
 -- argument) to one worker node and block for the result. Picks the next
--- node round-robin unless targetAddr is given. Completion is recorded in
--- `jobs` by pump()'s generic handling above, not here -- dispatchJob()
--- already created the record before this blocks on awaitReply.
+-- node round-robin unless targetAddr is given.
 local function submit(code, args, targetAddr)
   local id, addrOrErr = dispatchJob(code, args, targetAddr)
   if not id then
@@ -654,127 +873,99 @@ local function printWindows()
   end
 end
 
-local function repl()
-  print("muxos kernal -- " .. selfAddr)
-  print("commands:")
-  print("  discover | nodes | ping <node> [count] | quit")
-  print("  run <lua code> | runall <lua code> | processes")
-  print("  spawn <node> <lua code>")
-  print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
-  print("  bitdemo <halfblock|braille> <x> <y> -- draws a test pattern as a bit window")
-  print("  components <node> | call <node> <component addr> <method> [args table]")
-  print("(<node> is either a [n] index from 'nodes' or a full node address)")
-  discover(1)
-  listNodes()
-  while true do
-    io.write("muxos> ")
-    local line = io.read()
-    if not line or line == "quit" or line == "exit" then
-      break
-    elseif line == "discover" then
-      discover(1)
-      listNodes()
-    elseif line == "nodes" then
-      listNodes()
-    elseif line == "processes" then
-      printProcesses()
-    elseif line:match("^ping%s") then
-      local node, countStr = line:match("^ping%s+(%S+)%s*(%S*)$")
-      if not node then
-        print("usage: ping <node> [count]")
-      else
-        pingReport(resolveNode(node), tonumber(countStr))
-      end
-    elseif line:match("^run%s") then
-      local result, err = submit(line:sub(5), nil)
-      if err then print("error: " .. err) else print(tostring(result)) end
-    elseif line:match("^runall%s") then
-      local code = line:sub(8)
-      for _, addr in ipairs(nodeOrder) do
-        local result, err = submit(code, nil, addr)
-        if err then print(addr .. ": error: " .. err)
-        else print(addr .. ": " .. tostring(result)) end
-      end
-    elseif line:match("^spawn%s") then
-      local node, code = line:match("^spawn%s+(%S+)%s+(.*)$")
-      if not node then
-        print("usage: spawn <node> <lua code>")
-      else
-        local id, addrOrErr = dispatchJob(code, nil, resolveNode(node))
-        if not id then print("error: " .. addrOrErr) else print("spawned job [" .. id .. "] on " .. addrOrErr) end
-      end
-    elseif line:match("^window%s") then
-      local title, x, y, w, h, code = line:match("^window%s+(%S+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(.*)$")
-      if not title then
-        print("usage: window <title> <x> <y> <width> <height> <lua code drawing into `gpu`>")
-      else
-        local win, err = compositor.createWindow({title = title, x = tonumber(x), y = tonumber(y),
-          width = tonumber(w), height = tonumber(h), code = code})
-        if err then print("error: " .. err) else print("created window [" .. win.id .. "]") end
-      end
-    elseif line == "windows" then
-      printWindows()
-    elseif line:match("^bitdemo%s") then
-      local mode, x, y = line:match("^bitdemo%s+(%S+)%s+(%d+)%s+(%d+)$")
-      if not mode or (mode ~= "halfblock" and mode ~= "braille") then
-        print("usage: bitdemo <halfblock|braille> <x> <y>")
-      else
-        local win, err = compositor.createWindow({title = "bitdemo", x = tonumber(x), y = tonumber(y),
-          pixels = demoPixels(16), width = 16, height = 16, mode = mode, bg = 0x000000})
-        if err then print("error: " .. err) else print("created bit window [" .. win.id .. "] (" .. win.width .. "x" .. win.height .. " cells)") end
-      end
-    elseif line:match("^components%s") then
-      printComponents(resolveNode(line:match("^components%s+(%S+)")))
-    elseif line:match("^call%s") then
-      local node, compAddr, method, rest = line:match("^call%s+(%S+)%s+(%S+)%s+(%S+)%s*(.*)$")
-      if not node then
-        print("usage: call <node> <component addr> <method> [args table]")
-      else
-        local args, parseOk = nil, true
-        if rest ~= "" then
-          args = deserialize(rest)
-          if args == nil then
-            print("could not parse args table: " .. rest)
-            parseOk = false
-          end
-        end
-        if parseOk then
-          local result, err = invoke(resolveNode(node), compAddr, method, args)
-          if err then print("error: " .. err) else print(serialize(result)) end
-        end
-      end
-    elseif line ~= "" then
-      print("unknown command")
+runCommand = function(line)
+  if not line or line == "quit" or line == "exit" then
+    shutdown(false)
+  elseif line == "discover" then
+    discover(1)
+    listNodes()
+  elseif line == "nodes" then
+    listNodes()
+  elseif line == "processes" then
+    printProcesses()
+  elseif line:match("^ping%s") then
+    local node, countStr = line:match("^ping%s+(%S+)%s*(%S*)$")
+    if not node then
+      print("usage: ping <node> [count]")
+    else
+      pingReport(resolveNode(node), tonumber(countStr))
     end
+  elseif line:match("^run%s") then
+    local result, err = submit(line:sub(5), nil)
+    if err then print("error: " .. err) else print(tostring(result)) end
+  elseif line:match("^runall%s") then
+    local code = line:sub(8)
+    for _, addr in ipairs(nodeOrder) do
+      local result, err = submit(code, nil, addr)
+      if err then print(addr .. ": error: " .. err)
+      else print(addr .. ": " .. tostring(result)) end
+    end
+  elseif line:match("^spawn%s") then
+    local node, code = line:match("^spawn%s+(%S+)%s+(.*)$")
+    if not node then
+      print("usage: spawn <node> <lua code>")
+    else
+      local id, addrOrErr = dispatchJob(code, nil, resolveNode(node))
+      if not id then print("error: " .. addrOrErr) else print("spawned job [" .. id .. "] on " .. addrOrErr) end
+    end
+  elseif line:match("^window%s") then
+    local title, x, y, w, h, code = line:match("^window%s+(%S+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(.*)$")
+    if not title then
+      print("usage: window <title> <x> <y> <width> <height> <lua code drawing into `gpu`>")
+    else
+      local win, err = compositor.createWindow({title = title, x = tonumber(x), y = tonumber(y),
+        width = tonumber(w), height = tonumber(h), code = code})
+      if err then print("error: " .. err) else print("created window [" .. win.id .. "]") end
+    end
+  elseif line == "windows" then
+    printWindows()
+  elseif line:match("^bitdemo%s") then
+    local mode, x, y = line:match("^bitdemo%s+(%S+)%s+(%d+)%s+(%d+)$")
+    if not mode or (mode ~= "halfblock" and mode ~= "braille") then
+      print("usage: bitdemo <halfblock|braille> <x> <y>")
+    else
+      local win, err = compositor.createWindow({title = "bitdemo", x = tonumber(x), y = tonumber(y),
+        pixels = demoPixels(16), width = 16, height = 16, mode = mode, bg = 0x000000})
+      if err then print("error: " .. err) else print("created bit window [" .. win.id .. "] (" .. win.width .. "x" .. win.height .. " cells)") end
+    end
+  elseif line:match("^components%s") then
+    printComponents(resolveNode(line:match("^components%s+(%S+)")))
+  elseif line:match("^call%s") then
+    local node, compAddr, method, rest = line:match("^call%s+(%S+)%s+(%S+)%s+(%S+)%s*(.*)$")
+    if not node then
+      print("usage: call <node> <component addr> <method> [args table]")
+    else
+      local args, parseOk = nil, true
+      if rest ~= "" then
+        args = deserialize(rest)
+        if args == nil then
+          print("could not parse args table: " .. rest)
+          parseOk = false
+        end
+      end
+      if parseOk then
+        local result, err = invoke(resolveNode(node), compAddr, method, args)
+        if err then print("error: " .. err) else print(serialize(result)) end
+      end
+    end
+  elseif line ~= "" then
+    print("unknown command")
   end
 end
 
--- Background dispatcher: the sole caller of pump() (see its own comment
--- for why), draining everything currently queued every iteration -- the
--- network side isn't rate-limited (modem.send/broadcast aren't `direct`
--- calls, see docs/PROTOCOL.md's call-budget section) so there's no
--- reason to throttle message handling to once per tick. compositor.flush()
--- IS called once per iteration, though, which -- paced by the os.sleep(0.05)
--- below -- is the "upper bound of once per tick" for the real screen
--- write: every dirty window composited, at most one real bitblt to the
--- screen, however many CREATEWINDOW calls arrived since the last tick.
--- pcall-wrapped so one bad message or a draw-code error can't silently
--- kill this thread forever -- without it, an uncaught error here would
--- quietly disable boot-serving, every remote-component handler, AND the
--- compositor for the rest of the kernal's uptime, with no obvious symptom
--- beyond "nothing responds any more."
-thread.create(function()
-  while true do
-    local ok, err = pcall(function()
-      while pump() do end
-      sweepStaleChunks()
-      compositor.flush()
-    end)
-    if not ok then
-      print("background dispatcher error (continuing): " .. tostring(err))
-    end
-    os.sleep(0.05) -- ~1 tick
-  end
-end)
+print("muxos kernal -- " .. selfAddr)
+print("commands:")
+print("  discover | nodes | ping <node> [count] | quit")
+print("  run <lua code> | runall <lua code> | processes")
+print("  spawn <node> <lua code>")
+print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
+print("  bitdemo <halfblock|braille> <x> <y> -- draws a test pattern as a bit window")
+print("  components <node> | call <node> <component addr> <method> [args table]")
+print("(<node> is either a [n] index from 'nodes' or a full node address)")
+discover(1)
+listNodes()
+promptLine()
 
-repl()
+while true do
+  tick(0.05) -- ~1 tick between idle maintenance passes (sweepStaleChunks/compositor.flush)
+end

@@ -26,26 +26,45 @@
 -- responsibly" rather than each window touching the real screen on its
 -- own.
 --
--- Loaded via dofile() by kernal/muxos.lua as a sibling file, not
--- require() -- OpenOS's require() resolves against /lib, /usr/lib, etc,
--- not wherever this install happens to live, and dofile keeps the
--- "copy these files next to each other" install story consistent with
--- how muxos.lua itself finds node/runtime.lua.
+-- muxos replaces OpenOS on the kernal entirely -- there is no
+-- require(), no dofile(), no debug.getinfo-based script path (this
+-- whole file is loaded from a plain string by kernal/muxos.lua's own
+-- loadSibling(), under a synthetic chunk name, not a real path). The
+-- native `component` global (list/type/slot/methods/invoke/doc, see
+-- ComponentAPI.scala) is already visible here with no require needed
+-- -- it's a real Lua global, not something sandboxed per-module.
+--
+-- `loadSibling`, the one piece of context muxos.lua passes in as this
+-- chunk's own `...`, is how this file reads bitmap.lua off the same
+-- boot filesystem muxos.lua itself was loaded from -- same mechanism,
+-- duplicated rather than shared (same "both sides keep their own copy"
+-- reasoning as the wire-protocol serializer in node/runtime.lua and
+-- kernal/muxos.lua).
+local loadSibling = ...
+local bitmap = loadSibling("bitmap.lua")()
 
-local component = require("component")
-
-local function scriptDir()
-  local info = debug.getinfo(1, "S")
-  local path = info.source:match("^@(.*)$") or info.source
-  return path:match("^(.*)/[^/]*$") or "."
+-- Our OWN tiny component-proxy helper -- NOT OpenOS's
+-- component.proxy()/dot-shorthand sugar (confirmed absent from
+-- ComponentAPI.scala's native surface: only list/type/slot/methods/
+-- invoke/doc are real), but the same calling convention, built from
+-- the real primitive (component.invoke) so the rest of this file can
+-- keep writing gpu.set(...)/gpu.allocateBuffer(...) instead of
+-- component.invoke(addr, "set", ...) everywhere. Duplicated from
+-- kernal/muxos.lua's own copy for the same "no shared module to
+-- require" reason as everywhere else in this project.
+local function componentProxy(address)
+  return setmetatable({address = address}, {
+    __index = function(_, method)
+      return function(...) return component.invoke(address, method, ...) end
+    end,
+  })
 end
 
--- The encoder for "bit windows" (half-block/braille sub-cell bitmaps --
--- see bitmap.lua's own header for why that's the only way to get
--- anything bitmap-like on OC's character-cell-only GPU hardware).
--- Loaded the same way runtime.lua/compositor.lua itself are: dofile()
--- against a sibling file, not require().
-local bitmap = dofile(scriptDir() .. "/bitmap.lua")
+local function primaryComponent(ctype)
+  local address = component.list(ctype)()
+  if not address then return nil end
+  return componentProxy(address), address
+end
 
 local M = {}
 
@@ -67,7 +86,7 @@ local function nextId()
 end
 
 local function kernalGpu()
-  if component.isAvailable("gpu") then return component.gpu end
+  return primaryComponent("gpu")
 end
 
 local function ensureFrameBuffer(gpu)

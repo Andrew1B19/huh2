@@ -85,6 +85,91 @@ up yet, or busy -- see the `pump()` caveat below), the worker just waits
 authoritative source for what a worker runs; there's nothing sensible
 for a worker to fall back to on its own.
 
+## The kernal is bare-metal
+
+muxos **replaces** OpenOS on the kernal; it does not run under one.
+`kernal/bios.lua` is the kernal's entire EEPROM image, and
+`kernal/muxos.lua` is what it loads and runs directly off the boot
+filesystem -- there is no OpenOS `/init.lua` anywhere in this picture,
+the same way a worker never has one.
+
+This matters because a surprising amount of what looks like "the Lua
+sandbox" in OpenComputers is actually OpenOS, not the mod. Verified
+directly against the mod's own Scala source
+(`li.cil.oc.server.machine.luac.{ComponentAPI,ComputerAPI,SystemAPI}`,
+plus the stock EEPROM image the mod itself ships,
+`assets/opencomputers/lua/bios.lua`), not guessed:
+
+- **`component`'s real native surface is only `list`/`type`/`slot`/
+  `methods`/`invoke`/`doc`.** There is no `component.proxy()` and no
+  dot-shorthand (`component.gpu`, `component.isAvailable("gpu")`) --
+  that's all OpenOS's `lib/component.lua`. `node/bios.lua`/
+  `node/runtime.lua` actually called `component.proxy()` already,
+  something that was never caught because this project's tests mock
+  their own fake `component`/`computer` tables rather than running
+  against anything resembling the real native surface -- a real latent
+  bug (would have crashed with "attempt to call a nil value" the first
+  time a worker actually booted on real hardware), fixed alongside this
+  rewrite, not something introduced by it.
+- **There is no `computer.pullSignal` at all.** The real primitive is
+  yielding the kernel coroutine with `coroutine.yield(timeoutSeconds)`,
+  caught by the mod's own `NativeLuaArchitecture.runThreaded`, which
+  resumes the coroutine with the next signal's name + args once one
+  arrives (or with nothing, if the timeout simply elapses first).
+  `computer.pullSignal` is OpenOS's own thin wrapper over exactly that.
+  Every bare-metal file in this project (`node/bios.lua`,
+  `node/runtime.lua`, `kernal/muxos.lua`) now defines its own tiny
+  `pullSignal(timeout)` local function wrapping `coroutine.yield`
+  directly, rather than assuming OpenOS provided the real one.
+- **Shutdown/reboot works the same way**: yielding a plain boolean
+  (`false` = power off, `true` = reboot) is the real primitive
+  (`ExecutionResult.Shutdown`); falling off the end of the chunk with an
+  ordinary `return` is NOT a clean shutdown -- the mod's own
+  `runThreaded` logs "the kernel stopped unexpectedly" in that case.
+  `kernal/muxos.lua`'s `shutdown(reboot)` wraps the real primitive; the
+  REPL's `quit`/`exit` go through it instead of just returning.
+- **The native `print` never reaches the in-game screen at all** --
+  confirmed from its own source comment: "Until we get to ingame
+  screens we log to Java's stdout." It's a server-console debug stub,
+  not a terminal. `kernal/muxos.lua` shadows it with its own `print`
+  that routes through a small built-in text console (see below) --
+  without this, the REPL would be completely silent on the in-game
+  screen.
+- **`beep` works without OpenOS** (the stock `bios.lua` itself calls
+  `computer.beep(...)`) -- it's dispatched through the computer
+  component's own generic `@Callback` machinery, not one of
+  `ComputerAPI.scala`'s explicitly hand-written functions, but callable
+  all the same.
+
+### What muxos.lua builds itself, in place of each OpenOS piece
+
+| OpenOS provided | muxos.lua now builds | 
+|---|---|
+| `computer.pullSignal(timeout)` | `pullSignal(timeout)` -- `coroutine.yield(timeout)` |
+| `computer.shutdown(reboot)` | `shutdown(reboot)` -- `coroutine.yield(reboot)` |
+| `component.proxy(addr)` / dot-shorthand | `componentProxy(addr)`/`primaryComponent(ctype)` -- a metatable over `component.invoke`, duplicated (not shared) in `kernal/compositor.lua` too |
+| `event.pull`/`event.listen` | `tick(timeout)` -- one `pullSignal` call per invocation, dispatched inline by signal name; every wait in the program (REPL idle, `waitForReply`, `discover`) calls `tick()` instead of polling |
+| `thread.create` (the old background dispatcher) | nothing -- there is exactly one coroutine; see "Resolved, then resolved differently again" below for why the old two-"thread" design doesn't apply any more |
+| `io.read()`/`io.write()`, the REPL prompt | a `key_down`-driven line editor (`handleKeyDown`, `inputBuffer`) -- append/backspace only, no history or cursor movement within a line, a real gap against a proper shell, flagged rather than hidden |
+| `print` (screen output) | a local `print` shadowing the native (server-console-only) one, routed through a minimal built-in text console (`termWrite`) -- fixed-width, scrolls one row at a time via `gpu.copy`/`gpu.fill`, no word-wrap or scrollback |
+| `keyboard.isControlDown()`/`isAltDown()`/`keys.c` | the same key-code constants OpenOS's own `lib/keyboard.lua` uses internally (verified against its source), tracked by hand in a `heldKeys` table updated from raw `key_down`/`key_up` signals |
+| `require`/`dofile` (loading sibling files) | `loadSibling(name)` -- reads a file directly off the boot filesystem component (rediscovered via the EEPROM's own stored boot address, the same way `kernal/bios.lua` found it) and `load()`s it; `compositor.lua` receives this same function as its own `...` argument so it can load `bitmap.lua` the identical way |
+
+`kernal/compositor.lua` and `kernal/bitmap.lua` needed much smaller
+changes: `compositor.lua` drops its one `require("component")` (the
+native `component` global is already visible with no require needed)
+and duplicates its own tiny `componentProxy`/`primaryComponent` helper
+in place of `component.isAvailable("gpu")`/`component.gpu`;
+`bitmap.lua` needed no changes at all -- it never touched `component`
+directly, only ever receiving a `gpu`-shaped table as a parameter.
+
+One specific consequence worth calling out: the REPL text console and
+`kernal/compositor.lua` are now the only two places in this project
+allowed to touch the real gpu. The console isn't a window the
+compositor manages -- it IS the display, drawn directly, with the
+compositor's own windows compositing on top of it in Z-order the same
+way they would over any other screen content.
+
 ## Message types
 
 | type      | fields                                                  | sent by | meaning                                          |
@@ -410,42 +495,54 @@ same-process internals, not something a remote job could hold a
 reference to); `get_process`/`show_error` are plausible small
 additions but haven't been done.
 
-**Resolved**: the kernal used to only service an incoming request while
-something was actively polling the modem (`discover`, `awaitReply`,
-`pingOnce`), which meant a worker's boot or remote call could sit
-unanswered while the REPL was blocked on `io.read()` at the prompt. Fixed
-with a real background dispatcher thread (`thread.create(...)` near the
-bottom of `muxos.lua`) that calls `pump()` continuously and `compositor.flush()`
-once per iteration, paced by `os.sleep(0.05)` (~1 tick). Confirmed from
-OpenOS's own source this actually works while the REPL blocks: `lib/
-thread.lua` implements threads as real coroutines cooperatively scheduled
-through the same `event.pull` mechanism, and `os.sleep` (`boot/02_os.lua`:
-`repeat event.pull(deadline - computer.uptime()) until deadline`) always
-yields at least once, even for `os.sleep(0)` -- so the background thread
-keeps running regardless of what the foreground is doing.
+**Resolved, then resolved differently again**: the kernal used to only
+service an incoming request while something was actively polling the
+modem (`discover`, `awaitReply`, `pingOnce`), which meant a worker's
+boot or remote call could sit unanswered while the REPL was blocked on
+`io.read()` at the prompt. The first fix was a real background
+dispatcher thread (`thread.create(...)`) running `pump()` continuously
+alongside the REPL, built on OpenOS's own `lib/thread.lua` (real
+coroutines cooperatively scheduled through `event.pull`) and `os.sleep`
+always yielding at least once.
 
-This introduced a real hazard that needed a specific fix, not just "add
-a thread": two independent pollers both calling
-`event.pull(0, "modem_message")` would race over the same queue --
-whichever drains a given reply first keeps it, silently starving the
-other. So `pump()` is now the ONLY function allowed to touch the event
-queue at all, called exclusively from the background thread. Every
-synchronous wait (`awaitReply`/`pingOnce`, via the shared `waitForReply`)
-no longer polls the modem itself -- it just checks a shared table
-(`replyBox`, filled in by `pump()`) and yields with `os.sleep(0)` between
-checks. Verified with a mocked harness: a reply queued before a wait
-starts, a reply arriving mid-wait, an unsolicited request serviced
-directly without ever landing in `replyBox`, and the timeout path.
+That whole fix assumed OpenOS was present to provide `thread`/`event`/
+`io.read()` in the first place. Once the kernal became bare-metal (see
+"The kernal is bare-metal" below), none of those exist any more, so the
+fix changed shape again: there is now exactly ONE coroutine on the
+kernal, and the REPL itself is driven by raw `key_down` signals instead
+of a blocking `io.read()` -- so there's no separate "foreground blocked
+on a prompt" state for a background thread to work around in the first
+place. Every wait in the program, including ones nested arbitrarily
+deep (a REPL command's `submit()` call blocking on a network reply),
+funnels through the same `tick()` function, which pulls exactly one
+signal (via `pullSignal`, `coroutine.yield` underneath) and dispatches
+it inline -- a key_down to the REPL's line editor, a modem_message to
+`handleModemMessage`, either way followed by `sweepStaleChunks()` and
+`compositor.flush()`. This is simpler than the two-thread design, not a
+downgrade from it: with no OpenOS thread library to fake concurrency
+with, servicing everything inline from wherever a wait happens to be
+nested is the only correct shape left, and it has the nice property
+that `compositor.flush()`/`sweepStaleChunks()` run on every signal
+rather than being paced by a fixed `os.sleep(0.05)`.
 
-The background loop is `pcall`-wrapped around its per-iteration work --
-without that, an uncaught error in any handler (a bad `INVOKE`, a window
-draw-code bug, anything) would silently kill the thread forever, quietly
-disabling boot-serving, every remote-component handler, AND the
-compositor for the rest of the kernal's uptime, with no symptom beyond
-"nothing responds any more." One real gap left: if the thread itself
-fails to start, or OpenOS's thread scheduler misbehaves, there's no
-watchdog restarting it -- not handled, same honesty-over-coverage
-standard as everything else flagged in this doc.
+The one hazard the old design had to solve by construction -- two
+independent `event.pull(0, "modem_message")` pollers racing over the
+same queue, whichever drains a reply first silently starving the other
+-- can't recur at all now: there is only one place `pullSignal` is ever
+called (`tick`), so there is nothing left to race. `waitForReply`
+doesn't poll a separate shared table and yield between checks any more
+either; it just calls `tick()` in a loop and checks `replyBox` after
+each one, so a reply that arrives mid-wait is picked up on the very
+next signal rather than the next polling interval. Verified with a
+mocked harness: a reply queued before a wait starts, a reply arriving
+mid-wait, an unsolicited request serviced directly without ever landing
+in `replyBox`, and the timeout path (`/tmp/test_central_pump.lua`).
+
+`tick()` keeps the same `pcall` wrapper around its dispatch + maintenance
+work the old background thread had, for a sharper reason now: an
+uncaught error in a handler would otherwise propagate out of the
+kernal's ONLY coroutine, not just kill a background thread the REPL
+could survive without.
 
 ## Assumptions this depends on
 
@@ -457,9 +554,13 @@ standard as everything else flagged in this doc.
 - Worker nodes have no filesystem and no OS; `node/bios.lua` *is* the
   entire firmware, flashed straight onto the EEPROM, and `node/runtime.lua`
   is what it fetches and runs.
-- The kernal boots a normal OpenOS and runs `muxos.lua` as a regular
-  program, with `runtime.lua` installed alongside it as a sibling file on
-  its own disk (not on any worker).
+- The kernal has no OpenOS either, as of the bare-metal rewrite (see
+  "The kernal is bare-metal" below) -- `kernal/bios.lua` *is* its entire
+  firmware, and `kernal/muxos.lua` is what it loads and runs directly
+  off its own disk, with `compositor.lua`/`bitmap.lua`/`runtime.lua`
+  installed alongside it at the filesystem's root (not on any worker).
+  muxos REPLACES OpenOS on the kernal; it is not a program that runs
+  under one.
 
 ## EEPROM size
 
@@ -471,6 +572,14 @@ of room. `runtime.lua` (**14411 bytes** as of the generic chunking
 layer) carries everything that used to make the combined file blow past
 4096 -- it's fetched into RAM over the modem instead, so `eepromSize`
 doesn't apply to it.
+
+The kernal has the exact same split now that it's bare-metal too (see
+"The kernal is bare-metal" below): `kernal/bios.lua` is bound by the
+same 4096-byte limit and sits comfortably under it at **2833 bytes**;
+`kernal/muxos.lua` carries everything else and is read off the boot
+filesystem directly (not fetched over a network, since the kernal
+already has its own disk) rather than flashed, so `eepromSize` doesn't
+apply to it either.
 
 It exceeds `maxNetworkPacketSize` (8192) as a single message by a wide
 margin now (needing 3 chunks at `CHUNK_SIZE` = 7000 bytes/chunk) -- this

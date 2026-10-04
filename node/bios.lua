@@ -11,21 +11,40 @@
 
 local PORT = 4477
 
+-- The real EEPROM sandbox has no `computer.pullSignal` at all -- that's
+-- an OpenOS convenience wrapper (confirmed absent from
+-- ComputerAPI.scala's native method list) over the actual primitive:
+-- yielding the kernel coroutine with `coroutine.yield(timeout)`, caught
+-- by the mod's own NativeLuaArchitecture.runThreaded, which resumes it
+-- with the next signal's name + args (or nothing, if the timeout just
+-- elapsed with no signal). Confirmed from the stock bios.lua shipped
+-- with the mod itself (assets/opencomputers/lua/bios.lua): it never
+-- calls computer.pullSignal either, because at this level it doesn't
+-- exist yet -- only OpenOS's own boot sequence ever defines it.
+local function pullSignal(timeout)
+  return coroutine.yield(timeout)
+end
+
+-- `component.proxy(address)` is OpenOS's lib/component.lua sugar, not
+-- native either -- ComponentAPI.scala's real surface is only
+-- list/type/slot/methods/invoke/doc. No proxy wrapper is needed here:
+-- the modem only ever needs `open`/`broadcast`, called directly via
+-- component.invoke.
 local function findModem()
   for addr in component.list("modem") do
-    return component.proxy(addr)
+    return addr
   end
 end
 
-local modem = findModem()
-if not modem then
+local modemAddr = findModem()
+if not modemAddr then
   -- No network/wireless card present -- there is no way to reach the
   -- kernal at all. Beep and halt rather than spin silently.
   computer.beep(200, 0.5)
-  while true do computer.pullSignal() end
+  while true do pullSignal() end
 end
 
-modem.open(PORT)
+component.invoke(modemAddr, "open", PORT)
 
 local nodeId = computer.address()
 
@@ -38,7 +57,7 @@ local nodeId = computer.address()
 -- maxNetworkPacketSize -- see docs/PROTOCOL.md). Lua's `.` matches
 -- newlines too, so this is safe even though a chunk spans many lines.
 local function requestBoot()
-  modem.broadcast(PORT, "BOOT " .. nodeId)
+  component.invoke(modemAddr, "broadcast", PORT, "BOOT " .. nodeId)
 end
 
 requestBoot()
@@ -46,7 +65,7 @@ requestBoot()
 local chunks = {}
 local code
 while not code do
-  local name, _, _, port, _, data = computer.pullSignal(5)
+  local name, _, _, port, _, data = pullSignal(5)
   local gotChunk = false
   if name == "modem_message" and port == PORT and type(data) == "string" then
     local i, n, chunk = data:match("^CODE (%d+)/(%d+) (.*)$")

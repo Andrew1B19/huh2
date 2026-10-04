@@ -43,21 +43,32 @@ local function deserialize(s)
   return v
 end
 
+-- `computer.pullSignal` and `component.proxy` are both OpenOS
+-- convenience wrappers, not native (confirmed against the mod's own
+-- ComputerAPI.scala/ComponentAPI.scala -- neither is registered there,
+-- and the stock bios.lua itself never calls either). The real primitive
+-- for receiving a signal is `coroutine.yield(timeout)`, caught by
+-- NativeLuaArchitecture.runThreaded; component addressing is done with
+-- plain component.invoke, no proxy object needed.
+local function pullSignal(timeout)
+  return coroutine.yield(timeout)
+end
+
 local function findModem()
   for addr in component.list("modem") do
-    return component.proxy(addr)
+    return addr
   end
 end
 
-local modem = findModem()
-if not modem then
+local modemAddr = findModem()
+if not modemAddr then
   -- No network/wireless card present -- there is no way to receive jobs.
   -- Beep and halt rather than spin silently.
   computer.beep(200, 0.5)
-  while true do computer.pullSignal() end
+  while true do pullSignal() end
 end
 
-modem.open(PORT)
+component.invoke(modemAddr, "open", PORT)
 
 local nodeId = computer.address()
 
@@ -78,7 +89,7 @@ local function send(msg)
   local total = math.ceil(#payload / CHUNK_SIZE)
   for i = 1, total do
     local chunk = payload:sub((i - 1) * CHUNK_SIZE + 1, i * CHUNK_SIZE)
-    modem.broadcast(PORT, "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk)
+    component.invoke(modemAddr, "broadcast", PORT, "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk)
   end
 end
 
@@ -152,7 +163,7 @@ local function remoteRequest(msgType, extra)
 
   local deadline = computer.uptime() + RPC_TIMEOUT
   while computer.uptime() < deadline do
-    local name, _, from, port, _, data = computer.pullSignal(deadline - computer.uptime())
+    local name, _, from, port, _, data = pullSignal(deadline - computer.uptime())
     if name == "modem_message" and port == PORT and type(data) == "string" then
       local payload = reassemble(from, data)
       if payload then
@@ -309,7 +320,7 @@ while true do
   -- A bounded timeout (rather than blocking indefinitely) so stale,
   -- abandoned partial reassemblies get swept out periodically even if
   -- nothing else arrives for a while.
-  local name, _, from, port, _, data = computer.pullSignal(10)
+  local name, _, from, port, _, data = pullSignal(10)
   sweepStaleChunks()
   if name == "modem_message" and port == PORT and type(data) == "string" then
     local payload = reassemble(from, data)
