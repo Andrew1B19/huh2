@@ -34,6 +34,19 @@
 
 local component = require("component")
 
+local function scriptDir()
+  local info = debug.getinfo(1, "S")
+  local path = info.source:match("^@(.*)$") or info.source
+  return path:match("^(.*)/[^/]*$") or "."
+end
+
+-- The encoder for "bit windows" (half-block/braille sub-cell bitmaps --
+-- see bitmap.lua's own header for why that's the only way to get
+-- anything bitmap-like on OC's character-cell-only GPU hardware).
+-- Loaded the same way runtime.lua/compositor.lua itself are: dofile()
+-- against a sibling file, not require().
+local bitmap = dofile(scriptDir() .. "/bitmap.lua")
+
 local M = {}
 
 -- id -> {id, title, x, y, width, height, buffer, layer, dirty}
@@ -173,26 +186,72 @@ end
 
 -- Muxos-shaped create_window (also standing in for gmux's separate
 -- create_window_buffer -- see docs/PROTOCOL.md for why those two
--- collapse into one call here). Allocates a GPU buffer, runs `code`
--- against it if given, and marks the window dirty -- it does NOT touch
--- the real screen itself any more. The actual screen write happens in
--- flush(), batched with every other dirty window, at most once per
--- call. NOT live -- unlike gmux's create_window with a vgpu/vscreen
--- source, nothing here redraws on its own; redrawing means calling it
--- again (or a future update, not built). Closing a window isn't built
--- either, but the data model now supports it correctly in principle:
--- removing a window and marking every remaining one dirty would make
--- whatever was behind it reappear on the next flush.
+-- collapse into one call here). Allocates a GPU buffer, draws into it,
+-- and marks the window dirty -- it does NOT touch the real screen
+-- itself any more. The actual screen write happens in flush(), batched
+-- with every other dirty window, at most once per call. NOT live --
+-- unlike gmux's create_window with a vgpu/vscreen source, nothing here
+-- redraws on its own; redrawing means calling it again (or a future
+-- update, not built). Closing a window isn't built either, but the
+-- data model now supports it correctly in principle: removing a window
+-- and marking every remaining one dirty would make whatever was behind
+-- it reappear on the next flush.
+--
+-- Two ways to specify what's drawn, each giving options.width/height a
+-- DIFFERENT meaning:
+-- - `options.code` -- character-mode, as before: Lua source run with a
+--   `gpu` local pointed at the buffer. width/height mean the buffer's
+--   own character-cell size (default 30x10).
+-- - `options.pixels` -- a "bit window": a 2D pixel grid (pixels[y][x]
+--   = a 24-bit color or nil for background), encoded via bitmap.lua
+--   into character-cell runs (`options.mode`: "halfblock" (default) or
+--   "braille", `options.bg`: background color for off pixels). Here
+--   width/height are REQUIRED and mean the pixel grid's own dimensions
+--   -- NOT inferred from the grid itself (a row with no "on" pixels
+--   has Lua-`#`-visible length 0 regardless of its real width; this
+--   isn't a hypothetical, it's what the `bitdemo` REPL command's own
+--   test pattern hit). The allocated buffer is sized to fit the
+--   ENCODED cell grid, which is smaller than the pixel grid (1x2 or
+--   2x4 pixels per cell).
+-- Giving both `code` and `pixels` is not an error; `code` just runs
+-- after the bitmap is drawn, so it could annotate over it.
 function M.createWindow(options)
   local gpu = kernalGpu()
   if not gpu then return nil, "kernal has no gpu component" end
   if not gpu.allocateBuffer then return nil, "kernal's gpu does not support buffers (tier 1?)" end
   if not ensureFrameBuffer(gpu) then return nil, "could not allocate the frame buffer" end
 
-  local width = options.width or 30
-  local height = options.height or 10
+  local width, height, cells, cellCols, cellRows
+  if options.pixels then
+    -- options.width/height, in this mode, mean the PIXEL grid's own
+    -- dimensions -- required explicitly rather than inferred via `#`:
+    -- a row with no "on" pixels is a table whose first (and every)
+    -- entry is nil, and Lua's `#` on such a table reports 0 regardless
+    -- of how many columns it conceptually has. Found for real testing
+    -- a demo pattern whose first row happened to be entirely
+    -- background -- not a hypothetical edge case.
+    if not options.width or not options.height then
+      return nil, "options.pixels needs options.width/options.height (the pixel grid's own dimensions -- can't be inferred reliably from the grid itself)"
+    end
+    cells, cellCols, cellRows = bitmap.encode(options.mode, options.pixels, options.width, options.height, options.bg)
+    width, height = cellCols, cellRows
+  else
+    width = options.width or 30
+    height = options.height or 10
+  end
+
   local buffer, allocErr = gpu.allocateBuffer(width, height)
   if not buffer then return nil, "could not allocate a gpu buffer: " .. tostring(allocErr) end
+
+  if cells then
+    gpu.setActiveBuffer(buffer)
+    local ok, drawErr = pcall(bitmap.draw, gpu, cells, cellRows, cellCols, 1, 1)
+    gpu.setActiveBuffer(0)
+    if not ok then
+      gpu.freeBuffer(buffer)
+      return nil, "bitmap draw failed: " .. tostring(drawErr)
+    end
+  end
 
   if options.code then
     local ok, drawErr = drawIntoBuffer(gpu, buffer, options.code)

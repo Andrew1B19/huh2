@@ -58,9 +58,12 @@ and what isn't yet.
 ```
 kernal/muxos.lua    kernal program: boot-serving + discovery + round-robin job dispatch +
                        job registry (jobs) + REPL
-kernal/compositor.lua  the only file that touches the real gpu: window registry, buffer
-                       allocation, draw-code execution, blit-to-screen. Loaded by muxos.lua
-                       via dofile() as a sibling file.
+kernal/compositor.lua  the only file that touches the real gpu: window registry, Z-order,
+                       occlusion culling, dirty tracking, a persistent frame buffer, draw-code
+                       execution, blit-to-screen. Loaded by muxos.lua via dofile() as a sibling.
+kernal/bitmap.lua      half-block/braille pixel-grid encoder for "bit windows" -- OC's gpu
+                       hardware has no pixel API, so this is sub-cell encoding on top of the
+                       same character grid. Loaded by compositor.lua via dofile().
 node/bios.lua         worker EEPROM image: tiny network-boot stub, fetches node/runtime.lua
 node/runtime.lua       worker's real runtime, served by the kernal (installed as its sibling,
                        NOT flashed anywhere) -- job execution, remote-component bridge, gpu
@@ -97,12 +100,12 @@ answers; that's expected, not a hang.
 
 ## Running the kernal
 
-Copy `kernal/muxos.lua`, `kernal/compositor.lua`, **and**
-`node/runtime.lua` onto the kernal's filesystem as siblings (e.g. all
-three in `/home/`) and run `muxos.lua` from the OpenOS shell. Workers
-fetch `runtime.lua`'s source from the kernal's disk at boot -- it is
-never installed on a worker itself; `compositor.lua` likewise never
-leaves the kernal.
+Copy `kernal/muxos.lua`, `kernal/compositor.lua`, `kernal/bitmap.lua`,
+**and** `node/runtime.lua` onto the kernal's filesystem as siblings
+(e.g. all four in `/home/`) and run `muxos.lua` from the OpenOS shell.
+Workers fetch `runtime.lua`'s source from the kernal's disk at boot --
+it is never installed on a worker itself; `compositor.lua`/`bitmap.lua`
+likewise never leave the kernal.
 
 ```
 muxos.lua
@@ -121,6 +124,8 @@ muxos> processes
 muxos> spawn 1 return 42
 muxos> window hello 5 5 20 5 gpu.set(1,1,"hi from the kernal")
 muxos> windows
+muxos> bitdemo halfblock 5 5
+muxos> bitdemo braille 30 5
 muxos> components 1
 muxos> call 1 <component addr> getResolution
 muxos> quit
@@ -147,6 +152,18 @@ covered by another doesn't get needlessly re-composited, and a
 partially-covered one blits only its actually-visible fragments. See
 docs/PROTOCOL.md's "The compositor" section for the mechanism, adapted
 from gmux's real `graphics.lua`.
+
+`bitdemo <halfblock|braille> <x> <y>` draws a small test pattern as a
+**bit window** -- OC's GPU hardware has no pixel API at all (confirmed
+from source: every draw method operates on a character+color cell,
+never a raw pixel), so `kernal/bitmap.lua` encodes a pixel grid into
+half-block (`▀`, two real colors per cell, 1x2 sub-pixels -- good for
+color content like icons/a toolbar/wallpaper) or braille (`⠿`, one
+effective color per cell, 2x4 sub-pixels -- good for line art, not full
+color) character runs instead. `createWindow`'s `options.pixels`/
+`mode`/`bg` go through the exact same registry, Z-order, occlusion, and
+frame-buffer pipeline as a character-mode window -- `bitdemo` is just
+the REPL's way to see it work without typing a pixel grid by hand.
 
 `ping <node> [count]` times a round-trip PING/PONG with that node (default
 3 tries) and reports min/avg/max in milliseconds -- useful for measuring
@@ -245,7 +262,11 @@ reply-table (`replyBox`) so synchronous waits and the background poller
 can't steal each other's messages + five translated pieces of gmux's
 application API (`get_processes`, `create_headless_process`,
 `create_graphics_process`, `create_window`, `get_windows`) plus the
-fullscreen-grant pair + latency probing.
+fullscreen-grant pair + latency probing + "bit window" support
+(`kernal/bitmap.lua`: half-block and braille pixel-grid encoders, both
+verified dot-by-dot and run-length-batched into the fewest `gpu.set`
+calls possible, slotted into the same window/compositor pipeline as
+character-mode windows).
 Not yet built: a real scheduler (load balancing beyond round-robin, async
 futures/callbacks for `submit()` itself, not just `SPAWN`), node
 health/failure handling, the fullscreen grant's no-automatic-release-on-
@@ -253,11 +274,9 @@ crash gap, a watchdog if the background thread itself fails to start,
 broader OpenOS-library-shaped coverage beyond `gpu`, dragging/resizing/
 input routing (still not gmux's full desktop), per-job isolated drawing
 surfaces (so `create_graphics_process`'s job and its window are actually
-wired together), bitmap/"bit window" support (half-block or braille
-sub-cell encoding over the same character-cell hardware -- OC's GPUs
-have no pixel API at all, confirmed from source -- needed for a toolbar,
-icons, or a desktop background image; the window/compositor model is
-generic enough to not need rework when this lands, but the encoder
-itself doesn't exist yet), multi-monitor support (explicitly deferred
-until the single-GPU case works end to end), and anything
-workload-specific.
+wired together -- true for bit windows too now), an actual toolbar/
+icons/wallpaper built with the bit-window encoder (the encoder works,
+nothing composites a desktop with it yet), chunking for a large
+`CREATEWINDOW` pixel payload (only `CODE`/boot is chunked so far),
+multi-monitor support (explicitly deferred until the single-GPU case
+works end to end), and anything workload-specific.

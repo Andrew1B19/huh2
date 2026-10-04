@@ -532,6 +532,29 @@ local function printProcesses()
   end
 end
 
+-- Generates a small test pattern (a filled diamond, red center ring,
+-- blue outer ring, transparent corners) so `bitdemo` has something
+-- visually meaningful to draw without requiring anyone to type a pixel
+-- grid by hand at the REPL.
+local function demoPixels(size)
+  local pixels = {}
+  local center = (size + 1) / 2
+  for y = 1, size do
+    pixels[y] = {}
+    for x = 1, size do
+      local dist = math.abs(x - center) + math.abs(y - center)
+      if dist < size / 4 then
+        pixels[y][x] = 0xff0000 -- red center
+      elseif dist < size / 2 then
+        pixels[y][x] = 0x0000ff -- blue ring
+      else
+        pixels[y][x] = nil -- transparent corners
+      end
+    end
+  end
+  return pixels
+end
+
 local function printWindows()
   local list = compositor.listWindows()
   if #list == 0 then
@@ -550,6 +573,7 @@ local function repl()
   print("  run <lua code> | runall <lua code> | processes")
   print("  spawn <node> <lua code>")
   print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
+  print("  bitdemo <halfblock|braille> <x> <y> -- draws a test pattern as a bit window")
   print("  components <node> | call <node> <component addr> <method> [args table]")
   print("(<node> is either a [n] index from 'nodes' or a full node address)")
   discover(1)
@@ -602,6 +626,15 @@ local function repl()
       end
     elseif line == "windows" then
       printWindows()
+    elseif line:match("^bitdemo%s") then
+      local mode, x, y = line:match("^bitdemo%s+(%S+)%s+(%d+)%s+(%d+)$")
+      if not mode or (mode ~= "halfblock" and mode ~= "braille") then
+        print("usage: bitdemo <halfblock|braille> <x> <y>")
+      else
+        local win, err = compositor.createWindow({title = "bitdemo", x = tonumber(x), y = tonumber(y),
+          pixels = demoPixels(16), width = 16, height = 16, mode = mode, bg = 0x000000})
+        if err then print("error: " .. err) else print("created bit window [" .. win.id .. "] (" .. win.width .. "x" .. win.height .. " cells)") end
+      end
     elseif line:match("^components%s") then
       printComponents(resolveNode(line:match("^components%s+(%S+)")))
     elseif line:match("^call%s") then

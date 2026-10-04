@@ -215,9 +215,14 @@ gmuxapi = {
   -- vgpu/vscreen source, this never redraws on its own.
   create_window = function(options)
     options = options or {}
+    -- pixels/mode/bg make this a "bit window" (see kernal/bitmap.lua):
+    -- a 2D pixel grid encoded into half-block or braille sub-cell
+    -- characters instead of running `code` -- OC's GPUs have no pixel
+    -- API, so this is the only way to get anything bitmap-like.
     return remoteRequest("CREATEWINDOW", {
       title = options.title, x = options.x, y = options.y,
       width = options.width, height = options.height, code = options.code,
+      pixels = options.pixels, mode = options.mode, bg = options.bg,
     })
   end,
 

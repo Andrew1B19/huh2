@@ -69,7 +69,7 @@ for a worker to fall back to on its own.
 | `INVOKE`  | `from`, `to`, `id`, `address`, `method`, `args`           | either  | call `component.invoke(address, method, args...)` on the receiver's own component |
 | `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, muxos-shaped) |
 | `SPAWN`   | `from`, `to`, `id`, `code`, `args`, `node`                | worker  | "dispatch a new job" (gmux API's `create_headless_process`/`create_graphics_process`); replies immediately with a handle, doesn't wait for the job to finish |
-| `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code` | worker | "allocate a gpu buffer, optionally run `code` against it, blit it to your screen" (gmux API's `create_window`/`create_window_buffer`) |
+| `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`) |
 | `GETWINDOWS` | `from`, `to`, `id`                                      | worker  | "list every window you know about" (gmux API's `get_windows()`) |
 | `REQUESTFULLSCREEN` | `from`, `to`, `id`                                | worker  | "let me bypass the compositor and INVOKE the real gpu/screen directly" |
 | `RELEASEFULLSCREEN` | `from`, `to`, `id`                                | worker  | give that grant back |
@@ -330,7 +330,8 @@ from `application.conf`) is **4096**. This is why `node/bios.lua` and
 `node/runtime.lua` are split the way they are: `bios.lua` is the only
 thing actually bound by that limit, and at **2806 bytes** (grew a bit
 for chunk-reassembly logic, still comfortably clear) it has plenty of
-room. `runtime.lua` (**11710 bytes** as of the fullscreen-grant API)
+room. `runtime.lua` (**12054 bytes** as of passing `pixels`/`mode`/`bg`
+through `gmuxapi.create_window`)
 carries everything that used to make the combined file blow past 4096 --
 it's fetched into RAM over the modem instead, so `eepromSize` doesn't
 apply to it.
@@ -370,15 +371,69 @@ established techniques:
   per cell (dots are one color against the background), so it's suited
   to line art/outlines, not full-color images.
 
-Neither is built yet. A "bit window" would need an encoder (pixel grid
--> character+fg+bg triples, run-length-batched into as few `gpu.set`
-calls as possible -- the same call-minimization lesson as everything
-else in this doc) sitting alongside `compositor.lua`'s existing
-character-mode `drawIntoBuffer`, with the window registry's model
-(buffer, dirty flag, Z-order, occlusion) applying equally to both kinds
-of window -- that part of the redesign above was written generically
-enough to not need changing when bit windows arrive, but the encoder
-itself is a distinct, not-yet-started piece of work.
+**Built**: `kernal/bitmap.lua` encodes a pixel grid (`pixels[y][x]` = a
+24-bit color, or `nil` for background) into character+fg+bg cells for
+either mode, and `createWindow` accepts `options.pixels`/`options.mode`/
+`options.bg` as an alternative to `options.code` -- same window
+registry, same Z-order/occlusion/dirty/frame-buffer compositing either
+way, confirming the window model didn't need rework to add this.
+
+Both encoders are verified precisely, not just "doesn't crash": each of
+the 8 individual braille dot positions was tested in isolation against
+its expected bit (lighting up exactly one sub-pixel and checking the
+resulting codepoint matches `0x2800 + <that dot's bit>` -- this is the
+one place a wrong bit-to-position mapping would have silently produced
+a scrambled-but-still-rendering image, not an error), plus the all-8-on
+case (`U+28FF`). Half-block's solid-color collapse (both sub-pixels the
+same color -> a plain space, cheaper than a half-block glyph: `fill`'s
+own cost function in `GraphicsCard.scala` charges less for a space than
+any other character -- `gpuClearCost` vs `gpuFillCost`), its mixed-color
+case (▀ with fg=top/bg=bottom), and the fully-transparent case (both
+sub-pixels background) are all verified too.
+
+`gpu.set()` paints a whole string under ONE current foreground/
+background pair -- confirmed from `GraphicsCard.scala`, color is GPU
+state, not per-character within a call -- so `bitmap.draw()` groups
+each output row into runs of consecutive cells sharing the same
+`(char, fg, bg)` and emits one `setForeground`+`setBackground`+`set`
+per run, not per cell. Verified: 6 cells that look identical (3 pairs of
+2) collapsed into exactly 2 real `gpu.set` calls, with the right
+starting column for each run -- the same call-minimization lesson as
+the rest of this doc, and here it's required for correctness (you
+literally can't paint two different-colored cells in one `set` call),
+not just an optimization.
+
+**One real bug this surfaced, not just a theoretical risk**: width/
+height can't be inferred from the pixel grid itself via Lua's `#`
+operator -- a row with no "on" pixels is a table whose every entry is
+`nil`, and `#` on such a table reports 0 regardless of its real width.
+This wasn't a hypothetical; the `bitdemo` REPL command's own demo
+pattern (a diamond shape) has an all-background first row, and hit this
+exactly. Fixed by making `options.width`/`options.height` REQUIRED
+(and meaning the pixel grid's own dimensions, not the character-cell
+buffer size, when `options.pixels` is given) rather than inferred,
+with a clear error if omitted.
+
+`kernal/muxos.lua`'s `bitdemo <halfblock|braille> <x> <y>` REPL command
+exists because typing a pixel grid by hand at a text prompt isn't
+practical -- it generates a small filled-diamond test pattern (red
+center, blue ring, transparent corners) so there's a way to see the
+pipeline work without needing a real deployment yet.
+
+Still not done: no actual demonstrated use for a toolbar/icons/
+wallpaper (the encoder works, but nothing composites a desktop
+background or icon row yet), and per-job isolated bit-window surfaces
+have the same gap `create_graphics_process` already has for character
+windows (see above) -- a job can ask the kernal to create a bit window,
+but its own `gpu` face still isn't wired to draw into it.
+
+One more thing not handled: unlike `CODE`, a `CREATEWINDOW` carrying a
+large `pixels` grid isn't chunked -- it's a single message, still
+subject to `maxNetworkPacketSize` (8192). A roughly 90x90-pixel
+half-block bitmap (or a correspondingly larger braille one) is already
+in that neighborhood once serialized; nothing here would chunk it the
+way `serveBoot()` does for the runtime image. Not hit in practice yet
+(the `bitdemo` pattern is 16x16), but real for anything desktop-wallpaper-sized.
 
 ## Call budget: what's actually rate-limited, and what isn't
 
