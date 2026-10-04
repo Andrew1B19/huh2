@@ -2,11 +2,19 @@
 -- -- run this directly on REAL OpenComputers hardware to check a list
 -- of low-level primitives this project's design depends on. Several of
 -- these could only be verified by reading the mod's own Scala source
--- in the sandbox this project was built in -- there was no real OC Lua
--- environment available there to actually run against, and some of
--- these (eris's ability to persist a SUSPENDED coroutine specifically,
--- which the project's proposed "semi-live" job migration depends on
--- entirely) can only be answered by actually running them for real.
+-- in the sandbox this project was built in -- there was no running OC
+-- instance available there. The eris checks (6-9) are the one
+-- exception: GitHub's public-read access turned out to be reachable
+-- from that sandbox after all, so the real upstream eris library was
+-- cloned, built from source, and this exact file was run end to end
+-- against it (see test/hardware/README.md for the full account) --
+-- confirming, not just implying, that eris persists a SUSPENDED
+-- coroutine's call stack correctly and that a native function
+-- reference re-binds to the RECEIVING process's own binding across a
+-- real cross-process round trip. What that run couldn't reach: OC's
+-- own jnlua-bound integration specifically, and real OC
+-- component/computer behavior -- that's what running this on your
+-- actual hardware still needs to confirm.
 --
 -- Each check is self-contained and pcall-wrapped, so one failing or
 -- crashing check can't take down the rest of the suite -- important on
@@ -187,6 +195,41 @@ check("eris global exists with persist/unpersist", function()
   return "ok"
 end)
 
+-- Recursively marks every function/table reachable from `root` as
+-- permanent, keyed by its dotted path name -- mirroring exactly what
+-- OC's own PersistenceAPI.scala does (flattenAndStore, walking all of
+-- _G). Needed for ANY coroutine persist: a job coroutine's closure
+-- captures `_ENV` as an upvalue, which drags in every native/C
+-- function reachable from the whole global table, not just the ones
+-- the job's own code happens to call directly -- confirmed the hard
+-- way, against the real upstream eris library, not guessed: an EARLIER
+-- version of this exact check used empty perms/uperms tables and
+-- failed with "attempt to persist a light C function" the moment the
+-- persisted coroutine's body called coroutine.yield (itself a native
+-- function reachable via _ENV.coroutine.yield). Hand-picking a few
+-- "obviously native" globals (e.g. just computer.uptime) isn't
+-- enough either -- the SAME error recurs for whichever other native
+-- function the walk hasn't reached yet, so this has to cover
+-- everything reachable, not a guessed subset.
+local function buildPermsFromGlobals()
+  local perms, uperms = {}, {}
+  local function flatten(name, value, seen)
+    if type(value) ~= "function" and type(value) ~= "table" then return end
+    if perms[value] ~= nil then return end
+    if seen[value] then return end
+    seen[value] = true
+    perms[value] = name
+    uperms[name] = value
+    if type(value) == "table" then
+      for k, v in pairs(value) do
+        if type(k) == "string" then flatten(name .. "." .. k, v, seen) end
+      end
+    end
+  end
+  flatten("_G", _G, {})
+  return perms, uperms
+end
+
 -- --- 7. eris basic round trip: a plain table ---
 
 check("eris persists and unpersists a plain table correctly", function()
@@ -205,13 +248,17 @@ end)
 -- persist a SUSPENDED coroutine's call stack/locals, and does resuming
 -- the revived one continue correctly? This is the entire mechanism
 -- "semi-live" job migration (pause, serialize, ship, resume elsewhere)
--- would depend on. Strongly implied by OC's own use of eris to persist
--- a computer's live kernel thread across every world save
--- (PersistenceAPI.scala) -- but never run directly from Lua code in
--- this project before now. ---
+-- would depend on. CONFIRMED against the real upstream eris library
+-- (not just implied from OC's own PersistenceAPI.scala usage) --
+-- including a full cross-process round trip (persist in one process,
+-- write to a file, unpersist in a completely separate one) where a
+-- native function reference correctly re-bound to the RECEIVING
+-- process's own binding, not a stale reference to the sender's. See
+-- test/hardware/README.md for the full account. What that run
+-- couldn't confirm: OC's own jnlua-bound integration specifically. ---
 
 check("eris persists a SUSPENDED coroutine and it resumes correctly after unpersist", function()
-  local perms, uperms = {}, {}
+  local perms, uperms = buildPermsFromGlobals()
   local co = coroutine.create(function()
     local total = 0
     for i = 1, 10 do
@@ -256,9 +303,7 @@ end)
 -- either erroring or carrying a stale reference to the old node's. ---
 
 check("eris treats a marked-permanent native function correctly on unpersist", function()
-  local perms, uperms = {}, {}
-  perms[computer.uptime] = "computer.uptime"
-  uperms["computer.uptime"] = computer.uptime
+  local perms, uperms = buildPermsFromGlobals()
 
   local holder = {getTime = computer.uptime}
   local bytes = eris.persist(perms, holder)
