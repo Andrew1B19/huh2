@@ -8,15 +8,23 @@ the kernal is the scheduler/front-end.
 - **Kernal (1 node)** -- boots a normal OpenOS, is the bootstrap/scheduler
   and the only node you actually interact with. Runs `kernal/muxos.lua`.
   Eventually hosts a local GUI front end; draw calls from jobs running on
-  worker nodes get forwarded to it to run against its real GPU.
-- **Workers (3 nodes)** -- no OS, no disk, on purpose: `node/bios.lua` is
-  flashed directly onto each one's EEPROM and *is* the entire firmware.
-  Boot, open a Network Card, wait for jobs, run them, reply. Each one is a
-  physically separate computer, so job isolation between them is free --
-  no software sandboxing needed the way a single-process multiplexer
-  requires.
+  worker nodes get forwarded to it to run against its real GPU. It also
+  holds `node/runtime.lua` on its own disk and serves it to workers at
+  boot (see below) -- it's the authoritative source for what a worker runs.
+- **Workers (3 nodes)** -- no OS, no disk, on purpose. `node/bios.lua` is
+  the only thing flashed onto each one's EEPROM, and it's tiny: open a
+  Network Card, ask the kernal for `node/runtime.lua`'s source, `load()`
+  and run it. No local fallback -- if the kernal isn't up yet, it just
+  keeps asking. `runtime.lua` is where job execution, the remote-component
+  bridge, and the `gpu` face actually live; it arrives over the network
+  fresh every boot instead of being baked into the EEPROM, so it isn't
+  bound by the EEPROM's 4096-byte size limit the way the firmware is.
+  Each worker is a physically separate computer, so job isolation between
+  them is free -- no software sandboxing needed the way a single-process
+  multiplexer requires.
 
-See `docs/PROTOCOL.md` for the wire format between them.
+See `docs/PROTOCOL.md` for the wire format, including the separate tiny
+boot handshake `bios.lua` speaks before it has anything else loaded.
 
 `smux/` (vendored below) is **reference material, not a runtime
 dependency** -- it's a real, OpenOS-standalone server-side multiplexer
@@ -31,9 +39,11 @@ node, and nothing here currently calls into it.
 ## Layout
 
 ```
-kernal/muxos.lua    kernal program: discovery + round-robin job dispatch + REPL
-node/bios.lua         worker firmware, meant to be flashed onto an EEPROM
-docs/PROTOCOL.md      shared wire format (kept in sync by hand, see why in the file)
+kernal/muxos.lua    kernal program: boot-serving + discovery + round-robin job dispatch + REPL
+node/bios.lua         worker EEPROM image: tiny network-boot stub, fetches node/runtime.lua
+node/runtime.lua       worker's real runtime, served by the kernal (installed as its sibling,
+                       NOT flashed anywhere) -- job execution, remote-component bridge, gpu face
+docs/PROTOCOL.md      shared wire format: the boot handshake + the main message protocol
 smux/                 reference only (see above): a real, standalone OpenOS multiplexer,
                        forked from gmux's backend. Not run on any node in this project.
 ```
@@ -56,12 +66,16 @@ programmer):
 eeprom node/bios.lua
 ```
 
-Then boot that node with no filesystem attached -- it never looks for one.
+Then boot that node with no filesystem attached -- it never looks for
+one. It will sit broadcasting `BOOT` every 5 seconds until the kernal
+answers; that's expected, not a hang.
 
 ## Running the kernal
 
-Copy `kernal/muxos.lua` onto the kernal's filesystem and run it from
-the OpenOS shell:
+Copy `kernal/muxos.lua` **and** `node/runtime.lua` onto the kernal's
+filesystem as siblings (e.g. both in `/home/`) and run `muxos.lua` from
+the OpenOS shell. Workers fetch `runtime.lua`'s source from the kernal's
+disk at boot -- it is never installed on a worker itself.
 
 ```
 muxos.lua
@@ -96,25 +110,26 @@ doesn't allow direct cross-machine component access at all, Rack or not.
 
 `LIST`/`INVOKE` are symmetric -- either side can ask the other to act on
 its own components -- which is what lets a worker fall back to the
-kernal's hardware when it has none locally. `node/bios.lua` exposes this
-as a `gpu` face: `gpu.set(x, y, text)` etc. use a local `gpu` component
-if one happens to be attached (zero network hops), and only call back to
-the kernal, caching the discovered address, when the node has none. This
-is the first slice of "run OpenOS-API-shaped code on a worker, as close
-to native as makes sense, forwarding to the kernal only when something
-genuinely isn't local" -- not full OpenOS-library compatibility yet, just
-the dispatch pattern proven on one component type (`gpu`). See
-docs/PROTOCOL.md for the one known gap (the kernal only services an
-incoming request while something is actively polling, not while the REPL
-is blocked at its prompt) and a real size problem (`node/bios.lua` is now
-over the stock 4096-byte `eepromSize`, unresolved).
+kernal's hardware when it has none locally. `node/runtime.lua` exposes
+this as a `gpu` face: `gpu.set(x, y, text)` etc. use a local `gpu`
+component if one happens to be attached (zero network hops), and only
+call back to the kernal, caching the discovered address, when the node
+has none. This is the first slice of "run OpenOS-API-shaped code on a
+worker, as close to native as makes sense, forwarding to the kernal only
+when something genuinely isn't local" -- not full OpenOS-library
+compatibility yet, just the dispatch pattern proven on one component
+type (`gpu`). See docs/PROTOCOL.md for the one known gap (the kernal only
+services an incoming boot/remote request while something is actively
+polling, not while the REPL is blocked at its prompt).
 
 ## Status
 
-First working slice: discovery + synchronous round-robin job dispatch +
-a symmetric remote-component bridge (kernal<->worker, used by workers to
-reach kernal hardware they don't have locally, e.g. `gpu`) + latency
-probing.
+First working slice: network-boot handshake (tiny EEPROM stub + a
+kernal-served runtime, so the firmware itself is nowhere near the
+4096-byte EEPROM limit) + discovery + synchronous round-robin job
+dispatch + a symmetric remote-component bridge (kernal<->worker, used by
+workers to reach kernal hardware they don't have locally, e.g. `gpu`) +
+latency probing.
 Not yet built: a real scheduler (load balancing beyond round-robin, async
 futures/callbacks instead of blocking `submit()`), node health/failure
 handling, a real multi-threading kernel API (the REPL-blocks-the-network

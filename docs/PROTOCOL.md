@@ -1,21 +1,52 @@
 # Wire protocol
 
-Both sides (`node/bios.lua` and `kernal/muxos.lua`) talk over a Network
-Card, broadcasting on a fixed port:
+There are two layers here, both over the same Network Card and port:
 
 ```
 PORT = 4477
 ```
 
-Every message is a Lua table, turned into text with a small serializer
-(`[key]=value` pairs good enough for nil/boolean/number/string/table --
-no functions, no userdata) and sent as the single string payload of
-`modem.broadcast(PORT, text)`. The receiver reconstructs it with
-`load("return " .. text)`.
+1. **Boot protocol** -- `node/bios.lua` (the actual EEPROM image) speaks
+   this, and only this, before it has anything else loaded. Plain
+   `WORD <payload>` text, no serializer: `BOOT <node address>` from a
+   worker, `CODE <runtime source>` back from the kernal. See "Boot
+   protocol" below.
+2. **Runtime protocol** -- everything in the Message types table below.
+   Spoken by `node/runtime.lua` (what `bios.lua` fetches and runs) and
+   `kernal/muxos.lua`. Every message is a Lua table, turned into text
+   with a small serializer (`[key]=value` pairs good enough for
+   nil/boolean/number/string/table -- no functions, no userdata) and
+   sent as the single string payload of `modem.broadcast(PORT, text)`.
+   The receiver reconstructs it with `load("return " .. text)`.
 
-This serializer is implemented twice, once per side, on purpose: EEPROM
-firmware can't `require` another file, so there is no shared module to
-import. If you change the wire format, change both copies.
+The runtime-protocol serializer is implemented twice, once per side, on
+purpose: neither `node/runtime.lua` nor `kernal/muxos.lua` can `require`
+another file (the former for the same EEPROM-era reasons as before, even
+though it now arrives over the network instead of being flashed; the
+latter to stay a single deployable file), so there is no shared module
+to import. If you change the wire format, change both copies.
+
+## Boot protocol
+
+`node/bios.lua` is deliberately tiny (see "EEPROM size" below) and knows
+nothing about the real wire protocol yet -- it just needs to get
+`node/runtime.lua`'s source from the kernal and start running it:
+
+1. Worker broadcasts `BOOT <its own address>`.
+2. Kernal's `serveBoot()` reads `runtime.lua` off its own disk (a sibling
+   file of `muxos.lua`, cached after the first read) and broadcasts
+   `CODE <that source>` once. Every worker still waiting on its own BOOT
+   picks up this same reply, not just the one that asked -- they all
+   need the identical payload, so one broadcast serves all of them.
+3. Worker `load()`s the payload and calls it; `node/runtime.lua` becomes
+   that node's actual runtime, with no further involvement from
+   `bios.lua`.
+
+**No local fallback, by design**: if a `BOOT` goes unanswered (kernal not
+up yet, or busy -- see the `pump()` caveat below), the worker just waits
+5 seconds and re-broadcasts, indefinitely. The kernal is the
+authoritative source for what a worker runs; there's nothing sensible
+for a worker to fall back to on its own.
 
 ## Message types
 
@@ -63,9 +94,10 @@ zero-hop component call across the machine boundary in this mod.
 
 **Both message types are symmetric** -- either side can send them, and
 whichever side receives one services it against its *own* components
-(`kernal/muxos.lua`'s `handleList`/`handleInvoke` mirror `node/bios.lua`'s
-handling exactly). This is what lets a worker fall back to the kernal's
-hardware when it has none of its own: `node/bios.lua`'s `gpu` face
+(`kernal/muxos.lua`'s `handleList`/`handleInvoke` mirror
+`node/runtime.lua`'s handling exactly). This is what lets a worker fall
+back to the kernal's hardware when it has none of its own:
+`node/runtime.lua`'s `gpu` face
 (`gpu.set(x, y, text)`, etc.) checks for a local `gpu` component first --
 zero network hops if the node happens to have one -- and only sends a
 `LIST`/`INVOKE` to the kernal, caching the discovered address, when it
@@ -73,14 +105,17 @@ doesn't. "Lowest overhead": local when local makes sense, one round trip
 to the kernal otherwise, never more than that.
 
 One real limitation of this symmetric design as built: the kernal only
-services an incoming `LIST`/`INVOKE` request while something is actively
-polling the modem (`discover`, `awaitReply`, `pingOnce`). While the REPL
-is blocked on `io.read()` at the `muxos>` prompt, nothing pumps the modem
-at all, so a worker's remote call can sit unanswered until the next REPL
-command happens to trigger a poll. Fixing that for real needs the kernal
-to service the network in the background while still reading the prompt
--- exactly what a "multi-threading kernel API" would need to provide
-generally, not something patched in just for this.
+services an incoming `BOOT`/`LIST`/`INVOKE` request while something is
+actively polling the modem (`discover`, `awaitReply`, `pingOnce`). While
+the REPL is blocked on `io.read()` at the `muxos>` prompt, nothing pumps
+the modem at all, so a worker's boot or remote call can sit unanswered
+until the next REPL command happens to trigger a poll. A worker's own
+boot loop retries every 5s, so it recovers once a command does -- but a
+kernal that's sitting idle at the prompt the moment a worker powers on
+will stall that worker's boot for a while. Fixing that for real needs the
+kernal to service the network in the background while still reading the
+prompt -- exactly what a "multi-threading kernel API" would need to
+provide generally, not something patched in just for this.
 
 ## Assumptions this depends on
 
@@ -90,24 +125,26 @@ generally, not something patched in just for this.
   you're using Linked Cards instead, which are point-to-point and have no
   ports/broadcast), the networking code in both files needs to change.
 - Worker nodes have no filesystem and no OS; `node/bios.lua` *is* the
-  entire firmware, flashed straight onto the EEPROM.
+  entire firmware, flashed straight onto the EEPROM, and `node/runtime.lua`
+  is what it fetches and runs.
 - The kernal boots a normal OpenOS and runs `muxos.lua` as a regular
-  program.
+  program, with `runtime.lua` installed alongside it as a sibling file on
+  its own disk (not on any worker).
 
-## node/bios.lua's EEPROM size
+## EEPROM size
 
 Stock `eepromSize` (the max bytes of code an EEPROM can hold, confirmed
-from `application.conf`) is **4096**. As of the `gpu` face + remote-RPC
-addition, `node/bios.lua` is 7230 bytes raw, and **4892 bytes even with
-every comment and blank line stripped** -- over the limit either way.
-This needs one of:
-
-- Raise `eepromSize` in the server's OpenComputers config (e.g. to 8192).
-- Trim `node/bios.lua` itself (the `gpu` face and remote-RPC plumbing are
-  the biggest additions; cutting is possible but shrinks what a worker
-  can do without the kernal).
-
-Not resolved here -- flagging before anyone actually tries to flash this.
+from `application.conf`) is **4096**. This is why `node/bios.lua` and
+`node/runtime.lua` are split the way they are: `bios.lua` is the only
+thing actually bound by that limit, and at **2142 bytes** it has plenty
+of room. `runtime.lua` (**7571 bytes**) carries everything that used to
+make the combined file blow past 4096 -- it's fetched into RAM over the
+modem instead, so `eepromSize` doesn't apply to it. It does still need to
+fit in one `modem.broadcast` call under `maxNetworkPacketSize` (8192) --
+currently ~92% of that budget. Growing much further means either raising
+`maxNetworkPacketSize` or chunking `CODE` across multiple messages
+(`maxNetworkPacketParts` allows up to 8) -- not needed yet, but close
+enough to flag.
 
 ## Measured vs. documented latency
 

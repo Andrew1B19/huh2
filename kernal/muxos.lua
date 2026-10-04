@@ -1,15 +1,20 @@
 -- muxos kernal program for huh2. Runs under a normal OpenOS boot on the
 -- main rack node (own CPU/RAM/EEPROM/HDD, same as any OC computer).
 -- Discovers worker nodes flashed with node/bios.lua over the rack's shared
--- network segment and dispatches Lua jobs to them.
+-- network segment, serves them their actual runtime (node/runtime.lua) at
+-- boot, and dispatches Lua jobs to them.
 --
--- Install: copy onto the kernal's filesystem (e.g. /home/muxos.lua) and
--- run it from the OpenOS shell.
+-- Install: copy this AND node/runtime.lua onto the kernal's filesystem as
+-- siblings (e.g. /home/muxos.lua and /home/runtime.lua) and run this from
+-- the OpenOS shell. Workers only ever get bios.lua flashed to their
+-- EEPROM -- this script reads runtime.lua's source off the kernal's own
+-- disk and serves it to them over the modem (see serveBoot() below).
 --
 -- Wire format: see docs/PROTOCOL.md. The serializer below is a deliberate
--- duplicate of the one in node/bios.lua, not a shared dependency -- EEPROM
--- firmware can't `require` anything, so keeping both sides self-contained
--- avoids a split-brain "shared lib" that only one side can actually load.
+-- duplicate of the one in node/runtime.lua, not a shared dependency --
+-- that file can't `require` anything either, so keeping both sides
+-- self-contained avoids a split-brain "shared lib" that only one side
+-- can actually load.
 
 local component = require("component")
 local event = require("event")
@@ -70,6 +75,41 @@ local function noteNode(addr)
   nodes[addr].lastSeen = computer.uptime()
 end
 
+-- Resolve runtime.lua as a sibling of wherever this script is actually
+-- running from, so installs aren't tied to a hardcoded /home/ path.
+local function scriptDir()
+  local info = debug.getinfo(1, "S")
+  local path = info.source:match("^@(.*)$") or info.source
+  return path:match("^(.*)/[^/]*$") or "."
+end
+
+local RUNTIME_PATH = scriptDir() .. "/runtime.lua"
+local runtimeSource = nil -- loaded lazily and cached, see loadRuntime()
+
+local function loadRuntime()
+  if runtimeSource then return runtimeSource end
+  local f, openErr = io.open(RUNTIME_PATH, "r")
+  if not f then return nil, "could not open " .. RUNTIME_PATH .. ": " .. tostring(openErr) end
+  runtimeSource = f:read("a")
+  f:close()
+  return runtimeSource
+end
+
+-- Answer a worker's BOOT request (node/bios.lua's network-boot stub) with
+-- its real runtime, broadcast once -- any OTHER worker still waiting on
+-- its own BOOT picks up the same reply for free, since they all need the
+-- identical payload. Not wrapped in the serialized-table protocol: BOOT
+-- happens before a worker has that runtime loaded at all, so it uses its
+-- own plain "WORD <payload>" convention (see node/bios.lua).
+local function serveBoot(workerAddr)
+  local source, err = loadRuntime()
+  if not source then
+    print("boot request from " .. workerAddr .. " but " .. err)
+    return
+  end
+  modem.broadcast(PORT, "CODE " .. source)
+end
+
 -- Service a LIST/INVOKE request FROM a worker, against the kernal's OWN
 -- components. This is the reverse direction of the "remote component"
 -- bridge in node/bios.lua: a worker with no screen/disk of its own asks
@@ -93,21 +133,30 @@ local function handleInvoke(msg)
   end
 end
 
--- Pull one pending modem message, if any, without blocking. Used both by
--- discovery and by submit()'s wait loop. Incoming LIST/INVOKE requests
--- (from a worker calling back into the kernal) are serviced here directly
--- and never returned -- they aren't a reply anything is waiting on.
+-- Pull one pending modem message, if any, without blocking. Used by
+-- discovery, submit()'s wait loop, and the REPL's startup discover(1)
+-- call. Incoming BOOT requests and LIST/INVOKE requests (from a worker
+-- calling back into the kernal) are serviced here directly and never
+-- returned -- they aren't a reply anything is waiting on.
 --
 -- Caveat: this only runs while something is actively polling (discover,
 -- awaitReply, pingOnce). While the REPL is blocked on io.read() at the
--- prompt, nothing pumps the modem at all, so a worker's remote call can
--- sit unanswered until the next command triggers a pump() somewhere.
--- Fixing that needs real concurrency (a background thread/event.listen),
--- which is exactly the kind of thing the "multi-threading kernel API" is
--- meant to eventually provide -- not done here.
+-- prompt, nothing pumps the modem at all, so a worker's BOOT or remote
+-- call can sit unanswered until the next command triggers a pump()
+-- somewhere. A worker's own boot loop retries every 5s, so it recovers
+-- once a command does, but a kernal that's sitting idle at the prompt
+-- the moment a worker powers on will stall it for a while. Fixing that
+-- needs real concurrency (a background thread/event.listen), which is
+-- exactly the kind of thing the "multi-threading kernel API" is meant to
+-- eventually provide -- not done here.
 local function pump()
   local name, _, from, port, _, data = event.pull(0, "modem_message")
   if name and port == PORT and type(data) == "string" then
+    local bootFrom = data:match("^BOOT (.+)$")
+    if bootFrom then
+      serveBoot(bootFrom)
+      return nil
+    end
     local msg = deserialize(data)
     if type(msg) == "table" and msg.from and msg.from ~= selfAddr then
       if msg.type == "HELLO" or msg.type == "PONG" then
