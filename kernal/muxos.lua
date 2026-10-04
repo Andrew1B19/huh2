@@ -63,6 +63,17 @@ local nodeOrder = {}  -- address list, stable iteration/round-robin order
 local nextJobId = 1
 local nextNode = 1
 
+-- The kernal is the scheduler, so it's the one place that actually knows
+-- about every job dispatched to any node -- this is what lets
+-- get_processes() (the muxos equivalent of gmux's api.get_processes())
+-- be a real answer instead of each worker only knowing about its own
+-- single in-flight job. id -> {id, node, status, code, startedAt,
+-- finishedAt, result, error}. status is "running", "done", or "error",
+-- mirroring gmux's own process status values closely enough to be
+-- recognizable without claiming exact parity with its "waiting"/"dead".
+local jobs = {}
+local jobOrder = {}
+
 local function send(msg)
   modem.broadcast(PORT, serialize(msg))
 end
@@ -133,6 +144,19 @@ local function handleInvoke(msg)
   end
 end
 
+-- First real slice of the gmux application API, muxos-shaped:
+-- api.get_processes() in gmux reads one local process table; here it has
+-- to be a request, since the jobs it's asking about run on other
+-- physical nodes. Returns the same job records `jobs` holds -- a plain
+-- list, serializable as-is since each entry is only strings/numbers.
+local function handleGetProcesses(msg)
+  local list = {}
+  for _, id in ipairs(jobOrder) do
+    list[#list + 1] = jobs[id]
+  end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
+end
+
 -- Pull one pending modem message, if any, without blocking. Used by
 -- discovery, submit()'s wait loop, and the REPL's startup discover(1)
 -- call. Incoming BOOT requests and LIST/INVOKE requests (from a worker
@@ -166,6 +190,9 @@ local function pump()
         return nil
       elseif msg.to == selfAddr and msg.type == "INVOKE" then
         handleInvoke(msg)
+        return nil
+      elseif msg.to == selfAddr and msg.type == "GETPROCESSES" then
+        handleGetProcesses(msg)
         return nil
       end
       return msg
@@ -218,8 +245,21 @@ local function submit(code, args, targetAddr)
   end
 
   local id = nextId()
+  jobs[id] = {id = id, node = addr, status = "running", code = code, startedAt = computer.uptime()}
+  jobOrder[#jobOrder + 1] = id
+
   send({type = "JOB", from = selfAddr, to = addr, id = id, code = code, args = args})
-  return awaitReply(id, addr)
+  local result, err = awaitReply(id, addr)
+
+  jobs[id].finishedAt = computer.uptime()
+  if err then
+    jobs[id].status = "error"
+    jobs[id].error = err
+  else
+    jobs[id].status = "done"
+    jobs[id].result = result
+  end
+  return result, err
 end
 
 -- List the components physically attached to a remote node: address -> type.
@@ -310,11 +350,26 @@ local function printComponents(addr)
   end
 end
 
+-- No network round trip needed here, unlike get_processes() as seen from
+-- a worker (handleGetProcesses) -- the REPL runs in the same process as
+-- `jobs` itself.
+local function printProcesses()
+  if #jobOrder == 0 then
+    print("no jobs dispatched yet")
+    return
+  end
+  for _, id in ipairs(jobOrder) do
+    local job = jobs[id]
+    print(string.format("[%d] %s on %s%s", job.id, job.status, job.node,
+      job.error and (" -- " .. job.error) or ""))
+  end
+end
+
 local function repl()
   print("muxos kernal -- " .. selfAddr)
   print("commands:")
   print("  discover | nodes | ping <node> [count] | quit")
-  print("  run <lua code> | runall <lua code>")
+  print("  run <lua code> | runall <lua code> | processes")
   print("  components <node> | call <node> <component addr> <method> [args table]")
   print("(<node> is either a [n] index from 'nodes' or a full node address)")
   discover(1)
@@ -329,6 +384,8 @@ local function repl()
       listNodes()
     elseif line == "nodes" then
       listNodes()
+    elseif line == "processes" then
+      printProcesses()
     elseif line:match("^ping%s") then
       local node, countStr = line:match("^ping%s+(%S+)%s*(%S*)$")
       if not node then

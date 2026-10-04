@@ -158,6 +158,19 @@ gpu = setmetatable({}, {
   end,
 })
 
+-- First real slice of a muxos-shaped gmux application API: gmux's
+-- api.get_processes() reads one local process table (every job is a
+-- coroutine in the same Lua state as the caller); here a "process" is a
+-- job on some other physical node, so the only place that actually knows
+-- about all of them is the kernal's own scheduler (kernal/muxos.lua's
+-- `jobs` table) -- this is necessarily a remote call, always, not a
+-- local-or-remote dispatch like `gpu`.
+gmuxapi = {
+  get_processes = function()
+    return remoteRequest("GETPROCESSES")
+  end,
+}
+
 while true do
   local name, _, from, port, _, data = computer.pullSignal()
   if name == "modem_message" and port == PORT and type(data) == "string" then

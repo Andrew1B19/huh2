@@ -58,7 +58,8 @@ for a worker to fall back to on its own.
 | `JOB`     | `from`, `to`, `id`, `code`, `args`                        | kernal  | run `code` (a Lua chunk) with `args`               |
 | `LIST`    | `from`, `to`, `id`                                        | either  | "list the components attached to you"             |
 | `INVOKE`  | `from`, `to`, `id`, `address`, `method`, `args`           | either  | call `component.invoke(address, method, args...)` on the receiver's own component |
-| `RESULT`  | `from`, `to`, `id`, `result`                              | either  | success -- `JOB`'s return value, `LIST`'s address→type table, or `INVOKE`'s list of return values |
+| `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, muxos-shaped) |
+| `RESULT`  | `from`, `to`, `id`, `result`                              | either  | success -- `JOB`'s return value, `LIST`'s address→type table, `INVOKE`'s list of return values, or `GETPROCESSES`'s job list |
 | `ERROR`   | `from`, `to`, `id`, `error`                               | either  | failure -- load error, runtime error, or invoke error |
 
 `code` is compiled on the worker as `local args = ...` followed by your
@@ -103,6 +104,37 @@ zero network hops if the node happens to have one -- and only sends a
 `LIST`/`INVOKE` to the kernal, caching the discovered address, when it
 doesn't. "Lowest overhead": local when local makes sense, one round trip
 to the kernal otherwise, never more than that.
+
+## The gmux application API, translated
+
+`gmux/` (vendored, MIT, from `aawwaaa/OpenPrograms`) is a real OC
+graphical multiplexer. Its application-facing API is
+`gmux/lib/gmux/frontend/api.lua`, reachable from an app as
+`component.gmuxapi.*` -- `create_window`, `create_window_buffer`,
+`create_headless_process`, `create_graphics_process`, `get_processes`,
+`get_windows`, `get_backend`, `get_graphics`, `show_error`,
+`get_process`. In gmux this is all same-process, zero-hop: an app and
+the window system share one Lua process table, so `api.get_processes()`
+just reads `backend.process.processes` directly.
+
+That assumption doesn't hold for muxos: a "process" is a job on some
+other physical node, so **the kernal is the only place that actually
+knows about all of them** (it's already the scheduler -- `jobs` in
+`kernal/muxos.lua` is the real answer `get_processes()` needs, not a
+per-worker guess). `node/runtime.lua`'s `gmuxapi.get_processes()` is
+therefore always a remote call (`GETPROCESSES`), never local-first like
+`gpu` -- there's no local component that could answer it. `handleGetProcesses`
+mirrors `handleList`/`handleInvoke`'s shape, serving `jobs` as a plain
+list (serializable as-is: ids, node addresses, status, code, result).
+
+Not yet translated: `create_window`/`create_window_buffer` (these need
+the kernal to actually host a window system of its own -- gmux's
+`frontend/windows.lua`/`graphics.lua`/`desktop.lua`, or muxos's own
+equivalent -- which doesn't exist yet; `get_windows()` has the same
+problem as `get_processes()` did before this, for the same reason), and
+`create_headless_process`/`create_graphics_process` (spawning a job
+*is* `submit()`, but under gmux's names/option shape specifically,
+nothing here does that translation yet).
 
 One real limitation of this symmetric design as built: the kernal only
 services an incoming `BOOT`/`LIST`/`INVOKE` request while something is

@@ -26,26 +26,39 @@ the kernal is the scheduler/front-end.
 See `docs/PROTOCOL.md` for the wire format, including the separate tiny
 boot handshake `bios.lua` speaks before it has anything else loaded.
 
-`smux/` (vendored below) is **reference material, not a runtime
-dependency** -- it's a real, OpenOS-standalone server-side multiplexer
-(the "server version of gmux"), studied for its mechanisms (the
-metatable-swap isolation trick in `patch.lua`, the job-console/session/
-framing protocol for remote attach). muxos is its own implementation of
-equivalent capability, built for a different substrate: physically
+`smux/` and `gmux/` (both vendored below) are **reference material, not a
+runtime dependency**. `smux/` is a real, OpenOS-standalone server-side
+multiplexer (the "server version of gmux"), studied for its mechanisms
+(the metatable-swap isolation trick in `patch.lua`, the job-console/
+session/framing protocol for remote attach). `gmux/` (MIT, from
+`aawwaaa/OpenPrograms`) is the real graphical multiplexer smux forked
+its backend from -- vendored specifically for its **application-facing
+API** (`gmux/lib/gmux/frontend/api.lua`, called by apps as
+`component.gmuxapi.*`: `create_window`, `get_processes`, etc.), which
+smux's backend-only fork never carried. muxos is its own implementation
+of equivalent capability, built for a different substrate: physically
 separate firmware nodes over a network, not coroutines multiplexed
-inside one OpenOS process table. Nothing in `smux/` runs on a worker
-node, and nothing here currently calls into it.
+inside one OpenOS process table. Neither runs on a worker node; nothing
+here calls into their code directly -- `node/runtime.lua`'s `gmuxapi`
+table is muxos's own implementation of (a growing subset of) gmux's API
+shape, not gmux's code. See docs/PROTOCOL.md for what's translated so far
+and what isn't yet.
 
 ## Layout
 
 ```
-kernal/muxos.lua    kernal program: boot-serving + discovery + round-robin job dispatch + REPL
+kernal/muxos.lua    kernal program: boot-serving + discovery + round-robin job dispatch +
+                       job registry (jobs) + REPL
 node/bios.lua         worker EEPROM image: tiny network-boot stub, fetches node/runtime.lua
 node/runtime.lua       worker's real runtime, served by the kernal (installed as its sibling,
-                       NOT flashed anywhere) -- job execution, remote-component bridge, gpu face
-docs/PROTOCOL.md      shared wire format: the boot handshake + the main message protocol
+                       NOT flashed anywhere) -- job execution, remote-component bridge, gpu
+                       face, gmuxapi (muxos's own, gmux-API-shaped)
+docs/PROTOCOL.md      shared wire format: the boot handshake + the main message protocol +
+                       the gmux API translation
 smux/                 reference only (see above): a real, standalone OpenOS multiplexer,
                        forked from gmux's backend. Not run on any node in this project.
+gmux/                 reference only (see above): the real graphical multiplexer, vendored
+                       for its application API shape. Not run on any node in this project.
 ```
 
 ### smux's one external dependency
@@ -90,10 +103,18 @@ muxos> ping 1
 muxos> ping 1 10
 muxos> run return 1 + 1
 muxos> runall return computer.address()
+muxos> processes
 muxos> components 1
 muxos> call 1 <component addr> getResolution
 muxos> quit
 ```
+
+`processes` shows the kernal's own job registry (`jobs`) -- every job
+ever dispatched via `run`/`runall`, with its status, node, and result or
+error. This is also what answers a worker's `gmuxapi.get_processes()`
+call (see below): the kernal is the only place that actually knows about
+every job across every node, so it's the real implementation, not a
+per-worker guess.
 
 `ping <node> [count]` times a round-trip PING/PONG with that node (default
 3 tries) and reports min/avg/max in milliseconds -- useful for measuring
@@ -122,17 +143,31 @@ type (`gpu`). See docs/PROTOCOL.md for the one known gap (the kernal only
 services an incoming boot/remote request while something is actively
 polling, not while the REPL is blocked at its prompt).
 
+`node/runtime.lua`'s `gmuxapi.get_processes()` is muxos's first slice of
+gmux's actual *application* API (`component.gmuxapi.*` in gmux itself --
+see `gmux/lib/gmux/frontend/api.lua`), translated for a networked
+substrate rather than gmux's one-process-table assumption: it's always a
+remote call to the kernal's job registry, never local-first like `gpu`,
+since no worker could ever answer it from its own state alone. See
+docs/PROTOCOL.md for what else gmux's API exposes and what's not
+translated yet (`create_window`/`get_windows` need the kernal to host an
+actual window system first; spawning jobs under gmux's own option
+shape doesn't exist yet either).
+
 ## Status
 
 First working slice: network-boot handshake (tiny EEPROM stub + a
 kernal-served runtime, so the firmware itself is nowhere near the
 4096-byte EEPROM limit) + discovery + synchronous round-robin job
-dispatch + a symmetric remote-component bridge (kernal<->worker, used by
-workers to reach kernal hardware they don't have locally, e.g. `gpu`) +
-latency probing.
+dispatch with a kernal-side job registry + a symmetric remote-component
+bridge (kernal<->worker, used by workers to reach kernal hardware they
+don't have locally, e.g. `gpu`) + the first translated piece of gmux's
+application API (`get_processes`) + latency probing.
 Not yet built: a real scheduler (load balancing beyond round-robin, async
 futures/callbacks instead of blocking `submit()`), node health/failure
 handling, a real multi-threading kernel API (the REPL-blocks-the-network
 gap above needs this), broader OpenOS-library-shaped coverage beyond
-`gpu`, multi-monitor support (explicitly deferred until the single-GPU
-case works end to end), and anything workload-specific.
+`gpu`, the rest of the gmux API translation (windows, graphics/headless
+process spawning under its option shape), multi-monitor support
+(explicitly deferred until the single-GPU case works end to end), and
+anything workload-specific.
