@@ -746,6 +746,79 @@ yield" shape that can exhaust budget mid-draw -- prefer
 `fill`/`copy`/`bitblt` over `set`-loops in window draw code for this
 reason, not just speed.
 
+## JOB code and the non-yielding timeout
+
+Separate from the per-tick `callBudget` above: OpenComputers also kills
+a computer that runs too long in real wall-clock time without yielding
+at all, regardless of call budget. Not guessed -- `system.timeout` is a
+real value exposed to Lua (confirmed in `SystemAPI.scala`), and OpenOS's
+own boot code (`lib/core/boot.lua`) explicitly calls `pull(0)` at least
+once a second during boot specifically to *"protect from timeouts"*,
+pushing back with `computer.pushSignal` whatever it steals so the real
+recipient still gets it. The exact Java-side enforcement mechanism
+wasn't traced further in this codebase, but the behavior itself is
+confirmed real by OpenOS's own defensive code against it, not asserted
+from docs alone.
+
+Before this was fixed, `node/runtime.lua`'s `JOB` handler ran dispatched
+code as one uninterrupted `pcall` with no yield inside it at all -- a
+job with a long loop and no yield of its own risked the MOD killing
+that worker's whole computer, not just erroring the job, and the worker
+would be unable to answer `PING` or anything else for the job's entire
+duration either way.
+
+**The fix that seemed obvious doesn't work**: a `debug.sethook` count
+hook that forces a yield every N instructions, whether the job's code
+yields on its own or not, would in principle let the dispatch loop
+interleave network servicing with an arbitrary non-cooperating job.
+Tested directly against the real `lua5.3` binary (not assumed): yielding
+from inside a debug hook raises `"attempt to yield across a C-call
+boundary"` every single time. This is a genuine Lua 5.3 language
+restriction, not a muxos limitation or an OC sandboxing quirk -- a hook
+callback can never suspend execution, full stop.
+
+What a hook CAN do is `error()` -- confirmed that works fine from a
+hook, unwinding the coroutine cleanly and returned as `(false, msg)`
+from `coroutine.resume`, same as any other Lua error. So the actual
+design, in `node/runtime.lua`:
+
+- **`yield()`** -- exposed to job code as a real global (same pattern as
+  `gpu`/`gmuxapi`: JOB code is `load()`ed fresh each time with no
+  visibility into `runtime.lua`'s own locals, so it has to be a global).
+  Calling it is an ORDINARY yield from regular code, not from a hook --
+  confirmed that works fine -- so a job that expects to run long can
+  cooperate voluntarily, and `yieldToStayResponsive()` (pulls, then
+  immediately re-pushes with `computer.pushSignal`, the exact mechanism
+  OpenOS's own boot code uses) runs at each of its yield points, keeping
+  the node responsive for as long as the job keeps cooperating.
+- **A hard instruction-budget circuit breaker** -- also `debug.sethook`,
+  but erroring instead of attempting to yield. This can't resume a job
+  that blows the budget; it protects THIS NODE's availability, not that
+  job's progress, by killing a non-cooperating job outright, cleanly,
+  well before it risks the mod killing the whole computer instead.
+- **The hook is re-armed before every resume, not set once.** A count
+  hook's count is a running total of instructions executed by that
+  coroutine -- confirmed empirically it does NOT reset on its own across
+  a yield/resume cycle -- so without re-arming, a job that cooperates by
+  calling `yield()` periodically would still eventually trip the SAME
+  lifetime budget just by running long enough in total, defeating the
+  entire point of cooperating. Re-arming (`armBudgetHook`, called again
+  before each `coroutine.resume`) gives every voluntary yield a FRESH
+  budget for its next slice instead -- confirmed with a mocked test: a
+  job yielding every ~100 loop iterations against a budget that would
+  kill it in one continuous run instead completes normally across many
+  slices.
+
+`PREEMPT_INSTRUCTIONS` (2,000,000) is a judgment call, not measured
+against real hardware: large enough that ordinary job code shouldn't
+trip it by accident, with no empirical basis yet for exactly how that
+maps to OC's real (unverified) wall-clock timeout. Verified via
+`/tmp/test_job_preemption.lua`: a quick job under budget, a cooperating
+job surviving many slices via `yield()`, a signal arriving mid-job
+getting pushed back correctly, a non-cooperating job killed by the
+circuit breaker, and an ordinary error inside job code still reported
+distinctly from a budget-exceeded kill.
+
 ## Measured vs. documented latency
 
 The config numbers in OC's `application.conf` (`maxNetworkPacketSize`,

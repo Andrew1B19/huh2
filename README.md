@@ -312,7 +312,13 @@ into the fewest `gpu.set` calls possible, slotted into the same
 window/compositor pipeline as character-mode windows) + the kernal
 itself now fully bare-metal (`kernal/bios.lua` + a `muxos.lua` built
 entirely on native primitives, with its own minimal text console and
-keyboard-modifier tracking replacing OpenOS's io/keyboard libraries).
+keyboard-modifier tracking replacing OpenOS's io/keyboard libraries) +
+protection against OC's real non-yielding timeout for dispatched `JOB`
+code (a voluntary `yield()` a job can call to cooperate, plus a hard
+instruction-budget circuit breaker that kills a non-cooperating job
+before it risks the mod killing the whole worker -- see
+docs/PROTOCOL.md for why the obvious "force a yield from a debug hook"
+fix doesn't actually work in Lua 5.3).
 Not yet built: a real scheduler (load balancing beyond round-robin, async
 futures/callbacks for `submit()` itself, not just `SPAWN`), node
 health/failure handling, the fullscreen grant's no-automatic-release-on-

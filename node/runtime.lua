@@ -316,6 +316,101 @@ gmuxapi = {
   end,
 }
 
+-- OpenComputers really does kill a computer that runs too long without
+-- yielding -- not guessed: `system.timeout` is a real exposed value
+-- (confirmed in SystemAPI.scala), and OpenOS's OWN boot code
+-- (lib/core/boot.lua) explicitly calls `pull(0)` at least once a second
+-- during boot specifically to "protect from timeouts", pushing
+-- whatever it steals back onto the queue with computer.pushSignal so
+-- the real recipient still gets it. Before this fix, a JOB's code ran
+-- as one uninterrupted `pcall` with no yield inside it at all -- a job
+-- with a long loop and no yield of its own risked the MOD killing this
+-- node's whole computer, not just erroring the job, and this node would
+-- also be unable to answer PING or anything else while it ran.
+--
+-- The obvious fix -- a `debug.sethook` count hook that forces a yield
+-- periodically, whether the job's own code yields or not -- does NOT
+-- work: confirmed empirically against the real lua5.3 binary (not
+-- guessed from docs), yielding from inside a debug hook raises
+-- "attempt to yield across a C-call boundary" every time. Lua 5.3
+-- genuinely does not allow a hook to suspend execution; only ordinary
+-- code (not a hook callback) can yield. So real preemption of
+-- non-cooperating job code is not possible here, on real Lua 5.3, full
+-- stop -- not a muxos limitation, a language one.
+--
+-- What IS possible, and what this builds instead:
+-- 1. `yield()` -- exposed to job code as a real global, so code that
+--    expects to run long can voluntarily cooperate: calling it actually
+--    suspends the job's own coroutine (an ordinary yield from regular
+--    code, not from a hook, which works fine -- confirmed), at which
+--    point yieldToStayResponsive() pulls (and immediately re-pushes,
+--    the exact mechanism OpenOS's own boot code uses) any pending
+--    signal, so this node keeps answering PING/other messages for as
+--    long as the job keeps cooperating.
+-- 2. A hard instruction-budget circuit breaker (also `debug.sethook`,
+--    but erroring instead of yielding -- confirmed that DOES work from
+--    a hook) that kills a job outright, with a clear Lua error, if it
+--    runs for PREEMPT_INSTRUCTIONS VM instructions without the job
+--    EVER yielding or finishing. This can't resume a job that blows the
+--    budget -- only this node's own availability is being protected,
+--    not that specific job's progress -- but it guarantees a job that
+--    never cooperates gets killed by muxos, cleanly, well before it
+--    risks the mod killing this node's whole computer instead.
+-- PREEMPT_INSTRUCTIONS is a judgment call, not empirically measured
+-- against real hardware: large enough that ordinary job code doesn't
+-- trip it by accident, small enough to still be "well before" OC's own
+-- unverified real timeout.
+local PREEMPT_INSTRUCTIONS = 2000000
+
+-- Exposed as a real global (not `local`), like `gpu`/`gmuxapi` above --
+-- JOB code can call this periodically during a long computation to stay
+-- cooperative; see the header comment above for why this is the only
+-- real way to keep this node responsive during a long job.
+function yield()
+  coroutine.yield()
+end
+
+local function yieldToStayResponsive()
+  local sig = table.pack(pullSignal(0))
+  if sig.n > 0 and sig[1] ~= nil then
+    computer.pushSignal(table.unpack(sig, 1, sig.n))
+  end
+end
+
+local function armBudgetHook(co)
+  -- A debug.sethook count hook's count is a running total of
+  -- instructions executed by that coroutine, NOT reset by a
+  -- yield/resume cycle on its own (confirmed empirically) -- so without
+  -- re-arming it before every resume, a cooperating job that calls
+  -- yield() periodically would still eventually trip the SAME lifetime
+  -- budget just by running long enough overall, defeating the whole
+  -- point of cooperating. Re-arming here before each resume gives every
+  -- voluntary yield a FRESH budget for its next slice (confirmed this
+  -- actually works: a job yielding every ~300 instructions survives 5
+  -- slices against a 1000-instruction budget that would kill it in one
+  -- continuous run) -- cooperating costs nothing, not cooperating still
+  -- gets caught within one slice.
+  debug.sethook(co, function()
+    error("job exceeded its instruction budget (" .. PREEMPT_INSTRUCTIONS ..
+      ") without yielding or finishing -- call yield() periodically if it needs to run this long", 0)
+  end, "", PREEMPT_INSTRUCTIONS)
+end
+
+local function runJobCode(chunk, args)
+  local co = coroutine.create(chunk)
+  armBudgetHook(co)
+  local ok, a = coroutine.resume(co, args)
+  while ok and coroutine.status(co) ~= "dead" do
+    -- The job yielded voluntarily (called `yield()`) -- stay responsive
+    -- for one tick's worth of network traffic before resuming it with a
+    -- fresh instruction budget for its next slice.
+    yieldToStayResponsive()
+    armBudgetHook(co)
+    ok, a = coroutine.resume(co)
+  end
+  return ok, a
+end
+
 while true do
   -- A bounded timeout (rather than blocking indefinitely) so stale,
   -- abandoned partial reassemblies get swept out periodically even if
@@ -334,7 +429,7 @@ while true do
         if not chunk then
           send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = loadErr})
         else
-          local ok, result = pcall(chunk, msg.args)
+          local ok, result = runJobCode(chunk, msg.args)
           if ok then
             send({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = result})
           else
