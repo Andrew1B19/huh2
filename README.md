@@ -94,12 +94,30 @@ writing one-off job code. It still only works because of the Network Card
 message-passing underneath -- see `docs/PROTOCOL.md` for why OpenComputers
 doesn't allow direct cross-machine component access at all, Rack or not.
 
+`LIST`/`INVOKE` are symmetric -- either side can ask the other to act on
+its own components -- which is what lets a worker fall back to the
+kernal's hardware when it has none locally. `node/bios.lua` exposes this
+as a `gpu` face: `gpu.set(x, y, text)` etc. use a local `gpu` component
+if one happens to be attached (zero network hops), and only call back to
+the kernal, caching the discovered address, when the node has none. This
+is the first slice of "run OpenOS-API-shaped code on a worker, as close
+to native as makes sense, forwarding to the kernal only when something
+genuinely isn't local" -- not full OpenOS-library compatibility yet, just
+the dispatch pattern proven on one component type (`gpu`). See
+docs/PROTOCOL.md for the one known gap (the kernal only services an
+incoming request while something is actively polling, not while the REPL
+is blocked at its prompt) and a real size problem (`node/bios.lua` is now
+over the stock 4096-byte `eepromSize`, unresolved).
+
 ## Status
 
 First working slice: discovery + synchronous round-robin job dispatch +
-a remote-component bridge + latency probing.
+a symmetric remote-component bridge (kernal<->worker, used by workers to
+reach kernal hardware they don't have locally, e.g. `gpu`) + latency
+probing.
 Not yet built: a real scheduler (load balancing beyond round-robin, async
 futures/callbacks instead of blocking `submit()`), node health/failure
-handling, a GPU-forwarding virtual component for the kernal's eventual
-GUI front end (multi-monitor support is explicitly out of scope until
-the single-GPU case works end to end), and anything workload-specific.
+handling, a real multi-threading kernel API (the REPL-blocks-the-network
+gap above needs this), broader OpenOS-library-shaped coverage beyond
+`gpu`, multi-monitor support (explicitly deferred until the single-GPU
+case works end to end), and anything workload-specific.

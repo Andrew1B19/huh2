@@ -70,8 +70,41 @@ local function noteNode(addr)
   nodes[addr].lastSeen = computer.uptime()
 end
 
+-- Service a LIST/INVOKE request FROM a worker, against the kernal's OWN
+-- components. This is the reverse direction of the "remote component"
+-- bridge in node/bios.lua: a worker with no screen/disk of its own asks
+-- the kernal to act on its behalf, same wire shape either direction.
+local function handleList(msg)
+  local list = {}
+  for addr, ctype in component.list() do
+    list[addr] = ctype
+  end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
+end
+
+local function handleInvoke(msg)
+  local packed = table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(msg.args or {})))
+  if packed[1] then
+    local returns = {}
+    for i = 2, packed.n do returns[#returns + 1] = packed[i] end
+    send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = returns})
+  else
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = tostring(packed[2])})
+  end
+end
+
 -- Pull one pending modem message, if any, without blocking. Used both by
--- discovery and by submit()'s wait loop.
+-- discovery and by submit()'s wait loop. Incoming LIST/INVOKE requests
+-- (from a worker calling back into the kernal) are serviced here directly
+-- and never returned -- they aren't a reply anything is waiting on.
+--
+-- Caveat: this only runs while something is actively polling (discover,
+-- awaitReply, pingOnce). While the REPL is blocked on io.read() at the
+-- prompt, nothing pumps the modem at all, so a worker's remote call can
+-- sit unanswered until the next command triggers a pump() somewhere.
+-- Fixing that needs real concurrency (a background thread/event.listen),
+-- which is exactly the kind of thing the "multi-threading kernel API" is
+-- meant to eventually provide -- not done here.
 local function pump()
   local name, _, from, port, _, data = event.pull(0, "modem_message")
   if name and port == PORT and type(data) == "string" then
@@ -79,6 +112,12 @@ local function pump()
     if type(msg) == "table" and msg.from and msg.from ~= selfAddr then
       if msg.type == "HELLO" or msg.type == "PONG" then
         noteNode(msg.from)
+      elseif msg.to == selfAddr and msg.type == "LIST" then
+        handleList(msg)
+        return nil
+      elseif msg.to == selfAddr and msg.type == "INVOKE" then
+        handleInvoke(msg)
+        return nil
       end
       return msg
     end

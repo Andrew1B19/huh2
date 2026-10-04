@@ -65,11 +65,101 @@ end
 -- discovery pass if it happens to be listening already.
 send({type = "HELLO", from = nodeId})
 
+-- The kernal is whoever directly addresses us -- nothing else on this
+-- network talks to a worker node. Learned on the first message received,
+-- used by the "face" helpers below to call back into the kernal's own
+-- hardware when this node has none of its own.
+local kernalAddr = nil
+
+local nextRpcId = 1
+local function nextId()
+  local id = nextRpcId
+  nextRpcId = nextRpcId + 1
+  return id
+end
+
+local RPC_TIMEOUT = 5
+
+-- Ask the kernal to LIST or INVOKE one of ITS OWN components -- the
+-- reverse direction of the LIST/INVOKE handling below. Used when this
+-- node needs a resource it doesn't have locally (no screen of its own,
+-- say) and falls back to the kernal's hardware instead, at the cost of
+-- one network round trip instead of zero.
+local function remoteRequest(msgType, extra)
+  if not kernalAddr then
+    return nil, "kernal address not known yet"
+  end
+  local id = nextId()
+  local msg = {type = msgType, from = nodeId, to = kernalAddr, id = id}
+  for k, v in pairs(extra or {}) do msg[k] = v end
+  send(msg)
+
+  local deadline = computer.uptime() + RPC_TIMEOUT
+  while computer.uptime() < deadline do
+    local name, _, _, port, _, data = computer.pullSignal(deadline - computer.uptime())
+    if name == "modem_message" and port == PORT and type(data) == "string" then
+      local reply = deserialize(data)
+      if type(reply) == "table" and reply.id == id and reply.to == nodeId then
+        if reply.type == "RESULT" then
+          return reply.result
+        elseif reply.type == "ERROR" then
+          return nil, reply.error
+        end
+      end
+    end
+  end
+  return nil, "timed out waiting for kernal"
+end
+
+local function remoteList()
+  return remoteRequest("LIST")
+end
+
+local function remoteInvoke(address, method, args)
+  return remoteRequest("INVOKE", {address = address, method = method, args = args})
+end
+
+-- Lowest-overhead rule: use a local component if this node happens to
+-- have one, zero network hops; only fall back to the kernal's when this
+-- node has none. Cached after the first remote lookup so repeated calls
+-- don't pay for a LIST round trip every time.
+local remoteGpuAddr = nil
+local function faceGpu(method, ...)
+  for addr in component.list("gpu") do
+    return component.invoke(addr, method, ...)
+  end
+  if not remoteGpuAddr then
+    local list, err = remoteList()
+    if not list then return nil, err end
+    for addr, ctype in pairs(list) do
+      if ctype == "gpu" then
+        remoteGpuAddr = addr
+        break
+      end
+    end
+    if not remoteGpuAddr then return nil, "kernal has no gpu component" end
+  end
+  local results, err = remoteInvoke(remoteGpuAddr, method, {...})
+  if err then return nil, err end
+  return table.unpack(results or {})
+end
+
+-- Exposed as a real global (not `local`) so JOB code -- loaded fresh via
+-- `load()` each time, with no visibility into this file's own locals --
+-- can still call it as `gpu.set(x, y, text)`, same shape as OpenOS's own
+-- component.gpu proxy, without caring whether it ends up local or remote.
+gpu = setmetatable({}, {
+  __index = function(_, method)
+    return function(...) return faceGpu(method, ...) end
+  end,
+})
+
 while true do
   local name, _, from, port, _, data = computer.pullSignal()
   if name == "modem_message" and port == PORT and type(data) == "string" then
     local msg = deserialize(data)
     if type(msg) == "table" and (msg.to == nil or msg.to == nodeId) then
+      kernalAddr = msg.from
       if msg.type == "PING" then
         send({type = "PONG", from = nodeId, to = msg.from, id = msg.id})
       elseif msg.type == "JOB" then
