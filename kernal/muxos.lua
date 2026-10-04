@@ -74,6 +74,16 @@ local nextNode = 1
 local jobs = {}
 local jobOrder = {}
 
+-- Minimal window registry -- NOT a port of gmux's real desktop
+-- (lib/gmux/frontend/windows.lua + graphics.lua: layering, dragging,
+-- resizing, routing input by topmost-window-under-cursor). What this
+-- gives: allocate a GPU buffer, let code draw into it, blit it onto the
+-- kernal's own real screen at a fixed (x, y), and remember it existed.
+-- Enough to make create_window/get_windows real without pretending
+-- there's a desktop here. id -> {id, title, x, y, width, height, buffer}.
+local windows = {}
+local windowOrder = {}
+
 local function send(msg)
   modem.broadcast(PORT, serialize(msg))
 end
@@ -84,6 +94,34 @@ local function noteNode(addr)
     nodeOrder[#nodeOrder + 1] = addr
   end
   nodes[addr].lastSeen = computer.uptime()
+end
+
+local function nextId()
+  local id = nextJobId
+  nextJobId = nextJobId + 1
+  return id
+end
+
+-- Record a job's dispatch and actually send it, WITHOUT waiting for the
+-- result -- shared by submit() (which then blocks on awaitReply itself)
+-- and handleSpawn() (which must return to the calling worker immediately,
+-- gmux's own create_headless_process/create_graphics_process being
+-- fire-and-forget: you get a handle back right away, not the result).
+-- Completion is recorded generically in pump() below, so it's tracked
+-- correctly either way.
+local function dispatchJob(code, args, targetAddr)
+  if not targetAddr then
+    if #nodeOrder == 0 then
+      return nil, "no worker nodes discovered yet -- try 'discover'"
+    end
+    targetAddr = nodeOrder[nextNode]
+    nextNode = (nextNode % #nodeOrder) + 1
+  end
+  local id = nextId()
+  jobs[id] = {id = id, node = targetAddr, status = "running", code = code, startedAt = computer.uptime()}
+  jobOrder[#jobOrder + 1] = id
+  send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args})
+  return id, targetAddr
 end
 
 -- Resolve runtime.lua as a sibling of wherever this script is actually
@@ -112,13 +150,22 @@ end
 -- identical payload. Not wrapped in the serialized-table protocol: BOOT
 -- happens before a worker has that runtime loaded at all, so it uses its
 -- own plain "WORD <payload>" convention (see node/bios.lua).
+-- Stay comfortably under maxNetworkPacketSize (8192, confirmed from
+-- application.conf -- see docs/PROTOCOL.md) even accounting for the
+-- "CODE <i>/<n> " prefix on each chunk.
+local BOOT_CHUNK_SIZE = 7000
+
 local function serveBoot(workerAddr)
   local source, err = loadRuntime()
   if not source then
     print("boot request from " .. workerAddr .. " but " .. err)
     return
   end
-  modem.broadcast(PORT, "CODE " .. source)
+  local total = math.ceil(#source / BOOT_CHUNK_SIZE)
+  for i = 1, total do
+    local chunk = source:sub((i - 1) * BOOT_CHUNK_SIZE + 1, i * BOOT_CHUNK_SIZE)
+    modem.broadcast(PORT, "CODE " .. i .. "/" .. total .. " " .. chunk)
+  end
 end
 
 -- Service a LIST/INVOKE request FROM a worker, against the kernal's OWN
@@ -142,6 +189,105 @@ local function handleInvoke(msg)
   else
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = tostring(packed[2])})
   end
+end
+
+-- Muxos-shaped create_headless_process/create_graphics_process: a
+-- worker asks the kernal to dispatch a NEW job (possibly on a different
+-- node than the one asking), fire-and-forget -- gmux's own versions
+-- return a process handle immediately too, not the eventual result.
+-- gmux's `options.main` is a function value; that can't cross the
+-- network, so this takes `options.code` (a Lua source string, same
+-- convention as JOB) instead -- the one deliberate shape difference from
+-- the real API, documented in docs/PROTOCOL.md.
+local function handleSpawn(msg)
+  if not msg.code then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+      error = "spawn needs options.code (a Lua source string) -- gmux's options.main/main_path can't cross the network"})
+    return
+  end
+  local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node)
+  if not jobId then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = targetAddr})
+    return
+  end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {id = jobId, node = targetAddr}})
+end
+
+local function kernalGpu()
+  if component.isAvailable("gpu") then return component.gpu end
+end
+
+-- Runs `code` (compiled fresh, same convention as JOB/a job's `gpu`
+-- face) with a `gpu` local already pointed at the given buffer, so
+-- window-drawing code looks like ordinary gpu-face code -- it's just
+-- executed directly on the kernal instead of forwarded there, since gmux's
+-- own `func(gpu)` draw callback is a function value and can't cross the
+-- network the way `gpu`-face JOB code already doesn't need to.
+local function drawIntoBuffer(gpu, buffer, code)
+  gpu.setActiveBuffer(buffer)
+  local chunk, loadErr = load("local gpu = ...\n" .. code, "=window", "t")
+  local ok, err
+  if chunk then
+    ok, err = pcall(chunk, gpu)
+  else
+    ok, err = false, loadErr
+  end
+  gpu.setActiveBuffer(0)
+  if ok then return true end
+  return nil, err
+end
+
+-- Muxos-shaped create_window (also standing in for gmux's separate
+-- create_window_buffer -- see docs/PROTOCOL.md for why those two
+-- collapse into one remote call here). Allocates a GPU buffer, runs
+-- `code` against it if given, blits it onto the kernal's real screen at
+-- (x, y) once, and remembers it as a window. NOT live -- unlike gmux's
+-- create_window with a vgpu/vscreen source, this never redraws itself;
+-- redrawing means calling it again (or a future update, not built).
+local function createWindow(options)
+  local gpu = kernalGpu()
+  if not gpu then return nil, "kernal has no gpu component" end
+  if not gpu.allocateBuffer then return nil, "kernal's gpu does not support buffers (tier 1?)" end
+
+  local width = options.width or 30
+  local height = options.height or 10
+  local buffer, allocErr = gpu.allocateBuffer(width, height)
+  if not buffer then return nil, "could not allocate a gpu buffer: " .. tostring(allocErr) end
+
+  if options.code then
+    local ok, drawErr = drawIntoBuffer(gpu, buffer, options.code)
+    if not ok then
+      gpu.freeBuffer(buffer)
+      return nil, "window draw code failed: " .. tostring(drawErr)
+    end
+  end
+
+  local x, y = options.x or 1, options.y or 1
+  gpu.bitblt(0, x, y, width, height, buffer, 1, 1)
+
+  local id = nextId()
+  local win = {id = id, title = options.title or ("window " .. id), x = x, y = y,
+    width = width, height = height, buffer = buffer}
+  windows[id] = win
+  windowOrder[#windowOrder + 1] = id
+  return win
+end
+
+local function handleCreateWindow(msg)
+  local win, err = createWindow(msg)
+  if not win then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
+    return
+  end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = win})
+end
+
+local function handleGetWindows(msg)
+  local list = {}
+  for _, id in ipairs(windowOrder) do
+    list[#list + 1] = windows[id]
+  end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
 end
 
 -- First real slice of the gmux application API, muxos-shaped:
@@ -194,6 +340,30 @@ local function pump()
       elseif msg.to == selfAddr and msg.type == "GETPROCESSES" then
         handleGetProcesses(msg)
         return nil
+      elseif msg.to == selfAddr and msg.type == "SPAWN" then
+        handleSpawn(msg)
+        return nil
+      elseif msg.to == selfAddr and msg.type == "CREATEWINDOW" then
+        handleCreateWindow(msg)
+        return nil
+      elseif msg.to == selfAddr and msg.type == "GETWINDOWS" then
+        handleGetWindows(msg)
+        return nil
+      elseif msg.to == selfAddr and (msg.type == "RESULT" or msg.type == "ERROR")
+          and jobs[msg.id] and jobs[msg.id].status == "running" then
+        -- Generic job-completion recording: covers BOTH a submit()-dispatched
+        -- job (something is actively awaitReply()-ing on it, which still
+        -- gets this same msg via the `return msg` below) AND a
+        -- handleSpawn()-dispatched one (fire-and-forget -- nothing is
+        -- waiting locally, so this is the ONLY place its completion is
+        -- ever recorded).
+        local job = jobs[msg.id]
+        job.finishedAt = computer.uptime()
+        if msg.type == "RESULT" then
+          job.status, job.result = "done", msg.result
+        else
+          job.status, job.error = "error", msg.error
+        end
       end
       return msg
     end
@@ -224,42 +394,17 @@ local function awaitReply(id, addr)
   return nil, "timed out waiting for " .. addr
 end
 
-local function nextId()
-  local id = nextJobId
-  nextJobId = nextJobId + 1
-  return id
-end
-
 -- Submit `code` (compiled as a chunk and called with `args` as its only
 -- argument) to one worker node and block for the result. Picks the next
--- node round-robin unless targetAddr is given.
+-- node round-robin unless targetAddr is given. Completion is recorded in
+-- `jobs` by pump()'s generic handling above, not here -- dispatchJob()
+-- already created the record before this blocks on awaitReply.
 local function submit(code, args, targetAddr)
-  if #nodeOrder == 0 then
-    return nil, "no worker nodes discovered yet -- try 'discover'"
+  local id, addrOrErr = dispatchJob(code, args, targetAddr)
+  if not id then
+    return nil, addrOrErr
   end
-
-  local addr = targetAddr
-  if not addr then
-    addr = nodeOrder[nextNode]
-    nextNode = (nextNode % #nodeOrder) + 1
-  end
-
-  local id = nextId()
-  jobs[id] = {id = id, node = addr, status = "running", code = code, startedAt = computer.uptime()}
-  jobOrder[#jobOrder + 1] = id
-
-  send({type = "JOB", from = selfAddr, to = addr, id = id, code = code, args = args})
-  local result, err = awaitReply(id, addr)
-
-  jobs[id].finishedAt = computer.uptime()
-  if err then
-    jobs[id].status = "error"
-    jobs[id].error = err
-  else
-    jobs[id].status = "done"
-    jobs[id].result = result
-  end
-  return result, err
+  return awaitReply(id, addrOrErr)
 end
 
 -- List the components physically attached to a remote node: address -> type.
@@ -365,11 +510,24 @@ local function printProcesses()
   end
 end
 
+local function printWindows()
+  if #windowOrder == 0 then
+    print("no windows created yet")
+    return
+  end
+  for _, id in ipairs(windowOrder) do
+    local win = windows[id]
+    print(string.format("[%d] %q  %dx%d at (%d,%d)", win.id, win.title, win.width, win.height, win.x, win.y))
+  end
+end
+
 local function repl()
   print("muxos kernal -- " .. selfAddr)
   print("commands:")
   print("  discover | nodes | ping <node> [count] | quit")
   print("  run <lua code> | runall <lua code> | processes")
+  print("  spawn <node> <lua code>")
+  print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
   print("  components <node> | call <node> <component addr> <method> [args table]")
   print("(<node> is either a [n] index from 'nodes' or a full node address)")
   discover(1)
@@ -403,6 +561,25 @@ local function repl()
         if err then print(addr .. ": error: " .. err)
         else print(addr .. ": " .. tostring(result)) end
       end
+    elseif line:match("^spawn%s") then
+      local node, code = line:match("^spawn%s+(%S+)%s+(.*)$")
+      if not node then
+        print("usage: spawn <node> <lua code>")
+      else
+        local id, addrOrErr = dispatchJob(code, nil, resolveNode(node))
+        if not id then print("error: " .. addrOrErr) else print("spawned job [" .. id .. "] on " .. addrOrErr) end
+      end
+    elseif line:match("^window%s") then
+      local title, x, y, w, h, code = line:match("^window%s+(%S+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(.*)$")
+      if not title then
+        print("usage: window <title> <x> <y> <width> <height> <lua code drawing into `gpu`>")
+      else
+        local win, err = createWindow({title = title, x = tonumber(x), y = tonumber(y),
+          width = tonumber(w), height = tonumber(h), code = code})
+        if err then print("error: " .. err) else print("created window [" .. win.id .. "]") end
+      end
+    elseif line == "windows" then
+      printWindows()
     elseif line:match("^components%s") then
       printComponents(resolveNode(line:match("^components%s+(%S+)")))
     elseif line:match("^call%s") then

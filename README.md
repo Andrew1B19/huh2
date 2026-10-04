@@ -104,17 +104,28 @@ muxos> ping 1 10
 muxos> run return 1 + 1
 muxos> runall return computer.address()
 muxos> processes
+muxos> spawn 1 return 42
+muxos> window hello 5 5 20 5 gpu.set(1,1,"hi from the kernal")
+muxos> windows
 muxos> components 1
 muxos> call 1 <component addr> getResolution
 muxos> quit
 ```
 
 `processes` shows the kernal's own job registry (`jobs`) -- every job
-ever dispatched via `run`/`runall`, with its status, node, and result or
-error. This is also what answers a worker's `gmuxapi.get_processes()`
-call (see below): the kernal is the only place that actually knows about
-every job across every node, so it's the real implementation, not a
-per-worker guess.
+ever dispatched via `run`/`runall`/`spawn`, with its status, node, and
+result or error. This is also what answers a worker's
+`gmuxapi.get_processes()` call (see below): the kernal is the only
+place that actually knows about every job across every node, so it's
+the real implementation, not a per-worker guess.
+
+`spawn <node> <lua code>` dispatches a job and returns immediately with
+its id, without waiting for it to finish (unlike `run`) -- the REPL
+exposes this mainly to exercise the same fire-and-forget path a
+worker's `gmuxapi.create_headless_process()` uses. `window <title> <x>
+<y> <width> <height> <lua code>` allocates a GPU buffer, runs the code
+against it (with `gpu` bound to the buffer), blits it onto the kernal's
+real screen once, and remembers it; `windows` lists what's been created.
 
 `ping <node> [count]` times a round-trip PING/PONG with that node (default
 3 tries) and reports min/avg/max in milliseconds -- useful for measuring
@@ -143,31 +154,55 @@ type (`gpu`). See docs/PROTOCOL.md for the one known gap (the kernal only
 services an incoming boot/remote request while something is actively
 polling, not while the REPL is blocked at its prompt).
 
-`node/runtime.lua`'s `gmuxapi.get_processes()` is muxos's first slice of
-gmux's actual *application* API (`component.gmuxapi.*` in gmux itself --
-see `gmux/lib/gmux/frontend/api.lua`), translated for a networked
-substrate rather than gmux's one-process-table assumption: it's always a
-remote call to the kernal's job registry, never local-first like `gpu`,
-since no worker could ever answer it from its own state alone. See
-docs/PROTOCOL.md for what else gmux's API exposes and what's not
-translated yet (`create_window`/`get_windows` need the kernal to host an
-actual window system first; spawning jobs under gmux's own option
-shape doesn't exist yet either).
+`node/runtime.lua`'s `gmuxapi` table is muxos's translation of gmux's
+actual *application* API (`component.gmuxapi.*` in gmux itself -- see
+`gmux/lib/gmux/frontend/api.lua`) for a networked substrate rather than
+gmux's one-process-table assumption. All five pieces built so far are
+remote calls, never local-first like `gpu`, since no worker could ever
+answer any of them from its own state alone:
+
+- `get_processes()` -- the kernal's job registry, as before.
+- `create_headless_process(options)` / `create_graphics_process(options)`
+  -- dispatch a new job (`options.code`, a Lua source string, replacing
+  gmux's `options.main`/`main_path` -- a function or file path can't
+  cross the network). Fire-and-forget, like gmux's own versions: you get
+  `{process = {id, node}}` back immediately, not the result.
+  `create_graphics_process` also creates a window sized to
+  `options.width`/`height`, but does **not** wire the job's own `gpu`
+  face to that window's buffer yet -- flagged in docs/PROTOCOL.md, not
+  silently assumed to work.
+- `create_window(options)` -- also stands in for gmux's separate
+  `create_window_buffer`: `options.code` (run ON the kernal, drawing
+  into the allocated buffer) replaces gmux's `func(gpu)` callback, since
+  a function value can't cross the network either.
+- `get_windows()` -- the kernal's window registry.
+
+See docs/PROTOCOL.md for exactly what's NOT translated: this is not
+gmux's real desktop (no layering, dragging, resizing, or input routing
+-- `gmux/lib/gmux/frontend/windows.lua`/`graphics.lua` weren't ported),
+and `get_backend`/`get_graphics`/`get_process`/`show_error` don't exist
+here at all.
 
 ## Status
 
 First working slice: network-boot handshake (tiny EEPROM stub + a
-kernal-served runtime, so the firmware itself is nowhere near the
-4096-byte EEPROM limit) + discovery + synchronous round-robin job
-dispatch with a kernal-side job registry + a symmetric remote-component
-bridge (kernal<->worker, used by workers to reach kernal hardware they
-don't have locally, e.g. `gpu`) + the first translated piece of gmux's
-application API (`get_processes`) + latency probing.
+kernal-served runtime, chunked since the runtime now exceeds one modem
+message's size budget) + discovery + synchronous round-robin job
+dispatch with a kernal-side job registry (shared by `submit()` and the
+fire-and-forget `SPAWN` path, completion recorded generically either
+way) + a symmetric remote-component bridge (kernal<->worker, used by
+workers to reach kernal hardware they don't have locally, e.g. `gpu`) +
+a minimal kernal-side window registry + five translated pieces of
+gmux's application API (`get_processes`, `create_headless_process`,
+`create_graphics_process`, `create_window`, `get_windows`) + latency
+probing.
 Not yet built: a real scheduler (load balancing beyond round-robin, async
-futures/callbacks instead of blocking `submit()`), node health/failure
-handling, a real multi-threading kernel API (the REPL-blocks-the-network
-gap above needs this), broader OpenOS-library-shaped coverage beyond
-`gpu`, the rest of the gmux API translation (windows, graphics/headless
-process spawning under its option shape), multi-monitor support
+futures/callbacks for `submit()` itself, not just `SPAWN`), node
+health/failure handling, a real multi-threading kernel API (the
+REPL-blocks-the-network gap still stands), broader OpenOS-library-shaped
+coverage beyond `gpu`, a real windowing system (layering/dragging/
+resizing/input routing) rather than the current one-shot-blit registry,
+per-job isolated drawing surfaces (so `create_graphics_process`'s job and
+its window are actually wired together), multi-monitor support
 (explicitly deferred until the single-GPU case works end to end), and
 anything workload-specific.

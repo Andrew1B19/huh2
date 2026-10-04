@@ -158,16 +158,71 @@ gpu = setmetatable({}, {
   end,
 })
 
--- First real slice of a muxos-shaped gmux application API: gmux's
--- api.get_processes() reads one local process table (every job is a
--- coroutine in the same Lua state as the caller); here a "process" is a
--- job on some other physical node, so the only place that actually knows
--- about all of them is the kernal's own scheduler (kernal/muxos.lua's
--- `jobs` table) -- this is necessarily a remote call, always, not a
--- local-or-remote dispatch like `gpu`.
+-- Muxos-shaped gmux application API. Every one of these is necessarily
+-- a remote call to the kernal, never local-first like `gpu` -- a
+-- "process" is a job on some other physical node and a "window" lives on
+-- the kernal's own real screen, so no worker could ever answer either
+-- from its own state. See docs/PROTOCOL.md for what's deliberately
+-- different from gmux's real api.lua and why.
 gmuxapi = {
+  -- gmux's api.get_processes() reads one local process table; here the
+  -- kernal's own scheduler (kernal/muxos.lua's `jobs`) is the only thing
+  -- that actually knows about every job across every node.
   get_processes = function()
     return remoteRequest("GETPROCESSES")
+  end,
+
+  -- gmux's create_headless_process(options) takes options.main (a
+  -- function) or options.main_path (a dofile path); neither can cross
+  -- the network, so this takes options.code (a Lua source string, same
+  -- convention as a JOB) instead. Fire-and-forget, like gmux's own
+  -- version: returns {process = {id, node}} immediately, not the result.
+  create_headless_process = function(options)
+    options = options or {}
+    if not options.code then
+      return nil, "create_headless_process needs options.code (a Lua source string)"
+    end
+    local result, err = remoteRequest("SPAWN", {code = options.code, args = options.args, node = options.node})
+    if err then return nil, err end
+    return {process = result}
+  end,
+
+  -- gmux's create_graphics_process additionally wires the spawned job's
+  -- own gpu/screen/keyboard to a private virtual surface. That per-job
+  -- isolated drawing surface doesn't exist here yet -- this spawns the
+  -- job and creates a window of the requested size, but the job's own
+  -- `gpu` face still targets the kernal's PRIMARY screen directly, not
+  -- this window's buffer. Flagged, not silently pretended to work.
+  create_graphics_process = function(options)
+    options = options or {}
+    if not options.code then
+      return nil, "create_graphics_process needs options.code (a Lua source string)"
+    end
+    local proc, procErr = remoteRequest("SPAWN", {code = options.code, args = options.args, node = options.node})
+    if not proc then return nil, procErr end
+    local win, winErr = remoteRequest("CREATEWINDOW", {
+      title = options.name, width = options.width, height = options.height,
+    })
+    if not win then return {process = proc}, winErr end
+    return {process = proc, window = win}
+  end,
+
+  -- Also stands in for gmux's separate create_window_buffer: gmux draws
+  -- into a window via a `func(gpu)` callback, a function value that
+  -- can't cross the network; options.code (run ON the kernal, with
+  -- `gpu` bound to the real gpu already pointed at this window's
+  -- buffer) replaces it. Not live -- unlike gmux's create_window with a
+  -- vgpu/vscreen source, this never redraws on its own.
+  create_window = function(options)
+    options = options or {}
+    return remoteRequest("CREATEWINDOW", {
+      title = options.title, x = options.x, y = options.y,
+      width = options.width, height = options.height, code = options.code,
+    })
+  end,
+
+  get_windows = function()
+    return remoteRequest("GETWINDOWS")
   end,
 }
 

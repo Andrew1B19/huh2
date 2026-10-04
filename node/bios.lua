@@ -33,25 +33,42 @@ local nodeId = computer.address()
 -- per message, but that serializer is itself part of the runtime we
 -- haven't fetched yet, so boot uses its own tiny, separate convention:
 -- a type word, a space, then a payload that runs to the end of the
--- message ("BOOT <node address>" / "CODE <runtime source>"). Lua's `.`
--- matches newlines too, so this is safe even though runtime source
--- spans many lines.
+-- message -- "BOOT <node address>" from us, "CODE <i>/<n> <chunk>" back
+-- (chunked because the runtime can exceed one modem message's
+-- maxNetworkPacketSize -- see docs/PROTOCOL.md). Lua's `.` matches
+-- newlines too, so this is safe even though a chunk spans many lines.
 local function requestBoot()
   modem.broadcast(PORT, "BOOT " .. nodeId)
 end
 
 requestBoot()
 
+local chunks = {}
 local code
 while not code do
   local name, _, _, port, _, data = computer.pullSignal(5)
+  local gotChunk = false
   if name == "modem_message" and port == PORT and type(data) == "string" then
-    code = data:match("^CODE (.*)$")
+    local i, n, chunk = data:match("^CODE (%d+)/(%d+) (.*)$")
+    if i then
+      gotChunk = true
+      i, n = tonumber(i), tonumber(n)
+      chunks[i] = chunk
+      local haveAll = true
+      for j = 1, n do
+        if not chunks[j] then haveAll = false break end
+      end
+      if haveAll then
+        code = table.concat(chunks, "", 1, n)
+      end
+    end
   end
-  if not code then
-    -- Either nothing arrived within the timeout, or it wasn't a CODE
-    -- reply (could be another node's BOOT broadcast) -- re-announce and
-    -- keep waiting either way.
+  if not code and not gotChunk then
+    -- Nothing relevant arrived within the timeout -- the kernal may not
+    -- be up yet, or this is a fresh wait with no transfer in progress.
+    -- Re-announce rather than waiting silently. (Deliberately NOT
+    -- re-announced on every single received chunk -- that would restart
+    -- the kernal's whole chunked send on every reply.)
     requestBoot()
   end
 end
