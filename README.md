@@ -350,18 +350,30 @@ history, no cursor movement within a line), multi-monitor support
 (explicitly deferred until the single-GPU case works end to end), and
 anything workload-specific.
 
-**Designed but not yet built**: a real `.mxe` process model --
-parent/child jobs with direct node-to-node communication once spawned,
-a single global job table (kernal placement authority never moves, but
-every job and its parentage is visible in one place for the scheduler),
-per-spawn orphan policies (`orphan`/`kill`/`promote`, declared by the
-parent, not a system-wide rule), app identity by declared name with a
-global reclaim map so a relaunched app gets its old orphans back,
-planned node draining as distinct from an unrecoverable node death, and
-"semi-live" job migration via `eris` coroutine persistence -- confirmed
-for real against the genuine upstream `eris` library, including a full
-cross-process round trip, not just inferred from OC's own use of it.
-See docs/PROTOCOL.md's "The `.mxe` process model" section for the full
-design and what's still genuinely undecided within it (fan-out caps,
-contention policy when every worker's busy, the exact job-environment
-and persistent-window-handle APIs).
+**The `.mxe` process model, partially built**: parent/child jobs are
+real now -- `gmuxapi.create_headless_process`/`create_graphics_process`
+take `options.name`/`options.orphan_policy`, a job knows its own id via
+the real global `jobId`, the kernal's single global job table carries
+`parent`/`appName`/`orphanPolicy` on every entry (placement authority
+stays exactly where it was -- round-robin, unchanged), and
+`orphan`/`kill`/`promote` are all applied for real the moment a
+parent's job finishes (`kill` is best-effort, only reachable at a
+child's own cooperative yield points -- same fundamental limit as the
+JOB timeout circuit breaker). App identity and orphan reclaim are real
+too: `gmuxapi.get_orphans(name)` hands back a relaunched app's old
+orphans, claimed once. Building this surfaced and fixed a real bug in
+`remoteRequest()` that silently dropped a child's own `JOB` dispatch
+when it landed on its own parent's node -- see docs/PROTOCOL.md.
+Verified end to end in `test/emu/integration_test.lua` (test 12).
+
+**Still forward design, not yet built**: planned node draining as
+distinct from an unrecoverable node death, and "semi-live" job
+migration via `eris` coroutine persistence (the mechanism itself is
+confirmed for real against the genuine upstream `eris` library,
+including a full cross-process round trip -- see
+`test/hardware/verify.lua` -- but nothing in `kernal/muxos.lua`/
+`node/runtime.lua` uses it yet). See docs/PROTOCOL.md's "The `.mxe`
+process model" section for the full design and what's still genuinely
+undecided (fan-out caps, the exact job-environment and
+persistent-window-handle APIs, no cleanup timeout for an unreclaimed
+orphan).

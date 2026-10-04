@@ -886,15 +886,15 @@ reach, since each mock isolates the one function under test from
 everything else that would normally be running concurrently on real
 hardware.
 
-## The `.mxe` process model (forward design -- not yet built)
+## The `.mxe` process model
 
-Everything below is a design decided through discussion, not yet
-implemented. It's written down now, in this much detail, specifically
-so it doesn't get lost or reinvented differently later -- the same
-reason every other design decision in this document gets recorded
-here rather than left in chat. Treat every claim in this section as
-"this is what we decided to build," not "this is what `muxos.lua`
-currently does."
+This started as a design decided through discussion, written down
+before implementation so it wouldn't get lost or reinvented
+differently later. Parent/child jobs, orphan policies, and app-identity
+reclaim are now BUILT and verified end to end (`test/emu/integration_test.lua`'s
+test 12) -- marked below as each piece is covered. Semi-live migration
+and the persistent-window-handle API are still forward design, not yet
+implemented -- marked as such where they appear.
 
 ### Why this exists
 
@@ -916,30 +916,37 @@ asking a question ("please run this somewhere"), never making the
 placement decision itself. Everything else in this section is about
 what happens around that one fixed point.
 
-### Parent/child jobs
+### Parent/child jobs -- BUILT
 
-When a running job (the **parent**) wants more compute, it asks the
-kernal for it. The kernal places the new job exactly like it places
+When a running job (the **parent**) wants more compute, it calls
+`gmuxapi.create_headless_process`/`create_graphics_process` with
+`options.name` and `options.orphan_policy` -- these go out as a
+`SPAWN` carrying `parent` (the parent's own job id, exposed to its
+running code as the real global `jobId`, set by `node/runtime.lua`'s
+main loop right before invoking a `JOB`'s code), `appName`, and
+`orphanPolicy`. The kernal places the new job exactly like it places
 any other (today: round-robin; later: the real load-aware balancer --
 see "Not yet built" in README.md) and hands the **parent** a persistent
 handle -- the same `{id, node}` shape `SPAWN`/`create_headless_process`
-already returns today, nothing new needed there.
+already returned before this, nothing new needed there.
 
-Once that handle exists, **parent and child talk to each other
-directly** -- addressed by that handle, over the same wire framing as
-everything else (the generic `MSG <id> <i>/<n> <chunk>` chunking
-already documented above; no second wire format for this). The kernal
-is not a mandatory relay for every message between an already-connected
-parent and child -- its role is placement and bookkeeping, not routing
-every byte between two nodes that already know how to reach each other.
+**The kernal never loses visibility.** Every job -- parent or child,
+top-level or several levels deep -- lives in the SAME single global
+`jobs` table `kernal/muxos.lua` already had, with `parent`/`appName`/
+`orphanPolicy` fields added to each entry. A separate per-parent table
+was considered and rejected: the scheduler needs one true view of
+total system load to ever do real balancing, and splitting job
+visibility by parent would fragment exactly that.
 
-**The kernal never loses visibility, though.** Every job -- parent or
-child, top-level or ten levels deep -- lives in the SAME single global
-`jobs` table `kernal/muxos.lua` already has, with a new `parent` field
-on child entries pointing at the id of whatever asked for them. A
-separate per-parent table was considered and rejected: the scheduler
-needs one true view of total system load to ever do real balancing,
-and splitting job visibility by parent would fragment exactly that.
+**What "parent and child talk directly" actually turned out to mean**:
+not a second wire format or a bypass of the kernal's placement -- a
+child is dispatched exactly like any other `JOB`, and the generic `MSG`
+chunking already documented above is all that's needed. What's real
+about "direct" is narrower and already true of every worker: a child's
+own completion is reported straight to the kernal (updating `jobs`),
+and nothing about this requires the kernal to relay anything between
+an already-placed parent and child beyond what the existing protocol
+already does.
 
 A child can become a parent itself -- the relationship is just a field
 on a table entry, nothing stops it from recursing. **Still undecided:**
@@ -948,57 +955,106 @@ only 3 workers total, an unbounded spawner could starve everything
 else; some cap (e.g. "no more than N live descendants per top-level
 job") seems likely necessary but the exact number, and whether it's a
 hard limit or something the scheduler just weighs against, hasn't been
-decided.
+decided -- no cap is enforced today.
 
-**Also still undecided:** what the kernal does when something asks for
-more compute and all 3 workers are already busy -- queue the request
-until one frees up, deny it outright, or preempt something
-lower-priority. This is the first real piece of "scheduler" rather than
-"placement," and it's open.
+**The "what happens when every worker is busy" question turned out to
+already have an answer, implicitly, in the existing design**: a worker
+only ever runs one job at a time (`runJobCode` blocks that worker's own
+main loop until the job finishes, is killed, or hits the instruction
+budget), so round-robin dispatch to an already-busy worker just means
+the new `JOB` message waits in that worker's own signal queue until
+it's free -- not denied, not queued at the kernal, just delayed at the
+target. This is true for a child exactly the same as for a top-level
+job, including the edge case of a child landing (round-robin) on the
+SAME node as its own still-running parent -- which surfaced a real,
+separate bug while building this (see "A real bug this surfaced" below).
+A real load-aware balancer (preferring the least-busy worker) is still
+"not yet built" -- that's a quality-of-placement question, not the
+correctness question this needed answered first.
+
+**A real bug this surfaced**: `node/runtime.lua`'s `remoteRequest()`
+(the nested wait `gmuxapi.*` calls use) used to silently discard any
+fully-reassembled message that wasn't the specific reply it was
+waiting for. Harmless as long as nothing but that reply could ever
+arrive mid-wait -- which stopped being true the instant a child could
+be placed on its own parent's node: the kernal's fresh `JOB` message
+for the child would arrive at that node while it was still blocked
+inside `remoteRequest`, waiting for its own unrelated `SPAWN` reply,
+and got dropped on the floor -- the child's own `JOB` message simply
+vanished, and it never started. Fixed by pushing back (via
+`computer.pushSignal`) anything that isn't the awaited reply, so the
+outer dispatch loop still sees it once the wait resolves. Verified via
+`test/emu/integration_test.lua`'s test 12 (confirmed by reverting the
+fix and watching a child land on its own parent's node and never
+start). Known limitation, flagged rather than hidden: this correctly
+replays a single-chunk message (the common case) but not one that
+needed multiple chunks, since `reassemble()` already discarded the
+earlier chunks on the way to completing this one.
 
 ### Job environment abstraction
 
-Not yet designed in detail, but the shape is clear from the above: a
-dispatched job needs more than `load("local args = ...\n" .. code)`
-gives it today. At minimum it needs a name (see "App identity" below),
-a way to ask the kernal for a child (which gets it the handle above),
-and -- for an `.mxe` app specifically, as opposed to a plain headless
-`JOB` -- a window handle (see "Compositor access" below). What exactly
-this environment looks like (what's exposed as globals, how it differs
-between a plain `JOB` and a named `.mxe` app) is the next real design
-question once the process model above is built.
+Partially answered by what's built: a dispatched job gets the real
+global `jobId` (its own id) and, through `gmuxapi`, a way to ask for a
+child. What's still open is the harder part -- what's exposed to an
+`.mxe` app specifically, as opposed to a plain headless `JOB`, and
+whether that differs from today's shared `gpu`/`gmuxapi`/`yield`
+globals every job already gets regardless of whether it declared a
+name or any orphan policy at all.
 
-### App identity and orphan reclaim
+### App identity and orphan reclaim -- BUILT
 
-An `.mxe` app's identity is its own declared **name** -- not a raw job
-id (those don't survive a relaunch) and not a separately-chosen session
-id. The kernal keeps a **global map: app name -> the job(s) belonging to
-it**. When an app with that name launches again -- even much later,
-even after the kernal itself restarted in between, even if every
-internal id involved has changed -- the kernal can look up that name
-and hand its old orphans straight back to the new instance.
+An `.mxe` app's identity is its own declared **name** (`options.name`
+on `create_headless_process`/`create_graphics_process`) -- not a raw
+job id (those don't survive a relaunch) and not a separately-chosen
+session id. The kernal keeps `appsByName`, a **global map: app name ->
+the job id(s) spawned under it with `orphanPolicy == "orphan"`**. A new
+message type, `GETORPHANS` (`gmuxapi.get_orphans(name)` on the worker
+side), hands back every `{id, node}` handle still registered under
+that name and **removes them from the pool** -- claimed once, not
+re-handed-out to a second caller. When an app with that name launches
+again -- even much later, even if every internal id involved has
+changed in between -- calling `get_orphans` with its own name gets its
+old orphans back.
 
-### Orphan policy: declared at spawn time, not a system-wide rule
+### Orphan policy: declared at spawn time, not a system-wide rule -- BUILT
 
 What happens to a child whose parent died is **not** a single fixed
-policy -- it depends on what that specific app calls for, and the
-parent declares which policy it wants at the moment it asks the kernal
-to create the child:
+policy -- it depends on what that specific app calls for, declared via
+`options.orphan_policy` at the moment it asks the kernal to create the
+child (default: `"orphan"`). Applied by
+`applyOrphanPolicyForChildrenOf`, called the instant the kernal records
+a job as no longer running, for every child of that job:
 
-- **`orphan`** -- the child keeps running untethered. It's cleaned up
-  by a manual kill, by timing out, or by being reclaimed if the parent
-  (same declared name) relaunches, via the app-identity map above.
-- **`kill`** -- cascades. Parent dies, child dies with it.
-- **`promote`** -- the kernal takes direct ownership of the child, as
-  if it had been a top-level job all along. **Only valid if the child
-  is itself self-dependent** -- actually capable of talking to the
-  kernal and operating on its own, protocol-wise, without assuming a
-  parent is mediating for it. Promoting a child that was never meant to
-  be a standalone process (a plain headless number-crunching job, say)
-  would just be wasted cycles keeping something alive that has no way
-  to usefully report its own results or respond to anything on its
-  own -- `promote` is for children that were actually built to stand
-  alone if needed, not a safe default for everything.
+- **`orphan`** -- the child keeps running untethered. Nothing happens
+  mechanically; it's already registered in `appsByName` for reclaim
+  (see above), and stays there until reclaimed. There's no timeout or
+  manual-kill cleanup built yet for an orphan nobody ever reclaims --
+  flagged, not hidden.
+- **`kill`** -- the kernal broadcasts a raw, unchunked `"KILL <id>"`
+  (same convention as boot's own `BOOT`/`CODE`, bypassing the generic
+  `MSG` framing deliberately -- this needs to be checked cheaply at
+  every signal a running job's cooperative loop sees, and a kill
+  message is tiny enough to never need chunking anyway). **Best-effort
+  only**: `node/runtime.lua`'s `runJobCode` only checks for a matching
+  `KILL` at the job's own cooperative `yield()` points -- a child that
+  never yields can't be killed early this way, no sooner than its own
+  instruction-budget circuit breaker would catch it anyway (see "JOB
+  code and the non-yielding timeout"). This is the same fundamental
+  limit as that circuit breaker, not a gap specific to this feature.
+- **`promote`** -- the kernal clears the child's `parent` field and
+  removes it from `appsByName` (it's not seeking reclaim by name
+  anymore -- it's just an ordinary top-level job from here on).
+  **Only valid if the child is itself self-dependent** -- actually
+  capable of talking to the kernal and operating on its own,
+  protocol-wise, without assuming a parent is mediating for it.
+  Promoting a child that was never meant to be a standalone process (a
+  plain headless number-crunching job, say) would just be wasted
+  cycles keeping something alive that has no way to usefully report
+  its own results or respond to anything on its own -- `promote` is
+  for children that were actually built to stand alone if needed, not
+  a safe default for everything. (Nothing currently enforces
+  "self-dependent" -- the kernal takes the declared policy at face
+  value; this is a convention the app author has to actually honor.)
 
 ### Node death vs. planned draining -- two different things
 
@@ -1096,15 +1152,27 @@ designed yet.
 
 ### Still open
 
-Collected in one place, from the discussion above:
+Collected in one place:
 
 - Depth/fan-out caps on recursive parent/child spawning (or whether
-  there's a cap at all).
-- What the kernal does when something asks for more compute and every
-  worker is already busy (queue, deny, or preempt).
+  there's a cap at all) -- no cap is enforced today.
 - The exact shape of the "job environment abstraction" -- what's
-  actually exposed to a dispatched `.mxe` app vs. a plain `JOB`.
-- The persistent-window-handle API's exact shape.
+  actually exposed to a dispatched `.mxe` app vs. a plain `JOB`, beyond
+  the `jobId` global and `gmuxapi` every job already gets today.
+- The persistent-window-handle API's exact shape (semi-live migration
+  and the compositor handle model are both still forward design, not
+  implemented -- see their own sections above).
+- No timeout or manual-kill cleanup for an "orphan"-policy job that's
+  never reclaimed -- it just runs forever, registered in `appsByName`,
+  until something asks for it by name.
+- "promote"'s self-dependence requirement isn't enforced -- the kernal
+  takes the declared policy at face value.
+
+**Resolved while building the rest of this section**: "what the kernal
+does when every worker is already busy" turned out to already have an
+answer in the existing round-robin dispatch (see "Parent/child jobs"
+above) -- not a new design decision, just a finding about what the
+code already did.
 
 **Fixed, ahead of the rest of this section being built**: the
 `kernalAddr`-trust issue flagged above (`node/runtime.lua`'s main loop

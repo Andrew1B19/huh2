@@ -167,7 +167,7 @@ local function remoteRequest(msgType, extra)
 
   local deadline = computer.uptime() + RPC_TIMEOUT
   while computer.uptime() < deadline do
-    local name, _, from, port, _, data = pullSignal(deadline - computer.uptime())
+    local name, a2, from, port, a5, data = pullSignal(deadline - computer.uptime())
     if name == "modem_message" and port == PORT and type(data) == "string" then
       local payload = reassemble(from, data)
       if payload then
@@ -178,6 +178,30 @@ local function remoteRequest(msgType, extra)
           elseif reply.type == "ERROR" then
             return nil, reply.error
           end
+        else
+          -- A real bug, found the hard way: a fully-reassembled
+          -- message that ISN'T the reply we're waiting for used to
+          -- just be silently discarded here -- harmless as long as
+          -- nothing but the awaited reply could ever arrive while
+          -- this loop was waiting. That stopped being true the moment
+          -- a job could ask the kernal for a CHILD: the kernal places
+          -- the child with its own round-robin, which can land it on
+          -- THIS SAME NODE, which immediately sends it a fresh JOB
+          -- message -- arriving right here, mid-wait, while this node
+          -- is still blocked waiting for its OWN SPAWN reply. Silently
+          -- dropping it meant a child ever assigned to its own
+          -- parent's node could never actually start. Pushed back
+          -- instead, so the outer dispatch loop still sees it once
+          -- this wait resolves.
+          --
+          -- Known limitation, flagged rather than hidden: this
+          -- replays correctly for a single-chunk message (the common
+          -- case) but not one that needed multiple chunks --
+          -- reassemble() already consumed and discarded the earlier
+          -- chunks on the way to completing this one, so pushing back
+          -- only the chunk that triggered completion would start a
+          -- fresh reassembly that can never finish on its own.
+          computer.pushSignal(name, a2, from, port, a5, data)
         end
       end
     end
@@ -228,6 +252,16 @@ gpu = setmetatable({}, {
   end,
 })
 
+-- Set by the main loop (below) to this node's own currently-running
+-- job's id, right before running its code -- exposed as a real global
+-- (same reasoning as `gpu`/`gmuxapi`/`yield`: JOB code is load()ed
+-- fresh each time with no visibility into this file's own locals) so
+-- a job can tell the kernal "I am job X" when asking for a child --
+-- see create_headless_process's `parent = jobId` below, and
+-- docs/PROTOCOL.md's ".mxe process model" for why the kernal needs
+-- this to track parent/child relationships at all.
+jobId = nil
+
 -- Muxos-shaped gmux application API. Every one of these is necessarily
 -- a remote call to the kernal, never local-first like `gpu` -- a
 -- "process" is a job on some other physical node and a "window" lives on
@@ -247,12 +281,21 @@ gmuxapi = {
   -- the network, so this takes options.code (a Lua source string, same
   -- convention as a JOB) instead. Fire-and-forget, like gmux's own
   -- version: returns {process = {id, node}} immediately, not the result.
+  --
+  -- `parent = jobId` (this node's own currently-running job, see above)
+  -- is always included automatically -- the calling job never needs to
+  -- know or supply its own id for this to work. `options.orphan_policy`
+  -- ("orphan" (default) / "kill" / "promote") and `options.name` (the
+  -- app identity used for reclaim) implement the parent/child model
+  -- documented in docs/PROTOCOL.md's ".mxe process model" -- see there
+  -- for the full semantics; this is purely wire plumbing.
   create_headless_process = function(options)
     options = options or {}
     if not options.code then
       return nil, "create_headless_process needs options.code (a Lua source string)"
     end
-    local result, err = remoteRequest("SPAWN", {code = options.code, args = options.args, node = options.node})
+    local result, err = remoteRequest("SPAWN", {code = options.code, args = options.args, node = options.node,
+      parent = jobId, appName = options.name, orphanPolicy = options.orphan_policy})
     if err then return nil, err end
     return {process = result}
   end,
@@ -268,7 +311,8 @@ gmuxapi = {
     if not options.code then
       return nil, "create_graphics_process needs options.code (a Lua source string)"
     end
-    local proc, procErr = remoteRequest("SPAWN", {code = options.code, args = options.args, node = options.node})
+    local proc, procErr = remoteRequest("SPAWN", {code = options.code, args = options.args, node = options.node,
+      parent = jobId, appName = options.name, orphanPolicy = options.orphan_policy})
     if not proc then return nil, procErr end
     local win, winErr = remoteRequest("CREATEWINDOW", {
       title = options.name, width = options.width, height = options.height,
@@ -317,6 +361,17 @@ gmuxapi = {
 
   release_fullscreen = function()
     return remoteRequest("RELEASEFULLSCREEN")
+  end,
+
+  -- Hands back the still-unclaimed orphan handles (each {id, node})
+  -- registered under `name` -- the mechanism a relaunched app uses to
+  -- pick up where its last instance's "orphan"-policy children left
+  -- off. Claimed once: the kernal removes them from its own pool the
+  -- moment this returns them, so a second call returns an empty list
+  -- until new orphans accumulate under that name. See
+  -- docs/PROTOCOL.md's "App identity and orphan reclaim".
+  get_orphans = function(name)
+    return remoteRequest("GETORPHANS", {appName = name})
   end,
 }
 
@@ -427,7 +482,27 @@ local function armBudgetHook(co)
   end, "", PREEMPT_INSTRUCTIONS)
 end
 
-local function runJobCode(chunk, args)
+-- A raw, unchunked "KILL <id>" broadcast -- same convention as boot's
+-- own BOOT/CODE, bypassing the generic MSG framing deliberately: this
+-- needs to be checked cheaply, at every signal a running job's
+-- cooperative loop sees, without waiting on chunk reassembly (and a
+-- kill message is tiny -- it never needs to be chunked in the first
+-- place). Sent by the kernal when a "kill"-orphan-policy job's parent
+-- finishes (see kernal/muxos.lua's applyOrphanPolicyForChildrenOf).
+-- Returns true if `sig` (a packed pullSignal() result) is a KILL for
+-- `selfId` specifically -- every other worker running a DIFFERENT job
+-- just sees a non-matching id and ignores it, consistent with this
+-- project's all-broadcast design.
+local function isKillSignalFor(sig, selfId)
+  if sig[1] ~= "modem_message" or sig[4] ~= PORT or type(sig[6]) ~= "string" then return false end
+  local targetId = sig[6]:match("^KILL (%d+)$")
+  return targetId ~= nil and tonumber(targetId) == selfId
+end
+
+-- `selfId` is this job's own id (set as the `jobId` global by the main
+-- loop just before calling this) -- only used here to recognize a KILL
+-- addressed at THIS specific job among the broadcasts every worker sees.
+local function runJobCode(chunk, args, selfId)
   local co = coroutine.create(chunk)
   armBudgetHook(co)
   local ok, a = coroutine.resume(co, args)
@@ -436,8 +511,17 @@ local function runJobCode(chunk, args)
       -- The job's own voluntary yield() -- a brief, bounded pause, not
       -- a wait for anything specific. Resume with no extra argument,
       -- matching coroutine.yield()'s own "returns nothing" convention
-      -- for a bare cooperative pause.
-      yieldToStayResponsive()
+      -- for a bare cooperative pause. This is also the only point a
+      -- "kill"-policy orphan actually CAN be killed early -- a job
+      -- that never yields can't be reached here any sooner than its
+      -- own instruction-budget circuit breaker would catch it anyway.
+      local sig = table.pack(pullSignal(0))
+      if sig.n > 0 and sig[1] ~= nil then
+        if isKillSignalFor(sig, selfId) then
+          return false, "killed (orphan policy, parent no longer running)"
+        end
+        computer.pushSignal(table.unpack(sig, 1, sig.n))
+      end
       armBudgetHook(co)
       ok, a = coroutine.resume(co)
     else
@@ -446,8 +530,13 @@ local function runJobCode(chunk, args)
       -- reply id) -- forward a REAL signal through transparently,
       -- exactly as if the job coroutine were the top-level one, so its
       -- own wait for a specific reply actually completes instead of
-      -- spinning forever on signals it never receives.
+      -- spinning forever on signals it never receives. Still checked
+      -- for a KILL first -- that takes priority over whatever this
+      -- job's own nested wait was hoping to receive.
       local sig = table.pack(pullSignal(type(a) == "number" and a or nil))
+      if isKillSignalFor(sig, selfId) then
+        return false, "killed (orphan policy, parent no longer running)"
+      end
       armBudgetHook(co)
       ok, a = coroutine.resume(co, table.unpack(sig, 1, sig.n))
     end
@@ -483,7 +572,18 @@ while true do
         if not chunk then
           send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = loadErr})
         else
-          local ok, result = runJobCode(chunk, msg.args)
+          -- jobId is this job's OWN id -- `msg.id` IS that id for a JOB
+          -- message (dispatchJob assigns one `id` and uses it both as
+          -- the job's kernal-side identity and this message's own RPC
+          -- id, always the same value, by construction). Exposed as a
+          -- real global so the job's own code can tell the kernal "I
+          -- am job X" when asking for a child
+          -- (gmuxapi.create_headless_process's `parent = jobId`), and
+          -- passed to runJobCode so it can recognize a KILL addressed
+          -- at this specific job.
+          jobId = msg.id
+          local ok, result = runJobCode(chunk, msg.args, msg.id)
+          jobId = nil
           if ok then
             send({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = result})
           else

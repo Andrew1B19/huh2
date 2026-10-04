@@ -292,4 +292,56 @@ do
 end
 print("  OK -- exactly one kernalAddr assignment in the real source, and it's the boot-handoff capture")
 
+print("test 12: parent/child jobs -- orphan/promote/kill policies, applied for real when the parent finishes")
+-- A single job (dispatched via `run`, so it's a plain top-level job
+-- with no parent of its own) spawns THREE children with the three
+-- different orphan policies, then returns their ids. Once this `run`
+-- job itself completes, kernal/muxos.lua's
+-- applyOrphanPolicyForChildrenOf fires for real -- this is the actual
+-- mechanism from docs/PROTOCOL.md's ".mxe process model", not a mock
+-- of it.
+typeLine('run local a=gmuxapi.create_headless_process({code="local t=0 for i=1,2000 do t=t+1 if i%50==0 then yield() end end return t", name="testapp", orphan_policy="orphan"}); local b=gmuxapi.create_headless_process({code="return 123", name="testapp", orphan_policy="promote"}); local c=gmuxapi.create_headless_process({code="local t=0 for i=1,2000 do t=t+1 if i%50==0 then yield() end end return t", name="testapp", orphan_policy="kill"}); return tostring(a.process.id) .. "," .. tostring(b.process.id) .. "," .. tostring(c.process.id)')
+emu:advance(3)
+
+local childIds
+do
+  local screen = renderScreen():gsub("\n", "")
+  local a, b, c = screen:match("(%d+),(%d+),(%d+)")
+  if not a then
+    dumpScreenOnFailure("parent job's spawned child ids")
+    error("could not find the three spawned child ids on screen")
+  end
+  childIds = {orphan = tonumber(a), promote = tonumber(b), kill = tonumber(c)}
+end
+print("  OK -- parent job spawned 3 children: orphan=" .. childIds.orphan ..
+  " promote=" .. childIds.promote .. " kill=" .. childIds.kill)
+
+-- Give the "kill" child's own cooperative loop a chance to actually
+-- receive the KILL broadcast (it only checks at its own yield points --
+-- see node/runtime.lua's runJobCode/isKillSignalFor). This also
+-- exercised a real, separate bug the first time this scenario ran:
+-- the "kill" child happened to land (round-robin) on the SAME node
+-- already running its own parent, and remoteRequest()'s nested wait
+-- was silently discarding the child's own incoming JOB dispatch while
+-- waiting for its unrelated SPAWN reply -- fixed in remoteRequest
+-- itself (see its own comment) by pushing back anything that isn't
+-- the awaited reply instead of dropping it.
+emu:advance(2)
+
+typeLine("processes")
+emu:advance(2)
+assertScreenContains("[" .. childIds.kill .. "] error", "kill-policy child shows as errored")
+assertScreenContains("killed (orphan policy", "kill-policy child's error names the real reason")
+print("  OK -- the kill-policy child was actually killed once its parent finished, not just bookkept")
+
+typeLine('run local list = gmuxapi.get_orphans("testapp") local n = 0 for _ in pairs(list) do n = n + 1 end local firstId = n > 0 and list[1].id or -1 return "count=" .. n .. " id=" .. firstId')
+emu:advance(3)
+assertScreenContains("count=1 id=" .. childIds.orphan, "get_orphans returns exactly the orphan-policy child, not the promoted or killed ones")
+print("  OK -- gmuxapi.get_orphans(\"testapp\") returned exactly the orphan-policy child (" .. childIds.orphan .. "), excluding promote and kill")
+
+typeLine('run local list = gmuxapi.get_orphans("testapp") local n = 0 for _ in pairs(list) do n = n + 1 end return "count=" .. n')
+emu:advance(3)
+assertScreenContains("count=0", "orphans are claimed once -- a second get_orphans call for the same name returns nothing")
+print("  OK -- orphan was claimed once; a second get_orphans call returns none")
+
 print("ALL OK")

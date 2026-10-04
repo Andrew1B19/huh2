@@ -351,10 +351,40 @@ local function nextId()
   return id
 end
 
--- id -> {id, node, status, code, startedAt, finishedAt, result, error}
--- status is "running", "done", or "error".
+-- id -> {id, node, status, code, startedAt, finishedAt, result, error,
+-- parent, appName, orphanPolicy}. status is "running", "done", "error",
+-- or "killed". `parent`/`appName`/`orphanPolicy` are nil for an
+-- ordinary top-level job (REPL `run`/`spawn`, or a SPAWN with no
+-- parent) -- see docs/PROTOCOL.md's ".mxe process model" section for
+-- the full design these implement.
 local jobs = {}
 local jobOrder = {}
+
+-- appName -> {jobId, jobId, ...}. Only ever holds jobs whose
+-- orphanPolicy is "orphan" -- the pool a relaunched app's
+-- gmuxapi.get_orphans(name) draws from (handleGetOrphans, below).
+-- Entries are added at spawn time and removed once reclaimed, so this
+-- never accumulates jobs nobody will ever ask for again except by
+-- genuinely relaunching under the same name.
+local appsByName = {}
+
+local function registerOrphanCandidate(appName, id)
+  if not appName then return end
+  appsByName[appName] = appsByName[appName] or {}
+  local list = appsByName[appName]
+  list[#list + 1] = id
+end
+
+local function unregisterOrphanCandidate(appName, id)
+  if not appName or not appsByName[appName] then return end
+  local list = appsByName[appName]
+  for i, existingId in ipairs(list) do
+    if existingId == id then
+      table.remove(list, i)
+      break
+    end
+  end
+end
 
 -- id -> the RESULT/ERROR/PONG message that answered it. Filled in by
 -- handleModemMessage (see below), read and cleared by waitForReply.
@@ -365,19 +395,74 @@ local replyBox = {}
 -- and handleSpawn() (which must return to the calling worker immediately,
 -- gmux's own create_headless_process/create_graphics_process being
 -- fire-and-forget: you get a handle back right away, not the result).
-local function dispatchJob(code, args, targetAddr)
+-- `parent`/`appName`/`orphanPolicy` are nil for anything dispatched
+-- without a parent (REPL `run`/`spawn`, or a plain SPAWN) -- only a
+-- SPAWN carrying an explicit `parent` (its own job id, which
+-- node/runtime.lua now exposes to running job code as the global
+-- `jobId`) sets these.
+local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy)
   if not targetAddr then
     if #nodeOrder == 0 then
       return nil, "no worker nodes discovered yet -- try 'discover'"
     end
+    -- Round-robin, unconditionally -- this project's answer to "what
+    -- happens when every worker is already busy" is implicit, not an
+    -- admission-control gate: a worker only ever runs one job at a
+    -- time (runJobCode blocks that worker's own main loop until the
+    -- job finishes or is killed), so dispatching to an already-busy
+    -- worker just means the new JOB message waits in that worker's
+    -- own signal queue until it's free -- not denied, not queued at
+    -- the kernal, just delayed at the target. A real load-aware
+    -- balancer (preferring the least-busy worker) is still "not yet
+    -- built" -- see README.md's Status section -- but that's a
+    -- quality-of-placement question, not a correctness gate this
+    -- needed to answer first.
     targetAddr = nodeOrder[nextNode]
     nextNode = (nextNode % #nodeOrder) + 1
   end
   local id = nextId()
-  jobs[id] = {id = id, node = targetAddr, status = "running", code = code, startedAt = computer.uptime()}
+  jobs[id] = {id = id, node = targetAddr, status = "running", code = code, startedAt = computer.uptime(),
+    parent = parent, appName = appName, orphanPolicy = parent and (orphanPolicy or "orphan") or nil}
   jobOrder[#jobOrder + 1] = id
+  if parent and jobs[id].orphanPolicy == "orphan" then
+    registerOrphanCandidate(appName, id)
+  end
   send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args})
   return id, targetAddr
+end
+
+-- Applies a job's declared orphan policy once its PARENT is no longer
+-- running -- called from the generic completion-recording path below,
+-- for every child of whatever job just finished. See docs/PROTOCOL.md
+-- for the policy semantics (orphan/kill/promote) -- this is purely the
+-- mechanical side:
+-- - "orphan": nothing to do -- it just keeps running, already tracked
+--   in appsByName for a future gmuxapi.get_orphans(name) to reclaim.
+-- - "promote": it's now a top-level job in every sense -- clear
+--   `parent` and stop tracking it as reclaimable (nobody declared by
+--   this name will ever "come back" for it; it's independent now).
+-- - "kill": best-effort only -- broadcasts a raw, unchunked "KILL
+--   <id>" (same convention as boot's BOOT/CODE, bypassing the generic
+--   MSG framing since this needs to be checked cheaply and can't wait
+--   on reassembly) that node/runtime.lua's runJobCode checks for at
+--   the job's own cooperative yield points. A job that never yields
+--   can't be killed early this way -- same fundamental limit as the
+--   instruction-budget circuit breaker (see "JOB code and the
+--   non-yielding timeout"), not a gap specific to this feature.
+local function applyOrphanPolicyForChildrenOf(parentId)
+  for _, id in ipairs(jobOrder) do
+    local job = jobs[id]
+    if job.parent == parentId then
+      if job.orphanPolicy == "promote" then
+        unregisterOrphanCandidate(job.appName, id)
+        job.parent = nil
+      elseif job.orphanPolicy == "kill" then
+        modem.broadcast(PORT, "KILL " .. id)
+        job.parent = nil
+      end
+      -- "orphan" (or unset): nothing to do here.
+    end
+  end
 end
 
 local runtimeSource = nil -- loaded lazily and cached, see loadRuntime()
@@ -479,18 +564,46 @@ end
 -- network, so this takes `options.code` (a Lua source string, same
 -- convention as JOB) instead -- the one deliberate shape difference from
 -- the real API, documented in docs/PROTOCOL.md.
+local VALID_ORPHAN_POLICIES = {orphan = true, kill = true, promote = true}
+
 local function handleSpawn(msg)
   if not msg.code then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
       error = "spawn needs options.code (a Lua source string) -- gmux's options.main/main_path can't cross the network"})
     return
   end
-  local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node)
+  if msg.orphanPolicy and not VALID_ORPHAN_POLICIES[msg.orphanPolicy] then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+      error = "orphanPolicy must be one of orphan/kill/promote, got " .. tostring(msg.orphanPolicy)})
+    return
+  end
+  local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node, msg.parent, msg.appName, msg.orphanPolicy)
   if not jobId then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = targetAddr})
     return
   end
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {id = jobId, node = targetAddr}})
+end
+
+-- gmuxapi.get_orphans(name): hands back the still-unclaimed orphan
+-- handles registered under that app name, and removes them from the
+-- pool -- claimed once, not re-handed-out to a second caller. This is
+-- the mechanism a relaunched app uses to pick up where its last
+-- instance's orphaned children left off (see docs/PROTOCOL.md's "App
+-- identity and orphan reclaim").
+local function handleGetOrphans(msg)
+  local list = {}
+  local ids = appsByName[msg.appName]
+  if ids then
+    for _, id in ipairs(ids) do
+      local job = jobs[id]
+      if job then
+        list[#list + 1] = {id = job.id, node = job.node}
+      end
+    end
+    appsByName[msg.appName] = nil
+  end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
 end
 
 -- Both of these just delegate to the compositor (compositor.lua) -- the
@@ -562,6 +675,8 @@ local function handleModemMessage(from, port, data)
     handleGetProcesses(msg)
   elseif msg.type == "SPAWN" then
     handleSpawn(msg)
+  elseif msg.type == "GETORPHANS" then
+    handleGetOrphans(msg)
   elseif msg.type == "CREATEWINDOW" then
     handleCreateWindow(msg)
   elseif msg.type == "GETWINDOWS" then
@@ -586,6 +701,10 @@ local function handleModemMessage(from, port, data)
         else
           job.status, job.error = "error", msg.error
         end
+        -- This job is no longer running -- apply whatever orphan
+        -- policy ITS OWN children declared at spawn time (see
+        -- dispatchJob/applyOrphanPolicyForChildrenOf above).
+        applyOrphanPolicyForChildrenOf(job.id)
       end
     end
   end
@@ -834,8 +953,13 @@ local function printProcesses()
   end
   for _, id in ipairs(jobOrder) do
     local job = jobs[id]
-    print(string.format("[%d] %s on %s%s", job.id, job.status, job.node,
-      job.error and (" -- " .. job.error) or ""))
+    local parentInfo = ""
+    if job.appName or job.orphanPolicy then
+      parentInfo = string.format(" (parent=%s app=%s policy=%s)",
+        job.parent and tostring(job.parent) or "none", tostring(job.appName), tostring(job.orphanPolicy))
+    end
+    print(string.format("[%d] %s on %s%s%s", job.id, job.status, job.node,
+      job.error and (" -- " .. job.error) or "", parentInfo))
   end
 end
 
