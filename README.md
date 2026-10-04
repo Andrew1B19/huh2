@@ -89,6 +89,10 @@ node/runtime.lua       worker's real runtime, served by the kernal (installed as
                        face, gmuxapi (muxos's own, gmux-API-shaped)
 docs/PROTOCOL.md      shared wire format: the boot handshake + the main message protocol +
                        the gmux API translation + the bare-metal kernal design
+test/emu/              a 4-node (1 kernal + 3 workers) test environment, emulating this
+                       project's own verified native primitives -- not the community OCEmu
+                       (needs LÖVE2D, not installable headless here). Boots the REAL,
+                       unmodified repo files and drives the kernal's REPL like a human would.
 smux/                 reference only (see above): a real, standalone OpenOS multiplexer,
                        forked from gmux's backend. Not run on any node in this project.
 gmux/                 reference only (see above): the real graphical multiplexer, vendored
@@ -318,7 +322,13 @@ code (a voluntary `yield()` a job can call to cooperate, plus a hard
 instruction-budget circuit breaker that kills a non-cooperating job
 before it risks the mod killing the whole worker -- see
 docs/PROTOCOL.md for why the obvious "force a yield from a debug hook"
-fix doesn't actually work in Lua 5.3).
+fix doesn't actually work in Lua 5.3) + a 4-node test environment
+(`test/emu/`) that boots the real, unmodified files end to end and
+drives the kernal's REPL like a human would, which caught two genuine
+bugs no isolated unit mock could have (a compositor `flush()` that
+wiped the console's own output, and a job-preemption design that could
+hang a job calling `gmuxapi.*` forever -- see docs/PROTOCOL.md's
+"Hardening found by actually running the real files together").
 Not yet built: a real scheduler (load balancing beyond round-robin, async
 futures/callbacks for `submit()` itself, not just `SPAWN`), node
 health/failure handling, the fullscreen grant's no-automatic-release-on-

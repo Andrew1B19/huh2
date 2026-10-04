@@ -366,10 +366,37 @@ local PREEMPT_INSTRUCTIONS = 2000000
 -- JOB code can call this periodically during a long computation to stay
 -- cooperative; see the header comment above for why this is the only
 -- real way to keep this node responsive during a long job.
+--
+-- Yields a distinct sentinel, not a bare `coroutine.yield()`, for a
+-- real reason found the hard way: job code can ALSO reach `gmuxapi.*`
+-- (e.g. `request_fullscreen()`), which internally calls `remoteRequest()`
+-- -- and THAT does its own nested wait via this same file's `pullSignal`
+-- (`coroutine.yield(timeout)`), expecting to receive the actual network
+-- reply it's waiting for as the resume value. Once job code runs inside
+-- its own wrapped coroutine (`runJobCode`, below), both kinds of yield
+-- are bare `coroutine.yield(...)` calls somewhere down the call stack
+-- with no other way to tell them apart from the outside -- confirmed by
+-- actually hitting this: an early version of this fix treated every
+-- yield as "voluntary cooperation" and swallowed the real reply
+-- `remoteRequest` needed, hanging it forever. The sentinel lets
+-- `runJobCode` give the two cases their correct, different handling:
+-- a voluntary `yield()` gets a brief, bounded service pass; anything
+-- else (a bare number, or nothing) is `pullSignal`'s own wait and gets
+-- a REAL signal transparently forwarded into it, exactly as if the job
+-- coroutine were this node's top-level one.
+local YIELD_COOPERATE = "__cooperate"
+
 function yield()
-  coroutine.yield()
+  coroutine.yield(YIELD_COOPERATE)
 end
 
+-- A brief, bounded "let other things happen" pass for a job's own
+-- voluntary yield() -- pulls one real signal, if any arrived, and
+-- immediately pushes it back (the exact mechanism OpenOS's own boot
+-- code uses, `lib/core/boot.lua`) so the TOP-level loop still gets to
+-- see and service it once this job either finishes or yields again.
+-- Deliberately does NOT try to dispatch it inline here -- that's the
+-- top-level loop's job, not a nested job's.
 local function yieldToStayResponsive()
   local sig = table.pack(pullSignal(0))
   if sig.n > 0 and sig[1] ~= nil then
@@ -401,12 +428,25 @@ local function runJobCode(chunk, args)
   armBudgetHook(co)
   local ok, a = coroutine.resume(co, args)
   while ok and coroutine.status(co) ~= "dead" do
-    -- The job yielded voluntarily (called `yield()`) -- stay responsive
-    -- for one tick's worth of network traffic before resuming it with a
-    -- fresh instruction budget for its next slice.
-    yieldToStayResponsive()
-    armBudgetHook(co)
-    ok, a = coroutine.resume(co)
+    if a == YIELD_COOPERATE then
+      -- The job's own voluntary yield() -- a brief, bounded pause, not
+      -- a wait for anything specific. Resume with no extra argument,
+      -- matching coroutine.yield()'s own "returns nothing" convention
+      -- for a bare cooperative pause.
+      yieldToStayResponsive()
+      armBudgetHook(co)
+      ok, a = coroutine.resume(co)
+    else
+      -- Anything else is the job's OWN internal pullSignal() wait (for
+      -- example gmuxapi.*'s remoteRequest(), waiting on a specific
+      -- reply id) -- forward a REAL signal through transparently,
+      -- exactly as if the job coroutine were the top-level one, so its
+      -- own wait for a specific reply actually completes instead of
+      -- spinning forever on signals it never receives.
+      local sig = table.pack(pullSignal(type(a) == "number" and a or nil))
+      armBudgetHook(co)
+      ok, a = coroutine.resume(co, table.unpack(sig, 1, sig.n))
+    end
   end
   return ok, a
 end

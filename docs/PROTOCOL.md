@@ -791,6 +791,22 @@ design, in `node/runtime.lua`:
   immediately re-pushes with `computer.pushSignal`, the exact mechanism
   OpenOS's own boot code uses) runs at each of its yield points, keeping
   the node responsive for as long as the job keeps cooperating.
+- **`yield()` yields a sentinel (`"__cooperate"`), not a bare
+  `coroutine.yield()`** -- found necessary the hard way, via
+  `test/emu`'s end-to-end integration test (see "Hardening found by
+  actually running the real files together" below): job code can ALSO
+  reach `gmuxapi.*` (e.g. `request_fullscreen()`), which does its OWN
+  nested wait via this same `pullSignal`, expecting the REAL network
+  reply it's waiting for as the resume value. Once job code runs inside
+  `runJobCode`'s wrapped coroutine, both kinds of yield are bare
+  `coroutine.yield(...)` calls somewhere down the call stack with no
+  other way to tell them apart. An earlier version of this fix treated
+  every yield as voluntary cooperation and swallowed the real reply
+  `remoteRequest()` needed, hanging the job forever. The sentinel fixes
+  this: a voluntary `yield()` gets the brief, bounded service pass
+  above; anything else (a bare number, from `pullSignal`'s own timeout
+  argument, or nothing) gets a REAL signal transparently forwarded into
+  it, exactly as if the job coroutine were the node's top-level one.
 - **A hard instruction-budget circuit breaker** -- also `debug.sethook`,
   but erroring instead of attempting to yield. This can't resume a job
   that blows the budget; it protects THIS NODE's availability, not that
@@ -818,6 +834,57 @@ job surviving many slices via `yield()`, a signal arriving mid-job
 getting pushed back correctly, a non-cooperating job killed by the
 circuit breaker, and an ordinary error inside job code still reported
 distinctly from a budget-exceeded kill.
+
+## Hardening found by actually running the real files together
+
+`test/emu/` is a 4-node test environment (1 kernal + 3 workers) built
+on a purpose-written emulator of this project's own verified native
+primitives -- not the community OCEmu, which needs a full LÖVE2D
+graphics runtime not installable headless in this project's dev
+environment (see `test/emu/README.md` for the full design and its
+deliberate simplifications). It boots the REAL, unmodified repo files
+and drives the kernal's REPL by injecting `key_down` signals the way a
+human would, reading back what actually lands on the simulated screen.
+
+This is a different kind of test than everything in `/tmp/test_*.lua`:
+those are hand-copied mirrors of individual functions, each mocking its
+own `gpu`/`component` in isolation. `test/emu` is the first and only
+place the real files run against each other end to end -- and it found
+two genuine bugs within the first session of building it, neither of
+which any isolated unit mock could have caught:
+
+1. **`kernal/compositor.lua`'s `flush()` used to wipe the kernal's own
+   text console.** The console (`termWrite` in `kernal/muxos.lua`)
+   writes directly to the real screen (buffer 0) between flushes, since
+   it isn't a compositor window. `flush()` used to blit its own
+   separately-tracked frame buffer onto buffer 0 wholesale -- mostly
+   blank except where windows had been composited -- erasing the
+   console's entire prior output the moment any window existed, not
+   just the area the window actually covered. No isolated compositor
+   unit test could have caught this: none of them have a console
+   writing to the same screen concurrently. Fixed by syncing the frame
+   buffer FROM the real screen before compositing any newly-dirty
+   window -- one extra full-screen `bitblt` per dirty flush, only when
+   something is actually dirty, preserving the "zero real GPU calls
+   when nothing changed" property. See "The compositor" above for the
+   updated cost accounting.
+2. **`node/runtime.lua`'s job-preemption design could hang a job
+   forever.** Covered in full in "JOB code and the non-yielding
+   timeout" above -- wrapping JOB execution in its own coroutine meant a
+   job calling `gmuxapi.*` (which does its own nested wait for a
+   specific network reply) had that wait's yield mistaken for ordinary
+   voluntary cooperation and swallowed instead of forwarded, hanging
+   the job forever the moment it tried to use `request_fullscreen()` or
+   any other `gmuxapi` call from inside a dispatched `JOB`. Fixed with
+   the `yield()` sentinel described there.
+
+Both were caught by scenarios that exercise real cross-subsystem
+interaction (a worker's dispatched `JOB` code calling `gmuxapi`; a
+window being created while the console has prior output on screen) --
+exactly the category of bug a unit-mock suite structurally cannot
+reach, since each mock isolates the one function under test from
+everything else that would normally be running concurrently on real
+hardware.
 
 ## Measured vs. documented latency
 

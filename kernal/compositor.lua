@@ -315,13 +315,39 @@ end
 -- frame buffer onto the real screen with ONE bitblt -- but only if
 -- something actually changed (frameDirty), so a quiet tick costs zero
 -- real GPU calls. Meant to be called at most once per tick by the
--- caller (muxos.lua's background dispatcher thread); this function
--- itself doesn't rate-limit anything -- calling it twice in the same
--- tick just does the compositing work twice, redundantly but not
--- incorrectly.
+-- caller (kernal/muxos.lua's event loop); this function itself doesn't
+-- rate-limit anything -- calling it twice in the same tick just does
+-- the compositing work twice, redundantly but not incorrectly.
+--
+-- **Real bug found via test/emu's integration test, not a unit mock**:
+-- the frame buffer used to be composited into as if it were the only
+-- thing ever drawn to the screen -- but kernal/muxos.lua's own text
+-- console (termWrite) writes directly to the real screen (buffer 0)
+-- between flushes, since the console isn't a compositor window. Before
+-- this fix, the very first flush after any window existed would blit
+-- the ENTIRE frame buffer onto buffer 0, wiping out the console's own
+-- prior output everywhere the frame buffer was blank -- not just where
+-- the window actually was. Caught running the real, unmodified files
+-- end to end for the first time (every existing unit test mocks gpu in
+-- isolation, so none of them had a console writing to the same screen
+-- concurrently to catch this).
+--
+-- Fixed by syncing the frame buffer FROM the real screen before
+-- compositing any newly-dirty window -- this costs one extra full-
+-- screen bitblt per dirty flush (still O(1), still at most once per
+-- flush, not per window), but only when something is actually dirty,
+-- preserving the "zero real GPU calls when nothing changed" property.
 function M.flush()
   local gpu = kernalGpu()
   if not gpu or not frameBuffer then return end
+  local anyDirty = false
+  for i = 1, #windowOrder do
+    if windows[windowOrder[i]].dirty then anyDirty = true; break end
+  end
+  if anyDirty then
+    local w, h = gpu.getResolution()
+    gpu.bitblt(frameBuffer, 1, 1, w, h, 0, 1, 1)
+  end
   for i = 1, #windowOrder do
     compositeWindow(gpu, i)
   end
