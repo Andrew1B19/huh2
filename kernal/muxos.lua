@@ -19,6 +19,7 @@
 local component = require("component")
 local event = require("event")
 local computer = require("computer")
+local thread = require("thread")
 
 local PORT = 4477
 local TIMEOUT = 5 -- seconds to wait for a worker reply before giving up
@@ -86,6 +87,18 @@ local exclusiveFullscreenOwner = nil
 -- recognizable without claiming exact parity with its "waiting"/"dead".
 local jobs = {}
 local jobOrder = {}
+
+-- id -> the RESULT/ERROR/PONG message that answered it. Filled in ONLY
+-- by pump() (see below), read and cleared by waitForReply(). This is
+-- what lets pump() run exclusively inside the background dispatcher
+-- thread (started near the bottom of this file) without a second,
+-- independent poller: every synchronous wait (submit/listComponents/
+-- invoke/pingOnce) checks this shared table and yields with os.sleep(0)
+-- between checks, instead of calling event.pull itself. Two independent
+-- `event.pull(0, "modem_message")` callers would race over the same
+-- queue -- whichever drains a given reply first keeps it, silently
+-- starving the other -- so there must be exactly one.
+local replyBox = {}
 
 local function send(msg)
   modem.broadcast(PORT, serialize(msg))
@@ -292,66 +305,76 @@ local function handleGetProcesses(msg)
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
 end
 
--- Pull one pending modem message, if any, without blocking. Used by
--- discovery, submit()'s wait loop, and the REPL's startup discover(1)
--- call. Incoming BOOT requests and LIST/INVOKE requests (from a worker
--- calling back into the kernal) are serviced here directly and never
--- returned -- they aren't a reply anything is waiting on.
+-- Pull and fully handle one pending modem message, if any; never
+-- blocks. This is the ONLY function in the whole program allowed to
+-- call event.pull(0, "modem_message") -- see replyBox's comment above
+-- for why having a second independent poller would be a real bug, not
+-- just a style issue. A request (BOOT/LIST/INVOKE/.../RELEASEFULLSCREEN)
+-- is serviced immediately, right here. A reply (PONG/RESULT/ERROR) is
+-- stashed into replyBox for whoever's waiting on that id (waitForReply,
+-- below) to pick up -- never acted on directly here. Returns true if it
+-- did anything (including "received something irrelevant"), false if
+-- the queue was simply empty, so `while pump() do end` drains it.
 --
--- Caveat: this only runs while something is actively polling (discover,
--- awaitReply, pingOnce). While the REPL is blocked on io.read() at the
--- prompt, nothing pumps the modem at all, so a worker's BOOT or remote
--- call can sit unanswered until the next command triggers a pump()
--- somewhere. A worker's own boot loop retries every 5s, so it recovers
--- once a command does, but a kernal that's sitting idle at the prompt
--- the moment a worker powers on will stall it for a while. Fixing that
--- needs real concurrency (a background thread/event.listen), which is
--- exactly the kind of thing the "multi-threading kernel API" is meant to
--- eventually provide -- not done here.
+-- Called exclusively from the background dispatcher thread started near
+-- the bottom of this file -- which is what finally closes the old gap
+-- here: the kernal now services requests and discovery continuously,
+-- not just "whenever a REPL command happens to poll." Confirmed from
+-- OpenOS's own source (lib/thread.lua, boot/02_os.lua) that this
+-- actually works: threads are real coroutines cooperatively scheduled
+-- through the same event.pull mechanism, and os.sleep always yields at
+-- least once (`repeat event.pull(...) until deadline`) -- so the
+-- background thread keeps running even while the REPL is blocked on
+-- io.read() at the prompt.
 local function pump()
   local name, _, from, port, _, data = event.pull(0, "modem_message")
-  if name and port == PORT and type(data) == "string" then
-    local bootFrom = data:match("^BOOT (.+)$")
-    if bootFrom then
-      serveBoot(bootFrom)
-      return nil
-    end
-    local msg = deserialize(data)
-    if type(msg) == "table" and msg.from and msg.from ~= selfAddr then
-      if msg.type == "HELLO" or msg.type == "PONG" then
-        noteNode(msg.from)
-      elseif msg.to == selfAddr and msg.type == "LIST" then
-        handleList(msg)
-        return nil
-      elseif msg.to == selfAddr and msg.type == "INVOKE" then
-        handleInvoke(msg)
-        return nil
-      elseif msg.to == selfAddr and msg.type == "GETPROCESSES" then
-        handleGetProcesses(msg)
-        return nil
-      elseif msg.to == selfAddr and msg.type == "SPAWN" then
-        handleSpawn(msg)
-        return nil
-      elseif msg.to == selfAddr and msg.type == "CREATEWINDOW" then
-        handleCreateWindow(msg)
-        return nil
-      elseif msg.to == selfAddr and msg.type == "GETWINDOWS" then
-        handleGetWindows(msg)
-        return nil
-      elseif msg.to == selfAddr and msg.type == "REQUESTFULLSCREEN" then
-        handleRequestFullscreen(msg)
-        return nil
-      elseif msg.to == selfAddr and msg.type == "RELEASEFULLSCREEN" then
-        handleReleaseFullscreen(msg)
-        return nil
-      elseif msg.to == selfAddr and (msg.type == "RESULT" or msg.type == "ERROR")
-          and jobs[msg.id] and jobs[msg.id].status == "running" then
-        -- Generic job-completion recording: covers BOTH a submit()-dispatched
-        -- job (something is actively awaitReply()-ing on it, which still
-        -- gets this same msg via the `return msg` below) AND a
-        -- handleSpawn()-dispatched one (fire-and-forget -- nothing is
-        -- waiting locally, so this is the ONLY place its completion is
-        -- ever recorded).
+  if not (name and port == PORT and type(data) == "string") then
+    return false
+  end
+
+  local bootFrom = data:match("^BOOT (.+)$")
+  if bootFrom then
+    serveBoot(bootFrom)
+    return true
+  end
+
+  local msg = deserialize(data)
+  if type(msg) ~= "table" or not msg.from or msg.from == selfAddr then
+    return true
+  end
+
+  if msg.type == "HELLO" or msg.type == "PONG" then
+    noteNode(msg.from)
+  end
+  if msg.to ~= selfAddr then
+    return true
+  end
+
+  if msg.type == "LIST" then
+    handleList(msg)
+  elseif msg.type == "INVOKE" then
+    handleInvoke(msg)
+  elseif msg.type == "GETPROCESSES" then
+    handleGetProcesses(msg)
+  elseif msg.type == "SPAWN" then
+    handleSpawn(msg)
+  elseif msg.type == "CREATEWINDOW" then
+    handleCreateWindow(msg)
+  elseif msg.type == "GETWINDOWS" then
+    handleGetWindows(msg)
+  elseif msg.type == "REQUESTFULLSCREEN" then
+    handleRequestFullscreen(msg)
+  elseif msg.type == "RELEASEFULLSCREEN" then
+    handleReleaseFullscreen(msg)
+  elseif msg.type == "PONG" or msg.type == "RESULT" or msg.type == "ERROR" then
+    if msg.id then
+      replyBox[msg.id] = msg
+      -- Generic job-completion recording: covers BOTH a submit()-dispatched
+      -- job (something is actively waitForReply()-ing on it, which still
+      -- picks up this same msg from replyBox) AND a handleSpawn()-dispatched
+      -- one (fire-and-forget -- nothing is waiting locally, so this is the
+      -- ONLY place its completion is ever recorded).
+      if (msg.type == "RESULT" or msg.type == "ERROR") and jobs[msg.id] and jobs[msg.id].status == "running" then
         local job = jobs[msg.id]
         job.finishedAt = computer.uptime()
         if msg.type == "RESULT" then
@@ -360,33 +383,42 @@ local function pump()
           job.status, job.error = "error", msg.error
         end
       end
-      return msg
     end
   end
+  return true
 end
 
+-- Broadcasts PING and just waits out `wait` seconds -- the background
+-- thread's own pump() calls are what actually process the HELLO/PONG
+-- replies into `nodes` (noteNode) during that window; this doesn't poll
+-- the modem itself.
 local function discover(wait)
   send({type = "PING", from = selfAddr})
-  local deadline = computer.uptime() + (wait or 1)
-  while computer.uptime() < deadline do
-    pump()
-  end
+  os.sleep(wait or 1)
 end
 
--- Block until a RESULT/ERROR for `id` comes back from `addr`, or time out.
-local function awaitReply(id, addr)
-  local deadline = computer.uptime() + TIMEOUT
+-- Block until pump() (running in the background thread) stashes a reply
+-- for `id` into replyBox, or time out. The one shared wait primitive
+-- behind submit()/listComponents()/invoke()/pingOnce() -- none of them
+-- poll the modem themselves any more.
+local function waitForReply(id, addr, timeout)
+  local deadline = computer.uptime() + (timeout or TIMEOUT)
   while computer.uptime() < deadline do
-    local msg = pump()
-    if type(msg) == "table" and msg.id == id and msg.to == selfAddr then
-      if msg.type == "RESULT" then
-        return msg.result
-      elseif msg.type == "ERROR" then
-        return nil, msg.error
-      end
+    local msg = replyBox[id]
+    if msg then
+      replyBox[id] = nil
+      return msg
     end
+    os.sleep(0)
   end
-  return nil, "timed out waiting for " .. addr
+  return nil, "timed out waiting for " .. tostring(addr)
+end
+
+local function awaitReply(id, addr)
+  local msg, err = waitForReply(id, addr)
+  if not msg then return nil, err end
+  if msg.type == "RESULT" then return msg.result end
+  return nil, msg.error
 end
 
 -- Submit `code` (compiled as a chunk and called with `args` as its only
@@ -428,14 +460,9 @@ end
 local function pingOnce(addr, id)
   local sentAt = computer.uptime()
   send({type = "PING", from = selfAddr, to = addr, id = id})
-  local deadline = sentAt + TIMEOUT
-  while computer.uptime() < deadline do
-    local msg = pump()
-    if type(msg) == "table" and msg.type == "PONG" and msg.id == id and msg.to == selfAddr then
-      return computer.uptime() - sentAt
-    end
-  end
-  return nil, "timed out waiting for " .. addr
+  local msg, err = waitForReply(id, addr)
+  if not msg then return nil, err end
+  return computer.uptime() - sentAt
 end
 
 local function pingReport(addr, count)
@@ -600,5 +627,32 @@ local function repl()
     end
   end
 end
+
+-- Background dispatcher: the sole caller of pump() (see its own comment
+-- for why), draining everything currently queued every iteration -- the
+-- network side isn't rate-limited (modem.send/broadcast aren't `direct`
+-- calls, see docs/PROTOCOL.md's call-budget section) so there's no
+-- reason to throttle message handling to once per tick. compositor.flush()
+-- IS called once per iteration, though, which -- paced by the os.sleep(0.05)
+-- below -- is the "upper bound of once per tick" for the real screen
+-- write: every dirty window composited, at most one real bitblt to the
+-- screen, however many CREATEWINDOW calls arrived since the last tick.
+-- pcall-wrapped so one bad message or a draw-code error can't silently
+-- kill this thread forever -- without it, an uncaught error here would
+-- quietly disable boot-serving, every remote-component handler, AND the
+-- compositor for the rest of the kernal's uptime, with no obvious symptom
+-- beyond "nothing responds any more."
+thread.create(function()
+  while true do
+    local ok, err = pcall(function()
+      while pump() do end
+      compositor.flush()
+    end)
+    if not ok then
+      print("background dispatcher error (continuing): " .. tostring(err))
+    end
+    os.sleep(0.05) -- ~1 tick
+  end
+end)
 
 repl()

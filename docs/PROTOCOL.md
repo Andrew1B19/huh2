@@ -138,7 +138,42 @@ calls a real `gpu.*` method. `kernal/muxos.lua`'s `handleCreateWindow`/
 `compositor.createWindow()`/`compositor.listWindows()`; nothing else in
 `muxos.lua` touches `component.gpu` directly any more.
 
-That would be undermined by the generic `INVOKE` bridge, though: before
+**How it actually composites, adapted from gmux's real desktop**
+(`gmux/lib/gmux/frontend/graphics.lua`'s `Block`/`get_boxes`/
+`subtract_rectangle` -- not just its bookkeeping shape this time):
+
+- Windows are kept in `windowOrder`, a Z-ORDERED list (index 1 =
+  topmost), same convention gmux uses. A new window is inserted above
+  every existing window at the same or lower `layer`.
+- **Occlusion culling**: before compositing a window, `visibleBoxes()`
+  subtracts the rectangle of every window ABOVE it from its own
+  rectangle (`subtractRectangle`, pure geometry, ported faithfully),
+  leaving 0 (fully covered), 1 (unoccluded), or several disjoint
+  fragments (partially covered) -- verified with a window fully
+  interior to another, correctly splitting into exactly 4 strips whose
+  combined area matches the expected remainder.
+- **Dirty tracking**: a window only gets re-composited if `win.dirty` is
+  true (set by `createWindow`, cleared once composited) -- this is the
+  one-shot-draw analogue of gmux's `vgpu._is_dirty()` polling; we don't
+  have a live source to poll, so "dirty" just means "changed since the
+  last flush" instead of "changed since the last frame."
+- **A persistent frame buffer**: windows composite into it (buffer-to-
+  buffer `bitblt` -- confirmed from `GraphicsCard.scala`'s own doc
+  comment that `bitblt`'s `dst` isn't limited to the screen), and
+  `flush()` does exactly one `bitblt` from the frame buffer to the real
+  screen (buffer 0) -- and only if anything actually changed
+  (`frameDirty`). Verified: a flush with nothing dirty costs zero real
+  GPU calls; a flush with one new window costs exactly one buffer
+  composite plus one screen blit, not two separate screen writes.
+
+This is what "batch draw calls responsibly, upper bound once per tick"
+actually means in implementation: `flush()` doesn't rate-limit itself --
+calling it twice in one tick just repeats the (cheap, now-dirty-free)
+work -- the bound comes from *how often it's called*, which is the
+background dispatcher thread below, not from anything in `compositor.lua`
+itself.
+
+This would be undermined by the generic `INVOKE` bridge, though: before
 this, a worker's `gpu` face could reach the kernal's real gpu directly
 through `INVOKE`, completely bypassing the compositor's window registry.
 `handleInvoke` now checks `isDisplayComponent(address)` (true for the
@@ -208,22 +243,27 @@ vgpu/vscreen; muxos's doesn't have that per-job isolated surface yet.
 into a window via a `func(gpu)` callback -- a function value, which
 can't cross the network either. muxos's `create_window` takes
 `options.code` instead (run ON the kernal, with a `gpu` local already
-pointed at the allocated buffer -- `drawIntoBuffer`), and this single
-call stands in for both of gmux's -- there's no meaningful distinction
-between "draw once into a buffer" (`create_window_buffer`) and "bind a
-live source" (`create_window`) when drawing is already a one-shot
-remote call by construction, so muxos doesn't expose two separate
-functions for it. `createWindow` allocates a GPU buffer
-(`gpu.allocateBuffer`, erroring cleanly on a Tier 1 GPU that doesn't
-support buffers), runs `code` against it if given, blits it onto the
-kernal's real screen ONCE at `(x, y)` (`gpu.bitblt(0, x, y, w, h, buffer,
-1, 1)` -- the exact call shape gmux's own `graphics.lua` uses), and
-remembers it in `windows`. **This is not gmux's desktop**: no layering,
-no dragging, no resizing, no input routing by topmost-window-under-cursor
-(`gmux/lib/gmux/frontend/windows.lua`/`graphics.lua`, 482 + 345 lines,
-none of it ported) -- just enough bookkeeping to make `create_window`/
-`get_windows` real. A window also never redraws itself; "updating" one
-means calling `create_window` again.
+pointed at the allocated buffer -- `compositor.lua`'s `drawIntoBuffer`),
+and this single call stands in for both of gmux's -- there's no
+meaningful distinction between "draw once into a buffer"
+(`create_window_buffer`) and "bind a live source" (`create_window`) when
+drawing is already a one-shot remote call by construction, so muxos
+doesn't expose two separate functions for it.
+
+`kernal/compositor.lua` does adapt real pieces of gmux's actual desktop
+now, not just its bookkeeping shape -- see "The compositor" above for
+the full mechanism (z-order, occlusion culling via rectangle
+subtraction, dirty tracking, a persistent frame buffer composited into
+and flipped to the real screen with one `bitblt` per `flush()`, adapted
+from `gmux/lib/gmux/frontend/graphics.lua`'s `Block`/`get_boxes`/
+`subtract_rectangle`). **Still not gmux's full desktop**: no dragging,
+no resizing, no input routing (`gmux/lib/gmux/frontend/windows.lua`, 482
+lines, wasn't touched) -- and still character-cell only, like gmux
+itself and like the real GPU hardware (`get`/`set`/`copy`/`fill`/
+`bitblt` all operate on an `api.internal.TextBuffer` in
+`GraphicsCard.scala` -- there is no pixel/framebuffer API in OC at all).
+A window also never redraws itself; "updating" one means calling
+`create_window` again, which marks it dirty for the next `flush()`.
 
 **`get_backend`/`get_graphics`/`get_process`/`show_error`**: not
 translated at all. The first two return gmux's own backend/graphics
@@ -232,18 +272,42 @@ same-process internals, not something a remote job could hold a
 reference to); `get_process`/`show_error` are plausible small
 additions but haven't been done.
 
-One real limitation of this symmetric design as built: the kernal only
-services an incoming `BOOT`/`LIST`/`INVOKE` request while something is
-actively polling the modem (`discover`, `awaitReply`, `pingOnce`). While
-the REPL is blocked on `io.read()` at the `muxos>` prompt, nothing pumps
-the modem at all, so a worker's boot or remote call can sit unanswered
-until the next REPL command happens to trigger a poll. A worker's own
-boot loop retries every 5s, so it recovers once a command does -- but a
-kernal that's sitting idle at the prompt the moment a worker powers on
-will stall that worker's boot for a while. Fixing that for real needs the
-kernal to service the network in the background while still reading the
-prompt -- exactly what a "multi-threading kernel API" would need to
-provide generally, not something patched in just for this.
+**Resolved**: the kernal used to only service an incoming request while
+something was actively polling the modem (`discover`, `awaitReply`,
+`pingOnce`), which meant a worker's boot or remote call could sit
+unanswered while the REPL was blocked on `io.read()` at the prompt. Fixed
+with a real background dispatcher thread (`thread.create(...)` near the
+bottom of `muxos.lua`) that calls `pump()` continuously and `compositor.flush()`
+once per iteration, paced by `os.sleep(0.05)` (~1 tick). Confirmed from
+OpenOS's own source this actually works while the REPL blocks: `lib/
+thread.lua` implements threads as real coroutines cooperatively scheduled
+through the same `event.pull` mechanism, and `os.sleep` (`boot/02_os.lua`:
+`repeat event.pull(deadline - computer.uptime()) until deadline`) always
+yields at least once, even for `os.sleep(0)` -- so the background thread
+keeps running regardless of what the foreground is doing.
+
+This introduced a real hazard that needed a specific fix, not just "add
+a thread": two independent pollers both calling
+`event.pull(0, "modem_message")` would race over the same queue --
+whichever drains a given reply first keeps it, silently starving the
+other. So `pump()` is now the ONLY function allowed to touch the event
+queue at all, called exclusively from the background thread. Every
+synchronous wait (`awaitReply`/`pingOnce`, via the shared `waitForReply`)
+no longer polls the modem itself -- it just checks a shared table
+(`replyBox`, filled in by `pump()`) and yields with `os.sleep(0)` between
+checks. Verified with a mocked harness: a reply queued before a wait
+starts, a reply arriving mid-wait, an unsolicited request serviced
+directly without ever landing in `replyBox`, and the timeout path.
+
+The background loop is `pcall`-wrapped around its per-iteration work --
+without that, an uncaught error in any handler (a bad `INVOKE`, a window
+draw-code bug, anything) would silently kill the thread forever, quietly
+disabling boot-serving, every remote-component handler, AND the
+compositor for the rest of the kernal's uptime, with no symptom beyond
+"nothing responds any more." One real gap left: if the thread itself
+fails to start, or OpenOS's thread scheduler misbehaves, there's no
+watchdog restarting it -- not handled, same honesty-over-coverage
+standard as everything else flagged in this doc.
 
 ## Assumptions this depends on
 
@@ -279,6 +343,42 @@ of one `CODE <source>`, and `bios.lua`'s boot loop reassembles them by
 index regardless of arrival order (see "Boot protocol" above) -- this
 needed to actually be built, not just flagged, once `runtime.lua`
 crossed the line.
+
+## Character cells, not pixels -- and what "bitmap windows" means given that
+
+Confirmed from `GraphicsCard.scala`: `get`/`set`/`copy`/`fill`/`bitblt`
+all operate on an `api.internal.TextBuffer` -- a codepoint plus a
+foreground and background color per cell. There is no pixel or raw
+framebuffer API anywhere in OC's GPU/screen hardware. gmux's own desktop
+is character-mode for exactly this reason -- there's no lower level to
+drop to.
+
+The intended direction for muxos is a **hybrid** desktop: character-mode
+windows work the same way (this is what's built), but the compositor
+should also be able to composite bitmap-ish content -- a toolbar, icons,
+a desktop background image -- and support dedicated "bit windows." Given
+the hardware constraint above, that can only ever mean sub-cell encoding
+on top of the same character grid, not a real framebuffer. The two
+established techniques:
+
+- **Half-block** (`▀`/`▄`/`█`/space, U+2580-range): 1 column x 2 rows of
+  sub-pixels per cell, with TWO real colors per cell (foreground = top
+  half, background = bottom half). Best fit for a toolbar/icons/wallpaper,
+  where distinct color matters more than raw density.
+- **Braille** (U+2800 + an 8-bit dot pattern): 2 columns x 4 rows of
+  sub-pixels per cell -- higher density, but only one effective color
+  per cell (dots are one color against the background), so it's suited
+  to line art/outlines, not full-color images.
+
+Neither is built yet. A "bit window" would need an encoder (pixel grid
+-> character+fg+bg triples, run-length-batched into as few `gpu.set`
+calls as possible -- the same call-minimization lesson as everything
+else in this doc) sitting alongside `compositor.lua`'s existing
+character-mode `drawIntoBuffer`, with the window registry's model
+(buffer, dirty flag, Z-order, occlusion) applying equally to both kinds
+of window -- that part of the redesign above was written generically
+enough to not need changing when bit windows arrive, but the encoder
+itself is a distinct, not-yet-started piece of work.
 
 ## Call budget: what's actually rate-limited, and what isn't
 

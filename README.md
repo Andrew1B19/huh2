@@ -7,14 +7,19 @@ the kernal is the scheduler/front-end.
 
 - **Kernal (1 node)** -- boots a normal OpenOS, is the bootstrap/scheduler
   and the only node you actually interact with. Runs `kernal/muxos.lua`
-  plus `kernal/compositor.lua`, a sibling module it loads via `dofile`.
-  The compositor is the ONLY file in this whole project that makes a
-  real `gpu.*` call -- "only the display node actually needs to make
-  those budgeted calls for real" (every GPU method is a per-tick-budgeted
-  call in OC's own source, see docs/PROTOCOL.md), enforced structurally
-  rather than by convention. The kernal also holds `node/runtime.lua` on
-  its own disk and serves it to workers at boot (see below) -- it's the
-  authoritative source for what a worker runs.
+  plus `kernal/compositor.lua`, a sibling module it loads via `dofile`,
+  and a background dispatcher thread (`thread.create`) that services the
+  network and flushes the compositor continuously, even while the REPL
+  is blocked reading the prompt. The compositor is the ONLY file in this
+  whole project that makes a real `gpu.*` call -- "only the display node
+  actually needs to make those budgeted calls for real" (every GPU
+  method is a per-tick-budgeted call in OC's own source, see
+  docs/PROTOCOL.md), enforced structurally rather than by convention,
+  and it batches them: every window composites into a persistent frame
+  buffer, with at most one real screen write per flush, which the
+  background thread calls at most once per tick. The kernal also holds
+  `node/runtime.lua` on its own disk and serves it to workers at boot
+  (see below) -- it's the authoritative source for what a worker runs.
 - **Workers (3 nodes)** -- no OS, no disk, on purpose. `node/bios.lua` is
   the only thing flashed onto each one's EEPROM, and it's tiny: open a
   Network Card, ask the kernal for `node/runtime.lua`'s source, `load()`
@@ -133,8 +138,15 @@ its id, without waiting for it to finish (unlike `run`) -- the REPL
 exposes this mainly to exercise the same fire-and-forget path a
 worker's `gmuxapi.create_headless_process()` uses. `window <title> <x>
 <y> <width> <height> <lua code>` allocates a GPU buffer, runs the code
-against it (with `gpu` bound to the buffer), blits it onto the kernal's
-real screen once, and remembers it; `windows` lists what's been created.
+against it (with `gpu` bound to the buffer), and marks it dirty; the
+actual real screen write happens in the background dispatcher's next
+`compositor.flush()` (at most once per tick), not immediately when you
+run the command. `windows` lists what's been created. Overlapping
+windows are handled correctly -- occlusion culling means a window
+covered by another doesn't get needlessly re-composited, and a
+partially-covered one blits only its actually-visible fragments. See
+docs/PROTOCOL.md's "The compositor" section for the mechanism, adapted
+from gmux's real `graphics.lua`.
 
 `ping <node> [count]` times a round-trip PING/PONG with that node (default
 3 tries) and reports min/avg/max in milliseconds -- useful for measuring
@@ -159,9 +171,12 @@ has none. This is the first slice of "run OpenOS-API-shaped code on a
 worker, as close to native as makes sense, forwarding to the kernal only
 when something genuinely isn't local" -- not full OpenOS-library
 compatibility yet, just the dispatch pattern proven on one component
-type (`gpu`). See docs/PROTOCOL.md for the one known gap (the kernal only
-services an incoming boot/remote request while something is actively
-polling, not while the REPL is blocked at its prompt).
+type (`gpu`). The old gap here (the kernal only serviced an incoming
+request while something was actively polling, not while the REPL was
+blocked at its prompt) is resolved now by the background dispatcher
+thread -- see docs/PROTOCOL.md for how that avoids a real race (two
+independent pollers draining the same event queue can steal each
+other's replies) rather than just papering over it.
 
 **One exception to that symmetry**: `INVOKE` targeting the kernal's real
 gpu or its bound screen is blocked -- those are the compositor's, and
@@ -221,18 +236,28 @@ way) + a symmetric remote-component bridge (kernal<->worker, used by
 workers to reach kernal hardware they don't have locally, e.g. `gpu`),
 gated so direct gpu/screen access requires an exclusive fullscreen grant
 + a compositor module (`kernal/compositor.lua`) that's the sole real
-gpu-touching code in the project + five translated pieces of gmux's
+gpu-touching code in the project, with Z-order, occlusion culling, dirty
+tracking, and a persistent frame buffer flipped to the real screen with
+one `bitblt` per flush, adapted from gmux's real `graphics.lua` + a
+background dispatcher thread that runs the network and the compositor
+continuously regardless of what the REPL is doing, built on a central
+reply-table (`replyBox`) so synchronous waits and the background poller
+can't steal each other's messages + five translated pieces of gmux's
 application API (`get_processes`, `create_headless_process`,
 `create_graphics_process`, `create_window`, `get_windows`) plus the
 fullscreen-grant pair + latency probing.
 Not yet built: a real scheduler (load balancing beyond round-robin, async
 futures/callbacks for `submit()` itself, not just `SPAWN`), node
-health/failure handling, a real multi-threading kernel API (the
-REPL-blocks-the-network gap still stands, and so does the fullscreen
-grant's no-automatic-release-on-crash gap), broader OpenOS-library-shaped
-coverage beyond `gpu`, a real windowing system (layering/dragging/
-resizing/input routing) rather than the current one-shot-blit registry,
-per-job isolated drawing surfaces (so `create_graphics_process`'s job and
-its window are actually wired together), multi-monitor support
-(explicitly deferred until the single-GPU case works end to end), and
-anything workload-specific.
+health/failure handling, the fullscreen grant's no-automatic-release-on-
+crash gap, a watchdog if the background thread itself fails to start,
+broader OpenOS-library-shaped coverage beyond `gpu`, dragging/resizing/
+input routing (still not gmux's full desktop), per-job isolated drawing
+surfaces (so `create_graphics_process`'s job and its window are actually
+wired together), bitmap/"bit window" support (half-block or braille
+sub-cell encoding over the same character-cell hardware -- OC's GPUs
+have no pixel API at all, confirmed from source -- needed for a toolbar,
+icons, or a desktop background image; the window/compositor model is
+generic enough to not need rework when this lands, but the encoder
+itself doesn't exist yet), multi-monitor support (explicitly deferred
+until the single-GPU case works end to end), and anything
+workload-specific.

@@ -6,12 +6,25 @@
 -- every real draw call here, instead of leaving them scattered across
 -- muxos.lua, is what makes that true rather than just asserted.
 --
--- NOT gmux's real desktop: no layering, dragging, resizing, or input
--- routing (gmux/lib/gmux/frontend/windows.lua + graphics.lua, 482 + 345
--- lines, weren't ported). What this gives: allocate a GPU buffer, let
--- code draw into it, blit it onto the real screen once, and remember it
--- existed. Enough to make create_window/get_windows real without
--- pretending there's a desktop here.
+-- The z-order/occlusion-culling/dirty-tracking model below is adapted
+-- from gmux's real one (gmux/lib/gmux/frontend/graphics.lua's Block/
+-- get_boxes/subtract_rectangle) -- not a port of its live vgpu-source
+-- polling (`need_copy()` asking a virtual gpu "has anything drawn into
+-- you changed since last copy", which assumes an app sharing this Lua
+-- state; our windows are one-shot draws from code, possibly dispatched
+-- over the network, so "dirty" here just means "drawn since last
+-- flush", set once by createWindow rather than polled continuously).
+-- Still NOT gmux's full desktop: no dragging, resizing, or input
+-- routing (gmux/lib/gmux/frontend/windows.lua, 482 lines, wasn't
+-- touched). What this gives: allocate a GPU buffer per window, let code
+-- draw into it, composite every dirty, unoccluded window into one
+-- persistent frame buffer, and flip that onto the real screen with a
+-- SINGLE bitblt -- at most once per flush() call, which muxos.lua calls
+-- at most once per tick from its background dispatcher thread, not once
+-- per window. This is the actual implementation of "only the display
+-- node makes those budgeted calls for real, and batches them
+-- responsibly" rather than each window touching the real screen on its
+-- own.
 --
 -- Loaded via dofile() by kernal/muxos.lua as a sibling file, not
 -- require() -- OpenOS's require() resolves against /lib, /usr/lib, etc,
@@ -23,10 +36,16 @@ local component = require("component")
 
 local M = {}
 
--- id -> {id, title, x, y, width, height, buffer}
+-- id -> {id, title, x, y, width, height, buffer, layer, dirty}
 local windows = {}
-local windowOrder = {}
+local windowOrder = {} -- ids in Z-ORDER, index 1 = TOPMOST (matches gmux's convention)
 local nextWindowId = 1
+
+-- Persistent off-screen surface the whole desktop composites into
+-- before any real screen write. Allocated lazily (first window/flush),
+-- sized to the screen's own resolution.
+local frameBuffer = nil
+local frameDirty = false
 
 local function nextId()
   local id = nextWindowId
@@ -36,6 +55,90 @@ end
 
 local function kernalGpu()
   if component.isAvailable("gpu") then return component.gpu end
+end
+
+local function ensureFrameBuffer(gpu)
+  if frameBuffer then return frameBuffer end
+  local w, h = gpu.getResolution()
+  frameBuffer, _ = gpu.allocateBuffer(w, h)
+  return frameBuffer
+end
+
+-- --- pure geometry, no gpu calls -- adapted from gmux's graphics.lua ---
+
+local function rectanglesOverlap(a, b)
+  return not (a.x >= b.x + b.w or a.x + a.w <= b.x or a.y >= b.y + b.h or a.y + a.h <= b.y)
+end
+
+-- Cuts `blocker`'s overlap out of `rect`, returning the (0-4) remaining
+-- rectangles that cover what's left.
+local function subtractRectangle(rect, blocker)
+  if not rectanglesOverlap(rect, blocker) then return {rect} end
+  local pieces = {}
+  if rect.x < blocker.x then
+    pieces[#pieces + 1] = {x = rect.x, y = rect.y, w = blocker.x - rect.x, h = rect.h}
+  end
+  if rect.x + rect.w > blocker.x + blocker.w then
+    pieces[#pieces + 1] = {x = blocker.x + blocker.w, y = rect.y,
+      w = (rect.x + rect.w) - (blocker.x + blocker.w), h = rect.h}
+  end
+  if rect.y < blocker.y then
+    local left, right = math.max(rect.x, blocker.x), math.min(rect.x + rect.w, blocker.x + blocker.w)
+    if right > left then
+      pieces[#pieces + 1] = {x = left, y = rect.y, w = right - left, h = blocker.y - rect.y}
+    end
+  end
+  if rect.y + rect.h > blocker.y + blocker.h then
+    local left, right = math.max(rect.x, blocker.x), math.min(rect.x + rect.w, blocker.x + blocker.w)
+    if right > left then
+      pieces[#pieces + 1] = {x = left, y = blocker.y + blocker.h, w = right - left,
+        h = (rect.y + rect.h) - (blocker.y + blocker.h)}
+    end
+  end
+  local kept = {}
+  for _, p in ipairs(pieces) do
+    if p.w > 0 and p.h > 0 then kept[#kept + 1] = p end
+  end
+  return kept
+end
+
+-- The visible fragments of the window at `index` in windowOrder (1 =
+-- topmost): its own rectangle, with every window ABOVE it (indices
+-- 1..index-1, if shown) cut out. Can return 0 pieces (fully covered),
+-- 1 (unoccluded), or several (occluded on one side, e.g. by a window
+-- overlapping a corner).
+local function visibleBoxes(index)
+  local win = windows[windowOrder[index]]
+  local boxes = {{x = win.x, y = win.y, w = win.width, h = win.height}}
+  for i = 1, index - 1 do
+    local blocker = windows[windowOrder[i]]
+    local blockerRect = {x = blocker.x, y = blocker.y, w = blocker.width, h = blocker.height}
+    local cut = {}
+    for _, box in ipairs(boxes) do
+      for _, piece in ipairs(subtractRectangle(box, blockerRect)) do
+        cut[#cut + 1] = piece
+      end
+    end
+    boxes = cut
+    if #boxes == 0 then break end
+  end
+  return boxes
+end
+
+-- Composites one window's visible fragments into the frame buffer
+-- (buffer-to-buffer bitblt -- gpu.bitblt's `dst` isn't limited to the
+-- real screen, confirmed in GraphicsCard.scala's own doc comment).
+-- Does nothing if the window isn't dirty -- this is the actual dirty-
+-- tracking half of the gmux technique: don't spend a real GPU call
+-- recompositing a window that hasn't changed.
+local function compositeWindow(gpu, index)
+  local win = windows[windowOrder[index]]
+  if not win.dirty then return end
+  for _, box in ipairs(visibleBoxes(index)) do
+    gpu.bitblt(frameBuffer, box.x, box.y, box.w, box.h, win.buffer, box.x - win.x + 1, box.y - win.y + 1)
+  end
+  win.dirty = false
+  frameDirty = true
 end
 
 -- Runs `code` (compiled fresh, same convention as JOB/a job's `gpu`
@@ -71,15 +174,20 @@ end
 -- Muxos-shaped create_window (also standing in for gmux's separate
 -- create_window_buffer -- see docs/PROTOCOL.md for why those two
 -- collapse into one call here). Allocates a GPU buffer, runs `code`
--- against it if given, blits it onto the real screen at (x, y) once,
--- and remembers it as a window. NOT live -- unlike gmux's create_window
--- with a vgpu/vscreen source, this never redraws itself; redrawing
--- means calling it again (or a future update, not built). Closing a
--- window also isn't built -- nothing repaints whatever was behind it.
+-- against it if given, and marks the window dirty -- it does NOT touch
+-- the real screen itself any more. The actual screen write happens in
+-- flush(), batched with every other dirty window, at most once per
+-- call. NOT live -- unlike gmux's create_window with a vgpu/vscreen
+-- source, nothing here redraws on its own; redrawing means calling it
+-- again (or a future update, not built). Closing a window isn't built
+-- either, but the data model now supports it correctly in principle:
+-- removing a window and marking every remaining one dirty would make
+-- whatever was behind it reappear on the next flush.
 function M.createWindow(options)
   local gpu = kernalGpu()
   if not gpu then return nil, "kernal has no gpu component" end
   if not gpu.allocateBuffer then return nil, "kernal's gpu does not support buffers (tier 1?)" end
+  if not ensureFrameBuffer(gpu) then return nil, "could not allocate the frame buffer" end
 
   local width = options.width or 30
   local height = options.height or 10
@@ -95,13 +203,20 @@ function M.createWindow(options)
   end
 
   local x, y = options.x or 1, options.y or 1
-  gpu.bitblt(0, x, y, width, height, buffer, 1, 1)
-
   local id = nextId()
   local win = {id = id, title = options.title or ("window " .. id), x = x, y = y,
-    width = width, height = height, buffer = buffer}
+    width = width, height = height, buffer = buffer, layer = options.layer or 0, dirty = true}
   windows[id] = win
-  windowOrder[#windowOrder + 1] = id
+  -- New windows go on top, matching gmux's layer_begin for equal layers:
+  -- inserted before the first existing window whose layer is <= this one's.
+  local insertAt = #windowOrder + 1
+  for i, existingId in ipairs(windowOrder) do
+    if windows[existingId].layer <= win.layer then
+      insertAt = i
+      break
+    end
+  end
+  table.insert(windowOrder, insertAt, id)
   return win
 end
 
@@ -111,6 +226,27 @@ function M.listWindows()
     list[#list + 1] = windows[id]
   end
   return list
+end
+
+-- Composites every dirty window into the frame buffer, then flips the
+-- frame buffer onto the real screen with ONE bitblt -- but only if
+-- something actually changed (frameDirty), so a quiet tick costs zero
+-- real GPU calls. Meant to be called at most once per tick by the
+-- caller (muxos.lua's background dispatcher thread); this function
+-- itself doesn't rate-limit anything -- calling it twice in the same
+-- tick just does the compositing work twice, redundantly but not
+-- incorrectly.
+function M.flush()
+  local gpu = kernalGpu()
+  if not gpu or not frameBuffer then return end
+  for i = 1, #windowOrder do
+    compositeWindow(gpu, i)
+  end
+  if frameDirty then
+    local w, h = gpu.getBufferSize(frameBuffer)
+    gpu.bitblt(0, 1, 1, w, h, frameBuffer, 1, 1)
+    frameDirty = false
+  end
 end
 
 return M
