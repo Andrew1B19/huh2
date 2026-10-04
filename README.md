@@ -158,9 +158,11 @@ from gmux's real `graphics.lua`.
 from source: every draw method operates on a character+color cell,
 never a raw pixel), so `kernal/bitmap.lua` encodes a pixel grid into
 half-block (`▀`, two real colors per cell, 1x2 sub-pixels -- good for
-color content like icons/a toolbar/wallpaper) or braille (`⠿`, one
-effective color per cell, 2x4 sub-pixels -- good for line art, not full
-color) character runs instead. `createWindow`'s `options.pixels`/
+multi-color content like a wallpaper or gradient) or braille (`⠿`, one
+effective color per cell but 4x the sub-pixel density, 2x4 per cell --
+good for a toolbar and small icons, which are almost always monochrome
+silhouettes anyway, so the density matters more than the color limit)
+character runs instead. `createWindow`'s `options.pixels`/
 `mode`/`bg` go through the exact same registry, Z-order, occlusion, and
 frame-buffer pipeline as a character-mode window -- `bitdemo` is just
 the REPL's way to see it work without typing a pixel grid by hand.

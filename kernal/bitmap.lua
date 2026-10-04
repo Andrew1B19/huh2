@@ -5,11 +5,18 @@
 --
 -- "halfblock": 1x2 sub-pixels per cell (U+2580 upper half block), TWO
 -- real colors per cell (fg = top pixel, bg = bottom pixel). Best for
--- color content -- icons, a toolbar, a wallpaper.
+-- multi-color content where resolution matters less than true color --
+-- a wallpaper, a gradient.
 -- "braille": 2x4 sub-pixels per cell (U+2800 + an 8-bit dot pattern),
--- higher density but only ONE effective color per cell (dots are a
--- single foreground color against the background) -- best for line
--- art/outlines, not full-color images.
+-- 4x the sub-pixel density of halfblock but only ONE effective
+-- foreground color per cell (dots are a single color against the
+-- background). Best for a toolbar and small icons specifically: those
+-- are almost always monochrome silhouettes anyway, so the one-color-
+-- per-cell limit costs nothing, while the extra density is what keeps
+-- a small icon recognizable in very few cells -- and the background
+-- color is still free per cell, so button/highlight state (e.g. a
+-- toolbar item under the cursor) can still vary independently of the
+-- icon's own color.
 --
 -- A pixel grid is pixels[y][x] = a 24-bit color number, or nil/false
 -- for "background" (renders as `bg`). 1-based, y then x, matching how

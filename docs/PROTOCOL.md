@@ -364,12 +364,18 @@ established techniques:
 
 - **Half-block** (`▀`/`▄`/`█`/space, U+2580-range): 1 column x 2 rows of
   sub-pixels per cell, with TWO real colors per cell (foreground = top
-  half, background = bottom half). Best fit for a toolbar/icons/wallpaper,
-  where distinct color matters more than raw density.
+  half, background = bottom half). Best fit for multi-color content
+  where resolution matters less than true color -- a wallpaper, a
+  gradient.
 - **Braille** (U+2800 + an 8-bit dot pattern): 2 columns x 4 rows of
-  sub-pixels per cell -- higher density, but only one effective color
-  per cell (dots are one color against the background), so it's suited
-  to line art/outlines, not full-color images.
+  sub-pixels per cell -- 4x the sub-pixel density of half-block, but
+  only one effective foreground color per cell (dots are one color
+  against the background). Best fit for a toolbar and small icons
+  specifically: those are almost always monochrome silhouettes anyway,
+  so the one-color-per-cell limit costs nothing, while the extra
+  density is what keeps a small icon recognizable in very few cells --
+  and the background color is still free per cell, so button/highlight
+  state can vary independently of the icon's own color.
 
 **Built**: `kernal/bitmap.lua` encodes a pixel grid (`pixels[y][x]` = a
 24-bit color, or `nil` for background) into character+fg+bg cells for
