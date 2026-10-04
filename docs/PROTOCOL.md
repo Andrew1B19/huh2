@@ -1105,15 +1105,34 @@ Collected in one place, from the discussion above:
 - The exact shape of the "job environment abstraction" -- what's
   actually exposed to a dispatched `.mxe` app vs. a plain `JOB`.
 - The persistent-window-handle API's exact shape.
-- A real, separate, and still-unfixed issue surfaced while reasoning
-  through direct parent/child messaging: `node/runtime.lua`'s main loop
-  currently does `kernalAddr = msg.from` on ANY valid incoming message
-  -- it blindly trusts whoever messages a worker is the kernal. Direct
-  peer-to-peer (parent/child) messaging breaks that the moment two
-  workers exchange a message. The proposed fix -- learn `kernalAddr`
-  once, from the `BOOT`/`CODE` exchange a worker already goes through
-  at boot, and never reassign it from an ordinary message again -- has
-  been discussed but not implemented or confirmed as final.
+
+**Fixed, ahead of the rest of this section being built**: the
+`kernalAddr`-trust issue flagged above (`node/runtime.lua`'s main loop
+used to do `kernalAddr = msg.from` on ANY valid incoming message, which
+direct peer-to-peer messaging would have broken the moment two workers
+exchanged a message). `node/bios.lua` now captures the address that
+actually completed its `CODE` transfer and passes it into
+`node/runtime.lua` as `kernalAddr = ...`; the main loop never
+reassigns it afterward.
+
+Worth recording honestly: an end-to-end integration-test scenario for
+this (spoof a message as if from a peer, check a later `gpu`-face call
+still reaches the real kernal) was written first and then REMOVED after
+proving itself misleading -- deliberately reintroducing the old bug and
+re-running that scenario, it still passed. The reason: in the CURRENT
+protocol, every job dispatch is itself a legitimate kernal-origin
+message that heals the corruption immediately before the vulnerable
+`gpu`-face call ever runs, so there's no path through today's message
+types that actually exploits it yet -- the risk is real but entirely
+forward-looking, arriving the moment direct parent/child messaging
+exists (a long-running cooperating job could receive a peer message
+between `gmuxapi` calls with no intervening kernal message to heal it).
+Replaced with a structural check instead: the real source has exactly
+one assignment to `kernalAddr` (the boot-handoff capture), verified by
+reading `node/runtime.lua`'s own text in `test/emu/integration_test.lua`
+-- cheap, precise, and confirmed (by deliberately reintroducing the bug
+a second time) to actually catch the regression that matters, unlike
+the removed scenario.
 
 ## Measured vs. documented latency
 

@@ -15,6 +15,14 @@
 
 local PORT = 4477
 
+-- node/bios.lua passes this in: the address of whoever's CODE chunks
+-- actually completed the boot handshake -- the ONE place a worker ever
+-- learns which node is "the kernal". Kept authoritative for this
+-- node's whole lifetime; the main loop below no longer re-derives it
+-- from arbitrary incoming messages (see the real bug this fixes, noted
+-- where kernalAddr used to be reassigned, further down).
+local kernalAddr = ...
+
 local function serialize(v, seen)
   seen = seen or {}
   local t = type(v)
@@ -128,15 +136,11 @@ local function sweepStaleChunks()
   end
 end
 
--- Announce ourselves so the kernal can pick us up without a separate
--- discovery pass if it happens to be listening already.
+-- Announce ourselves so the kernal can pick up our HELLO (it already
+-- knows kernalAddr from the boot handshake above, so this is purely
+-- for the kernal's own discovery bookkeeping, not for learning
+-- anything on our end).
 send({type = "HELLO", from = nodeId})
-
--- The kernal is whoever directly addresses us -- nothing else on this
--- network talks to a worker node. Learned on the first message received,
--- used by the "face" helpers below to call back into the kernal's own
--- hardware when this node has none of its own.
-local kernalAddr = nil
 
 local nextRpcId = 1
 local function nextId()
@@ -461,7 +465,17 @@ while true do
     local payload = reassemble(from, data)
     local msg = payload and deserialize(payload)
     if type(msg) == "table" and (msg.to == nil or msg.to == nodeId) then
-      kernalAddr = msg.from
+      -- Real bug, fixed: this used to do `kernalAddr = msg.from` here,
+      -- treating whoever just messaged this node as "the kernal" --
+      -- harmless as long as only the kernal ever messaged a worker,
+      -- but kernalAddr is now seeded once, authoritatively, from the
+      -- boot handshake (see the top of this file) specifically so a
+      -- future peer (parent/child job) message exchanged directly
+      -- between two workers can't overwrite it. Every handler below
+      -- already replies to `msg.from` directly, not to `kernalAddr`,
+      -- so removing this reassignment doesn't change how replies are
+      -- addressed -- it only stops this node from mis-learning who
+      -- the kernal is.
       if msg.type == "PING" then
         send({type = "PONG", from = nodeId, to = msg.from, id = msg.id})
       elseif msg.type == "JOB" then

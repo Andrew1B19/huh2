@@ -64,8 +64,16 @@ requestBoot()
 
 local chunks = {}
 local code
+-- Captured from whichever sender's chunks actually complete the
+-- assembly -- this is the ONLY place a worker ever learns which
+-- address is "the kernal". Passed into runtime.lua below so it can
+-- treat that address as authoritative forever after, rather than
+-- re-learning (and so risk mis-learning) it from any later message --
+-- see node/runtime.lua's own header for why that distinction matters
+-- once direct peer (parent/child job) messaging exists.
+local kernalAddr
 while not code do
-  local name, _, _, port, _, data = pullSignal(5)
+  local name, _, from, port, _, data = pullSignal(5)
   local gotChunk = false
   if name == "modem_message" and port == PORT and type(data) == "string" then
     local i, n, chunk = data:match("^CODE (%d+)/(%d+) (.*)$")
@@ -79,6 +87,7 @@ while not code do
       end
       if haveAll then
         code = table.concat(chunks, "", 1, n)
+        kernalAddr = from
       end
     end
   end
@@ -97,4 +106,4 @@ if not chunk then
   computer.beep(1000, 0.3)
   error(err)
 end
-chunk()
+chunk(kernalAddr)

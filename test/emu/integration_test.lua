@@ -248,4 +248,48 @@ emu:advance(2)
 assertScreenContains("true|nil", "grant actually available again after Ctrl+Alt+C")
 print("  OK -- fullscreen grant was genuinely free after the escape hatch, not just the message")
 
+print("test 11: node/runtime.lua never reassigns kernalAddr after boot (structural regression check)")
+-- An end-to-end "spoof a peer message and see if kernalAddr breaks"
+-- scenario was tried here first and REMOVED after proving itself
+-- misleading: verified by deliberately reintroducing the old bug
+-- (`kernalAddr = msg.from` on any message) and re-running that
+-- scenario -- it still passed, because in the CURRENT protocol every
+-- job dispatch is itself a legitimate kernal-origin message that heals
+-- the corruption immediately before the vulnerable gpu-face call ever
+-- runs. The bug is real and the fix is still correct -- it matters
+-- the moment direct peer (parent/child) messaging exists, since a
+-- long-running cooperating job could receive a peer message between
+-- gmuxapi calls with no intervening kernal message to heal it -- but
+-- the CURRENT protocol has no path that actually exploits it yet, so
+-- an end-to-end test for it would either need peer messaging to exist
+-- first or would silently test nothing, as happened here.
+--
+-- What's actually checked instead, honestly: the real source has
+-- exactly ONE assignment to kernalAddr (the boot-handoff capture),
+-- and no reassignment anywhere in the message-dispatch loop. Cheap,
+-- precise, and catches exactly the regression that matters -- if
+-- `kernalAddr = msg.from` (or equivalent) ever reappears in the
+-- dispatch loop, this fails immediately.
+do
+  local runtimeSource = readFile(REPO_ROOT .. "/node/runtime.lua")
+  local assignments = {}
+  for line in runtimeSource:gmatch("[^\n]+") do
+    -- Skip comment lines -- the fix's own explanatory comment
+    -- mentions the OLD buggy assignment by name as a `-- Real bug,
+    -- fixed: ... kernalAddr = msg.from ...` note, which would
+    -- otherwise false-positive this check.
+    local codePart = line:match("^([^%-]*)%-%-") or line
+    local stmt = codePart:match("kernalAddr%s*=%s*[^=].*")
+    if stmt then assignments[#assignments + 1] = line end
+  end
+  if #assignments ~= 1 then
+    io.stderr:write("kernalAddr assignments found:\n")
+    for _, a in ipairs(assignments) do io.stderr:write("  " .. a .. "\n") end
+    error("expected exactly ONE assignment to kernalAddr (the boot-handoff capture), found " .. #assignments)
+  end
+  assert(assignments[1]:match("kernalAddr%s*=%s*%.%.%."),
+    "the one kernalAddr assignment must be the boot-handoff capture (`kernalAddr = ...`), got: " .. assignments[1])
+end
+print("  OK -- exactly one kernalAddr assignment in the real source, and it's the boot-handoff capture")
+
 print("ALL OK")
