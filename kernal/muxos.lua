@@ -223,6 +223,16 @@ end
 -- executed directly on the kernal instead of forwarded there, since gmux's
 -- own `func(gpu)` draw callback is a function value and can't cross the
 -- network the way `gpu`-face JOB code already doesn't need to.
+--
+-- Every GPU method (set/fill/copy/bitblt/...) is a Callback(direct =
+-- true) in OC's own source (confirmed in GraphicsCard.scala) -- meaning
+-- it executes with NO yield, straight-line, against a per-tick call
+-- budget (Machine.scala: resets once per tick, tier-scaled). `code` here
+-- runs as one uninterrupted resume with no yields in between, so a
+-- caller doing a big fill via many individual gpu.set() calls instead of
+-- one gpu.fill()/bitblt() is exactly the shape that can exhaust that
+-- budget mid-draw. Prefer fill/copy/bitblt over set-loops in window
+-- draw code for this reason, not just speed.
 local function drawIntoBuffer(gpu, buffer, code)
   gpu.setActiveBuffer(buffer)
   local chunk, loadErr = load("local gpu = ...\n" .. code, "=window", "t")

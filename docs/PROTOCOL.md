@@ -234,6 +234,66 @@ index regardless of arrival order (see "Boot protocol" above) -- this
 needed to actually be built, not just flagged, once `runtime.lua`
 crossed the line.
 
+## Call budget: what's actually rate-limited, and what isn't
+
+Verified against the real mod source (`MightyPirates/OpenComputers`,
+`li.cil.oc.server.machine.Machine.scala` and
+`li.cil.oc.server.component.{NetworkCard,GraphicsCard}.scala`), not just
+inferred from config:
+
+- A computer's entire Lua state is one coroutine. Anything that blocks
+  (`os.sleep`, `event.pull`, `computer.pullSignal`) does a real
+  `coroutine.yield(...)`, caught by the mod's own `Machine`/`Architecture`
+  driver (`NativeLuaArchitecture.runThreaded`) -- not by OpenOS, which is
+  just Lua code running inside that same coroutine. Ordinary execution
+  happens on a worker thread per computer, off the main Minecraft server
+  thread; it only hops onto the main thread for a `SynchronizedCall` (a
+  call that needs to touch the actual game world).
+- `callBudget` (reset once per tick, `Machine.scala:520`, alongside
+  `uptime += 1`) only applies to methods annotated
+  `@Callback(direct = true)` -- calls cheap/safe enough to run with NO
+  yield at all, straight-line, which is exactly why they need a separate
+  cap instead of self-limiting via yield overhead.
+- **`modem.send`/`broadcast` are NOT `direct`** (confirmed: no
+  `direct = true` in `NetworkCard.scala`). Every send yields and gets
+  dispatched normally -- no `LimitReachedException` risk, ever. The real
+  cost is a yield/dispatch/resume round trip per call, not a hard
+  ceiling: chatty messaging is slow, not failure-prone.
+- **Every GPU drawing method IS `direct = true`** -- `set`, `fill`,
+  `copy`, `bitblt`, `setActiveBuffer`, `allocateBuffer`,
+  `setBackground`/`setForeground`, all of it (`GraphicsCard.scala`).
+  These run with no yield and draw from the shared per-tick budget pool.
+  `component.invoke(address, method, ...)` costs exactly the same budget
+  as calling the method directly -- same annotation-checked path
+  (`Machine.scala:372-380`) -- so `handleInvoke`/`faceGpu` forwarding is
+  exposed to this exactly like native code would be.
+
+**So the budget-bound resource in this project is GPU calls, not
+network bandwidth.** A straight-line Lua loop calling `gpu.set` many
+times in one resume can exhaust a tick's budget and start failing a
+call partway through; the same loop calling `modem.broadcast` can't hit
+that wall at all.
+
+What's NOT verified from this source tree: the exact Lua-visible
+failure signature of a budget-exceeded direct call (a catchable
+`error()`, or a silent falsy return) -- the native fast-path dispatch
+for direct calls lives in the native Lua binding glue, not in this
+Scala repository. Not asserted here rather than guessed.
+
+**Why our protocol is already shaped correctly for this**: `JOB` and
+`CREATEWINDOW` both carry a whole `code` string executed as one batch,
+rather than the network being used per individual primitive. That's
+right on both axes that matter -- fewer messages (fewer yield/dispatch
+round trips) *and* confining GPU calls to one local resume on the
+kernal instead of one network round trip per draw call. The one place
+this risk is actually reachable in our own code: `drawIntoBuffer` runs
+`code` as one uninterrupted resume with no yields, so draw code doing a
+big fill via many individual `gpu.set` calls instead of one
+`gpu.fill`/`bitblt` is exactly the "many direct calls, same tick, no
+yield" shape that can exhaust budget mid-draw -- prefer
+`fill`/`copy`/`bitblt` over `set`-loops in window draw code for this
+reason, not just speed.
+
 ## Measured vs. documented latency
 
 The config numbers in OC's `application.conf` (`maxNetworkPacketSize`,
