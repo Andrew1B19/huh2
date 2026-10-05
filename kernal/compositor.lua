@@ -187,11 +187,47 @@ end
 -- Does nothing if the window isn't dirty -- this is the actual dirty-
 -- tracking half of the gmux technique: don't spend a real GPU call
 -- recompositing a window that hasn't changed.
+-- Characters [first, first + count - 1] of a row (UTF-8 aware, bytes
+-- for invalid UTF-8).
+local function textSlice(row, first, count)
+  local len = utf8.len(row)
+  if not len then return row:sub(first, first + count - 1) end
+  if first > len then return "" end
+  local from = utf8.offset(row, first)
+  local to = utf8.offset(row, first + count)
+  return to and row:sub(from, to - 1) or row:sub(from)
+end
+
+-- A text window has no gpu buffer at all: its rows live in regular
+-- memory (win.textRows) and are drawn straight into the frame buffer
+-- here, clipped to whatever part of it is visible.
+local function paintTextWindow(gpu, win, boxes)
+  gpu.setActiveBuffer(frameBuffer)
+  gpu.setForeground(win.fg)
+  gpu.setBackground(win.bg)
+  for _, box in ipairs(boxes) do
+    gpu.fill(box.x, box.y, box.w, box.h, " ")
+    for y = box.y, box.y + box.h - 1 do
+      local row = win.textRows[y - win.y + 1]
+      if row and row ~= "" then
+        local piece = textSlice(tostring(row), box.x - win.x + 1, box.w)
+        if piece ~= "" then gpu.set(box.x, y, piece) end
+      end
+    end
+  end
+  gpu.setActiveBuffer(0)
+end
+
 local function compositeWindow(gpu, order, index)
   local win = windows[order[index]]
   if not win.dirty then return end
-  for _, box in ipairs(visibleBoxes(order, index)) do
-    gpu.bitblt(frameBuffer, box.x, box.y, box.w, box.h, win.buffer, box.x - win.x + 1, box.y - win.y + 1)
+  local boxes = visibleBoxes(order, index)
+  if win.textRows then
+    paintTextWindow(gpu, win, boxes)
+  else
+    for _, box in ipairs(boxes) do
+      gpu.bitblt(frameBuffer, box.x, box.y, box.w, box.h, win.buffer, box.x - win.x + 1, box.y - win.y + 1)
+    end
   end
   win.dirty = false
   frameDirty = true
@@ -271,6 +307,25 @@ local function drawIntoBuffer(gpu, buffer, code)
   return nil, err
 end
 
+-- Adds a window to the z-order and gives it focus. New windows go on
+-- top, matching gmux's layer_begin for equal layers: inserted before the
+-- first existing window whose layer is <= this one's. A freshly created
+-- window also takes focus, same convention as it taking the top
+-- z-order slot (see M.setFocus to change that later).
+local function registerWindow(win)
+  windows[win.id] = win
+  local insertAt = #windowOrder + 1
+  for i, existingId in ipairs(windowOrder) do
+    if windows[existingId].layer <= win.layer then
+      insertAt = i
+      break
+    end
+  end
+  table.insert(windowOrder, insertAt, win.id)
+  focusedId = win.id
+  return win
+end
+
 -- Muxos-shaped create_window (also standing in for gmux's separate
 -- create_window_buffer -- see docs/PROTOCOL.md for why those two
 -- collapse into one call here). Allocates a GPU buffer, draws into it,
@@ -332,6 +387,18 @@ function M.createWindow(options)
     height = options.height or 10
   end
 
+  -- A text window (options.text) keeps its content in regular memory and
+  -- is painted straight into the frame buffer -- no video memory of its
+  -- own. Used for the kernal's console.
+  if options.text then
+    local x, y = options.x or 1, options.y or 1
+    local id = nextId()
+    local win = {id = id, title = options.title or ("window " .. id), x = x, y = y,
+      width = width, height = height, layer = options.layer or 0, dirty = true,
+      textRows = {}, fg = options.fg or 0xFFFFFF, bg = options.bg or 0x000000}
+    return registerWindow(win)
+  end
+
   local buffer, allocErr = gpu.allocateBuffer(width, height)
   if not buffer then return nil, "could not allocate a gpu buffer: " .. tostring(allocErr) end
 
@@ -366,24 +433,7 @@ function M.createWindow(options)
   local win = {id = id, title = options.title or ("window " .. id), x = x, y = y,
     width = width, height = height, buffer = buffer, layer = options.layer or 0, dirty = true,
     ownerJobId = options.ownerJobId}
-  windows[id] = win
-  -- New windows go on top, matching gmux's layer_begin for equal layers:
-  -- inserted before the first existing window whose layer is <= this one's.
-  local insertAt = #windowOrder + 1
-  for i, existingId in ipairs(windowOrder) do
-    if windows[existingId].layer <= win.layer then
-      insertAt = i
-      break
-    end
-  end
-  table.insert(windowOrder, insertAt, id)
-  -- A freshly created window also takes focus, same convention as it
-  -- taking the top z-order slot -- the newest thing on screen is, by
-  -- default, the thing that should receive input. Nothing stops this
-  -- being changed later (see M.setFocus below); this is just the
-  -- default a REPL/test has no reason to override.
-  focusedId = id
-  return win
+  return registerWindow(win)
 end
 
 function M.listWindows()
@@ -451,19 +501,13 @@ function M.drawDirect(fn)
   fn(gpu)
 end
 
--- Trusted drawing for the kernal's own windows (the console): runs
--- `fn(gpu)` with the window's buffer active, no sandbox, and marks the
--- window dirty. Window code from workers goes through drawIntoBuffer's
--- sandbox instead.
-function M.drawInto(id, fn)
+-- Replaces a text window's rows (strings, top to bottom) and marks it
+-- dirty.
+function M.setText(id, rows)
   local win = windows[id]
-  local gpu = kernalGpu()
-  if not win or not gpu then return end
-  gpu.setActiveBuffer(win.buffer)
-  local ok, err = pcall(fn, gpu)
-  gpu.setActiveBuffer(0)
+  if not win or not win.textRows then return end
+  win.textRows = rows
   win.dirty = true
-  if not ok then error(err, 0) end
 end
 
 -- Composites every dirty window into the frame buffer, then flips it

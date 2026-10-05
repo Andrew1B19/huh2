@@ -574,9 +574,9 @@ emu:advance(1)
 assertScreenContains("SOLOX", "window shown again after comp")
 print("  OK -- windows hidden in solo mode and shown again after `comp`")
 
--- Video memory: the console never gets a full-screen buffer of its own.
--- In console mode it draws straight onto the screen; otherwise it's a
--- smaller window. The compositor's frame buffer is the only full-screen
+-- Video memory: the console has no buffer at all -- its text is in
+-- regular memory, painted into the frame buffer (or straight onto the
+-- screen in console mode). The frame buffer is the only full-screen
 -- buffer.
 do
   local full = 0
@@ -584,11 +584,14 @@ do
     if idx ~= 0 and b.w == 50 and b.h == 30 then full = full + 1 end
   end
   assert(full == 1, "expected exactly one full-screen buffer (the frame), found " .. full)
+  for idx, b in pairs(screenBuffers) do
+    assert(not (b.w == 50 and b.h == 16), "the console has a video buffer (buffer " .. idx .. ")")
+  end
 end
 typeLine("windows")
 emu:advance(1)
 assertScreenContains('"console"  50x16 at (1,15)', "the console window is docked at the bottom, 16 rows tall")
-print("  OK -- only the frame buffer is full-screen; the console window is 50x16")
+print("  OK -- only the frame buffer is full-screen; the 50x16 console has no video buffer at all")
 
 print("test 21: console scrollback with PgUp/PgDn and the mouse wheel")
 local KEY_PAGEUP, KEY_PAGEDOWN = 0xC9, 0xD1
@@ -618,6 +621,23 @@ assert(screenHas("[scrolled 3"), "mouse wheel up did not scroll the console")
 emu:injectSignal(kernal, "scroll", screenAddr, 10, 10, -1, "tester"); emu:step()
 emu:advance(0.2)
 assert(not screenHas("[scrolled"), "mouse wheel down did not scroll back")
+-- Scrollback is three full screens (3 x 30 rows): paging far back stops
+-- at most 90 rows up, less the 16-row window itself.
+for _ = 1, 20 do
+  emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_PAGEUP, "tester"); emu:step()
+end
+emu:advance(0.2)
+do
+  local n = tonumber(renderScreen():gsub("\n", ""):match("%[scrolled (%d+)"))
+  if not n or n > 90 - 16 + 1 or n < 50 then
+    dumpScreenOnFailure("scrollback cap")
+    error("expected scrollback to stop near three screens, got " .. tostring(n))
+  end
+end
+for _ = 1, 20 do
+  emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_PAGEDOWN, "tester"); emu:step()
+end
+emu:advance(0.2)
 print("  OK -- PgUp/PgDn and the wheel scroll through earlier output and back")
 
 print("test 22: backspace works across a wrapped input line")

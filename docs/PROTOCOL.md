@@ -1315,20 +1315,22 @@ reacts to whatever it's handed.
 
 ### The console -- BUILT
 
-The REPL console has two sizes:
+The console's text lives in regular memory; it never has a video
+buffer of its own. It has two sizes:
 
-- **Normally** it's an ordinary compositor window on the bottom layer,
-  docked at the bottom of the screen and capped at 80x16 -- it doesn't
-  need full-screen video memory.
+- **Normally** it's a compositor *text window* on the bottom layer,
+  docked at the bottom of the screen and capped at 80x16. A text window
+  holds rows of text instead of a gpu buffer, and the compositor paints
+  the visible part of those rows straight into the frame buffer.
 - **In console mode** (Ctrl+Alt+C, until `comp`) it's the compositor's
-  exclusive owner and draws straight onto the real screen at full
-  resolution. No full-screen buffer is allocated for it.
+  exclusive owner -- the same mode a fullscreen node uses -- and draws
+  straight onto the real screen at full resolution.
 
-So the compositor's frame buffer is the only full-screen buffer muxos
-allocates (test 20 checks this); window buffers are sized to their
-windows. Output is kept as logical lines (the last 500) and wrapped only
-when rendered, at whichever width the console currently has, at most
-once per tick, which gives:
+So the frame buffer is the only full-screen buffer muxos allocates, and
+the console allocates none (test 20 checks both). Output is kept as
+logical lines -- three full screens' worth of rows, oldest dropped
+first -- and wrapped only when rendered, at whichever width the console
+currently has, at most once per tick, which gives:
 
 - **Scrollback**: PgUp/PgDn scroll a page; the mouse wheel scrolls 3
   rows. A `[scrolled N -- PgDn]` tag shows while scrolled back, a

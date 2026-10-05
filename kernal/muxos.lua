@@ -219,13 +219,13 @@ end
 
 -- --- The console, replacing OpenOS's io/term ---
 --
--- Normally an ordinary compositor window: bottom layer, docked at the
--- bottom of the screen, and smaller than the screen (CONSOLE_MAX_W x
--- CONSOLE_MAX_H) -- it doesn't need full-screen video memory. In
--- console mode (Ctrl+Alt+C) it's the compositor's exclusive owner
--- instead: compositing stops and the console draws straight onto the
--- real screen at full resolution, so no full-screen buffer is ever
--- allocated for it.
+-- The console's text lives in regular memory (consoleLines) and never
+-- has a video buffer of its own. Normally it's a compositor text
+-- window: bottom layer, docked at the bottom of the screen, at most
+-- CONSOLE_MAX_W x CONSOLE_MAX_H, painted from its rows straight into the
+-- frame buffer. In console mode (Ctrl+Alt+C) it's the compositor's
+-- exclusive owner instead and draws straight onto the real screen at
+-- full resolution.
 --
 -- Output is kept as logical (unwrapped) lines and wrapped only when
 -- rendered, at whatever width the console currently has -- which is
@@ -240,8 +240,12 @@ end
 
 local CONSOLE_LAYER = -1000
 local CONSOLE_MAX_W, CONSOLE_MAX_H = 80, 16
-local MAX_CONSOLE_LINES = 500
+-- Scrollback: three full screens' worth of rows (counted at full-screen
+-- width), oldest dropped first.
+local SCROLLBACK_PAGES = 3
 local consoleLines = {}      -- committed logical lines, oldest first
+local consoleLineRows = {}   -- rows each line takes at full-screen width
+local consoleRowTotal = 0
 local consoleDirty = true
 local scrollOffset = 0       -- wrapped rows scrolled back from the bottom
 local inputBuffer = ""       -- the REPL's line being typed
@@ -249,7 +253,7 @@ local commandBusy = false    -- a command is running; see handleKeyDown
 
 local consoleW, consoleH = math.min(termW, CONSOLE_MAX_W), math.min(termH, CONSOLE_MAX_H)
 local consoleWin = gpu and compositor.createWindow({title = "console", x = 1, y = termH - consoleH + 1,
-  width = consoleW, height = consoleH, layer = CONSOLE_LAYER}) or nil
+  width = consoleW, height = consoleH, layer = CONSOLE_LAYER, text = true}) or nil
 
 local function consoleOwnsScreen()
   return compositor.exclusiveOwner() == "console"
@@ -339,28 +343,41 @@ local function renderConsole()
   consoleDirty = false
   local w, h = viewSize()
   local rows = visibleRows(w, h)
-  local function draw(g)
-    g.setForeground(0xFFFFFF)
-    g.setBackground(0x000000)
-    g.fill(1, 1, w, h, " ")
-    for y = 1, h do
-      if rows[y] and rows[y] ~= "" then g.set(1, y, rows[y]) end
+  if scrollOffset > 0 then
+    local tag = "[scrolled " .. scrollOffset .. " -- PgDn]"
+    local first = rows[1] or ""
+    local keep = math.max(0, w - #tag)
+    local len = utf8.len(first) or #first
+    if len < keep then
+      first = first .. (" "):rep(keep - len)
+    else
+      first = first:sub(1, (utf8.offset(first, keep + 1) or (keep + 1)) - 1)
     end
-    if scrollOffset > 0 then
-      local tag = "[scrolled " .. scrollOffset .. " -- PgDn]"
-      g.set(math.max(1, w - #tag + 1), 1, tag)
-    end
+    rows[1] = first .. tag
   end
   if owner == "console" then
-    compositor.drawDirect(draw)
+    compositor.drawDirect(function(g)
+      g.setForeground(0xFFFFFF)
+      g.setBackground(0x000000)
+      g.fill(1, 1, w, h, " ")
+      for y = 1, h do
+        if rows[y] and rows[y] ~= "" then g.set(1, y, rows[y]) end
+      end
+    end)
   else
-    compositor.drawInto(consoleWin.id, draw)
+    compositor.setText(consoleWin.id, rows)
   end
 end
 
 local function consoleAppend(line)
+  local rows = #wrapLine(line, termW)
   consoleLines[#consoleLines + 1] = line
-  if #consoleLines > MAX_CONSOLE_LINES then table.remove(consoleLines, 1) end
+  consoleLineRows[#consoleLineRows + 1] = rows
+  consoleRowTotal = consoleRowTotal + rows
+  while consoleRowTotal > SCROLLBACK_PAGES * termH and #consoleLines > 1 do
+    table.remove(consoleLines, 1)
+    consoleRowTotal = consoleRowTotal - table.remove(consoleLineRows, 1)
+  end
   -- Keep a scrolled-back view still while new output arrives below it.
   if scrollOffset > 0 then scrollOffset = scrollOffset + #wrapLine(line, (viewSize())) end
   consoleDirty = true
@@ -979,6 +996,7 @@ end
 -- content. muxos.lua's job here is only wire plumbing: unwrap the
 -- request, call in, wrap the reply.
 local function handleCreateWindow(msg)
+  msg.text = nil -- text windows are the kernal's own (the console)
   local win, err = compositor.createWindow(msg)
   if not win then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
