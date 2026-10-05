@@ -127,25 +127,28 @@ function M.encode(mode, pixels, width, height, bg)
 end
 
 -- Draws pre-encoded cells into `gpu` (already pointed at the right
--- buffer) at (originX, originY), run-length batching consecutive
--- cells on the same row that share (char, fg, bg) into one
--- setForeground+setBackground+set call instead of one per cell.
+-- buffer) at (originX, originY). Every gpu call is budgeted per tick,
+-- so: consecutive cells on a row that share (fg, bg) go out as ONE
+-- set() of their concatenated characters (the characters themselves
+-- needn't match -- braille cells rarely do), and setForeground/
+-- setBackground are only called when the color actually changes.
 function M.draw(gpu, cells, rows, cols, originX, originY)
+  local curFg, curBg
   for row = 1, rows do
     local rowCells = cells[row]
     local col = 1
     while col <= cols do
       local cell = rowCells[col]
+      local fg, bg = cell.fg, cell.bg
+      local chars = {cell.char}
       local runEnd = col
-      while runEnd + 1 <= cols
-          and rowCells[runEnd + 1].char == cell.char
-          and rowCells[runEnd + 1].fg == cell.fg
-          and rowCells[runEnd + 1].bg == cell.bg do
+      while runEnd + 1 <= cols and rowCells[runEnd + 1].fg == fg and rowCells[runEnd + 1].bg == bg do
         runEnd = runEnd + 1
+        chars[#chars + 1] = rowCells[runEnd].char
       end
-      gpu.setForeground(cell.fg)
-      gpu.setBackground(cell.bg)
-      gpu.set(originX + col - 1, originY + row - 1, cell.char:rep(runEnd - col + 1))
+      if fg ~= curFg then gpu.setForeground(fg); curFg = fg end
+      if bg ~= curBg then gpu.setBackground(bg); curBg = bg end
+      gpu.set(originX + col - 1, originY + row - 1, table.concat(chars))
       col = runEnd + 1
     end
   end

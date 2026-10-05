@@ -84,11 +84,25 @@ local function primaryComponent(ctype)
   return componentProxy(address), address
 end
 
+-- tostring() would round floats to 14 significant digits and turn
+-- inf/nan into bare identifiers that deserialize as nil.
+local function serializeNumber(v)
+  if v ~= v then return "0/0" end
+  if v == math.huge then return "1/0" end
+  if v == -math.huge then return "-1/0" end
+  if math.type(v) == "integer" then return tostring(v) end
+  local s = string.format("%.17g", v)
+  if not s:find("[%.eE]") then s = s .. ".0" end
+  return s
+end
+
 local function serialize(v, seen)
   seen = seen or {}
   local t = type(v)
-  if t == "nil" or t == "boolean" or t == "number" then
+  if t == "nil" or t == "boolean" then
     return tostring(v)
+  elseif t == "number" then
+    return serializeNumber(v)
   elseif t == "string" then
     return string.format("%q", v)
   elseif t == "table" then
@@ -98,6 +112,9 @@ local function serialize(v, seen)
     for k, val in pairs(v) do
       parts[#parts + 1] = "[" .. serialize(k, seen) .. "]=" .. serialize(val, seen)
     end
+    -- Only tables on the current path count as cycles; the same table
+    -- referenced twice elsewhere is fine.
+    seen[v] = nil
     return "{" .. table.concat(parts, ",") .. "}"
   else
     error("cannot serialize a value of type " .. t)
@@ -163,7 +180,12 @@ local function loadSibling(name)
   return chunk
 end
 
-local selfAddr = computer.address()
+-- Every node's wire identity is its network card's address, not
+-- computer.address(): modem_message reports the SENDING CARD's address,
+-- so this is the only identity a receiver can check a payload's `from`
+-- against, and it's what node/bios.lua learns as kernalAddr from the
+-- boot handshake.
+local selfAddr = modemAddr
 local nodes = {}      -- address -> {lastSeen = computer.uptime()}
 local nodeOrder = {}  -- address list, stable iteration/round-robin order
 local nextJobId = 1
@@ -360,6 +382,13 @@ end
 local jobs = {}
 local jobOrder = {}
 
+-- Indexes kept alongside `jobs` so the per-tick and per-completion work
+-- (scheduler stress, fan-out counts, orphan sweeps, orphan policy) is
+-- proportional to what's live, not to every job ever dispatched.
+local runningJobs = {}   -- id -> true while status == "running"
+local runningCount = 0
+local childrenOf = {}    -- parent id -> {child id, ...}
+
 -- appName -> {jobId, jobId, ...}. Only ever holds jobs whose
 -- orphanPolicy is "orphan" -- the pool a relaunched app's
 -- gmuxapi.get_orphans(name) draws from (handleGetOrphans, below).
@@ -388,7 +417,12 @@ end
 
 -- id -> the RESULT/ERROR/PONG message that answered it. Filled in by
 -- handleModemMessage (see below), read and cleared by waitForReply.
+-- Only replies someone is actually waiting on (`awaiting`: id -> the
+-- address expected to answer) are stored -- otherwise every
+-- fire-and-forget spawned job's RESULT, and every reply that arrived
+-- after its waiter timed out, would sit here forever.
 local replyBox = {}
+local awaiting = {}
 
 -- Record a job's dispatch and actually send it, WITHOUT waiting for the
 -- result -- shared by submit() (which then blocks on awaitReply itself)
@@ -432,6 +466,13 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
     parent = parent, appName = appName, orphanPolicy = parent and (orphanPolicy or "orphan") or nil,
     rootId = rootId}
   jobOrder[#jobOrder + 1] = id
+  runningJobs[id] = true
+  runningCount = runningCount + 1
+  if parent then
+    childrenOf[parent] = childrenOf[parent] or {}
+    local siblings = childrenOf[parent]
+    siblings[#siblings + 1] = id
+  end
   if parent and jobs[id].orphanPolicy == "orphan" then
     registerOrphanCandidate(appName, id)
   end
@@ -449,8 +490,8 @@ end
 -- this way, rather than needing two separate limits.
 local function countRunningInTree(rootId)
   local count = 0
-  for _, id in ipairs(jobOrder) do
-    if jobs[id].rootId == rootId and jobs[id].status == "running" then
+  for id in pairs(runningJobs) do
+    if jobs[id].rootId == rootId then
       count = count + 1
     end
   end
@@ -476,24 +517,25 @@ end
 --   instruction-budget circuit breaker (see "JOB code and the
 --   non-yielding timeout"), not a gap specific to this feature.
 local function applyOrphanPolicyForChildrenOf(parentId)
-  for _, id in ipairs(jobOrder) do
+  for _, id in ipairs(childrenOf[parentId] or {}) do
     local job = jobs[id]
-    if job.parent == parentId then
-      if job.orphanPolicy == "promote" then
-        unregisterOrphanCandidate(job.appName, id)
-        job.parent = nil
-      elseif job.orphanPolicy == "kill" then
+    if job.orphanPolicy == "promote" then
+      unregisterOrphanCandidate(job.appName, id)
+      job.parent = nil
+    elseif job.orphanPolicy == "kill" then
+      if job.status == "running" then
         modem.broadcast(PORT, "KILL " .. id)
-        job.parent = nil
-      elseif job.orphanPolicy == "orphan" then
-        -- Marks WHEN this job actually became orphaned -- the clock
-        -- sweepStaleOrphans() (below) measures against, not when it
-        -- was originally spawned (which could have been long before
-        -- its parent actually finished).
-        job.orphanedAt = computer.uptime()
       end
+      job.parent = nil
+    elseif job.orphanPolicy == "orphan" then
+      -- Marks WHEN this job actually became orphaned -- the clock
+      -- sweepStaleOrphans() (below) measures against, not when it
+      -- was originally spawned (which could have been long before
+      -- its parent actually finished).
+      job.orphanedAt = computer.uptime()
     end
   end
+  childrenOf[parentId] = nil
 end
 
 -- How loaded the scheduler is right now: running jobs per worker node.
@@ -504,11 +546,7 @@ end
 -- real backlog measure, not just "is anything happening at all."
 local function schedulerStress()
   if #nodeOrder == 0 then return 0 end
-  local running = 0
-  for _, id in ipairs(jobOrder) do
-    if jobs[id].status == "running" then running = running + 1 end
-  end
-  return running / #nodeOrder
+  return runningCount / #nodeOrder
 end
 
 -- "Timeout is dependent on scheduler stress": an orphan nobody's
@@ -524,7 +562,9 @@ local function orphanTimeoutSeconds()
   return BASE_ORPHAN_TIMEOUT / (1 + schedulerStress())
 end
 
--- Called once per tick (see the main loop below). Finds every
+-- Called every tick (see the main loop below) but only does work about
+-- once a second -- the timeout is minutes, so per-tick precision buys
+-- nothing. Finds every
 -- "orphan"-policy job that's actually been orphaned (orphanedAt set)
 -- and still running, and kills it (same best-effort raw KILL broadcast
 -- as the "kill" policy, same cooperative-yield-point limitation) once
@@ -532,13 +572,17 @@ end
 -- Re-broadcasts periodically (not just once) in case the first KILL
 -- never reached a job that wasn't yielding yet when it was sent.
 local KILL_RETRY_INTERVAL = 10
+local ORPHAN_SWEEP_INTERVAL = 1
+local lastOrphanSweep = -math.huge
 
 local function sweepStaleOrphans()
-  local timeout = orphanTimeoutSeconds()
   local now = computer.uptime()
-  for _, id in ipairs(jobOrder) do
+  if now - lastOrphanSweep < ORPHAN_SWEEP_INTERVAL then return end
+  lastOrphanSweep = now
+  local timeout = orphanTimeoutSeconds()
+  for id in pairs(runningJobs) do
     local job = jobs[id]
-    if job.orphanPolicy == "orphan" and job.orphanedAt and job.status == "running"
+    if job.orphanPolicy == "orphan" and job.orphanedAt
         and now - job.orphanedAt > timeout then
       if not job.lastKillSentAt or now - job.lastKillSentAt > KILL_RETRY_INTERVAL then
         modem.broadcast(PORT, "KILL " .. id)
@@ -606,10 +650,14 @@ local function handleInvoke(msg)
       error = "direct gpu/screen access is blocked -- use create_window, or gmuxapi.request_fullscreen() for exclusive access"})
     return
   end
-  local packed = table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(msg.args or {})))
+  local args = msg.args or {}
+  local packed = table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(args, 1, args.n or #args)))
   if packed[1] then
-    local returns = {}
-    for i = 2, packed.n do returns[#returns + 1] = packed[i] end
+    -- Indexed with an explicit `n`, not appended: appending skipped
+    -- nils, so a method's `nil, "reason"` came back as `"reason"` alone,
+    -- a truthy first value that reads as success.
+    local returns = {n = packed.n - 1}
+    for i = 2, packed.n do returns[i - 1] = packed[i] end
     send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = returns})
   else
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = tostring(packed[2])})
@@ -750,7 +798,11 @@ local function handleModemMessage(from, port, data)
   end
 
   local msg = deserialize(payload)
-  if type(msg) ~= "table" or not msg.from or msg.from == selfAddr then
+  -- `from` (the transport-reported sending card) is the only sender
+  -- identity that can't be forged from inside a payload. Without this,
+  -- any node could claim to be the fullscreen holder (bypassing
+  -- handleInvoke's gate) or answer for another node's job.
+  if type(msg) ~= "table" or msg.from ~= from or from == selfAddr then
     return
   end
 
@@ -781,14 +833,19 @@ local function handleModemMessage(from, port, data)
     handleReleaseFullscreen(msg)
   elseif msg.type == "PONG" or msg.type == "RESULT" or msg.type == "ERROR" then
     if msg.id then
-      replyBox[msg.id] = msg
+      if awaiting[msg.id] == msg.from then
+        replyBox[msg.id] = msg
+      end
       -- Generic job-completion recording: covers BOTH a submit()-dispatched
       -- job (something is actively waitForReply()-ing on it, which still
       -- picks up this same msg from replyBox) AND a handleSpawn()-dispatched
       -- one (fire-and-forget -- nothing is waiting locally, so this is the
       -- ONLY place its completion is ever recorded).
-      if (msg.type == "RESULT" or msg.type == "ERROR") and jobs[msg.id] and jobs[msg.id].status == "running" then
+      if (msg.type == "RESULT" or msg.type == "ERROR") and jobs[msg.id] and jobs[msg.id].status == "running"
+          and jobs[msg.id].node == msg.from then
         local job = jobs[msg.id]
+        runningJobs[msg.id] = nil
+        runningCount = runningCount - 1
         job.finishedAt = computer.uptime()
         if msg.type == "RESULT" then
           job.status, job.result = "done", msg.result
@@ -926,14 +983,17 @@ end
 -- pingOnce().
 local function waitForReply(id, addr, timeout)
   local deadline = computer.uptime() + (timeout or TIMEOUT)
+  awaiting[id] = addr
   while computer.uptime() < deadline do
     local msg = replyBox[id]
     if msg then
       replyBox[id] = nil
+      awaiting[id] = nil
       return msg
     end
     tick(deadline - computer.uptime())
   end
+  awaiting[id] = nil
   return nil, "timed out waiting for " .. tostring(addr)
 end
 

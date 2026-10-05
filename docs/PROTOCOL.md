@@ -189,6 +189,25 @@ way they would over any other screen content.
 | `RESULT`  | `from`, `to`, `id`, `result`                              | either  | success -- `JOB`'s return value, `LIST`'s address→type table, `INVOKE`'s list of return values, `GETPROCESSES`'s job list, `SPAWN`'s `{id, node}` handle, `CREATEWINDOW`'s window record, `GETWINDOWS`'s window list, or `REQUESTFULLSCREEN`/`RELEASEFULLSCREEN`'s `{granted/released = true}` |
 | `ERROR`   | `from`, `to`, `id`, `error`                               | either  | failure -- load error, runtime error, invoke error, a bad `SPAWN`/`CREATEWINDOW` request, a blocked display-component `INVOKE`, or a refused fullscreen request |
 
+**Addresses and sender checks.** Every `from`/`to` is a node's
+**network card** address, not `computer.address()`: `modem_message`
+reports the sending card's address, so that's the only identity a
+receiver can check a payload against. The kernal drops any message
+whose `from` doesn't match the card that actually sent it, only
+records a job's `RESULT`/`ERROR` from the node that job was dispatched
+to, and only stores a reply someone is waiting on (from the node it was
+asked of). A worker drops mismatched `from` the same way, and accepts
+`JOB`/`LIST`/`INVOKE` only from the kernal's card (`kernalAddr`, learned
+once from the boot handshake). Until this was fixed, workers addressed
+the kernal by its card (from the handshake) while the kernal only
+answered to its computer address -- every worker->kernal request would
+have been ignored on real hardware. `test/emu`'s emulator had been
+reporting computer addresses in `modem_message`, which hid it.
+
+`INVOKE` arguments and results are `table.pack`-style lists with an
+explicit `n`, so a `nil` in the middle (a component's `nil, "reason"`
+failure return) stays in place instead of shifting what follows it.
+
 `code` is compiled on the worker as `local args = ...` followed by your
 code, then called as `chunk(args)` inside a `pcall`, so a job can refer to
 `args` directly:
@@ -567,8 +586,10 @@ could survive without.
 Stock `eepromSize` (the max bytes of code an EEPROM can hold, confirmed
 from `application.conf`) is **4096**. This is why `node/bios.lua` and
 `node/runtime.lua` are split the way they are: `bios.lua` is the only
-thing actually bound by that limit, and at **2806 bytes** it has plenty
-of room. `runtime.lua` (**14411 bytes** as of the generic chunking
+thing actually bound by that limit, and at **2413 bytes** it has room
+to spare. Comments count toward the limit too -- it once grew past 4096
+through comments alone, so `test/emu/integration_test.lua` (test 19) now
+checks both EEPROM images' sizes. `runtime.lua` (**14411 bytes** as of the generic chunking
 layer) carries everything that used to make the combined file blow past
 4096 -- it's fetched into RAM over the modem instead, so `eepromSize`
 doesn't apply to it.
@@ -811,7 +832,15 @@ design, in `node/runtime.lua`:
   but erroring instead of attempting to yield. This can't resume a job
   that blows the budget; it protects THIS NODE's availability, not that
   job's progress, by killing a non-cooperating job outright, cleanly,
-  well before it risks the mod killing the whole computer instead.
+  well before it risks the mod killing the whole computer instead. Once
+  tripped, the hook re-arms itself to error on every instruction: a
+  one-shot error is an ordinary Lua error, and a job wrapping its loop
+  in `pcall` used to be able to catch it and keep spinning forever.
+- **`sleep(seconds)`** is the way for job code to wait on time. A job
+  that waited with a bare `coroutine.yield(timeout)` would be handed --
+  and silently consume -- every signal that arrived meanwhile, including
+  the `JOB` message for a child the kernal had just queued on that same
+  node. `sleep` sets everything aside for the main loop instead.
 - **The hook is re-armed before every resume, not set once.** A count
   hook's count is a running total of instructions executed by that
   coroutine -- confirmed empirically it does NOT reset on its own across
@@ -999,15 +1028,26 @@ be placed on its own parent's node: the kernal's fresh `JOB` message
 for the child would arrive at that node while it was still blocked
 inside `remoteRequest`, waiting for its own unrelated `SPAWN` reply,
 and got dropped on the floor -- the child's own `JOB` message simply
-vanished, and it never started. Fixed by pushing back (via
-`computer.pushSignal`) anything that isn't the awaited reply, so the
-outer dispatch loop still sees it once the wait resolves. Verified via
+vanished, and it never started. Fixed by keeping anything that isn't
+the awaited reply for the main loop. Verified via
 `test/emu/integration_test.lua`'s test 12 (confirmed by reverting the
 fix and watching a child land on its own parent's node and never
-start). Known limitation, flagged rather than hidden: this correctly
-replays a single-chunk message (the common case) but not one that
-needed multiple chunks, since `reassemble()` already discarded the
-earlier chunks on the way to completing this one.
+start). The first version of the fix pushed the raw frame back with
+`computer.pushSignal`, which couldn't replay a multi-chunk message
+(its earlier chunks were already consumed) and made the waiter re-pull
+its own pushed-back signal in a tight loop until its reply arrived;
+it now queues the already-reassembled message instead
+(`pendingMessages`, drained by the main loop first). The match itself
+was also too loose: the kernal's job ids and a worker's RPC ids are
+independent counters, so a `JOB` for a child placed on this node could
+carry the same id as the reply being waited for, match, and be
+dropped. A reply now has to be a `RESULT`/`ERROR` from the kernal's
+card.
+
+A kill-policy child can also still be QUEUED on its node (behind
+another job) when its parent finishes, so `runJobCode` never sees the
+`KILL`. Workers now record every `KILL <id>` they see and refuse to
+start a queued `JOB` with that id (test 17).
 
 ### Job environment abstraction
 
@@ -1177,7 +1217,11 @@ of the compositor's own bookkeeping (z-order, occlusion, dirty
 tracking, flush timing all stay the compositor's).
 
 This is a real shift from how `createWindow` works today, though:
-right now it's one-shot (`options.code` runs once against a freshly
+right now it's one-shot (`options.code` runs once -- sandboxed, since
+it arrives from any worker but executes ON the kernal: no kernal
+globals, a `gpu` limited to drawing calls on its own buffer, no
+`pcall`, and an instruction budget in its own coroutine (test 18) --
+against a freshly
 allocated buffer, and "updating" a window means calling `createWindow`
 again). The handle model implies a **persistent, redrawable** window --
 an app holds its handle for its whole lifetime and pushes new content

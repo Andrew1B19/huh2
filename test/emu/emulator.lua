@@ -190,6 +190,17 @@ end
 -- that nothing in this project's production files ever calls
 -- modem.send (unicast); every message type is broadcast, with logical
 -- addressing carried inside the payload's own `to` field instead.
+--
+-- modem_message's first two arguments are the RECEIVING and SENDING
+-- network cards' own component addresses -- not either computer's
+-- computer.address(). Real OC raises the signal from the receiving
+-- card's component (Machine prepends that component's address) with
+-- packet.source, which NetworkCard sets to its own node address. This
+-- emulator used to pass the computers' addresses instead, which hid a
+-- real bug: node/runtime.lua was addressing the kernal by the
+-- boot-handshake sender address (a card address on real hardware)
+-- while the kernal only answered to its computer address, so on real
+-- hardware every worker->kernal request would have been ignored.
 function Emulator:addModem(node)
   local addr = self:addComponent(node, "modem", {
     open = function(port) node.modemOpenPorts[port] = true; return true end,
@@ -197,15 +208,16 @@ function Emulator:addModem(node)
       for _, otherAddr in ipairs(node.emu.nodeOrder) do
         if otherAddr ~= node.address then
           local other = node.emu.nodes[otherAddr]
-          if other.modemOpenPorts[port] then
+          if other.modemAddr and other.modemOpenPorts[port] then
             other.signalQueue[#other.signalQueue + 1] =
-              {"modem_message", otherAddr, node.address, port, 0, ...}
+              {"modem_message", other.modemAddr, node.modemAddr, port, 0, ...}
           end
         end
       end
       return true
     end,
   })
+  node.modemAddr = addr
   return addr
 end
 

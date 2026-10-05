@@ -96,8 +96,13 @@ local function nextId()
   return id
 end
 
+-- Resolved once: flush() runs every tick, and a fresh component.list
+-- plus a new proxy each time is pure overhead for a component that
+-- doesn't change while muxos is running.
+local cachedGpu = nil
 local function kernalGpu()
-  return primaryComponent("gpu")
+  if not cachedGpu then cachedGpu = primaryComponent("gpu") end
+  return cachedGpu
 end
 
 local function ensureFrameBuffer(gpu)
@@ -200,16 +205,60 @@ end
 -- of one gpu.fill()/bitblt() is exactly the shape that can exhaust that
 -- budget mid-draw. Prefer fill/copy/bitblt over set-loops in window
 -- draw code for this reason, not just speed.
+--
+-- `code` arrives from any worker and runs ON the kernal, so it gets a
+-- sandbox: no kernal globals (component/computer/load/...), copies of
+-- the pure libraries (so it can't clobber the kernal's own), a gpu that
+-- only exposes drawing calls against the buffer already made active
+-- (setActiveBuffer(0)/bind would otherwise be a way around the
+-- fullscreen gate), no pcall (which could absorb the budget error), and
+-- an instruction budget enforced in its own coroutine so the hook can't
+-- touch the kernal's own execution.
+local WINDOW_CODE_BUDGET = 1000000
+
+local WINDOW_GPU_METHODS = {
+  set = true, fill = true, copy = true, get = true,
+  setForeground = true, setBackground = true, getForeground = true, getBackground = true,
+}
+
+local function copyTable(t)
+  local c = {}
+  for k, v in pairs(t) do c[k] = v end
+  return c
+end
+
+local function windowEnv(gpu)
+  local drawGpu = setmetatable({}, {
+    __index = function(_, method)
+      if not WINDOW_GPU_METHODS[method] then
+        return function() error("gpu." .. tostring(method) .. " isn't available to window draw code", 2) end
+      end
+      return function(...) return gpu[method](...) end
+    end,
+  })
+  return {
+    gpu = drawGpu,
+    math = copyTable(math), string = copyTable(string), table = copyTable(table), utf8 = copyTable(utf8),
+    pairs = pairs, ipairs = ipairs, next = next, select = select,
+    tostring = tostring, tonumber = tonumber, type = type, error = error, assert = assert,
+  }
+end
+
 local function drawIntoBuffer(gpu, buffer, code)
+  local chunk, loadErr = load(code, "=window", "t", windowEnv(gpu))
+  if not chunk then return nil, loadErr end
+  local co = coroutine.create(chunk)
+  local message = "window draw code exceeded its instruction budget (" .. WINDOW_CODE_BUDGET .. ")"
+  debug.sethook(co, function()
+    debug.sethook(co, function() error(message, 0) end, "", 1)
+    error(message, 0)
+  end, "", WINDOW_CODE_BUDGET)
   gpu.setActiveBuffer(buffer)
-  local chunk, loadErr = load("local gpu = ...\n" .. code, "=window", "t")
-  local ok, err
-  if chunk then
-    ok, err = pcall(chunk, gpu)
-  else
-    ok, err = false, loadErr
-  end
+  local ok, err = coroutine.resume(co)
   gpu.setActiveBuffer(0)
+  if ok and coroutine.status(co) ~= "dead" then
+    ok, err = false, "window draw code can't yield"
+  end
   if ok then return true end
   return nil, err
 end

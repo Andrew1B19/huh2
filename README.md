@@ -322,7 +322,8 @@ itself now fully bare-metal (`kernal/bios.lua` + a `muxos.lua` built
 entirely on native primitives, with its own minimal text console and
 keyboard-modifier tracking replacing OpenOS's io/keyboard libraries) +
 protection against OC's real non-yielding timeout for dispatched `JOB`
-code (a voluntary `yield()` a job can call to cooperate, plus a hard
+code (a voluntary `yield()` a job can call to cooperate, `sleep(seconds)`
+to wait without swallowing other traffic, plus a hard
 instruction-budget circuit breaker that kills a non-cooperating job
 before it risks the mod killing the whole worker -- see
 docs/PROTOCOL.md for why the obvious "force a yield from a debug hook"

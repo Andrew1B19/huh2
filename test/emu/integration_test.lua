@@ -126,13 +126,15 @@ assertScreenContains("muxos>", "prompt visible")
 -- fixed-height scrolling console, see kernal/muxos.lua's termWrite),
 -- not something to assert on. All 3 workers should still be visible in
 -- the post-boot discover(1) + listNodes() output, though.
+-- Nodes are identified by their network card's address (see
+-- kernal/muxos.lua's selfAddr), so check for each worker's own card.
 do
   local screen = renderScreen()
-  local count = 0
-  for _ in screen:gmatch("worker%-%x+") do count = count + 1 end
-  if count < 3 then
-    dumpScreenOnFailure("worker discovery")
-    error("expected all 3 workers listed after boot, found " .. count)
+  for i, w in ipairs(workers) do
+    if not screen:find(w.modemAddr, 1, true) then
+      dumpScreenOnFailure("worker discovery")
+      error("worker " .. i .. " (card " .. w.modemAddr .. ") not listed after boot")
+    end
   end
 end
 print("  OK -- 3 workers visible on screen after boot")
@@ -352,43 +354,19 @@ print("test 13: fan-out cap -- a job tree can't have more running jobs than ther
 -- "running" (not finished) through all three back-to-back spawn round
 -- trips below for that cap to actually bind.
 --
--- Two earlier attempts at keeping a child "busy" long enough both
--- turned out to misunderstand the emulator's own time model and got
--- this wrong, confirmed by hand: a finite CPU-bound loop (even 2
--- million iterations, yielding every 500 via the cooperative yield()
--- global) finishes in effectively ZERO simulated time, because
--- test/emu/emulator.lua's own Emulator:step() advances its simulated
--- clock only for a REAL wait (a positive-timeout pullSignal), not for
--- yield()'s always-zero-delay cooperative check -- so all 3 children
--- had already run to completion, at the same instant, well before
--- advance() exhausted its budget. Going to the opposite extreme,
--- `while true do yield() end`, hung the test runner itself for the
--- very same reason: infinitely many zero-delay steps, the simulated
--- clock never moving, so advance()'s own "keep stepping until enough
--- simulated time has passed" loop never ends. The actual fix: have
--- the child block on a REAL timed wait -- `coroutine.yield(5)`
--- directly (confirmed against node/runtime.lua's own `pullSignal`,
--- which is nothing but `coroutine.yield(timeout)`; `computer` in
--- THIS emulator, unlike real OpenComputers, has no `pullSignal`
--- method of its own -- test/emu/emulator.lua's makeComputerAPI only
--- gives it address/uptime/beep/pushSignal, confirmed the hard way:
--- an earlier version of this child called `computer.pullSignal` and
--- every instance past the first died instantly with "attempt to call
--- a nil value", not a timing issue at all). A raw `coroutine.yield(n)`
--- from job code reaches runJobCode's own dispatch loop exactly like a
--- nested gmuxapi wait would, and IS a positive-timeout wait the
--- emulator genuinely advances its clock for -- so the child is still
--- truthfully "running" for the whole few-tick span the three spawns
--- below take.
-typeLine('run local childCode="local deadline = computer.uptime() + 5 while computer.uptime() < deadline do coroutine.yield(deadline - computer.uptime()) end return 1" local ok1,e1=gmuxapi.create_headless_process({code=childCode,name="fanout"}) local ok2,e2=gmuxapi.create_headless_process({code=childCode,name="fanout"}) local ok3,e3=gmuxapi.create_headless_process({code=childCode,name="fanout"}) return "r1="..tostring(ok1~=nil).." r2="..tostring(ok2~=nil).." r3="..tostring(ok3~=nil).." e3="..tostring(e3)')
+-- The child sleeps with sleep(): a CPU-bound loop (even with yield())
+-- finishes in zero simulated time, because the emulator only advances
+-- its clock for a real timed wait, so a busy-loop child would already
+-- be done -- and out of the tree's count -- before the 3rd spawn.
+typeLine('run local childCode="sleep(5) return 1" local ok1,e1=gmuxapi.create_headless_process({code=childCode,name="fanout"}) local ok2,e2=gmuxapi.create_headless_process({code=childCode,name="fanout"}) local ok3,e3=gmuxapi.create_headless_process({code=childCode,name="fanout"}) return "r1="..tostring(ok1~=nil).." r2="..tostring(ok2~=nil).." r3="..tostring(ok3~=nil).." e3="..tostring(e3)')
 emu:advance(3)
 assertScreenContains("r1=true r2=true r3=false", "first two children succeed, third is rejected")
 assertScreenContains("fan-out cap reached", "rejection names the real reason")
 print("  OK -- 1st and 2nd child spawns succeeded, 3rd was rejected once the tree hit the 3-node cap")
 
--- Test 13's own two surviving children are still mid-sleep (their
--- `coroutine.yield(5)` deadline runs 5 simulated seconds from when
--- each started, and only 3 of those have passed) -- drain that before
+-- Test 13's own two surviving children are still mid-sleep (5
+-- simulated seconds from when each started, and only 3 of those have
+-- passed) -- drain that before
 -- test 14 starts anything new, so every worker node is actually free
 -- rather than queued up behind a sleeper that has nothing to do with
 -- this next test.
@@ -398,11 +376,9 @@ print("test 14: window-focus tracking scaffolding -- ownership + default/explici
 -- create_graphics_process spawns a job AND a window FOR it, in one
 -- call -- the window's ownerJobId should be that job's own id, not
 -- whichever node happened to make the CREATEWINDOW request (this
--- `run` job's own node, not the spawned child's). Child code just
--- sleeps on a real timed wait (see test 13's own comment on why that,
--- not yield(), is what actually stays "running" here) so there's no
--- race with the checks below.
-typeLine('run local r=gmuxapi.create_graphics_process({code="local d=computer.uptime()+5 while computer.uptime()<d do coroutine.yield(d-computer.uptime()) end return 1", name="focustest", width=10, height=5}) return tostring(r.process.id) .. "," .. tostring(r.window.id) .. "," .. tostring(r.window.ownerJobId)')
+-- `run` job's own node, not the spawned child's). The child just
+-- sleeps so there's no race with the checks below.
+typeLine('run local r=gmuxapi.create_graphics_process({code="sleep(5) return 1", name="focustest", width=10, height=5}) return tostring(r.process.id) .. "," .. tostring(r.window.id) .. "," .. tostring(r.window.ownerJobId)')
 emu:advance(2)
 
 local focusProcId, focusWinId
@@ -454,5 +430,132 @@ typeLine("focus 99999")
 emu:advance(2)
 assertScreenContains("error: no such window", "focusing a nonexistent window id is rejected, not silently accepted")
 print("  OK -- focusing a nonexistent window id fails with a clear error, leaving focus unchanged")
+
+-- Returns everything after the LAST occurrence of `marker` on the
+-- (row-joined) screen, so an assertion can't be satisfied by output
+-- left over from an earlier test.
+local function screenAfter(marker)
+  local flat = renderScreen():gsub("\n", "")
+  local last
+  local from = 1
+  while true do
+    local s = flat:find(marker, from, true)
+    if not s then break end
+    last, from = s, s + 1
+  end
+  if not last then
+    dumpScreenOnFailure("marker " .. marker)
+    error("marker " .. marker .. " not on screen")
+  end
+  return flat:sub(last)
+end
+
+print("test 15: a job returning an unserializable value gets an ERROR back, and the worker survives")
+-- send() used to raise straight out of the worker's main loop when the
+-- RESULT couldn't be serialized, killing that worker's runtime outright.
+emu:advance(5)
+typeLine("runall return function() end")
+emu:advance(4)
+typeLine('runall return "alive" .. 15')
+emu:advance(4)
+do
+  local after = screenAfter("runall return function")
+  local errors = 0
+  for _ in after:gmatch("could not send job result") do errors = errors + 1 end
+  local alive = 0
+  for _ in after:gmatch("alive15") do alive = alive + 1 end
+  if errors ~= 3 or alive ~= 3 then
+    dumpScreenOnFailure("unserializable result")
+    error("expected 3 result-send errors and 3 live workers, got " .. errors .. " and " .. alive)
+  end
+end
+print("  OK -- each worker reported the bad result as an error and still answered the next job")
+
+print("test 16: a forged `from` can't release someone else's fullscreen grant")
+emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_LCONTROL, "tester"); emu:step()
+emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_LMENU, "tester"); emu:step()
+emu:injectSignal(kernal, "key_down", screenAddr, string.byte("c"), KEY_C, "tester"); emu:step()
+emu:advance(1)
+typeLine("spawn 1 gmuxapi.request_fullscreen()")
+emu:advance(2)
+local holder = screenAfter("spawn 1 gmuxapi"):match("spawned job %[%d+%] on (modem%-%x+)")
+assert(holder, "could not find the fullscreen holder's address")
+local forger
+for _, w in ipairs(workers) do
+  if w.modemAddr ~= holder then forger = w.modemAddr break end
+end
+-- Sent by `forger`'s card, but claiming to be the holder.
+local forged = string.format('MSG 990001 1/1 {["type"]="RELEASEFULLSCREEN",["from"]=%q,["to"]=%q,["id"]=990001}',
+  holder, kernal.modemAddr)
+emu:injectSignal(kernal, "modem_message", kernal.modemAddr, forger, 4477, 0, forged)
+emu:advance(1)
+typeLine('run return "MARK16"')
+emu:advance(2)
+emu:injectSignal(kernal, "key_down", screenAddr, string.byte("c"), KEY_C, "tester"); emu:step()
+emu:advance(1)
+if not screenAfter("MARK16"):find("force-releasing fullscreen grant held by " .. holder, 1, true) then
+  dumpScreenOnFailure("forged release")
+  error("the forged RELEASEFULLSCREEN released the real holder's grant")
+end
+print("  OK -- the grant was still held by " .. holder .. " after a forged release from " .. forger)
+
+print("test 17: a kill-policy child still QUEUED behind another job is killed, not run")
+-- nodeOrder[2] gets a 5-second sleeper; the parent on nodeOrder[1] then
+-- pins a kill-policy child onto that busy node and returns at once. The
+-- KILL arrives while the sleeper is running -- before the child has
+-- started -- and used to be swallowed by the sleeper's own wait.
+emu:advance(5)
+typeLine('spawn 2 sleep(5) return 1')
+emu:advance(1)
+local busyNode = screenAfter("spawn 2 sleep(5)"):match("spawned job %[%d+%] on (modem%-%x+)")
+assert(busyNode, "could not find the busy node's address")
+typeLine('spawn 1 gmuxapi.create_headless_process({code="return 17", orphan_policy="kill", node="' .. busyNode .. '"})')
+emu:advance(8)
+-- The full `processes` listing is longer than the screen by now, so
+-- ask for the newest kill-policy job's status directly.
+typeLine('run local last for _, p in ipairs(gmuxapi.get_processes()) do if p.orphanPolicy == "kill" then last = p end end return "K17=" .. tostring(last.status) .. "/" .. tostring(last.error)')
+emu:advance(3)
+if not screenAfter("K17="):find("K17=error/killed", 1, true) then
+  dumpScreenOnFailure("queued kill-policy child")
+  error("the queued kill-policy child was not killed")
+end
+print("  OK -- the queued child was killed when it reached the front of the queue")
+
+print("test 18: window draw code runs sandboxed on the kernal")
+-- CREATEWINDOW code comes from any worker and runs ON the kernal, so it
+-- must not see the kernal's globals or the raw gpu, and must not be able
+-- to hang the kernal.
+typeLine("window sb 1 1 5 1 component.list()")
+emu:advance(1)
+if not screenAfter("window sb 1 1 5 1"):find("window draw code failed", 1, true) then
+  dumpScreenOnFailure("window sandbox")
+  error("window draw code could reach the kernal's `component` global")
+end
+typeLine("window gs 1 1 5 1 gpu.setActiveBuffer(0)")
+emu:advance(1)
+if not screenAfter("window gs 1 1 5 1"):find("isn't available to window draw code", 1, true) then
+  dumpScreenOnFailure("window gpu whitelist")
+  error("window draw code could switch the gpu off its own buffer")
+end
+print("  OK -- no kernal globals, and only drawing calls on its own buffer")
+typeLine("window spin 1 1 5 1 while true do end")
+emu:advance(1)
+if not screenAfter("window spin 1 1 5 1"):find("exceeded its instruction budget", 1, true) then
+  dumpScreenOnFailure("window budget")
+  error("a non-terminating window draw was not stopped")
+end
+typeLine('run return "kernal" .. "-ok"')
+emu:advance(2)
+assertScreenContains("kernal-ok", "kernal still dispatching after a runaway window draw")
+print("  OK -- a non-terminating window draw is cut off and the kernal keeps running")
+
+print("test 19: both EEPROM images fit the 4096-byte EEPROM")
+-- Comments count toward the limit; node/bios.lua once grew to 4404
+-- bytes through comments alone without anything noticing.
+for _, path in ipairs({"/node/bios.lua", "/kernal/bios.lua"}) do
+  local size = #readFile(REPO_ROOT .. path)
+  assert(size <= 4096, path .. " is " .. size .. " bytes, over the 4096-byte EEPROM limit")
+  print("  OK -- " .. path:sub(2) .. " is " .. size .. " bytes")
+end
 
 print("ALL OK")

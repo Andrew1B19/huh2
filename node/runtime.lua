@@ -23,11 +23,25 @@ local PORT = 4477
 -- where kernalAddr used to be reassigned, further down).
 local kernalAddr = ...
 
+-- tostring() would round floats to 14 significant digits and turn
+-- inf/nan into bare identifiers that deserialize as nil.
+local function serializeNumber(v)
+  if v ~= v then return "0/0" end
+  if v == math.huge then return "1/0" end
+  if v == -math.huge then return "-1/0" end
+  if math.type(v) == "integer" then return tostring(v) end
+  local s = string.format("%.17g", v)
+  if not s:find("[%.eE]") then s = s .. ".0" end
+  return s
+end
+
 local function serialize(v, seen)
   seen = seen or {}
   local t = type(v)
-  if t == "nil" or t == "boolean" or t == "number" then
+  if t == "nil" or t == "boolean" then
     return tostring(v)
+  elseif t == "number" then
+    return serializeNumber(v)
   elseif t == "string" then
     return string.format("%q", v)
   elseif t == "table" then
@@ -37,6 +51,9 @@ local function serialize(v, seen)
     for k, val in pairs(v) do
       parts[#parts + 1] = "[" .. serialize(k, seen) .. "]=" .. serialize(val, seen)
     end
+    -- Only tables on the current path count as cycles; the same table
+    -- referenced twice elsewhere is fine.
+    seen[v] = nil
     return "{" .. table.concat(parts, ",") .. "}"
   else
     error("cannot serialize a value of type " .. t)
@@ -78,7 +95,9 @@ end
 
 component.invoke(modemAddr, "open", PORT)
 
-local nodeId = computer.address()
+-- The network card's address, not computer.address() -- see
+-- kernal/muxos.lua's selfAddr for why identity has to be the card.
+local nodeId = modemAddr
 
 -- Every message over the modem is chunked, not just boot's CODE --
 -- even a tiny PONG gets wrapped as one chunk, uniformly, rather than
@@ -136,6 +155,44 @@ local function sweepStaleChunks()
   end
 end
 
+-- Fully reassembled messages ({from = sending card, msg = table}) that
+-- arrived while this node was waiting on something else -- a
+-- remoteRequest() reply, or a job's sleep(). The main loop handles
+-- these before pulling anything new. Stashing the reassembled message,
+-- rather than computer.pushSignal-ing the raw frame back, is what lets
+-- a multi-chunk message survive (its earlier chunks are already gone
+-- from the signal queue) and keeps a waiter from re-pulling its own
+-- pushed-back signal in a tight loop until its deadline.
+local pendingMessages = {}
+
+-- Job ids the kernal has broadcast a raw "KILL <id>" for. A KILL can
+-- arrive while the target job is still queued here behind another job
+-- (so runJobCode never sees it); the main loop checks this before
+-- starting a JOB.
+local killedIds = {}
+
+local function noteKill(port, data)
+  if port ~= PORT or type(data) ~= "string" then return nil end
+  local id = data:match("^KILL (%d+)$")
+  if id then
+    id = tonumber(id)
+    killedIds[id] = true
+  end
+  return id
+end
+
+-- Sets aside one signal pulled while waiting for something else.
+-- Non-modem signals are dropped -- a worker has no use for them.
+local function stashSignal(name, from, port, data)
+  if name ~= "modem_message" or noteKill(port, data) then return end
+  if port ~= PORT or type(data) ~= "string" then return end
+  local payload = reassemble(from, data)
+  local msg = payload and deserialize(payload)
+  if type(msg) == "table" then
+    pendingMessages[#pendingMessages + 1] = {from = from, msg = msg}
+  end
+end
+
 -- Announce ourselves so the kernal can pick up our HELLO (it already
 -- knows kernalAddr from the boot handshake above, so this is purely
 -- for the kernal's own discovery bookkeeping, not for learning
@@ -167,43 +224,27 @@ local function remoteRequest(msgType, extra)
 
   local deadline = computer.uptime() + RPC_TIMEOUT
   while computer.uptime() < deadline do
-    local name, a2, from, port, a5, data = pullSignal(deadline - computer.uptime())
-    if name == "modem_message" and port == PORT and type(data) == "string" then
+    local name, _, from, port, _, data = pullSignal(deadline - computer.uptime())
+    if name == "modem_message" and from == kernalAddr and port == PORT
+        and type(data) == "string" and data:sub(1, 4) == "MSG " then
       local payload = reassemble(from, data)
-      if payload then
-        local reply = deserialize(payload)
-        if type(reply) == "table" and reply.id == id and reply.to == nodeId then
-          if reply.type == "RESULT" then
-            return reply.result
-          elseif reply.type == "ERROR" then
-            return nil, reply.error
-          end
-        else
-          -- A real bug, found the hard way: a fully-reassembled
-          -- message that ISN'T the reply we're waiting for used to
-          -- just be silently discarded here -- harmless as long as
-          -- nothing but the awaited reply could ever arrive while
-          -- this loop was waiting. That stopped being true the moment
-          -- a job could ask the kernal for a CHILD: the kernal places
-          -- the child with its own round-robin, which can land it on
-          -- THIS SAME NODE, which immediately sends it a fresh JOB
-          -- message -- arriving right here, mid-wait, while this node
-          -- is still blocked waiting for its OWN SPAWN reply. Silently
-          -- dropping it meant a child ever assigned to its own
-          -- parent's node could never actually start. Pushed back
-          -- instead, so the outer dispatch loop still sees it once
-          -- this wait resolves.
-          --
-          -- Known limitation, flagged rather than hidden: this
-          -- replays correctly for a single-chunk message (the common
-          -- case) but not one that needed multiple chunks --
-          -- reassemble() already consumed and discarded the earlier
-          -- chunks on the way to completing this one, so pushing back
-          -- only the chunk that triggered completion would start a
-          -- fresh reassembly that can never finish on its own.
-          computer.pushSignal(name, a2, from, port, a5, data)
-        end
+      local reply = payload and deserialize(payload)
+      -- The type check matters: the kernal's own JOB ids and this
+      -- node's RPC ids are independent counters, so a JOB for a child
+      -- placed on this node can carry the same id as the reply being
+      -- waited for -- it used to match here and be silently dropped.
+      if type(reply) == "table" and reply.id == id and reply.to == nodeId
+          and (reply.type == "RESULT" or reply.type == "ERROR") then
+        if reply.type == "RESULT" then return reply.result end
+        return nil, reply.error
+      elseif type(reply) == "table" then
+        -- Anything else (most importantly a JOB for a child the kernal
+        -- placed on this same node) is kept for the main loop rather
+        -- than dropped.
+        pendingMessages[#pendingMessages + 1] = {from = from, msg = reply}
       end
+    else
+      stashSignal(name, from, port, data)
     end
   end
   return nil, "timed out waiting for kernal"
@@ -237,9 +278,13 @@ local function faceGpu(method, ...)
     end
     if not remoteGpuAddr then return nil, "kernal has no gpu component" end
   end
-  local results, err = remoteInvoke(remoteGpuAddr, method, {...})
+  -- table.pack/`n` on both legs: a nil in the middle of the arguments or
+  -- the results (a component's `nil, "reason"` failure return, say)
+  -- must stay in place, not shift the values after it left.
+  local results, err = remoteInvoke(remoteGpuAddr, method, table.pack(...))
   if err then return nil, err end
-  return table.unpack(results or {})
+  results = results or {}
+  return table.unpack(results, 1, results.n or #results)
 end
 
 -- Exposed as a real global (not `local`) so JOB code -- loaded fresh via
@@ -458,6 +503,19 @@ function yield()
   coroutine.yield(YIELD_COOPERATE)
 end
 
+-- Exposed to JOB code: wait `seconds` without losing what arrives
+-- meanwhile. A job that waited with a bare coroutine.yield(timeout)
+-- would be handed (and silently consume) every signal that came in --
+-- including the JOB message for a child the kernal had just queued on
+-- this node. Everything is set aside for the main loop instead.
+function sleep(seconds)
+  local deadline = computer.uptime() + (seconds or 0)
+  while computer.uptime() < deadline do
+    local name, _, from, port, _, data = pullSignal(deadline - computer.uptime())
+    stashSignal(name, from, port, data)
+  end
+end
+
 -- A brief, bounded "let other things happen" pass for a job's own
 -- voluntary yield() -- pulls one real signal, if any arrived, and
 -- immediately pushes it back (the exact mechanism OpenOS's own boot
@@ -485,9 +543,15 @@ local function armBudgetHook(co)
   -- slices against a 1000-instruction budget that would kill it in one
   -- continuous run) -- cooperating costs nothing, not cooperating still
   -- gets caught within one slice.
+  local message = "job exceeded its instruction budget (" .. PREEMPT_INSTRUCTIONS ..
+    ") without yielding or finishing -- call yield() periodically if it needs to run this long"
   debug.sethook(co, function()
-    error("job exceeded its instruction budget (" .. PREEMPT_INSTRUCTIONS ..
-      ") without yielding or finishing -- call yield() periodically if it needs to run this long", 0)
+    -- Once tripped, error on EVERY instruction: a plain one-shot error
+    -- is just a Lua error, so job code wrapping its loop in pcall could
+    -- catch it and keep spinning forever. Each re-raise unwinds one
+    -- more pcall level, so the job dies after at most its nesting depth.
+    debug.sethook(co, function() error(message, 0) end, "", 1)
+    error(message, 0)
   end, "", PREEMPT_INSTRUCTIONS)
 end
 
@@ -553,73 +617,102 @@ local function runJobCode(chunk, args, selfId)
   return ok, a
 end
 
+-- Sends a reply, turning a value that can't cross the wire (a
+-- function, a cyclic table) into an ERROR for the requester. send()
+-- serializes before broadcasting anything, so a failure here sends
+-- nothing partial. Unguarded, that error used to escape the main loop
+-- and kill this worker's whole runtime.
+local function sendReply(msg, what)
+  local ok, err = pcall(send, msg)
+  if not ok then
+    send({type = "ERROR", from = nodeId, to = msg.to, id = msg.id,
+      error = "could not send " .. what .. ": " .. tostring(err)})
+  end
+end
+
+local function handleMessage(from, msg)
+  if msg.to ~= nil and msg.to ~= nodeId then return end
+  -- The payload's `from` has to be the card that actually sent it.
+  if msg.from ~= from then return end
+  -- Real bug, fixed: this used to do `kernalAddr = msg.from` here,
+  -- treating whoever just messaged this node as "the kernal". kernalAddr
+  -- is seeded once from the boot handshake (see the top of this file)
+  -- and only ever compared against from then on.
+  if msg.type == "PING" then
+    send({type = "PONG", from = nodeId, to = msg.from, id = msg.id})
+    return
+  end
+  -- Everything else runs code or touches hardware on this node, so it's
+  -- only accepted from the kernal itself, never from a peer.
+  if from ~= kernalAddr then return end
+
+  if msg.type == "JOB" then
+    if killedIds[msg.id] then
+      -- Its parent finished (with a "kill" policy) while this job was
+      -- still queued here, so it never started -- don't start it now.
+      killedIds[msg.id] = nil
+      send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id,
+        error = "killed (orphan policy, parent no longer running)"})
+      return
+    end
+    local chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t")
+    if not chunk then
+      send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = loadErr})
+      return
+    end
+    -- jobId is this job's OWN id -- `msg.id` IS that id for a JOB
+    -- message (dispatchJob uses one id as both the job's identity and
+    -- this message's RPC id). Exposed as a real global so the job can
+    -- tell the kernal "I am job X" when asking for a child
+    -- (gmuxapi.create_headless_process's `parent = jobId`), and passed to
+    -- runJobCode so it can recognize a KILL addressed at this job.
+    jobId = msg.id
+    local ok, result = runJobCode(chunk, msg.args, msg.id)
+    jobId = nil
+    if ok then
+      sendReply({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = result}, "job result")
+    else
+      send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = tostring(result)})
+    end
+  elseif msg.type == "LIST" then
+    -- Expose this node's own components to the kernal, so it can
+    -- address them without us having to write custom JOB code for it.
+    local list = {}
+    for addr, ctype in component.list() do
+      list[addr] = ctype
+    end
+    send({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = list})
+  elseif msg.type == "INVOKE" then
+    -- The "remote component" bridge: call a method on one of this
+    -- node's own components on the kernal's behalf. Results keep an
+    -- explicit `n` so a nil in the middle doesn't shift what follows.
+    local args = msg.args or {}
+    local packed = table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(args, 1, args.n or #args)))
+    if packed[1] then
+      local returns = {n = packed.n - 1}
+      for i = 2, packed.n do returns[i - 1] = packed[i] end
+      sendReply({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = returns}, "invoke result")
+    else
+      send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = tostring(packed[2])})
+    end
+  end
+end
+
 while true do
-  -- A bounded timeout (rather than blocking indefinitely) so stale,
-  -- abandoned partial reassemblies get swept out periodically even if
-  -- nothing else arrives for a while.
-  local name, _, from, port, _, data = pullSignal(10)
-  sweepStaleChunks()
-  if name == "modem_message" and port == PORT and type(data) == "string" then
-    local payload = reassemble(from, data)
-    local msg = payload and deserialize(payload)
-    if type(msg) == "table" and (msg.to == nil or msg.to == nodeId) then
-      -- Real bug, fixed: this used to do `kernalAddr = msg.from` here,
-      -- treating whoever just messaged this node as "the kernal" --
-      -- harmless as long as only the kernal ever messaged a worker,
-      -- but kernalAddr is now seeded once, authoritatively, from the
-      -- boot handshake (see the top of this file) specifically so a
-      -- future peer (parent/child job) message exchanged directly
-      -- between two workers can't overwrite it. Every handler below
-      -- already replies to `msg.from` directly, not to `kernalAddr`,
-      -- so removing this reassignment doesn't change how replies are
-      -- addressed -- it only stops this node from mis-learning who
-      -- the kernal is.
-      if msg.type == "PING" then
-        send({type = "PONG", from = nodeId, to = msg.from, id = msg.id})
-      elseif msg.type == "JOB" then
-        local chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t")
-        if not chunk then
-          send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = loadErr})
-        else
-          -- jobId is this job's OWN id -- `msg.id` IS that id for a JOB
-          -- message (dispatchJob assigns one `id` and uses it both as
-          -- the job's kernal-side identity and this message's own RPC
-          -- id, always the same value, by construction). Exposed as a
-          -- real global so the job's own code can tell the kernal "I
-          -- am job X" when asking for a child
-          -- (gmuxapi.create_headless_process's `parent = jobId`), and
-          -- passed to runJobCode so it can recognize a KILL addressed
-          -- at this specific job.
-          jobId = msg.id
-          local ok, result = runJobCode(chunk, msg.args, msg.id)
-          jobId = nil
-          if ok then
-            send({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = result})
-          else
-            send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = tostring(result)})
-          end
-        end
-      elseif msg.type == "LIST" then
-        -- Expose this node's own components to the kernal, so it can
-        -- address them without us having to write custom JOB code for it.
-        local list = {}
-        for addr, ctype in component.list() do
-          list[addr] = ctype
-        end
-        send({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = list})
-      elseif msg.type == "INVOKE" then
-        -- Call a method on one of this node's own components on the
-        -- kernal's behalf -- this is the "remote component" bridge:
-        -- addressed like a local component.invoke(), but carried over the
-        -- modem instead of being a direct in-process call.
-        local packed = table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(msg.args or {})))
-        if packed[1] then
-          local returns = {}
-          for i = 2, packed.n do returns[#returns + 1] = packed[i] end
-          send({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = returns})
-        else
-          send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = tostring(packed[2])})
-        end
+  local pending = table.remove(pendingMessages, 1)
+  if pending then
+    handleMessage(pending.from, pending.msg)
+  else
+    -- A bounded timeout (rather than blocking indefinitely) so stale,
+    -- abandoned partial reassemblies get swept out periodically even if
+    -- nothing else arrives for a while.
+    local name, _, from, port, _, data = pullSignal(10)
+    sweepStaleChunks()
+    if name == "modem_message" and not noteKill(port, data) and port == PORT and type(data) == "string" then
+      local payload = reassemble(from, data)
+      local msg = payload and deserialize(payload)
+      if type(msg) == "table" then
+        handleMessage(from, msg)
       end
     end
   end
