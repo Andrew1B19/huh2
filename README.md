@@ -338,9 +338,7 @@ wiped the console's own output, and a job-preemption design that could
 hang a job calling `gmuxapi.*` forever -- see docs/PROTOCOL.md's
 "Hardening found by actually running the real files together").
 Not yet built: a real scheduler (load balancing beyond round-robin, async
-futures/callbacks for `submit()` itself, not just `SPAWN`), node
-health/failure handling, the fullscreen grant's no-automatic-release-on-
-crash gap, broader OpenOS-compatibility-shim coverage for legacy
+futures/callbacks for `submit()` itself, not just `SPAWN`), broader OpenOS-compatibility-shim coverage for legacy
 programs beyond `gpu` (see docs/PROTOCOL.md's OpenOS-compatibility
 section for the intended shape), dragging/resizing/input routing (still
 not gmux's full desktop), per-job isolated drawing surfaces (so

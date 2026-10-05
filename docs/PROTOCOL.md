@@ -405,6 +405,31 @@ provides (per-node dispatch, the compositor, multithreading awareness);
 legacy OpenOS programs get the best-effort compatibility shim, not equal
 footing.
 
+### The legacy layer (decided, not yet built)
+
+What the compatibility path actually is, as decided in the design
+discussion (recorded late -- it was agreed but never written down):
+
+- **A heavily modified OpenOS, not a from-scratch rewrite.** OpenOS's
+  libraries get modified for muxos case by case: some are
+  straightforward, some need real reimplementation, and whatever
+  doesn't need rewriting from scratch isn't. The approach follows how
+  gmux does it where that works.
+- **Libraries move toward the nodes as faces.** The legacy userland
+  that runs alongside a program on a worker mostly ends up as front-end
+  faces: the same OpenOS-shaped API, making the real calls back to the
+  OS -- the same pattern as the worker's `gpu` face today.
+- **Legacy programs see virtual components, gmux-style.** A legacy
+  program is pointed at a virtual GPU/screen (and keyboard, modem,
+  ...) exactly as gmux does it, plus muxos's additions. gmux's own
+  virtual components (`gmux/lib/gmux/backend/virtual_components/`) get
+  forked and built into the OS for this.
+- **The front end comes from gmux.** The window/interaction side
+  (gmux's frontend) is built from gmux for now.
+- **Placement is the scheduler's.** Legacy programs are scheduled like
+  everything else -- the kernal decides where they run (see "Placement
+  authority never moves").
+
 ## `.mxe`: a native-app marker, not a security boundary
 
 muxos programs written to take advantage of its own API (rather than
@@ -422,6 +447,31 @@ in this project that would need one. Permissible on that basis -- it's
 exactly the kind of "which code path do I run this through" decision a
 file extension is good for, as long as nothing security-relevant is ever
 gated on it.
+
+## Program launcher (decided, not yet built)
+
+Works basically like OpenOS's -- a reimplementation, with muxos's
+additions. What it does differs by extension:
+
+- **`.lua`**: the legacy path above (virtual components, the modified
+  OpenOS userland).
+- **`.mxe`**: the program declares, at launch, what it expects:
+  - the muxos version it targets. A version mismatch does **not** stop
+    it from running;
+  - any libraries it wants beyond the native OS APIs, which every
+    `.mxe` always gets.
+
+  The launcher **responds** to that declaration (what's available, what
+  isn't, the actual version), so the program can adapt. The baseline
+  declaration is deliberately minimal -- only what's barely needed. The
+  full `.mxe` spec comes later; this baseline doesn't need it.
+
+Either way, the launched program is placed by the scheduler, not by the
+launcher or the program.
+
+**Package manager**: OPM (currently an OpenOS package manager) will be
+expanded into muxos's native package manager and track installed
+packages. The kernal only needs to provide a way for OPM to talk to it.
 
 ## Hardware requirements
 
@@ -1052,14 +1102,31 @@ Partially answered by what's built: a dispatched job gets the real
 global `jobId` (its own id), `yield`/`sleep`, and, through `gmuxapi`, a
 way to ask for a child.
 
-**Decided, not yet built**: isolation depends on the kind of program.
-A **legacy** (OpenOS/gmux-compat) program gets gmux-style isolation --
-its own environment, the way gmux gives each process one. An **`.mxe`**
-program gets open visibility -- the shared runtime globals, which is
-what every job gets today. Building this needs a way to tell the two
-apart at dispatch, which doesn't exist yet. A kernal system bus (a
-dbus-like named-service/signal bus) is a possible later addition for
-`.mxe` programs to talk to kernal services and each other.
+**Decided, not yet built -- process isolation for every program.** Both
+legacy programs and `.mxe`s run as isolated processes in the sense that
+matters for fault tolerance: a program crashing doesn't take down the
+node or the system, and the kernal can pause or end it.
+
+The difference is what each sees:
+
+- A **legacy** program gets gmux-style virtual components (its own
+  virtual gpu/screen/keyboard/modem -- see "The legacy layer").
+- An **`.mxe`** gets no virtual components. It's a pseudo-emulated
+  environment that makes kernel calls instead (the native OS APIs, plus
+  any libraries it asked for at launch) and has open visibility of the
+  system. "Open visibility" means it's system- and kernel-aware, not
+  that it shares globals with other programs. (Recorded wrongly at
+  first as "the shared runtime globals every job gets today"; corrected.)
+
+Where things stand today: a crashing job is already contained (its
+error comes back as an `ERROR`, the worker keeps running -- tests 6 and
+15), and the kernal can end a job at its yield points (`KILL`). Not
+built: pausing, per-process environments (jobs on a worker still share
+one global table), and telling legacy from `.mxe` at launch.
+
+A kernal system bus (a dbus-like named-service/signal bus) is a
+possible later addition for `.mxe` programs to talk to kernal services
+and each other.
 
 ### App identity and orphan reclaim -- BUILT
 
@@ -1236,6 +1303,12 @@ to a stand-in native function) -- that's what running the suite on
 real hardware still needs to close.
 
 ### Compositor access for `.mxe`
+
+An `.mxe` makes draw calls to the compositor directly -- no virtual GPU
+-- and doesn't have to run on the kernal's node to do it. The
+compositor's interface for this is built on a similar model to gmux's
+virtual GPU, but with far less overhead, and without a gmux-style
+virtual frame buffer per app.
 
 An `.mxe` app gets a **window handle** from the compositor, not
 compositor authority -- the same kind of restriction in kind as the
