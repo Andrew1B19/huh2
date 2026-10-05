@@ -68,10 +68,21 @@ end
 
 local M = {}
 
--- id -> {id, title, x, y, width, height, buffer, layer, dirty}
+-- id -> {id, title, x, y, width, height, buffer, layer, dirty, ownerJobId}
 local windows = {}
 local windowOrder = {} -- ids in Z-ORDER, index 1 = TOPMOST (matches gmux's convention)
 local nextWindowId = 1
+
+-- Scaffolding for focus-based keyboard delivery (see docs/PROTOCOL.md's
+-- ".mxe hardware access model" -- the design calls for the kernal to
+-- send keyboard updates straight to whichever .mxe job currently has
+-- focus, instead of through a virtual keyboard component). This is
+-- ONLY the tracking half: which window is focused, and which job (if
+-- any) owns it. Nothing actually forwards a key_down signal anywhere
+-- yet -- kernal/muxos.lua's handleKeyDown still only ever feeds the
+-- kernal's own REPL input buffer. That wiring is the next step, not
+-- this one, and needs this tracking to already exist first.
+local focusedId = nil
 
 -- Persistent off-screen surface the whole desktop composites into
 -- before any real screen write. Allocated lazily (first window/flush),
@@ -287,8 +298,17 @@ function M.createWindow(options)
 
   local x, y = options.x or 1, options.y or 1
   local id = nextId()
+  -- `ownerJobId` is OPTIONAL and purely informational to the
+  -- compositor itself -- it's whatever node/runtime.lua's
+  -- create_graphics_process passed through CREATEWINDOW's `ownerJobId`
+  -- field (handleCreateWindow forwards the whole message as `options`,
+  -- so this needs no wiring here beyond just reading it). A plain
+  -- create_window / the REPL's own `window` command leaves it nil --
+  -- there's no job to deliver keyboard input to for those, and that's
+  -- fine, not an error.
   local win = {id = id, title = options.title or ("window " .. id), x = x, y = y,
-    width = width, height = height, buffer = buffer, layer = options.layer or 0, dirty = true}
+    width = width, height = height, buffer = buffer, layer = options.layer or 0, dirty = true,
+    ownerJobId = options.ownerJobId}
   windows[id] = win
   -- New windows go on top, matching gmux's layer_begin for equal layers:
   -- inserted before the first existing window whose layer is <= this one's.
@@ -300,6 +320,12 @@ function M.createWindow(options)
     end
   end
   table.insert(windowOrder, insertAt, id)
+  -- A freshly created window also takes focus, same convention as it
+  -- taking the top z-order slot -- the newest thing on screen is, by
+  -- default, the thing that should receive input. Nothing stops this
+  -- being changed later (see M.setFocus below); this is just the
+  -- default a REPL/test has no reason to override.
+  focusedId = id
   return win
 end
 
@@ -309,6 +335,29 @@ function M.listWindows()
     list[#list + 1] = windows[id]
   end
   return list
+end
+
+-- Returns the currently-focused window's own record, or nil if no
+-- window has ever been created (or, in principle, once a real
+-- "destroy window" exists and removes the focused one -- not a case
+-- that can happen yet, since nothing ever removes a window today).
+function M.getFocus()
+  return focusedId and windows[focusedId]
+end
+
+-- Explicit focus change -- there's no mouse/click anywhere in this
+-- project (no pointer component is wired up at all), so this is the
+-- only way focus can move until some other input gesture is designed.
+-- Exposed mainly for kernal/muxos.lua's own `focus <id>` REPL command,
+-- a manual stand-in for whatever gesture eventually does this for
+-- real. Returns false + an error for an id that doesn't exist, rather
+-- than silently leaving the old focus in place or focusing nothing.
+function M.setFocus(id)
+  if not windows[id] then
+    return false, "no such window: " .. tostring(id)
+  end
+  focusedId = id
+  return true
 end
 
 -- Composites every dirty window into the frame buffer, then flips the

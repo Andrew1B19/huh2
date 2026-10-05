@@ -182,7 +182,7 @@ way they would over any other screen content.
 | `INVOKE`  | `from`, `to`, `id`, `address`, `method`, `args`           | either  | call `component.invoke(address, method, args...)` on the receiver's own component |
 | `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, muxos-shaped) |
 | `SPAWN`   | `from`, `to`, `id`, `code`, `args`, `node`                | worker  | "dispatch a new job" (gmux API's `create_headless_process`/`create_graphics_process`); replies immediately with a handle, doesn't wait for the job to finish |
-| `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`) |
+| `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
 | `GETWINDOWS` | `from`, `to`, `id`                                      | worker  | "list every window you know about" (gmux API's `get_windows()`) |
 | `REQUESTFULLSCREEN` | `from`, `to`, `id`                                | worker  | "let me bypass the compositor and INVOKE the real gpu/screen directly" |
 | `RELEASEFULLSCREEN` | `from`, `to`, `id`                                | worker  | give that grant back |
@@ -1186,6 +1186,61 @@ repeated draw call looks like, how dirty-tracking interacts with a
 handle that's drawn into intermittently rather than once) hasn't been
 designed yet.
 
+### Window-focus tracking -- scaffolding BUILT, keyboard delivery itself still NOT built
+
+The general `.mxe`-vs-legacy hardware access model (see "Still open"
+below) calls for the kernal to send keyboard updates straight to
+whichever `.mxe` job currently has focus, instead of through a virtual
+keyboard component. That needs the kernal to actually know which
+window is focused, and which job (if any) it belongs to, before any
+key signal can be routed anywhere -- this section is that tracking
+mechanism, and only that. **No key signal is forwarded to any job
+yet** -- `kernal/muxos.lua`'s `handleKeyDown` still only ever feeds the
+kernal's own REPL input buffer, exactly as before. Actually wiring
+delivery is the next piece, not this one.
+
+**Window ownership**: `CREATEWINDOW` gained an optional `ownerJobId`
+field. `node/runtime.lua`'s `create_graphics_process` sets it to the
+spawned child's own id (`proc.id`) -- not to whatever node happened to
+make the `CREATEWINDOW` request, which can be a totally different node
+than the child it just spawned for. A plain `create_window` (or the
+REPL's own `window` command) leaves it unset -- there's no job to
+deliver anything to for those, and that's a normal case, not an error.
+Given a focused window with an `ownerJobId`, the kernal can resolve
+`jobs[ownerJobId].node` directly through the single global job table
+it already keeps -- no separate bookkeeping needed to go from "this
+window is focused" to "this physical node should receive the key
+signal."
+
+**Focus itself**: `kernal/compositor.lua` keeps one `focusedId`,
+exposed as `M.getFocus()`/`M.setFocus(id)`. A freshly created window
+takes focus automatically, the same convention as it taking the top
+z-order slot -- the newest thing on screen is, by default, the thing
+that should receive input, whether or not it declared an owner.
+There's no mouse or click gesture anywhere in this project to move
+focus any other way yet, so `setFocus` is exposed at the kernal REPL
+as a manual `focus <window id>` command -- a stand-in for whatever
+gesture eventually does this for real, and the only way to change
+focus away from "whatever was created most recently" today. `windows`
+shows the current focus and each window's owning job (if any) so this
+is actually observable. Verified end to end in
+`test/emu/integration_test.lua`'s test 14: `create_graphics_process`'s
+window really is tagged with its spawned child's id (not the caller's
+own), a plain ownerless window still takes focus on creation same as
+an owned one, `focus <id>` moves it back explicitly, and focusing a
+nonexistent id fails with a clear error rather than silently doing
+nothing or crashing.
+
+**Still genuinely open**: what happens to focus when a window is
+destroyed (no "destroy window" exists yet at all, so this has never
+come up for real); whether focus should also move on anything besides
+window creation (e.g. Tab-cycling, or a future mouse/click gesture);
+and the actual keyboard-delivery wiring itself -- how a `key_down`
+signal reaches the focused window's owning job over the wire, what
+shape it arrives in on the worker side, and whether a job needs to ask
+the kernal "do I currently have focus" (a new message type) or just
+reacts to whatever it's handed.
+
 ### Still open
 
 Collected in one place:
@@ -1208,9 +1263,10 @@ Collected in one place:
   implementation plus eventual GERTi access, while legacy sees an
   emulated modem; keyboard input should be delivered directly to
   whichever `.mxe` job currently has focus, instead of via a virtual
-  keyboard component. Needs more scaffolding first -- no window-focus-
-  tracking mechanism exists yet, and that has to exist before
-  focus-based keyboard delivery can be built at all.
+  keyboard component. Window-focus tracking itself is now scaffolded
+  (see "Window-focus tracking" above) -- what's still open is the
+  networking side entirely (the modem kernel module, GERTi access) and
+  the actual keyboard-delivery wiring on top of that scaffolding.
 
 **Resolved while building the rest of this section**: "what the kernal
 does when every worker is already busy" turned out to already have an

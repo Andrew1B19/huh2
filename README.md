@@ -378,17 +378,28 @@ for the fan-out cap; the dynamic-timeout formula itself is also
 cross-checked in isolation, since its 300s base timeout makes a true
 end-to-end test of the sweep impractical).
 
+Window-focus tracking is scaffolded now too: `CREATEWINDOW` carries an
+optional `ownerJobId` (`create_graphics_process` sets it to the
+spawned child's own id), and `kernal/compositor.lua` tracks which
+window is focused (a new window takes focus automatically, same as it
+taking the top z-order slot) with `M.getFocus()`/`M.setFocus(id)` and a
+manual `focus <window id>` REPL command, since there's no mouse/click
+gesture anywhere in this project to move focus any other way. This is
+ONLY the tracking -- no key signal is actually forwarded to any job
+yet, `handleKeyDown` still only ever feeds the kernal's own REPL input.
+Verified in `test/emu/integration_test.lua` (test 14).
+
 **Still forward design, not yet built**: planned node draining as
 distinct from an unrecoverable node death, "semi-live" job migration
 via `eris` coroutine persistence (the mechanism itself is confirmed for
 real against the genuine upstream `eris` library, including a full
 cross-process round trip -- see `test/hardware/verify.lua` -- but
 nothing in `kernal/muxos.lua`/`node/runtime.lua` uses it yet), and the
-general `.mxe`-vs-legacy hardware access model (direct kernel calls for
-every subsystem, never virtualized hardware, for `.mxe` apps --
-networking and focus-based keyboard delivery are the two concrete
-examples on the table, but keyboard delivery needs window-focus
-tracking built first). See docs/PROTOCOL.md's "The `.mxe` process
-model" section for the full design and what's still genuinely
-undecided (the exact job-environment and persistent-window-handle
-APIs, "promote"'s unenforced self-dependence requirement).
+rest of the general `.mxe`-vs-legacy hardware access model: the
+networking side entirely (a lightweight kernal modem kernel module for
+`.mxe`, eventual GERTi access, vs. an emulated modem for legacy), and
+the actual keyboard-delivery wiring on top of the focus-tracking
+scaffolding above. See docs/PROTOCOL.md's "The `.mxe` process model"
+section for the full design and what's still genuinely undecided (the
+exact job-environment and persistent-window-handle APIs, "promote"'s
+unenforced self-dependence requirement).

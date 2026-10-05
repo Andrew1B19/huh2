@@ -1087,8 +1087,12 @@ local function printWindows()
     print("no windows created yet")
     return
   end
+  local focus = compositor.getFocus()
   for _, win in ipairs(list) do
-    print(string.format("[%d] %q  %dx%d at (%d,%d)", win.id, win.title, win.width, win.height, win.x, win.y))
+    local tags = ""
+    if focus and win.id == focus.id then tags = tags .. " (focused)" end
+    if win.ownerJobId then tags = tags .. " (owner job " .. win.ownerJobId .. ")" end
+    print(string.format("[%d] %q  %dx%d at (%d,%d)%s", win.id, win.title, win.width, win.height, win.x, win.y, tags))
   end
 end
 
@@ -1138,6 +1142,20 @@ runCommand = function(line)
     end
   elseif line == "windows" then
     printWindows()
+  elseif line:match("^focus%s") then
+    -- Manual stand-in for the gesture that will eventually move focus
+    -- for real (there's no mouse/click component anywhere in this
+    -- project) -- see kernal/compositor.lua's M.setFocus. Moving focus
+    -- doesn't yet DO anything beyond being observable via `windows`
+    -- (handleKeyDown below still only ever feeds the kernal's own REPL
+    -- input buffer) -- that's the next piece, not this one.
+    local idStr = line:match("^focus%s+(%d+)$")
+    if not idStr then
+      print("usage: focus <window id>")
+    else
+      local ok, err = compositor.setFocus(tonumber(idStr))
+      if ok then print("window [" .. idStr .. "] focused") else print("error: " .. err) end
+    end
   elseif line:match("^bitdemo%s") then
     local mode, x, y = line:match("^bitdemo%s+(%S+)%s+(%d+)%s+(%d+)$")
     if not mode or (mode ~= "halfblock" and mode ~= "braille") then
@@ -1178,6 +1196,7 @@ print("  discover | nodes | ping <node> [count] | quit")
 print("  run <lua code> | runall <lua code> | processes")
 print("  spawn <node> <lua code>")
 print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
+print("  focus <window id> -- moves keyboard focus (manual stand-in -- no mouse/click gesture exists yet)")
 print("  bitdemo <halfblock|braille> <x> <y> -- draws a test pattern as a bit window")
 print("  components <node> | call <node> <component addr> <method> [args table]")
 print("(<node> is either a [n] index from 'nodes' or a full node address)")

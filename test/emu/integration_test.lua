@@ -386,4 +386,73 @@ assertScreenContains("r1=true r2=true r3=false", "first two children succeed, th
 assertScreenContains("fan-out cap reached", "rejection names the real reason")
 print("  OK -- 1st and 2nd child spawns succeeded, 3rd was rejected once the tree hit the 3-node cap")
 
+-- Test 13's own two surviving children are still mid-sleep (their
+-- `coroutine.yield(5)` deadline runs 5 simulated seconds from when
+-- each started, and only 3 of those have passed) -- drain that before
+-- test 14 starts anything new, so every worker node is actually free
+-- rather than queued up behind a sleeper that has nothing to do with
+-- this next test.
+emu:advance(3)
+
+print("test 14: window-focus tracking scaffolding -- ownership + default/explicit focus (no keyboard delivery wired up yet)")
+-- create_graphics_process spawns a job AND a window FOR it, in one
+-- call -- the window's ownerJobId should be that job's own id, not
+-- whichever node happened to make the CREATEWINDOW request (this
+-- `run` job's own node, not the spawned child's). Child code just
+-- sleeps on a real timed wait (see test 13's own comment on why that,
+-- not yield(), is what actually stays "running" here) so there's no
+-- race with the checks below.
+typeLine('run local r=gmuxapi.create_graphics_process({code="local d=computer.uptime()+5 while computer.uptime()<d do coroutine.yield(d-computer.uptime()) end return 1", name="focustest", width=10, height=5}) return tostring(r.process.id) .. "," .. tostring(r.window.id) .. "," .. tostring(r.window.ownerJobId)')
+emu:advance(2)
+
+local focusProcId, focusWinId
+do
+  local screen = renderScreen():gsub("\n", "")
+  local p, w, owner = screen:match("(%d+),(%d+),(%d+)")
+  if not p then
+    dumpScreenOnFailure("create_graphics_process ids")
+    error("could not find process/window/owner ids on screen")
+  end
+  assert(p == owner, "the new window's ownerJobId must be the SPAWNED child's own id -- got process=" .. p .. " owner=" .. owner)
+  focusProcId, focusWinId = p, w
+end
+print("  OK -- create_graphics_process's window is owned by the job it was created for (job " .. focusProcId .. ", window " .. focusWinId .. ")")
+
+typeLine("windows")
+emu:advance(2)
+assertScreenContains("[" .. focusWinId .. "]", "graphics-process window listed")
+assertScreenContains("(focused)", "the newest window takes focus by default")
+assertScreenContains("(owner job " .. focusProcId .. ")", "the listing shows the real owning job, not just that one exists")
+print("  OK -- the new window took focus by default and shows its real owning job")
+
+-- A second, plain window (REPL `window` command, no owning job at
+-- all) should steal focus the same way -- "new window = new focus" is
+-- unconditional, not special-cased to only graphics-process windows.
+typeLine("window plain 1 1 5 3 gpu.set(1,1,\"x\")")
+emu:advance(2)
+local plainWinId = renderScreen():gsub("\n", ""):match("created window %[(%d+)%]")
+assert(plainWinId, "expected the plain window's own id to be echoed")
+typeLine("windows")
+emu:advance(2)
+assertScreenContains("[" .. plainWinId .. "]", "plain window listed")
+assertScreenContains("[" .. plainWinId .. "] \"plain\"  5x3 at (1,1) (focused)", "the plain window has no owner tag and now holds focus, having been created more recently")
+print("  OK -- a plain, ownerless window still takes focus on creation, same as an owned one")
+
+-- Explicit `focus <id>` (the manual stand-in for a gesture that
+-- doesn't exist yet -- no mouse/click anywhere in this project) moves
+-- focus back, and is reflected the same way in `windows`.
+typeLine("focus " .. focusWinId)
+emu:advance(2)
+assertScreenContains("window [" .. focusWinId .. "] focused", "focus command confirms the change")
+typeLine("windows")
+emu:advance(2)
+assertScreenContains("[" .. focusWinId .. "]", "graphics-process window still listed")
+assertScreenContains("(owner job " .. focusProcId .. ")", "owner tag still present after refocusing")
+print("  OK -- `focus <id>` moves focus back explicitly, observable via `windows`")
+
+typeLine("focus 99999")
+emu:advance(2)
+assertScreenContains("error: no such window", "focusing a nonexistent window id is rejected, not silently accepted")
+print("  OK -- focusing a nonexistent window id fails with a clear error, leaving focus unchanged")
+
 print("ALL OK")

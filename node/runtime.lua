@@ -314,8 +314,17 @@ gmuxapi = {
     local proc, procErr = remoteRequest("SPAWN", {code = options.code, args = options.args, node = options.node,
       parent = jobId, appName = options.name, orphanPolicy = options.orphan_policy})
     if not proc then return nil, procErr end
+    -- `ownerJobId = proc.id` links this window to the job it was just
+    -- created FOR, not to whichever node happened to make this
+    -- CREATEWINDOW request (this call itself can run on a totally
+    -- different node than the child it just spawned). This is the one
+    -- piece of scaffolding focus-based keyboard delivery actually
+    -- needs from this call: given a focused window, the kernal can
+    -- look up its ownerJobId and, from there, jobs[ownerJobId].node --
+    -- no separate bookkeeping required. See kernal/compositor.lua's
+    -- M.setFocus/M.getFocus for the tracking side of this.
     local win, winErr = remoteRequest("CREATEWINDOW", {
-      title = options.name, width = options.width, height = options.height,
+      title = options.name, width = options.width, height = options.height, ownerJobId = proc.id,
     })
     if not win then return {process = proc}, winErr end
     return {process = proc, window = win}
