@@ -14,6 +14,7 @@
 -- hand.
 
 local PORT = 4477
+local MUXOS_VERSION = "0.1.0"
 
 -- node/bios.lua passes this in: the address of whoever's CODE chunks
 -- actually completed the boot handshake -- the ONE place a worker ever
@@ -165,20 +166,40 @@ end
 -- pushed-back signal in a tight loop until its deadline.
 local pendingMessages = {}
 
--- Job ids the kernal has broadcast a raw "KILL <id>" for. A KILL can
--- arrive while the target job is still queued here behind another job
--- (so runJobCode never sees it); the main loop checks this before
--- starting a JOB.
-local killedIds = {}
+-- Process control from the kernal: raw, unchunked "KILL <id>",
+-- "PAUSE <id>", "RESUME <id>" broadcasts (cheap to recognize at every
+-- signal, no reassembly). Recorded per job id whether or not that job
+-- is running yet -- a control can arrive while the target is still
+-- queued here behind another job -- and acted on by runJobCode at the
+-- job's yield points, or by the main loop before a queued JOB starts.
+-- id -> "KILL" | "PAUSE"
+local controlState = {}
 
-local function noteKill(port, data)
+local function noteControl(port, data)
   if port ~= PORT or type(data) ~= "string" then return nil end
-  local id = data:match("^KILL (%d+)$")
-  if id then
-    id = tonumber(id)
-    killedIds[id] = true
+  local verb, id = data:match("^(%u+) (%d+)$")
+  if verb ~= "KILL" and verb ~= "PAUSE" and verb ~= "RESUME" then return nil end
+  id = tonumber(id)
+  if verb == "RESUME" then
+    if controlState[id] == "PAUSE" then controlState[id] = nil end
+  elseif controlState[id] ~= "KILL" then
+    controlState[id] = verb
   end
-  return id
+  return verb
+end
+
+-- Input events (keyboard, ...) the kernal has routed to a process on
+-- this node: job id -> list of packed events, oldest first. Read with
+-- gmuxapi.pull_event(). Capped so a process that never reads them can't
+-- grow this without bound.
+local eventQueues = {}
+local MAX_QUEUED_EVENTS = 64
+
+local function queueEvent(id, event)
+  if type(id) ~= "number" or type(event) ~= "table" then return end
+  local q = eventQueues[id]
+  if not q then q = {}; eventQueues[id] = q end
+  if #q < MAX_QUEUED_EVENTS then q[#q + 1] = event end
 end
 
 -- Sets aside one signal pulled while waiting for something else -- a
@@ -188,13 +209,15 @@ end
 -- heartbeat. Non-modem signals are dropped -- a worker has no use for
 -- them.
 local function stashSignal(name, from, port, data)
-  if name ~= "modem_message" or noteKill(port, data) then return end
+  if name ~= "modem_message" or noteControl(port, data) then return end
   if port ~= PORT or type(data) ~= "string" then return end
   local payload = reassemble(from, data)
   local msg = payload and deserialize(payload)
   if type(msg) ~= "table" then return end
   if msg.type == "PING" and msg.from == from and (msg.to == nil or msg.to == nodeId) then
     send({type = "PONG", from = nodeId, to = msg.from, id = msg.id})
+  elseif msg.type == "EVENT" and from == kernalAddr and msg.from == from and msg.to == nodeId then
+    queueEvent(msg.jobId, msg.event)
   else
     pendingMessages[#pendingMessages + 1] = {from = from, msg = msg}
   end
@@ -304,15 +327,11 @@ gpu = setmetatable({}, {
   end,
 })
 
--- Set by the main loop (below) to this node's own currently-running
--- job's id, right before running its code -- exposed as a real global
--- (same reasoning as `gpu`/`gmuxapi`/`yield`: JOB code is load()ed
--- fresh each time with no visibility into this file's own locals) so
--- a job can tell the kernal "I am job X" when asking for a child --
--- see create_headless_process's `parent = jobId` below, and
--- docs/PROTOCOL.md's ".mxe process model" for why the kernal needs
--- this to track parent/child relationships at all.
-jobId = nil
+-- The job this node is running right now (a worker runs one at a
+-- time), so gmuxapi calls can tell the kernal "I am job X" -- e.g. as
+-- the parent when asking for a child. The job itself sees its own id as
+-- `jobId` in its process environment.
+local currentJobId = nil
 
 -- Muxos-shaped gmux application API. Every one of these is necessarily
 -- a remote call to the kernal, never local-first like `gpu` -- a
@@ -340,7 +359,7 @@ gmuxapi = {
   -- convention as a JOB) instead. Fire-and-forget, like gmux's own
   -- version: returns {process = {id, node}} immediately, not the result.
   --
-  -- `parent = jobId` (this node's own currently-running job, see above)
+  -- The parent (this node's currently-running job, see above)
   -- is always included automatically -- the calling job never needs to
   -- know or supply its own id for this to work. `options.orphan_policy`
   -- ("orphan" (default) / "kill" / "promote") and `options.name` (the
@@ -353,7 +372,7 @@ gmuxapi = {
       return nil, "create_headless_process needs options.code (a Lua source string)"
     end
     local result, err = remoteRequest("SPAWN", {code = options.code, args = options.args, node = options.node,
-      parent = jobId, appName = options.name, orphanPolicy = options.orphan_policy})
+      parent = currentJobId, appName = options.name, orphanPolicy = options.orphan_policy})
     if err then return nil, err end
     return {process = result}
   end,
@@ -370,7 +389,7 @@ gmuxapi = {
       return nil, "create_graphics_process needs options.code (a Lua source string)"
     end
     local proc, procErr = remoteRequest("SPAWN", {code = options.code, args = options.args, node = options.node,
-      parent = jobId, appName = options.name, orphanPolicy = options.orphan_policy})
+      parent = currentJobId, appName = options.name, orphanPolicy = options.orphan_policy})
     if not proc then return nil, procErr end
     -- `ownerJobId = proc.id` links this window to the job it was just
     -- created FOR, not to whichever node happened to make this
@@ -440,6 +459,27 @@ gmuxapi = {
   get_orphans = function(name)
     return remoteRequest("GETORPHANS", {appName = name})
   end,
+
+  -- The next input event the kernal routed to this process (keyboard
+  -- events while one of its windows has focus), or nil after `timeout`
+  -- seconds (nil timeout: wait indefinitely). Events come back as
+  -- {name, ...} lists, e.g. {"key_down", char, code}.
+  pull_event = function(timeout)
+    local deadline = timeout and (computer.uptime() + timeout)
+    while true do
+      local q = eventQueues[currentJobId]
+      if q and #q > 0 then return table.remove(q, 1) end
+      if deadline and computer.uptime() >= deadline then return nil end
+      local name, _, from, port, _, data = pullSignal(deadline and (deadline - computer.uptime()) or nil)
+      stashSignal(name, from, port, data)
+    end
+  end,
+
+  -- Pause, resume, or end one of this process's own descendants. The
+  -- kernal refuses anything else.
+  pause_process = function(id) return remoteRequest("CONTROL", {jobId = id, verb = "PAUSE", caller = currentJobId}) end,
+  resume_process = function(id) return remoteRequest("CONTROL", {jobId = id, verb = "RESUME", caller = currentJobId}) end,
+  kill_process = function(id) return remoteRequest("CONTROL", {jobId = id, verb = "KILL", caller = currentJobId}) end,
 }
 
 -- OpenComputers really does kill a computer that runs too long without
@@ -553,69 +593,95 @@ local function armBudgetHook(co)
   end, "", PREEMPT_INSTRUCTIONS)
 end
 
--- A raw, unchunked "KILL <id>" broadcast -- same convention as boot's
--- own BOOT/CODE, bypassing the generic MSG framing deliberately: this
--- needs to be checked cheaply, at every signal a running job's
--- cooperative loop sees, without waiting on chunk reassembly (and a
--- kill message is tiny -- it never needs to be chunked in the first
--- place). Sent by the kernal when a "kill"-orphan-policy job's parent
--- finishes (see kernal/muxos.lua's applyOrphanPolicyForChildrenOf).
--- Returns true if `sig` (a packed pullSignal() result) is a KILL for
--- `selfId` specifically -- every other worker running a DIFFERENT job
--- just sees a non-matching id and ignores it, consistent with this
--- project's all-broadcast design.
-local function isKillSignalFor(sig, selfId)
-  if sig[1] ~= "modem_message" or sig[4] ~= PORT or type(sig[6]) ~= "string" then return false end
-  local targetId = sig[6]:match("^KILL (%d+)$")
-  return targetId ~= nil and tonumber(targetId) == selfId
+local KILLED = "killed"
+
+-- Blocks while `id` is paused (answering pings and setting traffic
+-- aside meanwhile). Returns true if it was killed instead of resumed.
+local function waitWhilePaused(id)
+  while controlState[id] == "PAUSE" do
+    local name, _, from, port, _, data = pullSignal()
+    stashSignal(name, from, port, data)
+  end
+  return controlState[id] == "KILL"
 end
 
--- `selfId` is this job's own id (set as the `jobId` global by the main
--- loop just before calling this) -- only used here to recognize a KILL
--- addressed at THIS specific job among the broadcasts every worker sees.
+-- `selfId` is this job's own id, used to pick out controls addressed at
+-- it among the broadcasts every worker sees. Controls are acted on at
+-- the job's yield points -- a job that never yields can't be paused or
+-- ended early, no sooner than its instruction-budget circuit breaker
+-- would catch it anyway.
 local function runJobCode(chunk, args, selfId)
+  if controlState[selfId] == "PAUSE" and waitWhilePaused(selfId) then return false, KILLED end
+  if controlState[selfId] == "KILL" then return false, KILLED end
   local co = coroutine.create(chunk)
   armBudgetHook(co)
   local ok, a = coroutine.resume(co, args)
   while ok and coroutine.status(co) ~= "dead" do
+    local resumeWith
     if a == YIELD_COOPERATE then
-      -- The job's own voluntary yield() -- a brief, bounded pause, not
-      -- a wait for anything specific. Resume with no extra argument,
-      -- matching coroutine.yield()'s own "returns nothing" convention
-      -- for a bare cooperative pause. This is also the only point a
-      -- "kill"-policy orphan actually CAN be killed early -- a job
-      -- that never yields can't be reached here any sooner than its
-      -- own instruction-budget circuit breaker would catch it anyway.
-      -- Anything that arrived is set aside for the main loop (and a
-      -- PING answered) rather than pushed back onto the signal queue,
-      -- which made every later yield() re-pull the same signal.
+      -- The job's own voluntary yield(): a brief pass over whatever
+      -- arrived (a PING answered, everything else set aside for the main
+      -- loop), then resume with nothing.
       local sig = table.pack(pullSignal(0))
       if sig.n > 0 and sig[1] ~= nil then
-        if isKillSignalFor(sig, selfId) then
-          return false, "killed (orphan policy, parent no longer running)"
-        end
         stashSignal(sig[1], sig[3], sig[4], sig[6])
       end
-      armBudgetHook(co)
-      ok, a = coroutine.resume(co)
+      resumeWith = {n = 0}
     else
-      -- Anything else is the job's OWN internal pullSignal() wait (for
-      -- example gmuxapi.*'s remoteRequest(), waiting on a specific
-      -- reply id) -- forward a REAL signal through transparently,
-      -- exactly as if the job coroutine were the top-level one, so its
-      -- own wait for a specific reply actually completes instead of
-      -- spinning forever on signals it never receives. Still checked
-      -- for a KILL first -- that takes priority over whatever this
-      -- job's own nested wait was hoping to receive.
+      -- The job's own wait (sleep, a gmuxapi call, pull_event): hand it
+      -- the real signal, unless it's a control, which is handled here.
       local sig = table.pack(pullSignal(type(a) == "number" and a or nil))
-      if isKillSignalFor(sig, selfId) then
-        return false, "killed (orphan policy, parent no longer running)"
+      if sig[1] == "modem_message" and noteControl(sig[4], sig[6]) then
+        resumeWith = {n = 0}
+      else
+        resumeWith = sig
       end
-      armBudgetHook(co)
-      ok, a = coroutine.resume(co, table.unpack(sig, 1, sig.n))
     end
+    if controlState[selfId] == "PAUSE" and waitWhilePaused(selfId) then return false, KILLED end
+    if controlState[selfId] == "KILL" then return false, KILLED end
+    armBudgetHook(co)
+    ok, a = coroutine.resume(co, table.unpack(resumeWith, 1, resumeWith.n))
   end
   return ok, a
+end
+
+-- --- Process environments ---
+--
+-- Every process gets its own environment table, so one program's
+-- globals never leak into another's on the same node. What it can see
+-- through it (read-only) is the native API: the standard libraries,
+-- yield/sleep, gpu, gmuxapi, and a computer subset. Deliberately absent:
+-- `debug` (a process could remove its own instruction budget with it)
+-- and raw `component` (an .mxe makes kernel calls rather than driving
+-- hardware itself). `load` defaults to the process's own environment so
+-- code it loads can't reach this file's globals.
+local function readOnly(t, name)
+  return setmetatable({}, {
+    __index = t,
+    __newindex = function() error(name .. " is read-only", 2) end,
+  })
+end
+
+local NATIVE = {}
+for _, k in ipairs({"assert", "error", "ipairs", "next", "pairs", "pcall", "rawequal", "rawget",
+    "rawlen", "rawset", "select", "setmetatable", "getmetatable", "tonumber", "tostring", "type", "xpcall"}) do
+  NATIVE[k] = _ENV[k]
+end
+for _, lib in ipairs({"string", "table", "math", "utf8", "coroutine"}) do
+  if _ENV[lib] then NATIVE[lib] = readOnly(_ENV[lib], lib) end
+end
+NATIVE.computer = readOnly({uptime = computer.uptime, address = computer.address}, "computer")
+NATIVE.gpu = gpu
+NATIVE.gmuxapi = readOnly(gmuxapi, "gmuxapi")
+NATIVE.yield = yield
+NATIVE.sleep = sleep
+NATIVE.muxos = readOnly({version = MUXOS_VERSION}, "muxos")
+
+local function newProcessEnv(id)
+  local env = setmetatable({jobId = id}, {__index = NATIVE})
+  env._G = env
+  env.load = function(chunk, name, mode, e) return load(chunk, name, mode, e or env) end
+  return env
 end
 
 -- Sends a reply, turning a value that can't cross the wire (a
@@ -648,33 +714,26 @@ local function handleMessage(from, msg)
   if from ~= kernalAddr then return end
 
   if msg.type == "JOB" then
-    if killedIds[msg.id] then
-      -- Its parent finished (with a "kill" policy) while this job was
-      -- still queued here, so it never started -- don't start it now.
-      killedIds[msg.id] = nil
-      send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id,
-        error = "killed (orphan policy, parent no longer running)"})
-      return
-    end
-    local chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t")
+    -- `msg.id` is the job's own id (dispatchJob uses one id as both the
+    -- job's identity and this message's RPC id).
+    local chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t", newProcessEnv(msg.id))
     if not chunk then
       send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = loadErr})
       return
     end
-    -- jobId is this job's OWN id -- `msg.id` IS that id for a JOB
-    -- message (dispatchJob uses one id as both the job's identity and
-    -- this message's RPC id). Exposed as a real global so the job can
-    -- tell the kernal "I am job X" when asking for a child
-    -- (gmuxapi.create_headless_process's `parent = jobId`), and passed to
-    -- runJobCode so it can recognize a KILL addressed at this job.
-    jobId = msg.id
+    currentJobId = msg.id
     local ok, result = runJobCode(chunk, msg.args, msg.id)
-    jobId = nil
+    currentJobId = nil
+    controlState[msg.id] = nil
+    eventQueues[msg.id] = nil
     if ok then
       sendReply({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = result}, "job result")
     else
       send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = tostring(result)})
     end
+  elseif msg.type == "EVENT" then
+    -- For a process still queued on this node; it reads it once it runs.
+    queueEvent(msg.jobId, msg.event)
   elseif msg.type == "LIST" then
     -- Expose this node's own components to the kernal, so it can
     -- address them without us having to write custom JOB code for it.
@@ -709,7 +768,7 @@ while true do
     -- nothing else arrives for a while.
     local name, _, from, port, _, data = pullSignal(10)
     sweepStaleChunks()
-    if name == "modem_message" and not noteKill(port, data) and port == PORT and type(data) == "string" then
+    if name == "modem_message" and not noteControl(port, data) and port == PORT and type(data) == "string" then
       local payload = reassemble(from, data)
       local msg = payload and deserialize(payload)
       if type(msg) == "table" then

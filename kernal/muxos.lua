@@ -486,12 +486,27 @@ local function liveNodeCount()
   return n
 end
 
+-- Round-robin with a simple multi-core balancer on top: the live node
+-- with the fewest running jobs wins, and round-robin order breaks ties
+-- (so an idle rack still rotates instead of piling onto node 1).
 local function nextLiveNode()
+  local best, bestLoad
   for _ = 1, #nodeOrder do
     local addr = nodeOrder[nextNode]
     nextNode = (nextNode % #nodeOrder) + 1
-    if not nodes[addr].down then return addr end
+    local node = nodes[addr]
+    if not node.down then
+      local load = node.running or 0
+      if not best or load < bestLoad then best, bestLoad = addr, load end
+      if load == 0 then break end
+    end
   end
+  if best then
+    for i, addr in ipairs(nodeOrder) do
+      if addr == best then nextNode = (i % #nodeOrder) + 1 break end
+    end
+  end
+  return best
 end
 
 local function nextId()
@@ -619,6 +634,7 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
     rootId = rootId}
   runningJobs[id] = true
   runningCount = runningCount + 1
+  nodes[targetAddr].running = (nodes[targetAddr].running or 0) + 1
   if parent then
     childrenOf[parent] = childrenOf[parent] or {}
     local siblings = childrenOf[parent]
@@ -677,6 +693,7 @@ local function applyOrphanPolicyForChildrenOf(parentId)
       job.parent = nil
     elseif job.orphanPolicy == "kill" then
       if job.status == "running" then
+        job.killReason = "killed (orphan policy, parent no longer running)"
         modem.broadcast(PORT, "KILL " .. id)
       end
       job.parent = nil
@@ -739,6 +756,7 @@ local function sweepStaleOrphans()
     if job.orphanPolicy == "orphan" and job.orphanedAt
         and now - job.orphanedAt > timeout then
       if not job.lastKillSentAt or now - job.lastKillSentAt > KILL_RETRY_INTERVAL then
+        job.killReason = "killed (unclaimed orphan timed out)"
         modem.broadcast(PORT, "KILL " .. id)
         job.lastKillSentAt = now
         unregisterOrphanCandidate(job.appName, id)
@@ -753,6 +771,9 @@ local function finishJob(id, status, result, err)
   local job = jobs[id]
   runningJobs[id] = nil
   runningCount = runningCount - 1
+  local node = nodes[job.node]
+  if node and node.running then node.running = node.running - 1 end
+  job.paused = nil
   job.status, job.result, job.error = status, result, err
   job.finishedAt = computer.uptime()
   job.code = nil
@@ -817,6 +838,40 @@ local function checkLiveness()
       end
     end
   end
+end
+
+-- Pause, resume, or end a running process. Raw broadcasts like KILL
+-- (see node/runtime.lua's noteControl); the worker acts on them at the
+-- process's yield points, so a pause/kill takes effect at its next
+-- yield, and a process still queued on its node is held/refused
+-- before it starts.
+local function controlJob(id, verb, reason)
+  local job = jobs[id]
+  if not job or job.status ~= "running" then
+    return false, "no running job " .. tostring(id)
+  end
+  if verb == "PAUSE" then
+    job.paused = true
+  elseif verb == "RESUME" then
+    job.paused = nil
+  elseif verb == "KILL" then
+    job.killReason = reason or "killed"
+  else
+    return false, "unknown control " .. tostring(verb)
+  end
+  modem.broadcast(PORT, verb .. " " .. id)
+  return true
+end
+
+local function isDescendantOf(id, ancestorId)
+  local job = jobs[id]
+  local seen = 0
+  while job and job.parent and seen < 1000 do
+    if job.parent == ancestorId then return true end
+    job = jobs[job.parent]
+    seen = seen + 1
+  end
+  return false
 end
 
 local runtimeSource = nil -- loaded lazily and cached, see loadRuntime()
@@ -969,6 +1024,26 @@ end
 -- that parent, so a second instance of the same app can't take it.
 -- Orphans that already finished are returned too, with their status and
 -- result, so a relaunched app can see what happened while it was gone.
+-- A process may pause/resume/kill only its own descendants.
+local function handleControl(msg)
+  local caller = jobs[msg.caller]
+  if not caller or caller.status ~= "running" or caller.node ~= msg.from then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "not called from a running process"})
+    return
+  end
+  if not isDescendantOf(msg.jobId, msg.caller) then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+      error = "job " .. tostring(msg.jobId) .. " is not a descendant of job " .. tostring(msg.caller)})
+    return
+  end
+  local ok, err = controlJob(msg.jobId, msg.verb, "killed by parent job " .. tostring(msg.caller))
+  if not ok then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
+    return
+  end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
+end
+
 local function handleGetOrphans(msg)
   local list, keep = {}, {}
   for _, id in ipairs(appsByName[msg.appName] or {}) do
@@ -1011,7 +1086,7 @@ end
 -- Summaries only (no source, no result); gmuxapi.get_process(id) (the
 -- GETPROCESS message) returns one job in full.
 local SUMMARY_FIELDS = {"id", "node", "status", "startedAt", "finishedAt", "parent", "appName",
-  "orphanPolicy", "rootId", "codePreview", "error"}
+  "orphanPolicy", "rootId", "codePreview", "error", "paused"}
 
 local function handleGetProcesses(msg)
   local list = {}
@@ -1083,6 +1158,8 @@ local function handleModemMessage(from, port, data)
     handleSpawn(msg)
   elseif msg.type == "GETORPHANS" then
     handleGetOrphans(msg)
+  elseif msg.type == "CONTROL" then
+    handleControl(msg)
   elseif msg.type == "CREATEWINDOW" then
     handleCreateWindow(msg)
   elseif msg.type == "GETWINDOWS" then
@@ -1103,8 +1180,11 @@ local function handleModemMessage(from, port, data)
       -- ONLY place its completion is ever recorded).
       if (msg.type == "RESULT" or msg.type == "ERROR") and jobs[msg.id] and jobs[msg.id].status == "running"
           and jobs[msg.id].node == msg.from then
+        local job = jobs[msg.id]
         if msg.type == "RESULT" then
           finishJob(msg.id, "done", msg.result, nil)
+        elseif job.killReason and msg.error == "killed" then
+          finishJob(msg.id, "killed", nil, job.killReason)
         else
           finishJob(msg.id, "error", nil, msg.error)
         end
@@ -1391,7 +1471,7 @@ local function printProcesses()
       parentInfo = string.format(" (parent=%s app=%s policy=%s)",
         job.parent and tostring(job.parent) or "none", tostring(job.appName), tostring(job.orphanPolicy))
     end
-    print(string.format("[%d] %s on %s%s%s", job.id, job.status, job.node,
+    print(string.format("[%d] %s on %s%s%s", job.id, job.paused and "paused" or job.status, job.node,
       job.error and (" -- " .. job.error) or "", parentInfo))
   end
 end
@@ -1501,6 +1581,14 @@ runCommand = function(line)
         print(string.format("console is now %dx%d at (%d,%d)", w, h, x, y))
       end
     end
+  elseif line:match("^pause%s") or line:match("^resume%s") or line:match("^kill%s") then
+    local verb, idStr = line:match("^(%a+)%s+(%d+)$")
+    if not verb then
+      print("usage: pause|resume|kill <job id>")
+    else
+      local ok, err = controlJob(tonumber(idStr), verb:upper(), "killed by user")
+      if ok then print(verb .. " sent to job [" .. idStr .. "]") else print("error: " .. err) end
+    end
   elseif line == "comp" then
     -- Back to normal compositing after a Ctrl+Alt+C console interrupt.
     -- Only takes the screen back from the console, never from a node
@@ -1560,7 +1648,7 @@ end
 print("muxos kernal -- " .. selfAddr)
 print("commands:")
 print("  discover | nodes | ping <node> [count] | quit")
-print("  run <lua code> | runall <lua code> | processes")
+print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job id>")
 print("  spawn <node> <lua code>")
 print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
 print("  console <width> <height> [x y] -- resize/move the console window")

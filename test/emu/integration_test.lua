@@ -334,7 +334,7 @@ emu:advance(2)
 
 typeLine("processes")
 emu:advance(2)
-assertScreenContains("[" .. childIds.kill .. "] error", "kill-policy child shows as errored")
+assertScreenContains("[" .. childIds.kill .. "] killed", "kill-policy child shows as killed")
 assertScreenContains("killed (orphan policy", "kill-policy child's error names the real reason")
 print("  OK -- the kill-policy child was actually killed once its parent finished, not just bookkept")
 
@@ -517,7 +517,7 @@ emu:advance(8)
 -- ask for the newest kill-policy job's status directly.
 typeLine('run local last for _, p in ipairs(gmuxapi.get_processes()) do if p.orphanPolicy == "kill" then last = p end end return "K17=" .. tostring(last.status) .. "/" .. tostring(last.error)')
 emu:advance(3)
-if not screenAfter("K17="):find("K17=error/killed", 1, true) then
+if not screenAfter("K17="):find("K17=killed/killed (orphan policy", 1, true) then
   dumpScreenOnFailure("queued kill-policy child")
   error("the queued kill-policy child was not killed")
 end
@@ -734,5 +734,60 @@ do
   end
 end
 print("  OK -- a long sleeper stayed up; the dead node was marked down, its job lost, and skipped")
+
+print("test 27: process isolation, pause/resume/kill, and the balancer")
+-- (Worker 3 is down after test 26, so 2 live nodes from here.)
+typeLine('runall leak27 = "leaked" return "set"')
+emu:advance(3)
+typeLine('runall return "g27=" .. tostring(leak27)')
+emu:advance(3)
+do
+  local after, n = screenAfter("runall return \"g27="), 0
+  for _ in after:gmatch("g27=nil") do n = n + 1 end
+  assert(n == 2 and not after:find("g27=leaked", 1, true), "a process's globals leaked into a later process")
+end
+typeLine('run local ok = pcall(function() string.x27 = 1 end) return "e27=" .. tostring(debug) .. "/" .. tostring(component) .. "/" .. tostring(ok)')
+emu:advance(2)
+assertScreenContains("e27=nil/nil/false", "no debug, no raw component, read-only libraries")
+print("  OK -- per-process globals; no debug or raw component; libraries are read-only")
+
+typeLine("spawn 1 for i = 1, 6 do sleep(0.5) end return \"slept27\"")
+emu:advance(0.5)
+local pid = screenAfter("spawn 1 for i = 1, 6"):match("spawned job %[(%d+)%]")
+typeLine("pause " .. pid)
+emu:advance(5)
+typeLine('run return "p27=" .. tostring(gmuxapi.get_process(' .. pid .. ').status) .. "/" .. tostring(gmuxapi.get_process(' .. pid .. ').paused)')
+emu:advance(2)
+assertScreenContains("p27=running/true", "the job is held while paused, well past when it would have finished")
+typeLine("resume " .. pid)
+emu:advance(5)
+typeLine('run return "r27=" .. gmuxapi.get_process(' .. pid .. ').status')
+emu:advance(2)
+assertScreenContains("r27=done", "the job finished after being resumed")
+print("  OK -- pause holds a process, resume lets it finish")
+
+typeLine("spawn 1 sleep(30) return 1")
+emu:advance(0.5)
+local kid = screenAfter("spawn 1 sleep(30)"):match("spawned job %[(%d+)%]")
+typeLine("kill " .. kid)
+emu:advance(2)
+typeLine('run local p = gmuxapi.get_process(' .. kid .. ') return "k27=" .. p.status .. "/" .. p.error')
+emu:advance(2)
+assertScreenContains("k27=killed/killed by user", "the user can end a process")
+print("  OK -- kill ends a process, recorded as killed by user")
+
+typeLine('run local c = gmuxapi.create_headless_process({code = "sleep(30) return 1"}) local ok, err = gmuxapi.kill_process(c.process.id) local ok2, err2 = gmuxapi.kill_process(' .. pid .. ') return "c27=" .. tostring(ok) .. "/" .. tostring(err2)')
+emu:advance(3)
+assertScreenContains("c27=true/job " .. pid .. " is not a descendant", "a process can end its own child but not an unrelated job")
+print("  OK -- a process can control its own descendants only")
+
+typeLine("spawn 1 sleep(6) return 0")
+emu:advance(0.5)
+local busyAddr = screenAfter("spawn 1 sleep(6)"):match("spawned job %[%d+%] on (modem%-%x+)")
+typeLine('run return "b27=" .. gmuxapi.get_process(jobId).node')
+emu:advance(2)
+local landed = screenAfter('b27="'):match("b27=(modem%-%x+)")
+assert(landed and landed ~= busyAddr, "the balancer sent new work to the busy node")
+print("  OK -- new work goes to the least-busy node")
 
 print("ALL OK")

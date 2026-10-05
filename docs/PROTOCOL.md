@@ -180,6 +180,9 @@ on the screen directly. See "The console" below.
 | `INVOKE`  | `from`, `to`, `id`, `address`, `method`, `args`           | either  | call `component.invoke(address, method, args...)` on the receiver's own component |
 | `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, muxos-shaped) -- summaries: no source, no result |
 | `GETPROCESS` | `from`, `to`, `id`, `jobId`                            | worker  | one job's full record (`gmuxapi.get_process(id)`) |
+| `CONTROL` | `from`, `to`, `id`, `jobId`, `verb`, `caller`                | worker  | pause/resume/kill one of the caller's own descendants (`gmuxapi.pause_process`/`resume_process`/`kill_process`) |
+| `EVENT`   | `from`, `to`, `jobId`, `event`                                | kernal  | an input event for a process on that node, read with `gmuxapi.pull_event` |
+| `KILL`/`PAUSE`/`RESUME <id>` | raw, unchunked                             | kernal  | process control broadcasts, acted on at the process's yield points |
 | `SPAWN`   | `from`, `to`, `id`, `code`, `args`, `node`                | worker  | "dispatch a new job" (gmux API's `create_headless_process`/`create_graphics_process`); replies immediately with a handle, doesn't wait for the job to finish |
 | `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
 | `GETWINDOWS` | `from`, `to`, `id`                                      | worker  | "list every window you know about" (gmux API's `get_windows()`) |
@@ -378,10 +381,9 @@ differently later.
 
 ## Scheduler
 
-**Direction, not yet built**: round-robin job dispatch across the
-worker nodes, with a "simple multi-core balancer" on top -- preferring
-whichever worker currently has the fewest active jobs rather than
-strictly rotating blind to load. Beyond that assignment policy, job
+**BUILT**: round-robin job dispatch across the live worker nodes, with
+a simple multi-core balancer on top -- the live node with the fewest
+running jobs wins, and round-robin order breaks ties (test 27). Beyond that assignment policy, job
 handling otherwise follows the same shape gmux already uses (a process
 table, `SPAWN`/`JOB` dispatch-and-record as already implemented --
 see "The gmux application API, translated" above) for now; this may get
@@ -405,10 +407,17 @@ provides (per-node dispatch, the compositor, multithreading awareness);
 legacy OpenOS programs get the best-effort compatibility shim, not equal
 footing.
 
-### The legacy layer (decided, not yet built)
+### Running OpenOS programs (decided, not yet built)
 
-What the compatibility path actually is, as decided in the design
-discussion (recorded late -- it was agreed but never written down):
+This isn't a separate translation layer sitting on top of muxos. muxos
+itself understands OpenOS programs and runs them as a native ability of
+the OS -- it just also has a much wider API, for much more direct
+calls, for programs written specifically for muxos. (A loose analogy:
+Windows 95 running DOS programs, except this is the reverse kind of
+implementation -- the new OS natively absorbing the old one's programs.)
+
+What that involves, as decided in the design discussion (recorded late
+-- it was agreed but never written down):
 
 - **A heavily modified OpenOS, not a from-scratch rewrite.** OpenOS's
   libraries get modified for muxos case by case: some are
@@ -1114,15 +1123,35 @@ The difference is what each sees:
 - An **`.mxe`** gets no virtual components. It's a pseudo-emulated
   environment that makes kernel calls instead (the native OS APIs, plus
   any libraries it asked for at launch) and has open visibility of the
-  system. "Open visibility" means it's system- and kernel-aware, not
-  that it shares globals with other programs. (Recorded wrongly at
-  first as "the shared runtime globals every job gets today"; corrected.)
+  system: it knows there are globals and is exposed to more of them
+  than a legacy program, which only sees its OpenOS/gmux environment.
+  Each process still has its own environment, so one program's globals
+  never leak into another's. (Recorded wrongly at first as "the shared
+  runtime globals every job gets today"; corrected.)
+- **Parent/child processes are `.mxe`-only.** They're a new concept
+  OpenOS programs never call, so legacy programs simply get the
+  OpenOS/gmux environment -- there's nothing to implement for them
+  there.
 
-Where things stand today: a crashing job is already contained (its
-error comes back as an `ERROR`, the worker keeps running -- tests 6 and
-15), and the kernal can end a job at its yield points (`KILL`). Not
-built: pausing, per-process environments (jobs on a worker still share
-one global table), and telling legacy from `.mxe` at launch.
+**BUILT for every job today (which all run as native processes):**
+
+- A crashing job is contained: its error comes back as an `ERROR` and
+  the worker keeps running (tests 6, 15).
+- The kernal can pause, resume, or end any process (`pause`/`resume`/
+  `kill <id>` at the REPL), and a process can do the same to its own
+  descendants (`gmuxapi.pause_process`/`resume_process`/
+  `kill_process`). Controls are raw broadcasts acted on at the
+  process's yield points; a paused process keeps answering liveness
+  probes, and a process still queued on its node is held or refused
+  before it starts. Ended processes get status `"killed"` with the
+  reason (user, parent, orphan policy, orphan timeout).
+- Each process has its own environment: its globals never leak into
+  another process on the same node. The native API it sees through it
+  is read-only, and it has no `debug` (which could remove its own
+  instruction budget) and no raw `component` (test 27).
+
+Not built yet: the legacy environment, which needs the launcher to tell
+legacy from `.mxe`.
 
 A kernal system bus (a dbus-like named-service/signal bus) is a
 possible later addition for `.mxe` programs to talk to kernal services
