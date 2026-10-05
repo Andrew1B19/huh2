@@ -9,14 +9,13 @@ the kernal is the scheduler/front-end.
   (mirroring the mod's own stock bios.lua, adapted to load `/muxos.lua`
   instead of OpenOS's `/init.lua`), and `kernal/muxos.lua` is its
   "init" -- not a program running under OpenOS, a REPLACEMENT for it.
-  There is no OpenOS anywhere on the kernal: no `require`, no `io`/`os`
-  libraries, no `event`/`thread`/`keyboard` libraries, no
-  `component.proxy()`/dot-shorthand component access. All of those are
-  confirmed ABSENT from the mod's own native Lua sandbox (verified
-  directly against its Scala source -- see docs/PROTOCOL.md), so
-  `muxos.lua` builds every one of those itself from the real primitives
-  (`component.list`/`component.invoke`, `coroutine.yield`) instead of
-  assuming OpenOS is there to provide them -- the same bare-metal
+  There is no OpenOS anywhere on the kernal: no `require`, no `io`,
+  no `event`/`thread`/`keyboard` libraries. It runs in the mod's own
+  `machine.lua` sandbox (see docs/PROTOCOL.md's "The real sandbox"),
+  which provides `component`, `computer` (including
+  `computer.pullSignal`) and the standard libraries, so `muxos.lua`
+  builds the rest itself instead of assuming OpenOS is there to
+  provide it -- the same bare-metal
   discipline `node/bios.lua`/`node/runtime.lua` always had to follow,
   just applied on the kernal too now, including its own minimal
   built-in text console (there is no `io`/`print`-to-screen without
@@ -75,7 +74,7 @@ kernal/bios.lua       the kernal's own EEPROM image: mirrors the mod's stock bio
                        OpenOS on the kernal, there's no OpenOS /init.lua in this picture.
 kernal/muxos.lua      kernal "init": boot-serving + discovery + round-robin job dispatch +
                        job registry (jobs) + a minimal built-in REPL/text console, all built
-                       on raw component.list/invoke + coroutine.yield, no OpenOS libraries.
+                       on the sandbox's component/computer APIs, no OpenOS libraries.
 kernal/compositor.lua  the only file that touches the real gpu for window content: window
                        registry, Z-order, occlusion culling, dirty tracking, a persistent
                        frame buffer, draw-code execution, blit-to-screen. Read off the boot
@@ -93,10 +92,9 @@ test/emu/              a 4-node (1 kernal + 3 workers) test environment, emulati
                        project's own verified native primitives -- not the community OCEmu
                        (needs LÖVE2D, not installable headless here). Boots the REAL,
                        unmodified repo files and drives the kernal's REPL like a human would.
-test/hardware/         verify.lua -- a bare-metal suite for REAL OpenComputers hardware,
-                       covering what test/emu's sandbox can't: real eris coroutine
-                       persistence (the proposed job-migration mechanism), the real Lua
-                       library profile, real GPU buffer operations.
+test/hardware/         verify.lua (+ its bios.lua loader) -- a suite for REAL OpenComputers
+                       hardware confirming the sandbox behavior muxos depends on; it
+                       also passes inside test/emu's emulated sandbox (test 30).
 smux/                 reference only (see above): a real, standalone OpenOS multiplexer,
                        forked from gmux's backend. Not run on any node in this project.
 gmux/                 reference only (see above): the real graphical multiplexer, vendored
@@ -329,12 +327,12 @@ entirely on native primitives, with its own minimal text console and
 keyboard-modifier tracking replacing OpenOS's io/keyboard libraries) +
 protection against OC's real non-yielding timeout for dispatched `JOB`
 code (a voluntary `yield()` a job can call to cooperate, `sleep(seconds)`
-to wait without swallowing other traffic, plus a hard
-instruction-budget circuit breaker that kills a non-cooperating job
-before it risks the mod killing the whole worker -- see
-docs/PROTOCOL.md for why the obvious "force a yield from a debug hook"
-fix doesn't actually work in Lua 5.3) + a 4-node test environment
-(`test/emu/`) that boots the real, unmodified files end to end and
+to wait without swallowing other traffic, and each job in its own
+coroutine so the machine's own "too long without yielding" deadline ends
+a runaway job without taking the worker down) + a 4-node test
+environment (`test/emu/`) that boots every node through the mod's own
+`machine.lua` sandbox (vendored in `test/emu/oc/`) and runs the real,
+unmodified files end to end, and
 drives the kernal's REPL like a human would, which caught two genuine
 bugs no isolated unit mock could have (a compositor `flush()` that
 wiped the console's own output, and a job-preemption design that could
@@ -363,8 +361,7 @@ the real global `jobId`, the kernal's single global job table carries
 stays exactly where it was -- round-robin, unchanged), and
 `orphan`/`kill`/`promote` are all applied for real the moment a
 parent's job finishes (`kill` is best-effort, only reachable at a
-child's own cooperative yield points -- same fundamental limit as the
-JOB timeout circuit breaker). App identity and orphan reclaim are real
+child's own cooperative yield points). App identity and orphan reclaim are real
 too: `gmuxapi.get_orphans(name)` hands back a relaunched app's old
 orphans, claimed once. Building this surfaced and fixed a real bug in
 `remoteRequest()` that silently dropped a child's own `JOB` dispatch
@@ -407,10 +404,8 @@ their result if they finished). Verified in `test/emu/integration_test.lua`
 
 **Still forward design, not yet built**: planned node draining as
 distinct from an unrecoverable node death, "semi-live" job migration
-via `eris` coroutine persistence (the mechanism itself is confirmed for
-real against the genuine upstream `eris` library, including a full
-cross-process round trip -- see `test/hardware/verify.lua` -- but
-nothing in `kernal/muxos.lua`/`node/runtime.lua` uses it yet), and the
+(blocked: the `eris` persistence it was designed on isn't reachable
+from the sandbox -- see docs/PROTOCOL.md), and the
 rest of the general `.mxe`-vs-legacy hardware access model: the
 networking side entirely (a lightweight kernal modem kernel module for
 `.mxe`, eventual GERTi access, vs. an emulated modem for legacy). See

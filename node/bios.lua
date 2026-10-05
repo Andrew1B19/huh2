@@ -6,10 +6,11 @@
 
 local PORT = 4477
 
--- There is no computer.pullSignal in the EEPROM sandbox (that's OpenOS);
--- the real primitive is yielding the kernel coroutine with a timeout.
+-- The sandbox's computer.pullSignal yields to the machine; a bare
+-- coroutine.yield(timeout) wouldn't (the sandbox wraps it as a user
+-- yield and the timeout is lost).
 local function pullSignal(timeout)
-  return coroutine.yield(timeout)
+  return computer.pullSignal(timeout)
 end
 
 local function findModem()

@@ -252,14 +252,15 @@ end
 --
 -- `code` arrives from any worker and runs ON the kernal, so it gets a
 -- sandbox: no kernal globals (component/computer/load/...), copies of
--- the pure libraries (so it can't clobber the kernal's own), a gpu that
--- only exposes drawing calls against the buffer already made active
--- (setActiveBuffer(0)/bind would otherwise be a way around the
--- fullscreen gate), no pcall (which could absorb the budget error), and
--- an instruction budget enforced in its own coroutine so the hook can't
--- touch the kernal's own execution.
-local WINDOW_CODE_BUDGET = 1000000
-
+-- the pure libraries (so it can't clobber the kernal's own), and a gpu
+-- that only exposes drawing calls against the buffer already made
+-- active (setActiveBuffer(0)/bind would otherwise be a way around the
+-- fullscreen gate). It runs in its own coroutine: one that never
+-- finishes is ended by the machine's own "too long without yielding"
+-- deadline (the sandbox's coroutine.resume enforces it on every
+-- coroutine) without taking the kernal down -- though the kernal is
+-- stalled until then (system.timeout(), 5s by default). The sandbox has
+-- no debug.sethook, so there's no finer-grained budget to use.
 local WINDOW_GPU_METHODS = {
   set = true, fill = true, copy = true, get = true,
   setForeground = true, setBackground = true, getForeground = true, getBackground = true,
@@ -298,16 +299,11 @@ local function compileWindowCode(gpu, code)
   return chunk, env
 end
 
--- Runs compiled draw code against `buffer` under the instruction budget,
+-- Runs compiled draw code against `buffer` in its own coroutine,
 -- with `args` visible to it as the global `args`.
 local function runWindowCode(gpu, buffer, chunk, env, args)
   env.args = args
   local co = coroutine.create(chunk)
-  local message = "window draw code exceeded its instruction budget (" .. WINDOW_CODE_BUDGET .. ")"
-  debug.sethook(co, function()
-    debug.sethook(co, function() error(message, 0) end, "", 1)
-    error(message, 0)
-  end, "", WINDOW_CODE_BUDGET)
   gpu.setActiveBuffer(buffer)
   local ok, err = coroutine.resume(co)
   gpu.setActiveBuffer(0)
@@ -545,7 +541,7 @@ end
 
 -- Redraws an existing buffered window -- the persistent-handle half of
 -- the window model: an app keeps its window and pushes new content into
--- it whenever it wants. Same sandbox and budget as at creation.
+-- it whenever it wants. Same sandbox as at creation.
 -- `options`: `code` (+ `args`), and/or `pixels`/`mode` like createWindow;
 -- `clear` (default true) blanks the buffer to `bg` first. Compiled draw
 -- code is cached per window, keyed by its source, so an app that redraws

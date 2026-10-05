@@ -111,42 +111,22 @@ plus the stock EEPROM image the mod itself ships,
   bug (would have crashed with "attempt to call a nil value" the first
   time a worker actually booted on real hardware), fixed alongside this
   rewrite, not something introduced by it.
-- **There is no `computer.pullSignal` at all.** The real primitive is
-  yielding the kernel coroutine with `coroutine.yield(timeoutSeconds)`,
-  caught by the mod's own `NativeLuaArchitecture.runThreaded`, which
-  resumes the coroutine with the next signal's name + args once one
-  arrives (or with nothing, if the timeout simply elapses first).
-  `computer.pullSignal` is OpenOS's own thin wrapper over exactly that.
-  Every bare-metal file in this project (`node/bios.lua`,
-  `node/runtime.lua`, `kernal/muxos.lua`) now defines its own tiny
-  `pullSignal(timeout)` local function wrapping `coroutine.yield`
-  directly, rather than assuming OpenOS provided the real one.
-- **Shutdown/reboot works the same way**: yielding a plain boolean
-  (`false` = power off, `true` = reboot) is the real primitive
-  (`ExecutionResult.Shutdown`); falling off the end of the chunk with an
-  ordinary `return` is NOT a clean shutdown -- the mod's own
-  `runThreaded` logs "the kernel stopped unexpectedly" in that case.
-  `kernal/muxos.lua`'s `shutdown(reboot)` wraps the real primitive; the
-  REPL's `quit`/`exit` go through it instead of just returning.
-- **The native `print` never reaches the in-game screen at all** --
-  confirmed from its own source comment: "Until we get to ingame
-  screens we log to Java's stdout." It's a server-console debug stub,
-  not a terminal. `kernal/muxos.lua` shadows it with its own `print`
-  that routes through a small built-in text console (see below) --
-  without this, the REPL would be completely silent on the in-game
-  screen.
-- **`beep` works without OpenOS** (the stock `bios.lua` itself calls
-  `computer.beep(...)`) -- it's dispatched through the computer
-  component's own generic `@Callback` machinery, not one of
-  `ComputerAPI.scala`'s explicitly hand-written functions, but callable
-  all the same.
+- **Corrected later -- see "The real sandbox" below.** This section
+  originally said there is no `computer.pullSignal` and that the real
+  primitive is yielding the kernel coroutine with
+  `coroutine.yield(timeout)`. That was read off the Scala side only and
+  is wrong for EEPROM code: the mod's own `machine.lua` runs the EEPROM
+  inside a sandbox that DOES provide `computer.pullSignal` and
+  `computer.shutdown`, and wraps `coroutine.yield`, so a bare
+  `coroutine.yield(timeout)` loses its timeout there. muxos now uses
+  `computer.pullSignal`/`computer.shutdown`.
 
 ### What muxos.lua builds itself, in place of each OpenOS piece
 
 | OpenOS provided | muxos.lua now builds | 
 |---|---|
-| `computer.pullSignal(timeout)` | `pullSignal(timeout)` -- `coroutine.yield(timeout)` |
-| `computer.shutdown(reboot)` | `shutdown(reboot)` -- `coroutine.yield(reboot)` |
+| `computer.pullSignal(timeout)` | provided by the sandbox -- used directly |
+| `computer.shutdown(reboot)` | provided by the sandbox -- used directly |
 | `component.proxy(addr)` / dot-shorthand | `componentProxy(addr)`/`primaryComponent(ctype)` -- a metatable over `component.invoke`, duplicated (not shared) in `kernal/compositor.lua` too |
 | `event.pull`/`event.listen` | `tick(timeout)` -- one `pullSignal` call per invocation, dispatched inline by signal name; every wait in the program (REPL idle, `waitForReply`, `discover`) calls `tick()` instead of polling |
 | `thread.create` (the old background dispatcher) | nothing -- there is exactly one coroutine; see "Resolved, then resolved differently again" below for why the old two-"thread" design doesn't apply any more |
@@ -167,6 +147,37 @@ One specific consequence worth calling out: `kernal/compositor.lua` owns
 the real screen. The REPL console is normally an ordinary compositor
 window; in console mode it's the compositor's exclusive owner and draws
 on the screen directly. See "The console" below.
+
+## The real sandbox
+
+All EEPROM code -- and so all of muxos, since the EEPROM loads it --
+runs inside the mod's own `machine.lua` sandbox, not on raw Lua. Read
+from the mod's source (`assets/opencomputers/lua/machine.lua`) and now
+exercised directly: `test/emu`'s emulator boots every node through that
+very file (vendored unmodified in `test/emu/oc/`, MIT), playing the
+Java host underneath. What it means for muxos:
+
+- **`computer.pullSignal(timeout)` and `computer.shutdown(reboot)` exist**
+  (defined in Lua by `machine.lua`) and are what muxos uses to wait and
+  to power off.
+- **`coroutine.yield` is wrapped**: it yields `(nil, ...)` as a *user*
+  yield, which the sandbox's `coroutine.resume` hands back to the
+  resumer; only `computer.pullSignal` and friends yield to the machine.
+  A bare `coroutine.yield(timeout)` at the top level -- what muxos used
+  to do -- loses its timeout: the wait only ends when some signal
+  arrives, and `coroutine.yield(true)` doesn't shut down.
+- **`debug` has only `getinfo`, `traceback`, `getlocal`, `getupvalue`**
+  -- no `debug.sethook`. Every instruction budget muxos had would have
+  crashed on its first use; the machine's own deadline replaces them
+  (see "JOB code and the non-yielding timeout").
+- **No `eris`** -- see "Semi-live migration".
+- **No `print`** -- muxos never relied on the native one.
+
+The emulator used to run boot code directly against raw Lua, which hid
+all of this (the same kind of gap as the modem-address bug). Running
+the old code inside the real sandbox reproduced it: the kernal booted
+but never discovered a worker. `test/hardware/verify.lua` checks each of
+these on real hardware, and passes in the emulated sandbox (test 30).
 
 ## Message types
 
@@ -867,81 +878,32 @@ that worker's whole computer, not just erroring the job, and the worker
 would be unable to answer `PING` or anything else for the job's entire
 duration either way.
 
-**The fix that seemed obvious doesn't work**: a `debug.sethook` count
-hook that forces a yield every N instructions, whether the job's code
-yields on its own or not, would in principle let the dispatch loop
-interleave network servicing with an arbitrary non-cooperating job.
-Tested directly against the real `lua5.3` binary (not assumed): yielding
-from inside a debug hook raises `"attempt to yield across a C-call
-boundary"` every single time. This is a genuine Lua 5.3 language
-restriction, not a muxos limitation or an OC sandboxing quirk -- a hook
-callback can never suspend execution, full stop.
+**How it works now** (after "The real sandbox" findings, below):
 
-What a hook CAN do is `error()` -- confirmed that works fine from a
-hook, unwinding the coroutine cleanly and returned as `(false, msg)`
-from `coroutine.resume`, same as any other Lua error. So the actual
-design, in `node/runtime.lua`:
-
-- **`yield()`** -- exposed to job code as a real global (same pattern as
-  `gpu`/`gmuxapi`: JOB code is `load()`ed fresh each time with no
-  visibility into `runtime.lua`'s own locals, so it has to be a global).
-  Calling it is an ORDINARY yield from regular code, not from a hook --
-  confirmed that works fine -- so a job that expects to run long can
-  cooperate voluntarily, and `yieldToStayResponsive()` (pulls, then
-  immediately re-pushes with `computer.pushSignal`, the exact mechanism
-  OpenOS's own boot code uses) runs at each of its yield points, keeping
-  the node responsive for as long as the job keeps cooperating.
-- **`yield()` yields a sentinel (`"__cooperate"`), not a bare
-  `coroutine.yield()`** -- found necessary the hard way, via
-  `test/emu`'s end-to-end integration test (see "Hardening found by
-  actually running the real files together" below): job code can ALSO
-  reach `gmuxapi.*` (e.g. `request_fullscreen()`), which does its OWN
-  nested wait via this same `pullSignal`, expecting the REAL network
-  reply it's waiting for as the resume value. Once job code runs inside
-  `runJobCode`'s wrapped coroutine, both kinds of yield are bare
-  `coroutine.yield(...)` calls somewhere down the call stack with no
-  other way to tell them apart. An earlier version of this fix treated
-  every yield as voluntary cooperation and swallowed the real reply
-  `remoteRequest()` needed, hanging the job forever. The sentinel fixes
-  this: a voluntary `yield()` gets the brief, bounded service pass
-  above; anything else (a bare number, from `pullSignal`'s own timeout
-  argument, or nothing) gets a REAL signal transparently forwarded into
-  it, exactly as if the job coroutine were the node's top-level one.
-- **A hard instruction-budget circuit breaker** -- also `debug.sethook`,
-  but erroring instead of attempting to yield. This can't resume a job
-  that blows the budget; it protects THIS NODE's availability, not that
-  job's progress, by killing a non-cooperating job outright, cleanly,
-  well before it risks the mod killing the whole computer instead. Once
-  tripped, the hook re-arms itself to error on every instruction: a
-  one-shot error is an ordinary Lua error, and a job wrapping its loop
-  in `pcall` used to be able to catch it and keep spinning forever.
+- **The machine's own deadline is the circuit breaker.** OpenComputers
+  ends any coroutine that runs longer than `system.timeout()` (5s by
+  default) without the machine getting a yield -- the sandbox's
+  `coroutine.resume` installs that check on every coroutine. A job runs
+  in its own coroutine, so a job that never yields is ended with "too
+  long without yielding", comes back as an ordinary `ERROR`, and the
+  worker survives because its main loop yields to the machine promptly
+  afterwards (test 6). There is no tighter muxos-side budget: the
+  sandbox has no `debug.sethook`, and a Lua 5.3 hook can't yield anyway,
+  so forced preemption isn't possible.
+- **`yield()`** -- exposed to job code -- is how a long job cooperates:
+  it suspends the job, and `runJobCode` does a real zero-timeout
+  `computer.pullSignal` (which resets the machine's deadline), answers
+  a PING, sets other traffic aside, acts on pause/kill, then resumes it.
+- **`yield()` yields a sentinel (`"__cooperate"`)** because a job's own
+  waits (`sleep`, a `gmuxapi` call, `pull_event`) also yield to
+  `runJobCode`, with their timeout; the sentinel tells the two apart, so
+  a voluntary `yield()` gets a brief pass while a wait gets a real
+  signal handed back to it.
 - **`sleep(seconds)`** is the way for job code to wait on time. A job
   that waited with a bare `coroutine.yield(timeout)` would be handed --
   and silently consume -- every signal that arrived meanwhile, including
   the `JOB` message for a child the kernal had just queued on that same
   node. `sleep` sets everything aside for the main loop instead.
-- **The hook is re-armed before every resume, not set once.** A count
-  hook's count is a running total of instructions executed by that
-  coroutine -- confirmed empirically it does NOT reset on its own across
-  a yield/resume cycle -- so without re-arming, a job that cooperates by
-  calling `yield()` periodically would still eventually trip the SAME
-  lifetime budget just by running long enough in total, defeating the
-  entire point of cooperating. Re-arming (`armBudgetHook`, called again
-  before each `coroutine.resume`) gives every voluntary yield a FRESH
-  budget for its next slice instead -- confirmed with a mocked test: a
-  job yielding every ~100 loop iterations against a budget that would
-  kill it in one continuous run instead completes normally across many
-  slices.
-
-`PREEMPT_INSTRUCTIONS` (2,000,000) is a judgment call, not measured
-against real hardware: large enough that ordinary job code shouldn't
-trip it by accident, with no empirical basis yet for exactly how that
-maps to OC's real (unverified) wall-clock timeout. Verified via
-`/tmp/test_job_preemption.lua`: a quick job under budget, a cooperating
-job surviving many slices via `yield()`, a signal arriving mid-job
-getting pushed back correctly, a non-cooperating job killed by the
-circuit breaker, and an ordinary error inside job code still reported
-distinctly from a budget-exceeded kill.
 
 ## Hardening found by actually running the real files together
 
@@ -1170,8 +1132,7 @@ The difference is what each sees:
   reason (user, parent, orphan policy, orphan timeout).
 - Each process has its own environment: its globals never leak into
   another process on the same node. The native API it sees through it
-  is read-only, and it has no `debug` (which could remove its own
-  instruction budget) and no raw `component` (test 27).
+  is read-only, and it has no `debug` and no raw `component` (test 27).
 
 Not built yet: the legacy environment, which needs the launcher to tell
 legacy from `.mxe`.
@@ -1300,59 +1261,22 @@ node out of rotation on purpose (maintenance, say), as opposed to it
 just dying. This is a real, distinct capability worth having, separate
 from crash handling.
 
-### Semi-live migration
+### Semi-live migration -- BLOCKED: no `eris` in the sandbox
 
-For planned draining (or any other reason to move a running job off its
-current node without losing its progress), the design is: **pause,
-serialize, ship, resume** -- and the job itself never knows the
-difference. Concretely:
+The design was: **pause, serialize, ship, resume** -- pause the job,
+`eris.persist` its suspended coroutine (call stack and locals) to bytes,
+ship them to the target node, `eris.unpersist` and resume there, with
+the job never knowing. The mechanism itself works (confirmed against
+the real upstream `eris` library earlier, including a cross-process
+round trip).
 
-1. **Pause**: the kernal simply stops resuming that job's coroutine.
-   No special signal needed -- "paused" just means "not scheduled."
-2. **Serialize**: `eris.persist(perms, co)` turns the live, suspended
-   coroutine -- including its call stack and local variables -- into a
-   byte string.
-3. **Ship**: the bytes go over the same wire framing as everything
-   else (`MSG` chunking) to the target node.
-4. **Resume**: `eris.unpersist(uperms, bytes)` on the target
-   reconstitutes it as a live coroutine; resuming it continues exactly
-   where it left off.
-
-**This is confirmed, not speculative.** `eris` is a real native Lua
-global in OC's own sandbox (`LuaStateFactory.scala` opens the `ERIS`
-library in all three of OC's Lua profiles -- 5.2, 5.3, *and* 5.4, so it
-coexists with `kernal/bitmap.lua`'s `utf8.char` dependency on any
-5.3/5.4 build with no conflict). More than that: the actual mechanism
-was run for real, against the genuine upstream `fnuecke/eris` library
-(built from its own source, since it's a modified Lua distribution, not
-a loadable module) -- not OC's exact binding, but the same real
-implementation OC's own `PersistenceAPI.scala` is built on. Confirmed
-directly:
-
-- A coroutine persisted mid-loop, with real accumulated local state,
-  revives into a brand-new coroutine object that resumes and continues
-  correctly.
-- **The scenario that actually matters for migration**: persisting in
-  ONE process, writing the bytes to a file, and unpersisting in a
-  COMPLETELY SEPARATE process -- the revived job continued its exact
-  progress, and a native function reference marked permanent (the
-  stand-in for `component`/`computer` in a real migration) correctly
-  re-bound to the **receiving** process's own binding, not a stale
-  reference to the sender's.
-- Getting this right requires marking essentially everything reachable
-  from the persisted coroutine's `_ENV` as permanent in `eris`'s
-  `perms` table -- not just the one native function you think to mark
-  (found the hard way: an empty `perms` table fails the instant the
-  coroutine's closure reaches `coroutine.yield` itself via its
-  environment). The fix mirrors exactly what OC's own
-  `PersistenceAPI.scala` does: walk all of `_G` recursively.
-
-See `test/hardware/verify.lua` (checks 6-9) and its own README for the
-full account, including what still ISN'T confirmed: OC's own
-jnlua-bound `eris` integration specifically, and real OC
-`component`/`computer` behavior under an actual migration (as opposed
-to a stand-in native function) -- that's what running the suite on
-real hardware still needs to close.
+**But sandboxed code can't reach `eris`.** The mod opens the ERIS
+library in the Lua state for its own use (saving machines when a world
+saves), but `machine.lua`'s sandbox -- which EEPROM code, and so all of
+muxos, runs in -- doesn't expose it. Confirmed by reading the mod's
+`machine.lua` and by `test/hardware/verify.lua`, which reports it absent
+in the emulated sandbox. So this can't be built as designed. See "Still
+open" for the options.
 
 ### Compositor access for `.mxe`
 
@@ -1376,7 +1300,8 @@ redraws it whenever it wants with `gmuxapi.draw_window(id, options)`
 (`DRAWWINDOW`): `code` (with `args`, visible to the code as `args`)
 and/or a `pixels` bitmap, blanking the buffer first unless
 `clear = false`. Redraw code runs in the same sandbox as creation (no
-kernal globals, drawing-only `gpu`, no `pcall`, an instruction budget).
+kernal globals, drawing-only `gpu`, no `pcall`, its own coroutine
+under the machine's deadline).
 Compiled draw code is cached per window keyed by its source, so an app
 that redraws with the same code and new `args` doesn't recompile each
 time. Any other process is refused (test 28).
@@ -1450,6 +1375,13 @@ Collected in one place:
   the `jobId` global and `gmuxapi` every job already gets today.
 - "promote"'s self-dependence requirement isn't enforced -- the kernal
   takes the declared policy at face value.
+- **Semi-live migration needs a new mechanism** -- `eris` isn't
+  reachable from the sandbox (see "Semi-live migration"). Options:
+  cooperative checkpointing (an `.mxe` hands the kernal a state table at
+  its yield points and is restarted from it on the new node -- `.mxe`
+  only, legacy programs can't); restart-from-scratch for jobs marked
+  restartable; or no migration, with draining simply waiting for a
+  node's jobs to finish while giving it no new ones.
 - The general `.mxe`-vs-legacy hardware access model: `.mxe` apps make
   direct kernel calls for every subsystem (the `gmuxapi` pattern
   already built for windows/gpu, generalized) and never see

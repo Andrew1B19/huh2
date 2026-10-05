@@ -31,12 +31,14 @@ local runtimeSrc = readFile(REPO_ROOT .. "/node/runtime.lua")
 local workerBiosSrc = readFile(REPO_ROOT .. "/node/bios.lua")
 
 local emu = Emulator.new()
+-- system.timeout() for every node: 1s of host CPU per slice keeps the
+-- "too long without yielding" scenarios fast.
+emu.timeout = 1
 
 -- --- Build the kernal ---
 local kernal = emu:newNode("kernal")
-local kernalEnv = emu:buildEnv(kernal)
 emu:addModem(kernal)
-emu:addEeprom(kernal)
+emu:addEeprom(kernal, kernalBiosSrc)
 local gpuAddr, screenAddr, screenBuffers = emu:addGpuScreen(kernal, 50, 30)
 emu:addFilesystem(kernal, {
   ["/muxos.lua"] = muxosSrc,
@@ -88,18 +90,16 @@ local function dumpScreenOnFailure(label)
   end
 end
 
-local biosChunk = assert(kernalEnv.load(kernalBiosSrc, "=bios", "t", kernalEnv))
-emu:boot(kernal, biosChunk)
+emu:boot(kernal)
 assert(kernal.status == "running", "kernal failed to boot: see log")
 
 -- --- Build 3 workers ---
 local workers = {}
 for i = 1, 3 do
   local w = emu:newNode("worker")
-  local wenv = emu:buildEnv(w)
   emu:addModem(w)
-  local chunk = assert(wenv.load(workerBiosSrc, "=bios", "t", wenv))
-  emu:boot(w, chunk)
+  emu:addEeprom(w, workerBiosSrc)
+  emu:boot(w)
   assert(w.status == "running", "worker " .. i .. " failed to boot: see log")
   workers[i] = w
 end
@@ -193,11 +193,11 @@ emu:advance(3)
 assertScreenContains("reply from", "ping after long job")
 print("  OK -- worker still answers PING immediately after a long cooperating job")
 
-print("test 6: a NON-cooperating long JOB gets killed by the instruction-budget circuit breaker, not the worker")
-typeLine("run local x = 0 for i = 1, 100000000 do x = x + 1 end return x")
+print("test 6: a NON-cooperating long JOB is ended by the machine's deadline, not the worker")
+typeLine("run local x = 0 while true do x = x + 1 end")
 emu:advance(4)
 assertScreenContains("error", "non-cooperating job error")
-assertScreenContains("instruction budget", "circuit breaker message")
+assertScreenContains("too long without yielding", "the machine's own deadline ended the job")
 print("  OK -- non-cooperating job was killed with the expected error, worker itself survived")
 
 -- Confirm the worker that ran it is STILL alive and answering, not
@@ -567,7 +567,7 @@ end
 print("  OK -- no kernal globals, and only drawing calls on its own buffer")
 typeLine("window spin 1 1 5 1 while true do end")
 emu:advance(1)
-if not screenAfter("window spin 1 1 5 1"):find("exceeded its instruction budget", 1, true) then
+if not screenAfter("window spin 1 1 5 1"):find("too long without yielding", 1, true) then
   dumpScreenOnFailure("window budget")
   error("a non-terminating window draw was not stopped")
 end
@@ -873,5 +873,31 @@ typeLine("nosuchprogram")
 emu:advance(1)
 assertScreenContains("unknown command", "an unknown name is still an unknown command")
 print("  OK -- background launch, gmuxapi.launch (as parent), unknown names")
+
+print("test 30: the hardware verification suite passes inside the emulated sandbox")
+-- test/hardware/verify.lua is what you run on real hardware; it runs
+-- here through the same machine.lua sandbox, booted by its own loader.
+do
+  local hw = Emulator.new()
+  hw.timeout = 1
+  local node = hw:newNode("hw")
+  hw:addEeprom(node, readFile(REPO_ROOT .. "/test/hardware/bios.lua"))
+  hw:addFilesystem(node, {["/verify.lua"] = readFile(REPO_ROOT .. "/test/hardware/verify.lua")})
+  local _, _, bufs = hw:addGpuScreen(node, 100, 30)
+  hw:boot(node)
+  hw:advance(30)
+  local rows = {}
+  for y = 1, bufs[0].h do
+    local row, chars = bufs[0].cells[y] or {}, {}
+    for x = 1, bufs[0].w do chars[x] = (row[x] and row[x].char) or " " end
+    rows[#rows + 1] = table.concat(chars)
+  end
+  local screen = table.concat(rows, "\n")
+  if not screen:find("checks, 0 failed", 1, true) then
+    io.stderr:write(screen .. "\n")
+    error("the hardware verification suite failed in the emulated sandbox")
+  end
+end
+print("  OK -- every check in test/hardware/verify.lua passes")
 
 print("ALL OK")

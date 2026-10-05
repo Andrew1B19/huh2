@@ -5,23 +5,15 @@
 -- this file directly off the boot filesystem; there is no OpenOS
 -- /init.lua anywhere in this picture.
 --
--- Everything OpenOS would normally provide at this point --
--- computer.pullSignal, event.pull/listen, thread.create, the keyboard
--- library, io/print-to-screen, component.proxy/dot-shorthand access --
--- is confirmed ABSENT from the mod's own native Lua sandbox surface,
--- verified directly against its Scala source
--- (li.cil.oc.server.machine.luac.{ComponentAPI,ComputerAPI,SystemAPI}):
--- component's real surface is only list/type/slot/methods/invoke/doc;
--- computer has no pullSignal at all (the real primitive is yielding the
--- kernel coroutine, caught by NativeLuaArchitecture.runThreaded); and
--- the native `print` only logs to the Java server console per its own
--- source comment ("Until we get to ingame screens we log to Java's
--- stdout"), never the in-game screen. So this file builds every one of
--- those itself from the real primitives (component.list/component.invoke,
--- coroutine.yield) instead of assuming OpenOS is there to provide them
--- -- the same bare-metal discipline node/bios.lua and node/runtime.lua
--- already had to follow, just applied here too now instead of resting
--- on a normal OpenOS boot underneath.
+-- This runs inside the mod's own sandbox (its machine.lua), not on raw
+-- Lua: what's there is component (list/type/slot/methods/invoke/doc/
+-- proxy), computer (including computer.pullSignal, pushSignal,
+-- shutdown, uptime), the standard libraries with a wrapped
+-- coroutine.yield/resume, and a debug table with only getinfo/
+-- traceback/getlocal/getupvalue. What OpenOS would add on top --
+-- event.pull/listen, thread.create, the keyboard library,
+-- io/print-to-screen -- isn't there, so this file builds what it needs
+-- itself (the sandbox has no `print` at all).
 --
 -- Install: kernal/bios.lua (flashed to the EEPROM), this file,
 -- kernal/compositor.lua, kernal/bitmap.lua, and node/runtime.lua all
@@ -43,24 +35,19 @@ local PORT = 4477
 local MUXOS_VERSION = "0.1.0"
 local TIMEOUT = 5 -- seconds to wait for a worker reply before giving up
 
--- The real primitive behind every blocking wait in this file. Yielding
--- the kernel coroutine with a timeout (in seconds) IS computer.pullSignal's
--- actual underlying mechanism -- confirmed from NativeLuaArchitecture's
--- runThreaded, which resumes a yielded coroutine with the next signal's
--- name + args once one arrives (or with nothing, if the timeout simply
--- elapses first).
+-- Every blocking wait goes through the sandbox's computer.pullSignal,
+-- which yields to the machine. (A bare coroutine.yield(timeout) does
+-- NOT: the sandbox wraps coroutine.yield to yield (nil, ...) as a user
+-- yield, so the timeout is lost and the wait only ends on a signal.)
 local function pullSignal(timeout)
-  return coroutine.yield(timeout)
+  return computer.pullSignal(timeout)
 end
 
--- Yielding a plain boolean is the real shutdown/reboot primitive
--- (false = power off, true = reboot) -- OpenOS's own computer.shutdown()
--- is just a wrapper over this. Falling off the end of this file instead
--- (a normal Lua `return`) is NOT a clean shutdown -- the mod's own
--- runThreaded treats that as "the kernel stopped unexpectedly" and logs
--- a warning, so "quit"/"exit" at the REPL go through this instead.
+-- Falling off the end of this file is NOT a clean shutdown -- the
+-- machine treats that as the kernel stopping unexpectedly -- so
+-- "quit"/"exit" go through this.
 local function shutdown(reboot)
-  coroutine.yield(reboot and true or false)
+  computer.shutdown(reboot)
 end
 
 -- Our OWN tiny component-proxy helper -- NOT OpenOS's
@@ -687,7 +674,6 @@ end
 -- the program. Either way, the scheduler places it.
 local PROGRAM_PATH = {"/bin", "/usr/bin"}
 local MXE_LIBRARY_DIR = "/lib/mxe/"
-local MANIFEST_BUDGET = 10000
 
 local function fileExists(path)
   return tryInvoke(fsAddr, "exists", path) == true
@@ -713,8 +699,10 @@ local function resolveProgram(name)
   end
 end
 
--- The header is evaluated as Lua assignments in an empty environment,
--- under an instruction budget -- it's data, not a place to run code.
+-- The header is evaluated as Lua assignments in an empty environment --
+-- it's data, not a place to run code. It runs in its own coroutine, so
+-- one that never finishes is ended by the machine's own "too long
+-- without yielding" deadline without taking the kernal down.
 local function readManifest(source)
   local body = source:match("^%s*%-%-%[%[mxe(.-)%]%]")
   if not body then return {} end
@@ -722,7 +710,6 @@ local function readManifest(source)
   local chunk, err = load(body, "=mxe header", "t", env)
   if not chunk then return nil, "bad .mxe header: " .. tostring(err) end
   local co = coroutine.create(chunk)
-  debug.sethook(co, function() error("header does too much work", 0) end, "", MANIFEST_BUDGET)
   local ok, runErr = coroutine.resume(co)
   if not ok then return nil, "bad .mxe header: " .. tostring(runErr) end
   return {muxos = env.muxos, libraries = env.libraries}

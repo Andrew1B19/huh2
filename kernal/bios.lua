@@ -11,13 +11,10 @@
 -- pattern, same "try the remembered boot device first, then scan every
 -- filesystem component for a bootable one" fallback, same gpu/screen
 -- auto-bind -- except it loads /muxos.lua instead of /init.lua, because
--- muxos IS the init here. Everything past this point (computer.pullSignal,
--- event, thread, keyboard, io, component.proxy/dot-shorthand, ...) is
--- OpenOS's own lib/boot code, confirmed absent from the mod's native
--- Scala-registered API surface (ComponentAPI.scala/ComputerAPI.scala),
--- so kernal/muxos.lua builds every one of those itself from the real
--- primitives (component.list/component.invoke, coroutine.yield) rather
--- than assuming they exist.
+-- muxos IS the init here. Like all EEPROM code, it runs in the mod's
+-- sandbox (machine.lua); what OpenOS would add on top (event, thread,
+-- keyboard, io, ...) isn't there, so kernal/muxos.lua builds what it
+-- needs itself.
 
 local component_invoke = component.invoke
 local function boot_invoke(address, method, ...)
