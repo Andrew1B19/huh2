@@ -175,13 +175,15 @@ on the screen directly. See "The console" below.
 | `HELLO`   | `from`                                                    | worker  | "I just booted, here's my address"                |
 | `PING`    | `from`                                                    | kernal  | "who's out there"                                  |
 | `PONG`    | `from`, `to`                                              | worker  | reply to `PING`                                    |
-| `JOB`     | `from`, `to`, `id`, `code`, `args`                        | kernal  | run `code` (a Lua chunk) with `args`               |
+| `JOB`     | `from`, `to`, `id`, `code`, `args`, `program`             | kernal  | run `code` (a Lua chunk) with `args`; `program` (path, kind, `.mxe` launch response and libraries) when it's a launched program |
 | `LIST`    | `from`, `to`, `id`                                        | either  | "list the components attached to you"             |
 | `INVOKE`  | `from`, `to`, `id`, `address`, `method`, `args`           | either  | call `component.invoke(address, method, args...)` on the receiver's own component |
 | `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, muxos-shaped) -- summaries: no source, no result |
 | `GETPROCESS` | `from`, `to`, `id`, `jobId`                            | worker  | one job's full record (`gmuxapi.get_process(id)`) |
 | `CONTROL` | `from`, `to`, `id`, `jobId`, `verb`, `caller`                | worker  | pause/resume/kill one of the caller's own descendants (`gmuxapi.pause_process`/`resume_process`/`kill_process`) |
 | `EVENT`   | `from`, `to`, `jobId`, `event`                                | kernal  | an input event for a process on that node, read with `gmuxapi.pull_event` |
+| `OUTPUT`  | `from`, `to`, `jobId`, `text`                                 | worker  | a process's printed output, for the console |
+| `LAUNCH`  | `from`, `to`, `id`, `path`, `args`, `caller`                  | worker  | launch a program as the caller's child (`gmuxapi.launch`) |
 | `KILL`/`PAUSE`/`RESUME <id>` | raw, unchunked                             | kernal  | process control broadcasts, acted on at the process's yield points |
 | `SPAWN`   | `from`, `to`, `id`, `code`, `args`, `node`                | worker  | "dispatch a new job" (gmux API's `create_headless_process`/`create_graphics_process`); replies immediately with a handle, doesn't wait for the job to finish |
 | `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
@@ -458,26 +460,46 @@ exactly the kind of "which code path do I run this through" decision a
 file extension is good for, as long as nothing security-relevant is ever
 gated on it.
 
-## Program launcher (decided, not yet built)
+## Program launcher -- BUILT
 
-Works basically like OpenOS's -- a reimplementation, with muxos's
-additions. What it does differs by extension:
+Works like OpenOS's shell: a name typed at the console that isn't a
+built-in command is looked up on `/bin` then `/usr/bin` (`.mxe` before
+`.lua`), or a path is used as given; the rest of the line is its
+arguments, passed as `...`. It runs in the foreground -- the console
+waits until it ends and feeds it typed input, echoing it like a
+terminal -- unless the line ends with `&`, which runs it in the
+background. A process can launch a program too, with
+`gmuxapi.launch(nameOrPath, args)`, and becomes its parent. Either way,
+the scheduler places it.
 
-- **`.lua`**: the legacy path above (virtual components, the modified
-  OpenOS userland).
-- **`.mxe`**: the program declares, at launch, what it expects:
-  - the muxos version it targets. A version mismatch does **not** stop
-    it from running;
-  - any libraries it wants beyond the native OS APIs, which every
-    `.mxe` always gets.
+- **`.lua`** runs in the OpenOS environment: the standard libraries,
+  `print`, `io.write`/`io.read` (console output and input), and `os`
+  (`sleep`, `clock`, `time`, `exit`), and nothing muxos-specific (no
+  `gmuxapi`). Not built yet: the OpenOS libraries behind `require`, and
+  gmux's virtual components (see "Running OpenOS programs").
+- **`.mxe`** declares what it expects in a header at the top of the file:
 
-  The launcher **responds** to that declaration (what's available, what
-  isn't, the actual version), so the program can adapt. The baseline
-  declaration is deliberately minimal -- only what's barely needed. The
-  full `.mxe` spec comes later; this baseline doesn't need it.
+  ```lua
+  --[[mxe
+  muxos = "0.1.0"
+  libraries = {"name", ...}
+  ]]
+  ```
 
-Either way, the launched program is placed by the scheduler, not by the
-launcher or the program.
+  The header is evaluated as data (empty environment, small instruction
+  budget). The program gets the launcher's response as the global
+  `launch`: `muxos` (the actual version), `requested`, `versionMatch`
+  (a mismatch never stops it from running), `libraries` (name ->
+  found or not) and `errors`. Libraries live at `/lib/mxe/<name>.lua` on
+  the kernal's disk, are shipped with the program, load into its own
+  environment, and are reached with `require(name)`. Both headers and
+  libraries are deliberately minimal for now; the full `.mxe` spec comes
+  later.
+
+Every process's `print` (and a legacy program's `io.write`) goes to the
+kernal console as `OUTPUT` messages, buffered per process and sent at
+its yield points, before it reads input, when it ends, or past 1 KB.
+Test 29 covers all of the above.
 
 **Package manager**: OPM (currently an OpenOS package manager) will be
 expanded into muxos's native package manager and track installed

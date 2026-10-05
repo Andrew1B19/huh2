@@ -40,6 +40,7 @@
 -- actually load.
 
 local PORT = 4477
+local MUXOS_VERSION = "0.1.0"
 local TIMEOUT = 5 -- seconds to wait for a worker reply before giving up
 
 -- The real primitive behind every blocking wait in this file. Yielding
@@ -248,6 +249,7 @@ local consoleLines = {}      -- committed logical lines, oldest first
 local consoleDirty = true
 local scrollOffset = 0       -- wrapped rows scrolled back from the bottom
 local inputBuffer = ""       -- the REPL's line being typed
+local consolePartial = ""    -- program output not yet ended by a newline
 local commandBusy = false    -- a command is running; see handleKeyDown
 
 local consoleW, consoleH = termW, math.max(CONSOLE_MIN_H, math.floor(termH / 2))
@@ -287,7 +289,13 @@ local function wrapLine(line, width)
 end
 
 local function liveLine()
-  if commandBusy then return nil end
+  if commandBusy then
+    -- A foreground program is running: show its unfinished output line
+    -- (e.g. a prompt it wrote with io.write, plus the echo of what's
+    -- being typed into it).
+    if consolePartial ~= "" then return consolePartial .. "_" end
+    return nil
+  end
   return "muxos> " .. inputBuffer .. "_"
 end
 
@@ -384,7 +392,28 @@ local function print(...)
   local parts = {}
   for i = 1, n do parts[i] = tostring((select(i, ...))) end
   local text = table.concat(parts, "\t")
+  if consolePartial ~= "" then
+    consoleAppend(consolePartial)
+    consolePartial = ""
+  end
   for line in (text .. "\n"):gmatch("(.-)\n") do consoleAppend(line) end
+end
+
+-- Program output (OUTPUT messages): may end mid-line, so the unfinished
+-- part is held in consolePartial until its newline arrives.
+local function consoleWrite(text)
+  local start = 1
+  while true do
+    local nl = text:find("\n", start, true)
+    if not nl then
+      consolePartial = consolePartial .. text:sub(start)
+      break
+    end
+    consoleAppend(consolePartial .. text:sub(start, nl - 1))
+    consolePartial = ""
+    start = nl + 1
+  end
+  consoleDirty = true
 end
 
 -- --- Minimal keyboard modifier tracking, replacing OpenOS's keyboard library ---
@@ -597,7 +626,7 @@ local awaiting = {}
 -- SPAWN carrying an explicit `parent` (its own job id, which
 -- node/runtime.lua now exposes to running job code as the global
 -- `jobId`) sets these.
-local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy)
+local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy, program)
   if targetAddr then
     if not nodes[targetAddr] then return nil, "unknown node: " .. tostring(targetAddr) end
     if nodes[targetAddr].down then return nil, "node is down: " .. targetAddr end
@@ -605,18 +634,9 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
     if liveNodeCount() == 0 then
       return nil, "no live worker nodes -- try 'discover'"
     end
-    -- Round-robin, unconditionally -- this project's answer to "what
-    -- happens when every worker is already busy" is implicit, not an
-    -- admission-control gate: a worker only ever runs one job at a
-    -- time (runJobCode blocks that worker's own main loop until the
-    -- job finishes or is killed), so dispatching to an already-busy
-    -- worker just means the new JOB message waits in that worker's
-    -- own signal queue until it's free -- not denied, not queued at
-    -- the kernal, just delayed at the target. A real load-aware
-    -- balancer (preferring the least-busy worker) is still "not yet
-    -- built" -- see README.md's Status section -- but that's a
-    -- quality-of-placement question, not a correctness gate this
-    -- needed to answer first.
+    -- Least-busy live node (see nextLiveNode). A worker runs one job at
+    -- a time, so a job sent to a busy worker just waits in that
+    -- worker's own queue -- not denied, not queued at the kernal.
     targetAddr = nextLiveNode()
   end
   nodes[targetAddr].lastDispatch = computer.uptime()
@@ -631,7 +651,7 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
   jobs[id] = {id = id, node = targetAddr, status = "running", code = code, codePreview = codePreview(code),
     startedAt = computer.uptime(),
     parent = parent, appName = appName, orphanPolicy = parent and (orphanPolicy or "orphan") or nil,
-    rootId = rootId}
+    rootId = rootId, path = program and program.path, kind = program and program.kind}
   runningJobs[id] = true
   runningCount = runningCount + 1
   nodes[targetAddr].running = (nodes[targetAddr].running or 0) + 1
@@ -643,8 +663,106 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
   if parent and jobs[id].orphanPolicy == "orphan" then
     registerOrphanCandidate(appName, id)
   end
-  send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args})
+  send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args, program = program})
   return id, targetAddr
+end
+
+-- --- Program launcher ---
+--
+-- Works like OpenOS's: a name typed at the console is looked up on
+-- PROGRAM_PATH (.mxe before .lua), or a path is used as given. A .lua
+-- program runs in the OpenOS environment; an .mxe declares, in a
+-- header at the top of the file, the muxos version it targets and any
+-- libraries it wants beyond the native API:
+--
+--   --[[mxe
+--   muxos = "0.1.0"
+--   libraries = {"name", ...}
+--   ]]
+--
+-- and gets a response (the global `launch` in its environment): the
+-- actual version, whether it matches (a mismatch never stops it from
+-- running), and which libraries were found. Libraries live at
+-- MXE_LIBRARY_DIR/<name>.lua on the kernal's disk and are shipped with
+-- the program. Either way, the scheduler places it.
+local PROGRAM_PATH = {"/bin", "/usr/bin"}
+local MXE_LIBRARY_DIR = "/lib/mxe/"
+local MANIFEST_BUDGET = 10000
+
+local function fileExists(path)
+  return tryInvoke(fsAddr, "exists", path) == true
+end
+
+local function resolveProgram(name)
+  local candidates = {}
+  local function add(base)
+    if base:match("%.mxe$") or base:match("%.lua$") then
+      candidates[#candidates + 1] = base
+    else
+      candidates[#candidates + 1] = base .. ".mxe"
+      candidates[#candidates + 1] = base .. ".lua"
+    end
+  end
+  if name:find("/", 1, true) then
+    add(name)
+  else
+    for _, dir in ipairs(PROGRAM_PATH) do add(dir .. "/" .. name) end
+  end
+  for _, path in ipairs(candidates) do
+    if fileExists(path) then return path end
+  end
+end
+
+-- The header is evaluated as Lua assignments in an empty environment,
+-- under an instruction budget -- it's data, not a place to run code.
+local function readManifest(source)
+  local body = source:match("^%s*%-%-%[%[mxe(.-)%]%]")
+  if not body then return {} end
+  local env = {}
+  local chunk, err = load(body, "=mxe header", "t", env)
+  if not chunk then return nil, "bad .mxe header: " .. tostring(err) end
+  local co = coroutine.create(chunk)
+  debug.sethook(co, function() error("header does too much work", 0) end, "", MANIFEST_BUDGET)
+  local ok, runErr = coroutine.resume(co)
+  if not ok then return nil, "bad .mxe header: " .. tostring(runErr) end
+  return {muxos = env.muxos, libraries = env.libraries}
+end
+
+local function versionParts(v)
+  local parts = {}
+  for n in tostring(v):gmatch("%d+") do parts[#parts + 1] = tonumber(n) end
+  return parts
+end
+
+local function sameVersion(a, b)
+  local x, y = versionParts(a), versionParts(b)
+  for i = 1, math.max(#x, #y, 1) do
+    if (x[i] or 0) ~= (y[i] or 0) then return false end
+  end
+  return true
+end
+
+local function launchProgram(path, args, parent)
+  local source, err = readFile(path)
+  if not source then return nil, "can't read " .. path .. ": " .. tostring(err) end
+  local program = {path = path, kind = path:match("%.mxe$") and "mxe" or "legacy"}
+  if program.kind == "mxe" then
+    local manifest, manifestErr = readManifest(source)
+    if not manifest then return nil, manifestErr end
+    local response = {muxos = MUXOS_VERSION, requested = manifest.muxos, libraries = {},
+      versionMatch = manifest.muxos == nil or sameVersion(manifest.muxos, MUXOS_VERSION)}
+    local libs = {}
+    for _, name in ipairs(type(manifest.libraries) == "table" and manifest.libraries or {}) do
+      if type(name) == "string" and name:match("^[%w_%.%-]+$") then
+        local libSource = readFile(MXE_LIBRARY_DIR .. name .. ".lua")
+        response.libraries[name] = libSource ~= nil
+        libs[name] = libSource
+      end
+    end
+    program.launch, program.libs = response, libs
+  end
+  local appName = path:match("([^/]+)%.%w+$")
+  return dispatchJob(source, args, nil, parent, appName, nil, program)
 end
 
 -- Fan-out/depth cap on recursive spawning: "for as many nodes as
@@ -1044,6 +1162,40 @@ local function handleControl(msg)
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
 end
 
+-- The process making a request, if it's really running on the node
+-- that sent it.
+local function callerJob(msg)
+  local job = jobs[msg.caller]
+  if job and job.status == "running" and job.node == msg.from then return job end
+end
+
+local function handleOutput(msg)
+  local job = jobs[msg.jobId]
+  if job and job.node == msg.from and type(msg.text) == "string" then
+    consoleWrite(msg.text)
+  end
+end
+
+-- gmuxapi.launch: a process launching a program becomes its parent.
+local function handleLaunch(msg)
+  local caller = callerJob(msg)
+  local path = type(msg.path) == "string" and resolveProgram(msg.path)
+  local reply
+  if not caller then
+    reply = "not called from a running process"
+  elseif not path then
+    reply = "program not found: " .. tostring(msg.path)
+  else
+    local id, addrOrErr = launchProgram(path, type(msg.args) == "table" and msg.args or {}, caller.id)
+    if id then
+      send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {id = id, node = addrOrErr, path = path}})
+      return
+    end
+    reply = addrOrErr
+  end
+  send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = reply})
+end
+
 local function handleGetOrphans(msg)
   local list, keep = {}, {}
   for _, id in ipairs(appsByName[msg.appName] or {}) do
@@ -1063,13 +1215,6 @@ end
 -- one file in this project allowed to touch the real gpu for window
 -- content. muxos.lua's job here is only wire plumbing: unwrap the
 -- request, call in, wrap the reply.
--- The process making a request, if it's really running on the node
--- that sent it.
-local function callerJob(msg)
-  local job = jobs[msg.caller]
-  if job and job.status == "running" and job.node == msg.from then return job end
-end
-
 local function handleCreateWindow(msg)
   msg.text = nil -- text windows are the kernal's own (the console)
   -- A window belongs to the process it was made for (create_graphics_
@@ -1197,6 +1342,10 @@ local function handleModemMessage(from, port, data)
     handleGetOrphans(msg)
   elseif msg.type == "CONTROL" then
     handleControl(msg)
+  elseif msg.type == "OUTPUT" then
+    handleOutput(msg)
+  elseif msg.type == "LAUNCH" then
+    handleLaunch(msg)
   elseif msg.type == "CREATEWINDOW" then
     handleCreateWindow(msg)
   elseif msg.type == "GETWINDOWS" then
@@ -1278,6 +1427,39 @@ local function deliverEvent(job, event)
   send({type = "EVENT", from = selfAddr, to = job.node, jobId = job.id, event = event})
 end
 
+-- The program running in the foreground from the console (see
+-- runForeground), which gets the console's typed input. The kernal
+-- echoes it like a terminal: printable characters, backspace (only over
+-- what was typed since the last Enter), and Enter.
+local foregroundJob = nil
+local foregroundTyped = ""
+
+local function feedForeground(char, code)
+  local job = jobs[foregroundJob]
+  if not job or job.status ~= "running" then return false end
+  deliverEvent(job, {"key_down", char, code})
+  if code == KEY_ENTER then
+    consoleAppend(consolePartial)
+    consolePartial, foregroundTyped = "", ""
+  elseif code == KEY_BACK then
+    local len = utf8.len(foregroundTyped)
+    if len and len > 0 then
+      local cut = utf8.offset(foregroundTyped, -1)
+      local removed = #foregroundTyped - cut + 1
+      foregroundTyped = foregroundTyped:sub(1, cut - 1)
+      consolePartial = consolePartial:sub(1, #consolePartial - removed)
+    end
+  elseif char and char >= 32 then
+    local ok, ch = pcall(utf8.char, char)
+    if ok then
+      foregroundTyped = foregroundTyped .. ch
+      consolePartial = consolePartial .. ch
+    end
+  end
+  consoleDirty = true
+  return true
+end
+
 local function handleKeyDown(char, code)
   heldKeys[code] = true
   -- Ctrl+Alt+C was OpenOS's own interrupt shortcut; muxos has no OpenOS
@@ -1294,6 +1476,7 @@ local function handleKeyDown(char, code)
   -- Scrolling never waits behind a running command.
   if code == KEY_PAGEUP then scrollConsole(select(2, viewSize()) - 1) return end
   if code == KEY_PAGEDOWN then scrollConsole(-(select(2, viewSize()) - 1)) return end
+  if commandBusy and foregroundJob and feedForeground(char, code) then return end
   if commandBusy then
     queuedKeys[#queuedKeys + 1] = {char, code}
     return
@@ -1434,6 +1617,25 @@ end
 -- Submit `code` (compiled as a chunk and called with `args` as its only
 -- argument) to one worker node and block for the result. Picks the next
 -- node round-robin unless targetAddr is given.
+-- Runs a launched program in the foreground: the console waits until it
+-- ends (any way: done, error, killed, lost), feeding it typed input
+-- meanwhile, like an OpenOS shell.
+local function runForeground(id)
+  foregroundJob, foregroundTyped = id, ""
+  while jobs[id] and jobs[id].status == "running" do
+    tick(0.5)
+  end
+  foregroundJob = nil
+  if consolePartial ~= "" then
+    consoleAppend(consolePartial)
+    consolePartial = ""
+  end
+  local job = jobs[id]
+  if job and job.status ~= "done" then
+    print(job.status .. ": " .. tostring(job.error))
+  end
+end
+
 local function submit(code, args, targetAddr)
   local id, addrOrErr = dispatchJob(code, args, targetAddr)
   if not id then
@@ -1712,7 +1914,25 @@ runCommand = function(line)
       end
     end
   elseif line ~= "" then
-    print("unknown command")
+    -- Not a built-in: run it as a program, OpenOS-shell style. A
+    -- trailing "&" runs it in the background.
+    local words = {}
+    for word in line:gmatch("%S+") do words[#words + 1] = word end
+    local background = words[#words] == "&"
+    if background then table.remove(words) end
+    local path = words[1] and resolveProgram(words[1])
+    if not path then
+      print("unknown command")
+      return
+    end
+    local id, addrOrErr = launchProgram(path, {table.unpack(words, 2)})
+    if not id then
+      print("error: " .. addrOrErr)
+    elseif background then
+      print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
+    else
+      runForeground(id)
+    end
   end
 end
 

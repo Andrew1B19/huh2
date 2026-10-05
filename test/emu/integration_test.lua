@@ -43,6 +43,25 @@ emu:addFilesystem(kernal, {
   ["/compositor.lua"] = compositorSrc,
   ["/bitmap.lua"] = bitmapSrc,
   ["/runtime.lua"] = runtimeSrc,
+  -- Sample programs for the launcher (test 29).
+  ["/bin/hello.mxe"] = [==[--[[mxe
+muxos = "0.1.0"
+libraries = {"greeting", "nosuchlib"}
+]]
+local greeting = require("greeting")
+print(greeting.say("mxe") .. " v=" .. tostring(launch.versionMatch) .. " g=" .. tostring(launch.libraries.greeting)
+  .. " n=" .. tostring(launch.libraries.nosuchlib) .. " a=" .. tostring((...)))
+]==],
+  ["/lib/mxe/greeting.lua"] = [==[return {say = function(name) return "hello " .. name end}]==],
+  ["/bin/old.mxe"] = [==[--[[mxe
+muxos = "9.9"
+]]
+print("old-runs v=" .. tostring(launch.versionMatch) .. " want=" .. tostring(launch.requested) .. " have=" .. launch.muxos)
+]==],
+  ["/bin/ask.lua"] = [==[io.write("name? ")
+local name = io.read()
+print("hi " .. name .. " gmuxapi=" .. tostring(gmuxapi) .. " os.time=" .. type(os.time))
+]==],
 })
 
 local function renderScreen()
@@ -823,5 +842,36 @@ typeLine([[run local ok, err = gmuxapi.draw_window(1, {code = "gpu.set(1,1,'x')"
 emu:advance(2)
 assertScreenContains("d28=window 1 belongs to another process", "a process can't draw into a window it doesn't own")
 print("  OK -- drawing into another process's window is refused")
+
+print("test 29: the program launcher -- .mxe headers and libraries, legacy .lua programs, foreground/background")
+typeLine("hello world")
+emu:advance(3)
+assertScreenContains("hello mxe v=true g=true n=false a=world", ".mxe got its header response, its library, and its args")
+typeLine("old")
+emu:advance(3)
+assertScreenContains("old-runs v=false want=9.9 have=0.1.0", "a version mismatch is reported but the program still runs")
+print("  OK -- .mxe launched by name: version response, granted/missing libraries, require, args")
+
+typeLine("ask")
+emu:advance(2)
+assertScreenContains("name? _", "the legacy program's prompt is shown while it waits for input")
+typeLine("bob")
+emu:advance(3)
+assertScreenContains("name? bob", "typed input was echoed after the prompt")
+assertScreenContains("hi bob gmuxapi=nil os.time=function", "legacy program read the input, and sees the OpenOS environment, not gmuxapi")
+print("  OK -- a legacy .lua program runs in the foreground, writes a prompt, and reads console input")
+
+typeLine("hello bg &")
+emu:advance(3)
+assertScreenContains("/bin/hello.mxe started on", "a trailing & runs it in the background")
+assertScreenContains("a=bg", "the background program's output still reaches the console")
+typeLine('run local h = gmuxapi.launch("hello", {"kid"}) sleep(1) return "L29=" .. tostring(gmuxapi.get_process(h.id).parent == jobId)')
+emu:advance(4)
+assertScreenContains("a=kid", "a program launched by a process ran")
+assertScreenContains("L29=true", "the launching process is its parent")
+typeLine("nosuchprogram")
+emu:advance(1)
+assertScreenContains("unknown command", "an unknown name is still an unknown command")
+print("  OK -- background launch, gmuxapi.launch (as parent), unknown names")
 
 print("ALL OK")

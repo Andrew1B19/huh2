@@ -202,6 +202,13 @@ local function queueEvent(id, event)
   if #q < MAX_QUEUED_EVENTS then q[#q + 1] = event end
 end
 
+-- Program output (print, io.write) is buffered per process and sent to
+-- the kernal's console as OUTPUT messages -- at the process's yield
+-- points, when it ends, before it reads input, or once the buffer
+-- passes OUTPUT_FLUSH_AT -- rather than one message per call.
+local outputBuffers = {}
+local OUTPUT_FLUSH_AT = 1024
+
 -- Sets aside one signal pulled while waiting for something else -- a
 -- job's yield(), sleep(), or a gmuxapi call. A PING is answered on the
 -- spot: that's how the kernal knows a node busy with a job is still
@@ -278,6 +285,22 @@ local function remoteRequest(msgType, extra)
     end
   end
   return nil, "timed out waiting for kernal"
+end
+
+local function flushOutput(id)
+  local buf = outputBuffers[id]
+  if buf and #buf > 0 and kernalAddr then
+    outputBuffers[id] = nil
+    send({type = "OUTPUT", from = nodeId, to = kernalAddr, jobId = id, text = table.concat(buf)})
+  end
+end
+
+local function writeOutput(id, text)
+  local buf = outputBuffers[id]
+  if not buf then buf = {n = 0}; outputBuffers[id] = buf end
+  buf[#buf + 1] = text
+  buf.n = buf.n + #text
+  if buf.n >= OUTPUT_FLUSH_AT then flushOutput(id) end
 end
 
 local function remoteList()
@@ -479,6 +502,7 @@ gmuxapi = {
   -- seconds (nil timeout: wait indefinitely). Events come back as
   -- {name, ...} lists, e.g. {"key_down", char, code}.
   pull_event = function(timeout)
+    flushOutput(currentJobId)
     local deadline = timeout and (computer.uptime() + timeout)
     while true do
       local q = eventQueues[currentJobId]
@@ -487,6 +511,12 @@ gmuxapi = {
       local name, _, from, port, _, data = pullSignal(deadline and (deadline - computer.uptime()) or nil)
       stashSignal(name, from, port, data)
     end
+  end,
+
+  -- Launch a program (name or path, like typing it at the console); the
+  -- calling process becomes its parent. Returns {id, node, path}.
+  launch = function(program, args)
+    return remoteRequest("LAUNCH", {path = program, args = args, caller = currentJobId})
   end,
 
   -- Pause, resume, or end one of this process's own descendants. The
@@ -651,6 +681,7 @@ local function runJobCode(chunk, args, selfId)
         resumeWith = sig
       end
     end
+    flushOutput(selfId)
     if controlState[selfId] == "PAUSE" and waitWhilePaused(selfId) then return false, KILLED end
     if controlState[selfId] == "KILL" then return false, KILLED end
     armBudgetHook(co)
@@ -691,8 +722,111 @@ NATIVE.yield = yield
 NATIVE.sleep = sleep
 NATIVE.muxos = readOnly({version = MUXOS_VERSION}, "muxos")
 
+local function printTo(id)
+  return function(...)
+    local n = select("#", ...)
+    local parts = {}
+    for i = 1, n do parts[i] = tostring((select(i, ...))) end
+    writeOutput(id, table.concat(parts, "\t") .. "\n")
+  end
+end
+
 local function newProcessEnv(id)
-  local env = setmetatable({jobId = id}, {__index = NATIVE})
+  local env = setmetatable({jobId = id, print = printTo(id)}, {__index = NATIVE})
+  env._G = env
+  env.load = function(chunk, name, mode, e) return load(chunk, name, mode, e or env) end
+  return env
+end
+
+-- An .mxe: the native environment, plus the launcher's response
+-- (`launch`) and `require` for the libraries it asked for and was
+-- granted. Libraries are loaded into the process's own environment.
+local function newMxeEnv(id, program)
+  local env = newProcessEnv(id)
+  local launch = program.launch or {libraries = {}}
+  launch.errors = {}
+  env.launch = launch
+  local loaded = {}
+  env.require = function(name)
+    local value = loaded[name]
+    if value == nil then error("library '" .. tostring(name) .. "' wasn't granted at launch", 2) end
+    return value
+  end
+  local function loadLibraries()
+    for name, source in pairs(program.libs or {}) do
+      local fn, err = load(source, "=lib:" .. name, "t", env)
+      local ok, value = false, err
+      if fn then ok, value = pcall(fn) end
+      if ok then
+        loaded[name] = value == nil and true or value
+      else
+        launch.libraries[name] = false
+        launch.errors[name] = tostring(value)
+      end
+    end
+  end
+  return env, loadLibraries
+end
+
+-- A .lua program: the OpenOS environment -- the standard libraries,
+-- print/io/os, and nothing muxos-specific (no gmuxapi; parent/child
+-- processes are an .mxe concept). The rest of the OpenOS userland
+-- (require-able libraries, virtual components) isn't built yet.
+local EXIT = {}
+
+local function readLine(id)
+  flushOutput(id)
+  local line = ""
+  while true do
+    local event = gmuxapi.pull_event()
+    if event and event[1] == "key_down" then
+      local char, code = event[2], event[3]
+      if code == 28 then
+        return line
+      elseif code == 14 then
+        local len = utf8.len(line)
+        if len and len > 0 then line = line:sub(1, utf8.offset(line, -1) - 1) end
+      elseif char and char >= 32 then
+        local ok, ch = pcall(utf8.char, char)
+        if ok then line = line .. ch end
+      end
+    end
+  end
+end
+
+local function newLegacyEnv(id)
+  local env = {}
+  for _, k in ipairs({"assert", "error", "ipairs", "next", "pairs", "pcall", "rawequal", "rawget",
+      "rawlen", "rawset", "select", "setmetatable", "getmetatable", "tonumber", "tostring", "type", "xpcall"}) do
+    env[k] = _ENV[k]
+  end
+  for _, lib in ipairs({"string", "table", "math", "utf8", "coroutine"}) do env[lib] = NATIVE[lib] end
+  env.computer = NATIVE.computer
+  env.print = printTo(id)
+  local function write(...)
+    for i = 1, select("#", ...) do writeOutput(id, tostring((select(i, ...)))) end
+  end
+  local stream = {write = function(self, ...) write(...) return self end}
+  env.io = {
+    write = write,
+    read = function(format)
+      local line = readLine(id)
+      if format == "n" or format == "*n" then return tonumber(line) end
+      if format == "L" or format == "*L" then return line .. "\n" end
+      return line
+    end,
+    stdout = stream,
+    stderr = stream,
+  }
+  env.os = {
+    sleep = sleep,
+    clock = computer.uptime,
+    time = function() return math.floor(computer.uptime()) end,
+    exit = function() error(EXIT, 0) end,
+  }
+  env.require = function(name)
+    error("module '" .. tostring(name) .. "' not found: muxos doesn't provide the OpenOS libraries yet", 2)
+  end
   env._G = env
   env.load = function(chunk, name, mode, e) return load(chunk, name, mode, e or env) end
   return env
@@ -729,17 +863,41 @@ local function handleMessage(from, msg)
 
   if msg.type == "JOB" then
     -- `msg.id` is the job's own id (dispatchJob uses one id as both the
-    -- job's identity and this message's RPC id).
-    local chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t", newProcessEnv(msg.id))
+    -- job's identity and this message's RPC id). A launched program
+    -- (msg.program) gets the environment for its kind and its arguments
+    -- as `...`; plain code gets the native environment and `args`.
+    local program, chunk, loadErr, entry = msg.program
+    if type(program) == "table" then
+      local env, loadLibraries
+      if program.kind == "mxe" then
+        env, loadLibraries = newMxeEnv(msg.id, program)
+      else
+        env = newLegacyEnv(msg.id)
+      end
+      chunk, loadErr = load(msg.code, "=" .. tostring(program.path), "t", env)
+      if chunk then
+        local args = type(msg.args) == "table" and msg.args or {}
+        if loadLibraries then
+          entry = function() loadLibraries() return chunk(table.unpack(args, 1, args.n or #args)) end
+        else
+          entry = function() return chunk(table.unpack(args, 1, args.n or #args)) end
+        end
+      end
+    else
+      chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t", newProcessEnv(msg.id))
+      entry = chunk
+    end
     if not chunk then
       send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = loadErr})
       return
     end
     currentJobId = msg.id
-    local ok, result = runJobCode(chunk, msg.args, msg.id)
+    local ok, result = runJobCode(entry, msg.args, msg.id)
     currentJobId = nil
+    flushOutput(msg.id)
     controlState[msg.id] = nil
     eventQueues[msg.id] = nil
+    if not ok and result == EXIT then ok, result = true, nil end
     if ok then
       sendReply({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = result}, "job result")
     else

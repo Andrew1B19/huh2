@@ -172,6 +172,9 @@ muxos> window hello 5 5 20 5 gpu.set(1,1,"hi from the kernal")
 muxos> windows
 muxos> comp
 muxos> console 80 20
+muxos> hello world            (runs /bin/hello.mxe or /bin/hello.lua)
+muxos> hello world &          (in the background)
+muxos> pause 12 / resume 12 / kill 12
 muxos> bitdemo halfblock 5 5
 muxos> bitdemo braille 30 5
 muxos> components 1
@@ -418,4 +421,8 @@ Processes are isolated (own environment, crash-contained) and the
 kernal can pause, resume, or end any of them; windows are persistent
 handles their process can redraw (`gmuxapi.draw_window`), and keyboard
 input goes to the process owning the focused window
-(`gmuxapi.pull_event`). Verified in tests 27-28.
+(`gmuxapi.pull_event`). Programs launch OpenOS-shell style by name
+from the console (foreground, or background with `&`) or via
+`gmuxapi.launch`: `.mxe` headers declare the muxos version and
+libraries they want and get a response; `.lua` programs get an
+OpenOS environment with console I/O. Verified in tests 27-29.
