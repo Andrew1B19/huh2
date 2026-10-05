@@ -410,9 +410,12 @@ cross-process round trip -- see `test/hardware/verify.lua` -- but
 nothing in `kernal/muxos.lua`/`node/runtime.lua` uses it yet), and the
 rest of the general `.mxe`-vs-legacy hardware access model: the
 networking side entirely (a lightweight kernal modem kernel module for
-`.mxe`, eventual GERTi access, vs. an emulated modem for legacy), and
-the actual keyboard-delivery wiring on top of the focus-tracking
-scaffolding above. See docs/PROTOCOL.md's "The `.mxe` process model"
-section for the full design and what's still genuinely undecided (the
-exact job-environment and persistent-window-handle APIs, "promote"'s
-unenforced self-dependence requirement).
+`.mxe`, eventual GERTi access, vs. an emulated modem for legacy). See
+docs/PROTOCOL.md's "The `.mxe` process model" section for the full
+design and what's still genuinely undecided.
+
+Processes are isolated (own environment, crash-contained) and the
+kernal can pause, resume, or end any of them; windows are persistent
+handles their process can redraw (`gmuxapi.draw_window`), and keyboard
+input goes to the process owning the focused window
+(`gmuxapi.pull_event`). Verified in tests 27-28.

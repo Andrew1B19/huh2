@@ -1063,14 +1063,51 @@ end
 -- one file in this project allowed to touch the real gpu for window
 -- content. muxos.lua's job here is only wire plumbing: unwrap the
 -- request, call in, wrap the reply.
+-- The process making a request, if it's really running on the node
+-- that sent it.
+local function callerJob(msg)
+  local job = jobs[msg.caller]
+  if job and job.status == "running" and job.node == msg.from then return job end
+end
+
 local function handleCreateWindow(msg)
   msg.text = nil -- text windows are the kernal's own (the console)
+  -- A window belongs to the process it was made for (create_graphics_
+  -- process names its child), otherwise to the process that made it.
+  if not msg.ownerJobId then
+    local caller = callerJob(msg)
+    msg.ownerJobId = caller and caller.id
+  end
   local win, err = compositor.createWindow(msg)
   if not win then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
     return
   end
-  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = win})
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = compositor.describe(win)})
+end
+
+-- Redraw an existing window. Only its owner process (or an ancestor of
+-- it) may draw into it.
+local function handleDrawWindow(msg)
+  local caller = callerJob(msg)
+  local win = compositor.getWindow(msg.windowId)
+  local reply
+  if not caller then
+    reply = "not called from a running process"
+  elseif not win then
+    reply = "no such window: " .. tostring(msg.windowId)
+  elseif win.ownerJobId ~= caller.id and not (win.ownerJobId and isDescendantOf(win.ownerJobId, caller.id)) then
+    reply = "window " .. tostring(msg.windowId) .. " belongs to another process"
+  end
+  if not reply then
+    local ok, err = compositor.redrawWindow(msg.windowId, msg)
+    if ok then
+      send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
+      return
+    end
+    reply = err
+  end
+  send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = reply})
 end
 
 local function handleGetWindows(msg)
@@ -1164,6 +1201,8 @@ local function handleModemMessage(from, port, data)
     handleCreateWindow(msg)
   elseif msg.type == "GETWINDOWS" then
     handleGetWindows(msg)
+  elseif msg.type == "DRAWWINDOW" then
+    handleDrawWindow(msg)
   elseif msg.type == "REQUESTFULLSCREEN" then
     handleRequestFullscreen(msg)
   elseif msg.type == "RELEASEFULLSCREEN" then
@@ -1223,12 +1262,33 @@ local function scrollConsole(rows)
   setScroll(scrollOffset + rows)
 end
 
+-- The process that gets keyboard/scroll input right now: the owner of
+-- the focused window, if it's a live process. Otherwise (console mode,
+-- the console focused, or a window whose process has ended) the console
+-- gets it. Ctrl+Alt+C always reaches the kernal.
+local function focusedProcess()
+  if consoleOwnsScreen() then return nil end
+  local win = compositor.getFocus()
+  if not win or (consoleWin and win.id == consoleWin.id) or not win.ownerJobId then return nil end
+  local job = jobs[win.ownerJobId]
+  if job and job.status == "running" and nodes[job.node] and not nodes[job.node].down then return job end
+end
+
+local function deliverEvent(job, event)
+  send({type = "EVENT", from = selfAddr, to = job.node, jobId = job.id, event = event})
+end
+
 local function handleKeyDown(char, code)
   heldKeys[code] = true
   -- Ctrl+Alt+C was OpenOS's own interrupt shortcut; muxos has no OpenOS
   -- underneath, so it's reclaimed as the kernal's console interrupt.
   if code == KEY_C and isControlDown() and isAltDown() then
     consoleInterrupt()
+    return
+  end
+  local target = focusedProcess()
+  if target then
+    deliverEvent(target, {"key_down", char, code})
     return
   end
   -- Scrolling never waits behind a running command.
@@ -1273,8 +1333,20 @@ local function handleKeyDown(char, code)
   -- handling -- a flat append/backspace-only line editor.
 end
 
-local function handleKeyUp(code)
+local function handleKeyUp(char, code)
   heldKeys[code] = nil
+  local target = focusedProcess()
+  if target then deliverEvent(target, {"key_up", char, code}) end
+end
+
+local function handleScroll(x, y, direction)
+  local target = focusedProcess()
+  if target then
+    deliverEvent(target, {"scroll", x, y, direction})
+  else
+    -- Mouse wheel over the screen: positive direction is up.
+    scrollConsole((direction or 0) > 0 and 3 or -3)
+  end
 end
 
 -- Pulls and fully handles exactly one signal, or times out -- the ONE
@@ -1301,10 +1373,9 @@ local function tick(timeout)
     if name == "key_down" then
       handleKeyDown(a3, a4)
     elseif name == "key_up" then
-      handleKeyUp(a4)
+      handleKeyUp(a3, a4)
     elseif name == "scroll" then
-      -- Mouse wheel over the screen: positive direction is up.
-      scrollConsole((a5 or 0) > 0 and 3 or -3)
+      handleScroll(a3, a4, a5)
     elseif name == "modem_message" then
       handleModemMessage(a3, a4, a6)
     end

@@ -402,6 +402,7 @@ gmuxapi = {
     -- M.setFocus/M.getFocus for the tracking side of this.
     local win, winErr = remoteRequest("CREATEWINDOW", {
       title = options.name, width = options.width, height = options.height, ownerJobId = proc.id,
+      caller = currentJobId,
     })
     if not win then return {process = proc}, winErr end
     return {process = proc, window = win}
@@ -422,8 +423,21 @@ gmuxapi = {
     return remoteRequest("CREATEWINDOW", {
       title = options.title, x = options.x, y = options.y,
       width = options.width, height = options.height, code = options.code,
-      pixels = options.pixels, mode = options.mode, bg = options.bg,
+      pixels = options.pixels, mode = options.mode, bg = options.bg, args = options.args,
+      caller = currentJobId,
     })
+  end,
+
+  -- Redraw a window this process owns (or one owned by a descendant):
+  -- `options.code` (+ `options.args`, visible to the code as `args`),
+  -- and/or `options.pixels`/`mode`/`width`/`height` like create_window;
+  -- `options.clear = false` draws over the existing content instead of
+  -- blanking it first. Same sandbox as create_window.
+  draw_window = function(id, options)
+    options = options or {}
+    return remoteRequest("DRAWWINDOW", {windowId = id, code = options.code, args = options.args,
+      pixels = options.pixels, mode = options.mode, width = options.width, height = options.height,
+      bg = options.bg, clear = options.clear, caller = currentJobId})
   end,
 
   get_windows = function()

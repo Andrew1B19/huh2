@@ -288,9 +288,20 @@ local function windowEnv(gpu)
   }
 end
 
-local function drawIntoBuffer(gpu, buffer, code)
-  local chunk, loadErr = load(code, "=window", "t", windowEnv(gpu))
-  if not chunk then return nil, loadErr end
+-- Compiles window draw code into its own sandbox environment. Returns
+-- the chunk and its environment (kept together so a window can cache
+-- them and redraw without recompiling), or nil and the error.
+local function compileWindowCode(gpu, code)
+  local env = windowEnv(gpu)
+  local chunk, err = load(code, "=window", "t", env)
+  if not chunk then return nil, err end
+  return chunk, env
+end
+
+-- Runs compiled draw code against `buffer` under the instruction budget,
+-- with `args` visible to it as the global `args`.
+local function runWindowCode(gpu, buffer, chunk, env, args)
+  env.args = args
   local co = coroutine.create(chunk)
   local message = "window draw code exceeded its instruction budget (" .. WINDOW_CODE_BUDGET .. ")"
   debug.sethook(co, function()
@@ -305,6 +316,12 @@ local function drawIntoBuffer(gpu, buffer, code)
   end
   if ok then return true end
   return nil, err
+end
+
+local function drawIntoBuffer(gpu, buffer, code, args)
+  local chunk, envOrErr = compileWindowCode(gpu, code)
+  if not chunk then return nil, envOrErr end
+  return runWindowCode(gpu, buffer, chunk, envOrErr, args)
 end
 
 -- Adds a window to the z-order and gives it focus. New windows go on
@@ -413,7 +430,7 @@ function M.createWindow(options)
   end
 
   if options.code then
-    local ok, drawErr = drawIntoBuffer(gpu, buffer, options.code)
+    local ok, drawErr = drawIntoBuffer(gpu, buffer, options.code, options.args)
     if not ok then
       gpu.freeBuffer(buffer)
       return nil, "window draw code failed: " .. tostring(drawErr)
@@ -432,14 +449,22 @@ function M.createWindow(options)
   -- fine, not an error.
   local win = {id = id, title = options.title or ("window " .. id), x = x, y = y,
     width = width, height = height, buffer = buffer, layer = options.layer or 0, dirty = true,
-    ownerJobId = options.ownerJobId}
+    ownerJobId = options.ownerJobId, drawCache = {}, drawCacheSize = 0}
   return registerWindow(win)
+end
+
+-- A plain, serializable description of a window -- what crosses the
+-- wire (the record itself holds a gpu buffer index and compiled draw
+-- code).
+function M.describe(win)
+  return {id = win.id, title = win.title, x = win.x, y = win.y, width = win.width, height = win.height,
+    layer = win.layer, ownerJobId = win.ownerJobId}
 end
 
 function M.listWindows()
   local list = {}
   for _, id in ipairs(windowOrder) do
-    list[#list + 1] = windows[id]
+    list[#list + 1] = M.describe(windows[id])
   end
   return list
 end
@@ -459,6 +484,10 @@ end
 -- a manual stand-in for whatever gesture eventually does this for
 -- real. Returns false + an error for an id that doesn't exist, rather
 -- than silently leaving the old focus in place or focusing nothing.
+function M.getWindow(id)
+  return windows[id]
+end
+
 function M.setFocus(id)
   if not windows[id] then
     return false, "no such window: " .. tostring(id)
@@ -511,6 +540,56 @@ function M.setGeometry(id, x, y, width, height)
   win.x, win.y, win.width, win.height = x, y, width, height
   -- What was behind its old outline has to show again.
   M.invalidateAll()
+  return true
+end
+
+-- Redraws an existing buffered window -- the persistent-handle half of
+-- the window model: an app keeps its window and pushes new content into
+-- it whenever it wants. Same sandbox and budget as at creation.
+-- `options`: `code` (+ `args`), and/or `pixels`/`mode` like createWindow;
+-- `clear` (default true) blanks the buffer to `bg` first. Compiled draw
+-- code is cached per window, keyed by its source, so an app that redraws
+-- with the same code and different `args` doesn't recompile each time.
+local DRAW_CACHE_LIMIT = 8
+
+function M.redrawWindow(id, options)
+  local win = windows[id]
+  local gpu = kernalGpu()
+  if not win then return nil, "no such window: " .. tostring(id) end
+  if win.textRows or not win.buffer then return nil, "window " .. tostring(id) .. " has no drawable buffer" end
+  if not gpu then return nil, "kernal has no gpu component" end
+  if options.clear ~= false then
+    gpu.setActiveBuffer(win.buffer)
+    gpu.setBackground(options.bg or 0x000000)
+    gpu.fill(1, 1, win.width, win.height, " ")
+    gpu.setActiveBuffer(0)
+  end
+  if options.pixels then
+    if not options.width or not options.height then
+      return nil, "options.pixels needs options.width/options.height"
+    end
+    local cells, cellCols, cellRows = bitmap.encode(options.mode, options.pixels, options.width, options.height, options.bg)
+    gpu.setActiveBuffer(win.buffer)
+    local ok, err = pcall(bitmap.draw, gpu, cells, math.min(cellRows, win.height), math.min(cellCols, win.width), 1, 1)
+    gpu.setActiveBuffer(0)
+    if not ok then return nil, "bitmap draw failed: " .. tostring(err) end
+  end
+  if options.code then
+    local cached = win.drawCache[options.code]
+    if not cached then
+      local chunk, envOrErr = compileWindowCode(gpu, options.code)
+      if not chunk then return nil, envOrErr end
+      if win.drawCacheSize >= DRAW_CACHE_LIMIT then
+        win.drawCache, win.drawCacheSize = {}, 0
+      end
+      cached = {chunk = chunk, env = envOrErr}
+      win.drawCache[options.code] = cached
+      win.drawCacheSize = win.drawCacheSize + 1
+    end
+    local ok, err = runWindowCode(gpu, win.buffer, cached.chunk, cached.env, options.args)
+    if not ok then return nil, "window draw code failed: " .. tostring(err) end
+  end
+  win.dirty = true
   return true
 end
 

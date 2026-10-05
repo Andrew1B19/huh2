@@ -374,7 +374,7 @@ print("  OK -- 1st and 2nd child spawns succeeded, 3rd was rejected once the tre
 -- this next test.
 emu:advance(3)
 
-print("test 14: window-focus tracking scaffolding -- ownership + default/explicit focus (no keyboard delivery wired up yet)")
+print("test 14: window focus -- ownership + default/explicit focus")
 -- create_graphics_process spawns a job AND a window FOR it, in one
 -- call -- the window's ownerJobId should be that job's own id, not
 -- whichever node happened to make the CREATEWINDOW request (this
@@ -395,6 +395,12 @@ do
   focusProcId, focusWinId = p, w
 end
 print("  OK -- create_graphics_process's window is owned by the job it was created for (job " .. focusProcId .. ", window " .. focusWinId .. ")")
+
+-- While that window is focused and its process is alive, keystrokes go
+-- to the process (test 28), so let it finish (it sleeps 5s) before
+-- typing more commands -- with its owner gone, input falls back to the
+-- console even though the window keeps focus.
+emu:advance(5)
 
 typeLine("windows")
 emu:advance(2)
@@ -789,5 +795,33 @@ emu:advance(2)
 local landed = screenAfter('b27="'):match("b27=(modem%-%x+)")
 assert(landed and landed ~= busyAddr, "the balancer sent new work to the busy node")
 print("  OK -- new work goes to the least-busy node")
+
+print("test 28: keyboard input goes to the focused window's process, which redraws its window")
+typeLine('run local r = gmuxapi.create_graphics_process({name = "kbd28", width = 12, height = 1, code = [[' ..
+  'local win while not win do for _, w in ipairs(gmuxapi.get_windows()) do if w.ownerJobId == jobId then win = w.id end end if not win then sleep(0.2) end end ' ..
+  'local s = "" while true do local e = gmuxapi.pull_event(20) if not e then break end ' ..
+  'if e[1] == "key_down" then if e[3] == 28 then break end s = s .. utf8.char(e[2]) ' ..
+  'gmuxapi.draw_window(win, {code = "gpu.set(1, 1, args.t)", args = {t = s}}) end end return s]]}) return "w28=" .. r.process.id')
+emu:advance(2)
+local kbdId = screenAfter("w28="):match("w28=(%d+)")
+assert(kbdId, "graphics process id not shown")
+typeLine("hi28")
+emu:advance(2)
+do
+  local firstRow = renderScreen():match("^[^\n]*")
+  if firstRow:sub(1, 4) ~= "hi28" or screenHas("muxos> hi28") then
+    dumpScreenOnFailure("keyboard delivery")
+    error("typed keys didn't reach the focused process and its window")
+  end
+end
+typeLine('run return "R28=" .. tostring(gmuxapi.get_process(' .. kbdId .. ').result)')
+emu:advance(2)
+assertScreenContains("R28=hi28", "the process received the keys and returned them")
+print("  OK -- keys went to the focused window's process (not the console), which redrew its window")
+
+typeLine([[run local ok, err = gmuxapi.draw_window(1, {code = "gpu.set(1,1,'x')"}) return "d28=" .. tostring(err)]])
+emu:advance(2)
+assertScreenContains("d28=window 1 belongs to another process", "a process can't draw into a window it doesn't own")
+print("  OK -- drawing into another process's window is refused")
 
 print("ALL OK")

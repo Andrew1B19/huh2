@@ -186,6 +186,7 @@ on the screen directly. See "The console" below.
 | `SPAWN`   | `from`, `to`, `id`, `code`, `args`, `node`                | worker  | "dispatch a new job" (gmux API's `create_headless_process`/`create_graphics_process`); replies immediately with a handle, doesn't wait for the job to finish |
 | `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
 | `GETWINDOWS` | `from`, `to`, `id`                                      | worker  | "list every window you know about" (gmux API's `get_windows()`) |
+| `DRAWWINDOW` | `from`, `to`, `id`, `windowId`, `code`, `args`, `pixels`, `mode`, `width`, `height`, `bg`, `clear`, `caller` | worker | redraw a window the calling process owns (`gmuxapi.draw_window`) |
 | `REQUESTFULLSCREEN` | `from`, `to`, `id`                                | worker  | "let me bypass the compositor and INVOKE the real gpu/screen directly" |
 | `RELEASEFULLSCREEN` | `from`, `to`, `id`                                | worker  | give that grant back |
 | `RESULT`  | `from`, `to`, `id`, `result`                              | either  | success -- `JOB`'s return value, `LIST`'s address→type table, `INVOKE`'s list of return values, `GETPROCESSES`'s job list, `SPAWN`'s `{id, node}` handle, `CREATEWINDOW`'s window record, `GETWINDOWS`'s window list, or `REQUESTFULLSCREEN`/`RELEASEFULLSCREEN`'s `{granted/released = true}` |
@@ -977,9 +978,9 @@ This started as a design decided through discussion, written down
 before implementation so it wouldn't get lost or reinvented
 differently later. Parent/child jobs, orphan policies, and app-identity
 reclaim are now BUILT and verified end to end (`test/emu/integration_test.lua`'s
-test 12) -- marked below as each piece is covered. Semi-live migration
-and the persistent-window-handle API are still forward design, not yet
-implemented -- marked as such where they appear.
+test 12) -- marked below as each piece is covered, as are persistent
+window handles and keyboard delivery. Semi-live migration is still
+forward design, not yet implemented.
 
 ### Why this exists
 
@@ -1346,74 +1347,41 @@ its own handle, but it doesn't get to touch anyone else's window or any
 of the compositor's own bookkeeping (z-order, occlusion, dirty
 tracking, flush timing all stay the compositor's).
 
-This is a real shift from how `createWindow` works today, though:
-right now it's one-shot (`options.code` runs once -- sandboxed, since
-it arrives from any worker but executes ON the kernal: no kernal
-globals, a `gpu` limited to drawing calls on its own buffer, no
-`pcall`, and an instruction budget in its own coroutine (test 18) --
-against a freshly
-allocated buffer, and "updating" a window means calling `createWindow`
-again). The handle model implies a **persistent, redrawable** window --
-an app holds its handle for its whole lifetime and pushes new content
-into it whenever it wants, not once. The exact API for this (what a
-repeated draw call looks like, how dirty-tracking interacts with a
-handle that's drawn into intermittently rather than once) hasn't been
-designed yet.
+**Persistent window handles -- BUILT.** A window belongs to the process
+it was created for (`create_graphics_process`'s child) or, otherwise, to
+the process that created it. That process -- or an ancestor of it --
+redraws it whenever it wants with `gmuxapi.draw_window(id, options)`
+(`DRAWWINDOW`): `code` (with `args`, visible to the code as `args`)
+and/or a `pixels` bitmap, blanking the buffer first unless
+`clear = false`. Redraw code runs in the same sandbox as creation (no
+kernal globals, drawing-only `gpu`, no `pcall`, an instruction budget).
+Compiled draw code is cached per window keyed by its source, so an app
+that redraws with the same code and new `args` doesn't recompile each
+time. Any other process is refused (test 28).
 
-### Window-focus tracking -- scaffolding BUILT, keyboard delivery itself still NOT built
+### Window focus and keyboard delivery -- BUILT
 
-The general `.mxe`-vs-legacy hardware access model (see "Still open"
-below) calls for the kernal to send keyboard updates straight to
-whichever `.mxe` job currently has focus, instead of through a virtual
-keyboard component. That needs the kernal to actually know which
-window is focused, and which job (if any) it belongs to, before any
-key signal can be routed anywhere -- this section is that tracking
-mechanism, and only that. **No key signal is forwarded to any job
-yet** -- `kernal/muxos.lua`'s `handleKeyDown` still only ever feeds the
-kernal's own REPL input buffer, exactly as before. Actually wiring
-delivery is the next piece, not this one.
+**Focus**: `kernal/compositor.lua` keeps one focused window. A newly
+created window takes focus, the same convention as it taking the top
+z-order slot. There's no mouse/click gesture to move focus yet; the
+`focus <window id>` REPL command does it manually, and Ctrl+Alt+C
+focuses the console. `windows` shows the focused window and each
+window's owning process (test 14).
 
-**Window ownership**: `CREATEWINDOW` gained an optional `ownerJobId`
-field. `node/runtime.lua`'s `create_graphics_process` sets it to the
-spawned child's own id (`proc.id`) -- not to whatever node happened to
-make the `CREATEWINDOW` request, which can be a totally different node
-than the child it just spawned for. A plain `create_window` (or the
-REPL's own `window` command) leaves it unset -- there's no job to
-deliver anything to for those, and that's a normal case, not an error.
-Given a focused window with an `ownerJobId`, the kernal can resolve
-`jobs[ownerJobId].node` directly through the single global job table
-it already keeps -- no separate bookkeeping needed to go from "this
-window is focused" to "this physical node should receive the key
-signal."
+**Delivery**: keyboard (`key_down`/`key_up`) and mouse-wheel input go to
+the process that owns the focused window, as `EVENT` messages to its
+node; the process reads them with `gmuxapi.pull_event(timeout)`, which
+returns `{name, ...}` lists like `{"key_down", char, code}`. Events for
+a process still queued on its node wait for it (up to 64). The console
+gets the input instead in console mode, when it's focused, or when the
+focused window's process has ended or its node is down; Ctrl+Alt+C
+always reaches the kernal (test 28). This is the `.mxe` model -- the
+kernal hands the process its input directly, no virtual keyboard
+component.
 
-**Focus itself**: `kernal/compositor.lua` keeps one `focusedId`,
-exposed as `M.getFocus()`/`M.setFocus(id)`. A freshly created window
-takes focus automatically, the same convention as it taking the top
-z-order slot -- the newest thing on screen is, by default, the thing
-that should receive input, whether or not it declared an owner.
-There's no mouse or click gesture anywhere in this project to move
-focus any other way yet, so `setFocus` is exposed at the kernal REPL
-as a manual `focus <window id>` command -- a stand-in for whatever
-gesture eventually does this for real, and the only way to change
-focus away from "whatever was created most recently" today. `windows`
-shows the current focus and each window's owning job (if any) so this
-is actually observable. Verified end to end in
-`test/emu/integration_test.lua`'s test 14: `create_graphics_process`'s
-window really is tagged with its spawned child's id (not the caller's
-own), a plain ownerless window still takes focus on creation same as
-an owned one, `focus <id>` moves it back explicitly, and focusing a
-nonexistent id fails with a clear error rather than silently doing
-nothing or crashing.
-
-**Still genuinely open**: what happens to focus when a window is
-destroyed (no "destroy window" exists yet at all, so this has never
-come up for real); whether focus should also move on anything besides
-window creation (e.g. Tab-cycling, or a future mouse/click gesture);
-and the actual keyboard-delivery wiring itself -- how a `key_down`
-signal reaches the focused window's owning job over the wire, what
-shape it arrives in on the worker side, and whether a job needs to ask
-the kernal "do I currently have focus" (a new message type) or just
-reacts to whatever it's handed.
+**Still open**: what happens to a window (and focus) when its process
+ends, and a keyboard gesture for moving focus between windows (today
+only `focus` at the console and Ctrl+Alt+C).
 
 ### The console -- BUILT
 
@@ -1448,8 +1416,8 @@ currently has, at most once per tick, which gives:
   command nested inside the first one's wait. (A different approach may
   replace this later.) Ctrl+Alt+C and scrolling are never queued.
 
-Keyboard input still always goes to the console; focus is tracked (see
-above) but nothing delivers keys to other windows yet.
+The console gets keyboard input whenever no live process owns the
+focused window (see "Window focus and keyboard delivery" above).
 
 ### Still open
 
@@ -1458,9 +1426,6 @@ Collected in one place:
 - The exact shape of the "job environment abstraction" -- what's
   actually exposed to a dispatched `.mxe` app vs. a plain `JOB`, beyond
   the `jobId` global and `gmuxapi` every job already gets today.
-- The persistent-window-handle API's exact shape (semi-live migration
-  and the compositor handle model are both still forward design, not
-  implemented -- see their own sections above).
 - "promote"'s self-dependence requirement isn't enforced -- the kernal
   takes the declared policy at face value.
 - The general `.mxe`-vs-legacy hardware access model: `.mxe` apps make
