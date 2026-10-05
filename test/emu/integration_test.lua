@@ -574,19 +574,42 @@ emu:advance(1)
 assertScreenContains("SOLOX", "window shown again after comp")
 print("  OK -- windows hidden in solo mode and shown again after `comp`")
 
+-- Video memory: the console never gets a full-screen buffer of its own.
+-- In console mode it draws straight onto the screen; otherwise it's a
+-- smaller window. The compositor's frame buffer is the only full-screen
+-- buffer.
+do
+  local full = 0
+  for idx, b in pairs(screenBuffers) do
+    if idx ~= 0 and b.w == 50 and b.h == 30 then full = full + 1 end
+  end
+  assert(full == 1, "expected exactly one full-screen buffer (the frame), found " .. full)
+end
+typeLine("windows")
+emu:advance(1)
+assertScreenContains('"console"  50x16 at (1,15)', "the console window is docked at the bottom, 16 rows tall")
+print("  OK -- only the frame buffer is full-screen; the console window is 50x16")
+
 print("test 21: console scrollback with PgUp/PgDn and the mouse wheel")
 local KEY_PAGEUP, KEY_PAGEDOWN = 0xC9, 0xD1
 typeLine('run local t = {} for i = 1, 40 do t[#t + 1] = string.format("L%02d", i) end return table.concat(t, "\\n")')
 emu:advance(2)
 local function screenHas(text) return renderScreen():gsub("\n", ""):find(text, 1, true) ~= nil end
 assert(screenHas("L40") and not screenHas("L01"), "expected only the tail of the 40-line output on screen")
-emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_PAGEUP, "tester"); emu:step()
+-- The console is a 16-row window again after `comp`, so a page is 15
+-- rows; line 1 of 40 sits 41 rows up (under the prompt row), so two
+-- pages (offset 30, rows 31-46 in view) bring it into view.
+for _ = 1, 2 do
+  emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_PAGEUP, "tester"); emu:step()
+end
 emu:advance(0.2)
 if not (screenHas("L01") and screenHas("[scrolled")) then
   dumpScreenOnFailure("PgUp")
   error("PgUp did not scroll the console back")
 end
-emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_PAGEDOWN, "tester"); emu:step()
+for _ = 1, 2 do
+  emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_PAGEDOWN, "tester"); emu:step()
+end
 emu:advance(0.2)
 assert(screenHas("L40") and not screenHas("L01") and not screenHas("[scrolled"), "PgDn did not return to the bottom")
 emu:injectSignal(kernal, "scroll", screenAddr, 10, 10, 1, "tester"); emu:step()

@@ -163,11 +163,10 @@ in place of `component.isAvailable("gpu")`/`component.gpu`;
 `bitmap.lua` needed no changes at all -- it never touched `component`
 directly, only ever receiving a `gpu`-shaped table as a parameter.
 
-One specific consequence worth calling out: `kernal/compositor.lua` is
-the only place in this project that draws on the real screen. The REPL
-console is an ordinary compositor window -- full-screen, bottom layer
--- that the kernal draws into through `compositor.drawInto`. See "The
-console" below.
+One specific consequence worth calling out: `kernal/compositor.lua` owns
+the real screen. The REPL console is normally an ordinary compositor
+window; in console mode it's the compositor's exclusive owner and draws
+on the screen directly. See "The console" below.
 
 ## Message types
 
@@ -330,18 +329,20 @@ blocked" instead of quietly drawing onto the kernal's live screen. Use
 `gmuxapi.create_window()` for ordinary output; reach for
 `request_fullscreen()` only when actually building a fullscreen app.
 
-**Fullscreen suspends compositing.** While a node holds the grant it
-draws on the real screen directly, so the compositor stops flushing
-(nothing, the console included, paints over it) and redraws everything
-when the grant is released.
+**The compositor's exclusive mode.** One owner at a time can have the
+real screen to itself, with compositing stopped entirely: a node holding
+the fullscreen grant, or the kernal's console (console mode, below).
+Leaving the mode redraws the composited picture from the window
+buffers.
 
 **The console interrupt (Ctrl+Alt+C).** The grant isn't released
 automatically if its holder disappears, and a fullscreen app (or a
 window covering everything) can hide the console, so Ctrl+Alt+C at the
 kernal is a kernal-level interrupt: it force-releases the grant
-(whoever holds it), resumes compositing, focuses the console, and tells
-the compositor to draw ONLY the console window. The `comp` command
-returns to normal compositing. Ctrl+Alt+C was OpenOS's own
+(whoever holds it), focuses the console, and makes the console the
+compositor's exclusive owner -- it then draws straight onto the real
+screen at full resolution. The `comp` command returns to normal
+compositing. Ctrl+Alt+C was OpenOS's own
 process-interrupt shortcut (`lib/event.lua` checks it on every signal
 pull); muxos has no OpenOS underneath, so there's nothing to conflict
 with any more and the combo is reclaimed for this.
@@ -1314,11 +1315,20 @@ reacts to whatever it's handed.
 
 ### The console -- BUILT
 
-The REPL console is an ordinary compositor window: full-screen, on the
-bottom layer, drawn by the kernal through `compositor.drawInto` (the
-compositor is the only thing that touches the real screen). Output is
-kept as logical lines (the last 500) and wrapped only when rendered, at
-most once per tick, which gives:
+The REPL console has two sizes:
+
+- **Normally** it's an ordinary compositor window on the bottom layer,
+  docked at the bottom of the screen and capped at 80x16 -- it doesn't
+  need full-screen video memory.
+- **In console mode** (Ctrl+Alt+C, until `comp`) it's the compositor's
+  exclusive owner and draws straight onto the real screen at full
+  resolution. No full-screen buffer is allocated for it.
+
+So the compositor's frame buffer is the only full-screen buffer muxos
+allocates (test 20 checks this); window buffers are sized to their
+windows. Output is kept as logical lines (the last 500) and wrapped only
+when rendered, at whichever width the console currently has, at most
+once per tick, which gives:
 
 - **Scrollback**: PgUp/PgDn scroll a page; the mouse wheel scrolls 3
   rows. A `[scrolled N -- PgDn]` tag shows while scrolled back, a

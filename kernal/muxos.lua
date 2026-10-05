@@ -217,14 +217,21 @@ if gpu and screenAddr then
   tryInvoke(gpuAddr, "bind", screenAddr)
 end
 
--- --- The console: an ordinary compositor window, replacing OpenOS's io/term ---
+-- --- The console, replacing OpenOS's io/term ---
 --
--- It's the bottom-layer, full-screen window; the compositor is the only
--- thing that touches the real screen. Output is kept as logical
--- (unwrapped) lines and wrapped only when rendered, which is what makes
--- scrollback and backspacing across a wrapped input line simple.
--- Rendering happens at most once per tick (renderConsole, from tick()),
--- however many lines were printed in between.
+-- Normally an ordinary compositor window: bottom layer, docked at the
+-- bottom of the screen, and smaller than the screen (CONSOLE_MAX_W x
+-- CONSOLE_MAX_H) -- it doesn't need full-screen video memory. In
+-- console mode (Ctrl+Alt+C) it's the compositor's exclusive owner
+-- instead: compositing stops and the console draws straight onto the
+-- real screen at full resolution, so no full-screen buffer is ever
+-- allocated for it.
+--
+-- Output is kept as logical (unwrapped) lines and wrapped only when
+-- rendered, at whatever width the console currently has -- which is
+-- what makes scrollback, switching between the two sizes, and
+-- backspacing across a wrapped input line simple. Rendering happens at
+-- most once per tick (renderConsole, from tick()).
 
 local termW, termH = 1, 1
 if gpu then
@@ -232,6 +239,7 @@ if gpu then
 end
 
 local CONSOLE_LAYER = -1000
+local CONSOLE_MAX_W, CONSOLE_MAX_H = 80, 16
 local MAX_CONSOLE_LINES = 500
 local consoleLines = {}      -- committed logical lines, oldest first
 local consoleDirty = true
@@ -239,26 +247,38 @@ local scrollOffset = 0       -- wrapped rows scrolled back from the bottom
 local inputBuffer = ""       -- the REPL's line being typed
 local commandBusy = false    -- a command is running; see handleKeyDown
 
-local consoleWin = gpu and compositor.createWindow({title = "console", x = 1, y = 1,
-  width = termW, height = termH, layer = CONSOLE_LAYER}) or nil
+local consoleW, consoleH = math.min(termW, CONSOLE_MAX_W), math.min(termH, CONSOLE_MAX_H)
+local consoleWin = gpu and compositor.createWindow({title = "console", x = 1, y = termH - consoleH + 1,
+  width = consoleW, height = consoleH, layer = CONSOLE_LAYER}) or nil
 
--- Splits one logical line into screen rows of at most termW characters
+local function consoleOwnsScreen()
+  return compositor.exclusiveOwner() == "console"
+end
+
+-- The console's current size: the whole screen in console mode, its
+-- window otherwise.
+local function viewSize()
+  if consoleOwnsScreen() then return termW, termH end
+  return consoleW, consoleH
+end
+
+-- Splits one logical line into rows of at most `width` characters
 -- (UTF-8 aware; falls back to bytes for invalid UTF-8).
-local function wrapLine(line)
+local function wrapLine(line, width)
   local len = utf8.len(line)
   if not len then
     local rows = {}
-    for i = 1, math.max(#line, 1), termW do rows[#rows + 1] = line:sub(i, i + termW - 1) end
+    for i = 1, math.max(#line, 1), width do rows[#rows + 1] = line:sub(i, i + width - 1) end
     return rows
   end
-  if len <= termW then return {line} end
+  if len <= width then return {line} end
   local rows = {}
   local startChar = 1
   while startChar <= len do
     local from = utf8.offset(line, startChar)
-    local to = utf8.offset(line, startChar + termW)
+    local to = utf8.offset(line, startChar + width)
     rows[#rows + 1] = to and line:sub(from, to - 1) or line:sub(from)
-    startChar = startChar + termW
+    startChar = startChar + width
   end
   return rows
 end
@@ -268,27 +288,28 @@ local function liveLine()
   return "muxos> " .. inputBuffer .. "_"
 end
 
-local function totalRows()
+local function totalRows(width)
   local n = 0
-  for _, line in ipairs(consoleLines) do n = n + #wrapLine(line) end
+  for _, line in ipairs(consoleLines) do n = n + #wrapLine(line, width) end
   local live = liveLine()
-  if live then n = n + #wrapLine(live) end
+  if live then n = n + #wrapLine(live, width) end
   return n
 end
 
 local function setScroll(rows)
-  scrollOffset = math.max(0, math.min(rows, totalRows() - termH))
+  local w, h = viewSize()
+  scrollOffset = math.max(0, math.min(rows, totalRows(w) - h))
   consoleDirty = true
 end
 
--- The termH rows currently in view, top to bottom. Content shorter than
--- the screen starts at the top, like a fresh terminal.
-local function visibleRows()
-  local needed = termH + scrollOffset
+-- The h rows currently in view, top to bottom. Content shorter than the
+-- view starts at the top, like a fresh terminal.
+local function visibleRows(w, h)
+  local needed = h + scrollOffset
   local rows = {}            -- collected bottom-up
   local exhausted = true
   local function addLine(line)
-    local wrapped = wrapLine(line)
+    local wrapped = wrapLine(line, w)
     for i = #wrapped, 1, -1 do
       rows[#rows + 1] = wrapped[i]
       if #rows >= needed then return true end
@@ -302,37 +323,46 @@ local function visibleRows()
     end
   end
   local out = {}
-  if exhausted and #rows < termH then
+  if exhausted and #rows < h then
     for i = 1, #rows do out[i] = rows[#rows - i + 1] end
   else
-    for r = 1, termH do out[termH - r + 1] = rows[scrollOffset + r] end
+    for r = 1, h do out[h - r + 1] = rows[scrollOffset + r] end
   end
   return out
 end
 
 local function renderConsole()
   if not consoleDirty or not consoleWin then return end
+  -- Another owner (a fullscreen node) has the screen: leave it alone.
+  local owner = compositor.exclusiveOwner()
+  if owner and owner ~= "console" then return end
   consoleDirty = false
-  local rows = visibleRows()
-  compositor.drawInto(consoleWin.id, function(g)
+  local w, h = viewSize()
+  local rows = visibleRows(w, h)
+  local function draw(g)
     g.setForeground(0xFFFFFF)
     g.setBackground(0x000000)
-    g.fill(1, 1, termW, termH, " ")
-    for y = 1, termH do
+    g.fill(1, 1, w, h, " ")
+    for y = 1, h do
       if rows[y] and rows[y] ~= "" then g.set(1, y, rows[y]) end
     end
     if scrollOffset > 0 then
       local tag = "[scrolled " .. scrollOffset .. " -- PgDn]"
-      g.set(math.max(1, termW - #tag + 1), 1, tag)
+      g.set(math.max(1, w - #tag + 1), 1, tag)
     end
-  end)
+  end
+  if owner == "console" then
+    compositor.drawDirect(draw)
+  else
+    compositor.drawInto(consoleWin.id, draw)
+  end
 end
 
 local function consoleAppend(line)
   consoleLines[#consoleLines + 1] = line
   if #consoleLines > MAX_CONSOLE_LINES then table.remove(consoleLines, 1) end
   -- Keep a scrolled-back view still while new output arrives below it.
-  if scrollOffset > 0 then scrollOffset = scrollOffset + #wrapLine(line) end
+  if scrollOffset > 0 then scrollOffset = scrollOffset + #wrapLine(line, (viewSize())) end
   consoleDirty = true
 end
 
@@ -746,7 +776,8 @@ local function markNodeDown(addr)
   print("node " .. addr .. " stopped responding -- marking it down")
   if exclusiveFullscreenOwner == addr then
     exclusiveFullscreenOwner = nil
-    compositor.setSuspended(false)
+    compositor.setExclusive(nil)
+    consoleDirty = true
   end
   local lost = {}
   for id in pairs(runningJobs) do
@@ -860,7 +891,7 @@ local function handleRequestFullscreen(msg)
     return
   end
   exclusiveFullscreenOwner = msg.from
-  compositor.setSuspended(true)
+  compositor.setExclusive(msg.from)
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {granted = true}})
 end
 
@@ -871,7 +902,8 @@ local function handleReleaseFullscreen(msg)
     return
   end
   exclusiveFullscreenOwner = nil
-  compositor.setSuspended(false)
+  compositor.setExclusive(nil)
+  consoleDirty = true
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {released = true}})
 end
 
@@ -1089,11 +1121,8 @@ local function consoleInterrupt()
     print("Ctrl+Alt+C: force-releasing fullscreen grant held by " .. exclusiveFullscreenOwner)
     exclusiveFullscreenOwner = nil
   end
-  compositor.setSuspended(false)
-  if consoleWin then
-    compositor.setSolo(consoleWin.id)
-    compositor.setFocus(consoleWin.id)
-  end
+  compositor.setExclusive("console")
+  if consoleWin then compositor.setFocus(consoleWin.id) end
   scrollOffset = 0
   consoleDirty = true
   print("console only -- type 'comp' to show windows again")
@@ -1112,8 +1141,8 @@ local function handleKeyDown(char, code)
     return
   end
   -- Scrolling never waits behind a running command.
-  if code == KEY_PAGEUP then scrollConsole(termH - 1) return end
-  if code == KEY_PAGEDOWN then scrollConsole(-(termH - 1)) return end
+  if code == KEY_PAGEUP then scrollConsole(select(2, viewSize()) - 1) return end
+  if code == KEY_PAGEDOWN then scrollConsole(-(select(2, viewSize()) - 1)) return end
   if commandBusy then
     queuedKeys[#queuedKeys + 1] = {char, code}
     return
@@ -1444,7 +1473,11 @@ runCommand = function(line)
     printWindows()
   elseif line == "comp" then
     -- Back to normal compositing after a Ctrl+Alt+C console interrupt.
-    compositor.setSolo(nil)
+    -- Only takes the screen back from the console, never from a node
+    -- holding the fullscreen grant.
+    if consoleOwnsScreen() then compositor.setExclusive(nil) end
+    scrollOffset = 0
+    consoleDirty = true
     print("compositor restored -- all windows shown")
   elseif line:match("^focus%s") then
     -- Manual stand-in for the gesture that will eventually move focus

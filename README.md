@@ -392,8 +392,10 @@ ONLY the tracking -- no key signal is actually forwarded to any job
 yet, `handleKeyDown` still only ever feeds the kernal's own REPL input.
 Verified in `test/emu/integration_test.lua` (test 14).
 
-The console is a compositor window now, with scrollback (PgUp/PgDn,
-mouse wheel) and input queued while a command runs. Nodes are tracked
+The console is a small compositor window (up to 80x16) that takes the
+whole screen only in console mode, drawing on it directly -- so the
+frame buffer is the only full-screen video buffer. It has scrollback
+(PgUp/PgDn, mouse wheel) and queues input while a command runs. Nodes are tracked
 for liveness without a heartbeat (probes answered at job yield points;
 a silent node's jobs become `lost`), finished-job history is capped at
 100 without source, and `get_orphans` only hands out real orphans (with

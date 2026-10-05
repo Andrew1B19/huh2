@@ -84,13 +84,13 @@ local nextWindowId = 1
 -- this one, and needs this tracking to already exist first.
 local focusedId = nil
 
--- When set, flush() composites ONLY this window (kernal/muxos.lua's
--- Ctrl+Alt+C interrupt uses it to show the console alone; `comp` clears it).
-local soloId = nil
-
--- True while a node holds the fullscreen grant and draws on the real
--- screen directly -- compositing then would paint over it.
-local suspended = false
+-- The compositor's special mode: while set, ONE owner has the real
+-- screen to itself and compositing stops entirely -- either the
+-- kernal's console (Ctrl+Alt+C; it draws straight onto the screen via
+-- M.drawDirect, so it needs no full-screen buffer of its own) or a node
+-- holding the fullscreen grant. Clearing it rebuilds the composited
+-- picture from the window buffers.
+local exclusiveOwner = nil
 
 -- Persistent off-screen surface the whole desktop composites into
 -- before any real screen write. Allocated lazily (first window/flush),
@@ -419,7 +419,7 @@ end
 
 -- Marks every window dirty and blanks the frame buffer, so the next
 -- flush rebuilds the whole picture -- needed whenever what's shown
--- changes wholesale (solo mode toggled, fullscreen grant released).
+-- changes wholesale (leaving the exclusive mode).
 function M.invalidateAll()
   local gpu = kernalGpu()
   if gpu and frameBuffer then
@@ -432,19 +432,23 @@ function M.invalidateAll()
   for _, win in pairs(windows) do win.dirty = true end
 end
 
-function M.setSolo(id)
-  if id ~= nil and not windows[id] then return false, "no such window: " .. tostring(id) end
-  soloId = id
-  M.invalidateAll()
-  return true
+function M.setExclusive(owner)
+  local was = exclusiveOwner
+  exclusiveOwner = owner
+  if was and not owner then M.invalidateAll() end
 end
 
-function M.setSuspended(on)
-  if suspended and not on then
-    suspended = false
-    M.invalidateAll()
-  end
-  suspended = on and true or false
+function M.exclusiveOwner()
+  return exclusiveOwner
+end
+
+-- Draws straight onto the real screen -- only for the exclusive owner
+-- living on the kernal (the console); the frame buffer isn't involved.
+function M.drawDirect(fn)
+  local gpu = kernalGpu()
+  if not gpu then return end
+  gpu.setActiveBuffer(0)
+  fn(gpu)
 end
 
 -- Trusted drawing for the kernal's own windows (the console): runs
@@ -465,16 +469,15 @@ end
 -- Composites every dirty window into the frame buffer, then flips it
 -- onto the real screen with ONE bitblt -- only if something changed, so
 -- a quiet tick costs zero real GPU calls. Nothing else draws on the
--- real screen any more (the console is a window too), so the frame
--- buffer no longer needs syncing back FROM the screen before each
--- composite; the one exception, a fullscreen grant, suspends flushing.
+-- real screen while compositing is active, so the frame buffer never
+-- needs syncing back FROM the screen; whoever draws directly (the
+-- console in console mode, a fullscreen node) does so only as the
+-- exclusive owner, when this does nothing.
 function M.flush()
   local gpu = kernalGpu()
-  if suspended or not gpu or not frameBuffer then return end
-  local order = windowOrder
-  if soloId and windows[soloId] then order = {soloId} end
-  for i = 1, #order do
-    compositeWindow(gpu, order, i)
+  if exclusiveOwner or not gpu or not frameBuffer then return end
+  for i = 1, #windowOrder do
+    compositeWindow(gpu, windowOrder, i)
   end
   if frameDirty then
     local w, h = gpu.getBufferSize(frameBuffer)
