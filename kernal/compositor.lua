@@ -84,6 +84,14 @@ local nextWindowId = 1
 -- this one, and needs this tracking to already exist first.
 local focusedId = nil
 
+-- When set, flush() composites ONLY this window (kernal/muxos.lua's
+-- Ctrl+Alt+C interrupt uses it to show the console alone; `comp` clears it).
+local soloId = nil
+
+-- True while a node holds the fullscreen grant and draws on the real
+-- screen directly -- compositing then would paint over it.
+local suspended = false
+
 -- Persistent off-screen surface the whole desktop composites into
 -- before any real screen write. Allocated lazily (first window/flush),
 -- sized to the screen's own resolution.
@@ -155,11 +163,11 @@ end
 -- 1..index-1, if shown) cut out. Can return 0 pieces (fully covered),
 -- 1 (unoccluded), or several (occluded on one side, e.g. by a window
 -- overlapping a corner).
-local function visibleBoxes(index)
-  local win = windows[windowOrder[index]]
+local function visibleBoxes(order, index)
+  local win = windows[order[index]]
   local boxes = {{x = win.x, y = win.y, w = win.width, h = win.height}}
   for i = 1, index - 1 do
-    local blocker = windows[windowOrder[i]]
+    local blocker = windows[order[i]]
     local blockerRect = {x = blocker.x, y = blocker.y, w = blocker.width, h = blocker.height}
     local cut = {}
     for _, box in ipairs(boxes) do
@@ -179,10 +187,10 @@ end
 -- Does nothing if the window isn't dirty -- this is the actual dirty-
 -- tracking half of the gmux technique: don't spend a real GPU call
 -- recompositing a window that hasn't changed.
-local function compositeWindow(gpu, index)
-  local win = windows[windowOrder[index]]
+local function compositeWindow(gpu, order, index)
+  local win = windows[order[index]]
   if not win.dirty then return end
-  for _, box in ipairs(visibleBoxes(index)) do
+  for _, box in ipairs(visibleBoxes(order, index)) do
     gpu.bitblt(frameBuffer, box.x, box.y, box.w, box.h, win.buffer, box.x - win.x + 1, box.y - win.y + 1)
   end
   win.dirty = false
@@ -409,45 +417,64 @@ function M.setFocus(id)
   return true
 end
 
--- Composites every dirty window into the frame buffer, then flips the
--- frame buffer onto the real screen with ONE bitblt -- but only if
--- something actually changed (frameDirty), so a quiet tick costs zero
--- real GPU calls. Meant to be called at most once per tick by the
--- caller (kernal/muxos.lua's event loop); this function itself doesn't
--- rate-limit anything -- calling it twice in the same tick just does
--- the compositing work twice, redundantly but not incorrectly.
---
--- **Real bug found via test/emu's integration test, not a unit mock**:
--- the frame buffer used to be composited into as if it were the only
--- thing ever drawn to the screen -- but kernal/muxos.lua's own text
--- console (termWrite) writes directly to the real screen (buffer 0)
--- between flushes, since the console isn't a compositor window. Before
--- this fix, the very first flush after any window existed would blit
--- the ENTIRE frame buffer onto buffer 0, wiping out the console's own
--- prior output everywhere the frame buffer was blank -- not just where
--- the window actually was. Caught running the real, unmodified files
--- end to end for the first time (every existing unit test mocks gpu in
--- isolation, so none of them had a console writing to the same screen
--- concurrently to catch this).
---
--- Fixed by syncing the frame buffer FROM the real screen before
--- compositing any newly-dirty window -- this costs one extra full-
--- screen bitblt per dirty flush (still O(1), still at most once per
--- flush, not per window), but only when something is actually dirty,
--- preserving the "zero real GPU calls when nothing changed" property.
+-- Marks every window dirty and blanks the frame buffer, so the next
+-- flush rebuilds the whole picture -- needed whenever what's shown
+-- changes wholesale (solo mode toggled, fullscreen grant released).
+function M.invalidateAll()
+  local gpu = kernalGpu()
+  if gpu and frameBuffer then
+    gpu.setActiveBuffer(frameBuffer)
+    gpu.setBackground(0x000000)
+    local w, h = gpu.getBufferSize(frameBuffer)
+    gpu.fill(1, 1, w, h, " ")
+    gpu.setActiveBuffer(0)
+  end
+  for _, win in pairs(windows) do win.dirty = true end
+end
+
+function M.setSolo(id)
+  if id ~= nil and not windows[id] then return false, "no such window: " .. tostring(id) end
+  soloId = id
+  M.invalidateAll()
+  return true
+end
+
+function M.setSuspended(on)
+  if suspended and not on then
+    suspended = false
+    M.invalidateAll()
+  end
+  suspended = on and true or false
+end
+
+-- Trusted drawing for the kernal's own windows (the console): runs
+-- `fn(gpu)` with the window's buffer active, no sandbox, and marks the
+-- window dirty. Window code from workers goes through drawIntoBuffer's
+-- sandbox instead.
+function M.drawInto(id, fn)
+  local win = windows[id]
+  local gpu = kernalGpu()
+  if not win or not gpu then return end
+  gpu.setActiveBuffer(win.buffer)
+  local ok, err = pcall(fn, gpu)
+  gpu.setActiveBuffer(0)
+  win.dirty = true
+  if not ok then error(err, 0) end
+end
+
+-- Composites every dirty window into the frame buffer, then flips it
+-- onto the real screen with ONE bitblt -- only if something changed, so
+-- a quiet tick costs zero real GPU calls. Nothing else draws on the
+-- real screen any more (the console is a window too), so the frame
+-- buffer no longer needs syncing back FROM the screen before each
+-- composite; the one exception, a fullscreen grant, suspends flushing.
 function M.flush()
   local gpu = kernalGpu()
-  if not gpu or not frameBuffer then return end
-  local anyDirty = false
-  for i = 1, #windowOrder do
-    if windows[windowOrder[i]].dirty then anyDirty = true; break end
-  end
-  if anyDirty then
-    local w, h = gpu.getResolution()
-    gpu.bitblt(frameBuffer, 1, 1, w, h, 0, 1, 1)
-  end
-  for i = 1, #windowOrder do
-    compositeWindow(gpu, i)
+  if suspended or not gpu or not frameBuffer then return end
+  local order = windowOrder
+  if soloId and windows[soloId] then order = {soloId} end
+  for i = 1, #order do
+    compositeWindow(gpu, order, i)
   end
   if frameDirty then
     local w, h = gpu.getBufferSize(frameBuffer)

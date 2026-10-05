@@ -209,70 +209,131 @@ local exclusiveFullscreenOwner = nil
 -- load bitmap.lua the same way this file loaded it.
 local compositor = loadSibling("compositor.lua")(loadSibling)
 
--- The kernal's own gpu/screen, cached once -- used for isDisplayComponent
--- (below) AND for the REPL's own minimal text console (see "Minimal
--- built-in terminal" below): there is no OpenOS io/term to print through
--- any more, so the REPL draws onto the SAME real screen the compositor
--- owns, directly, the one other place in this project allowed to touch
--- the real gpu (the compositor's own windows still composite on top of
--- whatever the console drew, in z-order, same as any other screen content).
+-- The kernal's own gpu/screen, cached once -- used for
+-- isDisplayComponent (below) and to size the console window.
 local gpu, gpuAddr = primaryComponent("gpu")
 local _, screenAddr = primaryComponent("screen")
 if gpu and screenAddr then
   tryInvoke(gpuAddr, "bind", screenAddr)
 end
 
--- --- Minimal built-in terminal, replacing OpenOS's io/term entirely ---
+-- --- The console: an ordinary compositor window, replacing OpenOS's io/term ---
+--
+-- It's the bottom-layer, full-screen window; the compositor is the only
+-- thing that touches the real screen. Output is kept as logical
+-- (unwrapped) lines and wrapped only when rendered, which is what makes
+-- scrollback and backspacing across a wrapped input line simple.
+-- Rendering happens at most once per tick (renderConsole, from tick()),
+-- however many lines were printed in between.
 
 local termW, termH = 1, 1
 if gpu then
   termW, termH = gpu.getResolution()
 end
-local cursorX, cursorY = 1, 1
 
-local function scrollUp()
-  gpu.copy(1, 2, termW, termH - 1, 0, -1)
-  gpu.fill(1, termH, termW, 1, " ")
+local CONSOLE_LAYER = -1000
+local MAX_CONSOLE_LINES = 500
+local consoleLines = {}      -- committed logical lines, oldest first
+local consoleDirty = true
+local scrollOffset = 0       -- wrapped rows scrolled back from the bottom
+local inputBuffer = ""       -- the REPL's line being typed
+local commandBusy = false    -- a command is running; see handleKeyDown
+
+local consoleWin = gpu and compositor.createWindow({title = "console", x = 1, y = 1,
+  width = termW, height = termH, layer = CONSOLE_LAYER}) or nil
+
+-- Splits one logical line into screen rows of at most termW characters
+-- (UTF-8 aware; falls back to bytes for invalid UTF-8).
+local function wrapLine(line)
+  local len = utf8.len(line)
+  if not len then
+    local rows = {}
+    for i = 1, math.max(#line, 1), termW do rows[#rows + 1] = line:sub(i, i + termW - 1) end
+    return rows
+  end
+  if len <= termW then return {line} end
+  local rows = {}
+  local startChar = 1
+  while startChar <= len do
+    local from = utf8.offset(line, startChar)
+    local to = utf8.offset(line, startChar + termW)
+    rows[#rows + 1] = to and line:sub(from, to - 1) or line:sub(from)
+    startChar = startChar + termW
+  end
+  return rows
 end
 
-local function newline()
-  cursorX = 1
-  cursorY = cursorY + 1
-  if cursorY > termH then
-    scrollUp()
-    cursorY = termH
-  end
+local function liveLine()
+  if commandBusy then return nil end
+  return "muxos> " .. inputBuffer .. "_"
 end
 
--- No word-wrap, no scrollback, no resize handling -- a flat fixed-width
--- console that scrolls one row at a time. A real gap against a proper
--- terminal, flagged rather than hidden, same honesty-over-coverage
--- standard as everything else in this project; good enough for a REPL
--- whose output is mostly short status lines.
-local function termWrite(text)
-  if not gpu then return end
-  local pos = 1
-  local len = #text
-  while pos <= len do
-    local nl = text:find("\n", pos, true)
-    local lineEnd = (nl or len + 1) - 1
-    while pos <= lineEnd do
-      local available = termW - cursorX + 1
-      local take = math.min(available, lineEnd - pos + 1)
-      if take > 0 then
-        gpu.set(cursorX, cursorY, text:sub(pos, pos + take - 1))
-        cursorX = cursorX + take
-        pos = pos + take
-      end
-      if cursorX > termW then
-        newline()
-      end
-    end
-    if nl then
-      newline()
-      pos = nl + 1
+local function totalRows()
+  local n = 0
+  for _, line in ipairs(consoleLines) do n = n + #wrapLine(line) end
+  local live = liveLine()
+  if live then n = n + #wrapLine(live) end
+  return n
+end
+
+local function setScroll(rows)
+  scrollOffset = math.max(0, math.min(rows, totalRows() - termH))
+  consoleDirty = true
+end
+
+-- The termH rows currently in view, top to bottom. Content shorter than
+-- the screen starts at the top, like a fresh terminal.
+local function visibleRows()
+  local needed = termH + scrollOffset
+  local rows = {}            -- collected bottom-up
+  local exhausted = true
+  local function addLine(line)
+    local wrapped = wrapLine(line)
+    for i = #wrapped, 1, -1 do
+      rows[#rows + 1] = wrapped[i]
+      if #rows >= needed then return true end
     end
   end
+  local live = liveLine()
+  if live and addLine(live) then exhausted = false end
+  if exhausted then
+    for i = #consoleLines, 1, -1 do
+      if addLine(consoleLines[i]) then exhausted = false break end
+    end
+  end
+  local out = {}
+  if exhausted and #rows < termH then
+    for i = 1, #rows do out[i] = rows[#rows - i + 1] end
+  else
+    for r = 1, termH do out[termH - r + 1] = rows[scrollOffset + r] end
+  end
+  return out
+end
+
+local function renderConsole()
+  if not consoleDirty or not consoleWin then return end
+  consoleDirty = false
+  local rows = visibleRows()
+  compositor.drawInto(consoleWin.id, function(g)
+    g.setForeground(0xFFFFFF)
+    g.setBackground(0x000000)
+    g.fill(1, 1, termW, termH, " ")
+    for y = 1, termH do
+      if rows[y] and rows[y] ~= "" then g.set(1, y, rows[y]) end
+    end
+    if scrollOffset > 0 then
+      local tag = "[scrolled " .. scrollOffset .. " -- PgDn]"
+      g.set(math.max(1, termW - #tag + 1), 1, tag)
+    end
+  end)
+end
+
+local function consoleAppend(line)
+  consoleLines[#consoleLines + 1] = line
+  if #consoleLines > MAX_CONSOLE_LINES then table.remove(consoleLines, 1) end
+  -- Keep a scrolled-back view still while new output arrives below it.
+  if scrollOffset > 0 then scrollOffset = scrollOffset + #wrapLine(line) end
+  consoleDirty = true
 end
 
 -- Shadows the native `print` (which only logs to the Java server
@@ -282,7 +343,8 @@ local function print(...)
   local n = select("#", ...)
   local parts = {}
   for i = 1, n do parts[i] = tostring((select(i, ...))) end
-  termWrite(table.concat(parts, "\t") .. "\n")
+  local text = table.concat(parts, "\t")
+  for line in (text .. "\n"):gmatch("(.-)\n") do consoleAppend(line) end
 end
 
 -- --- Minimal keyboard modifier tracking, replacing OpenOS's keyboard library ---
@@ -359,12 +421,37 @@ local function sweepStaleChunks()
   end
 end
 
+-- Any verified message from a node counts as a sign of life -- there's
+-- no dedicated heartbeat. See checkLiveness() for how a quiet node is
+-- probed and eventually marked down.
 local function noteNode(addr)
   if not nodes[addr] then
     nodes[addr] = {}
     nodeOrder[#nodeOrder + 1] = addr
   end
-  nodes[addr].lastSeen = computer.uptime()
+  local node = nodes[addr]
+  node.lastSeen = computer.uptime()
+  node.probedAt = nil
+  if node.down then
+    node.down = nil
+    print("node " .. addr .. " is responding again")
+  end
+end
+
+local function liveNodeCount()
+  local n = 0
+  for _, addr in ipairs(nodeOrder) do
+    if not nodes[addr].down then n = n + 1 end
+  end
+  return n
+end
+
+local function nextLiveNode()
+  for _ = 1, #nodeOrder do
+    local addr = nodeOrder[nextNode]
+    nextNode = (nextNode % #nodeOrder) + 1
+    if not nodes[addr].down then return addr end
+  end
 end
 
 local function nextId()
@@ -380,7 +467,28 @@ end
 -- parent) -- see docs/PROTOCOL.md's ".mxe process model" section for
 -- the full design these implement.
 local jobs = {}
-local jobOrder = {}
+
+-- Finished jobs are kept for `processes`/get_processes, but only the
+-- most recent MAX_FINISHED_JOBS of them, and without their full source
+-- (a short `codePreview` stays). Running jobs are always kept.
+local MAX_FINISHED_JOBS = 100
+local finishedOrder = {}
+local CODE_PREVIEW_CHARS = 40
+
+local function codePreview(code)
+  if type(code) ~= "string" then return nil end
+  local len = utf8.len(code)
+  if not len then return code:sub(1, CODE_PREVIEW_CHARS) end
+  if len <= CODE_PREVIEW_CHARS then return code end
+  return code:sub(1, utf8.offset(code, CODE_PREVIEW_CHARS + 1) - 1) .. "..."
+end
+
+local function orderedJobIds()
+  local ids = {}
+  for id in pairs(jobs) do ids[#ids + 1] = id end
+  table.sort(ids)
+  return ids
+end
 
 -- Indexes kept alongside `jobs` so the per-tick and per-completion work
 -- (scheduler stress, fan-out counts, orphan sweeps, orphan policy) is
@@ -435,9 +543,12 @@ local awaiting = {}
 -- node/runtime.lua now exposes to running job code as the global
 -- `jobId`) sets these.
 local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy)
-  if not targetAddr then
-    if #nodeOrder == 0 then
-      return nil, "no worker nodes discovered yet -- try 'discover'"
+  if targetAddr then
+    if not nodes[targetAddr] then return nil, "unknown node: " .. tostring(targetAddr) end
+    if nodes[targetAddr].down then return nil, "node is down: " .. targetAddr end
+  else
+    if liveNodeCount() == 0 then
+      return nil, "no live worker nodes -- try 'discover'"
     end
     -- Round-robin, unconditionally -- this project's answer to "what
     -- happens when every worker is already busy" is implicit, not an
@@ -451,9 +562,9 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
     -- built" -- see README.md's Status section -- but that's a
     -- quality-of-placement question, not a correctness gate this
     -- needed to answer first.
-    targetAddr = nodeOrder[nextNode]
-    nextNode = (nextNode % #nodeOrder) + 1
+    targetAddr = nextLiveNode()
   end
+  nodes[targetAddr].lastDispatch = computer.uptime()
   local id = nextId()
   -- rootId is the ultimate ancestor of this job's tree -- itself, for
   -- a top-level job; inherited in O(1) from the parent's own rootId
@@ -462,10 +573,10 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
   -- now," not a global count, so one tree hitting its cap doesn't
   -- block unrelated top-level work.
   local rootId = parent and jobs[parent] and jobs[parent].rootId or id
-  jobs[id] = {id = id, node = targetAddr, status = "running", code = code, startedAt = computer.uptime(),
+  jobs[id] = {id = id, node = targetAddr, status = "running", code = code, codePreview = codePreview(code),
+    startedAt = computer.uptime(),
     parent = parent, appName = appName, orphanPolicy = parent and (orphanPolicy or "orphan") or nil,
     rootId = rootId}
-  jobOrder[#jobOrder + 1] = id
   runningJobs[id] = true
   runningCount = runningCount + 1
   if parent then
@@ -482,8 +593,8 @@ end
 
 -- Fan-out/depth cap on recursive spawning: "for as many nodes as
 -- there is" -- a job tree (the top-level job plus every descendant it
--- spawned, directly or through several levels) may not have more than
--- `#nodeOrder` jobs counted as "running" at once. Counts the WHOLE
+-- spawned, directly or through several levels) may not have more jobs
+-- "running" at once than there are live worker nodes. Counts the WHOLE
 -- tree via each job's own rootId, not just direct children, so a
 -- grandchild spawning its own child is covered the same as a direct
 -- child -- "depth" and "fan-out" collapse into the same single check
@@ -519,7 +630,9 @@ end
 local function applyOrphanPolicyForChildrenOf(parentId)
   for _, id in ipairs(childrenOf[parentId] or {}) do
     local job = jobs[id]
-    if job.orphanPolicy == "promote" then
+    if not job then
+      -- already dropped from history
+    elseif job.orphanPolicy == "promote" then
       unregisterOrphanCandidate(job.appName, id)
       job.parent = nil
     elseif job.orphanPolicy == "kill" then
@@ -545,8 +658,9 @@ end
 -- busy target just queues rather than being denied) -- so this is a
 -- real backlog measure, not just "is anything happening at all."
 local function schedulerStress()
-  if #nodeOrder == 0 then return 0 end
-  return runningCount / #nodeOrder
+  local live = liveNodeCount()
+  if live == 0 then return 0 end
+  return runningCount / live
 end
 
 -- "Timeout is dependent on scheduler stress": an orphan nobody's
@@ -588,6 +702,77 @@ local function sweepStaleOrphans()
         modem.broadcast(PORT, "KILL " .. id)
         job.lastKillSentAt = now
         unregisterOrphanCandidate(job.appName, id)
+      end
+    end
+  end
+end
+
+-- Records a job as no longer running ("done", "error", or "lost"),
+-- applies its children's orphan policies, and trims history.
+local function finishJob(id, status, result, err)
+  local job = jobs[id]
+  runningJobs[id] = nil
+  runningCount = runningCount - 1
+  job.status, job.result, job.error = status, result, err
+  job.finishedAt = computer.uptime()
+  job.code = nil
+  finishedOrder[#finishedOrder + 1] = id
+  while #finishedOrder > MAX_FINISHED_JOBS do
+    local old = table.remove(finishedOrder, 1)
+    local oldJob = jobs[old]
+    if oldJob then
+      unregisterOrphanCandidate(oldJob.appName, old)
+      jobs[old] = nil
+      childrenOf[old] = nil
+    end
+  end
+  -- This job is no longer running -- apply whatever orphan policy ITS
+  -- OWN children declared at spawn time.
+  applyOrphanPolicyForChildrenOf(id)
+end
+
+-- Liveness without a dedicated heartbeat: every message a node sends
+-- refreshes it (noteNode), and workers answer PING at their jobs' yield
+-- points, so a node running a job only needs probing when it has gone
+-- quiet. Only nodes with running jobs are watched -- an idle node that
+-- died is found out the first time a job is sent its way and goes
+-- unacknowledged.
+local PROBE_AFTER = 3
+local DOWN_AFTER = 10
+local lastLivenessCheck = -math.huge
+
+local function markNodeDown(addr)
+  nodes[addr].down = true
+  print("node " .. addr .. " stopped responding -- marking it down")
+  if exclusiveFullscreenOwner == addr then
+    exclusiveFullscreenOwner = nil
+    compositor.setSuspended(false)
+  end
+  local lost = {}
+  for id in pairs(runningJobs) do
+    if jobs[id].node == addr then lost[#lost + 1] = id end
+  end
+  table.sort(lost)
+  for _, id in ipairs(lost) do
+    finishJob(id, "lost", nil, "node stopped responding")
+  end
+end
+
+local function checkLiveness()
+  local now = computer.uptime()
+  if now - lastLivenessCheck < 1 then return end
+  lastLivenessCheck = now
+  local watched = {}
+  for id in pairs(runningJobs) do watched[jobs[id].node] = true end
+  for addr in pairs(watched) do
+    local node = nodes[addr]
+    if node and not node.down then
+      local silent = now - math.max(node.lastSeen or 0, node.lastDispatch or 0)
+      if silent > DOWN_AFTER then
+        markNodeDown(addr)
+      elseif silent > PROBE_AFTER and (not node.probedAt or now - node.probedAt > PROBE_AFTER) then
+        node.probedAt = now
+        send({type = "PING", from = selfAddr, to = addr})
       end
     end
   end
@@ -675,6 +860,7 @@ local function handleRequestFullscreen(msg)
     return
   end
   exclusiveFullscreenOwner = msg.from
+  compositor.setSuspended(true)
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {granted = true}})
 end
 
@@ -685,6 +871,7 @@ local function handleReleaseFullscreen(msg)
     return
   end
   exclusiveFullscreenOwner = nil
+  compositor.setSuspended(false)
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {released = true}})
 end
 
@@ -712,10 +899,11 @@ local function handleSpawn(msg)
   if msg.parent and jobs[msg.parent] then
     local rootId = jobs[msg.parent].rootId or msg.parent
     local running = countRunningInTree(rootId)
-    if running >= #nodeOrder then
+    local live = liveNodeCount()
+    if running >= live then
       send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
         error = "fan-out cap reached: this job tree already has " .. running ..
-          " running job(s), as many as there are worker nodes (" .. #nodeOrder .. ")"})
+          " running job(s), as many as there are live worker nodes (" .. live .. ")"})
       return
     end
   end
@@ -733,18 +921,24 @@ end
 -- the mechanism a relaunched app uses to pick up where its last
 -- instance's orphaned children left off (see docs/PROTOCOL.md's "App
 -- identity and orphan reclaim").
+--
+-- Only jobs that are actually orphaned (their parent is no longer
+-- running) can be claimed -- a child whose parent is alive stays with
+-- that parent, so a second instance of the same app can't take it.
+-- Orphans that already finished are returned too, with their status and
+-- result, so a relaunched app can see what happened while it was gone.
 local function handleGetOrphans(msg)
-  local list = {}
-  local ids = appsByName[msg.appName]
-  if ids then
-    for _, id in ipairs(ids) do
-      local job = jobs[id]
-      if job then
-        list[#list + 1] = {id = job.id, node = job.node}
-      end
+  local list, keep = {}, {}
+  for _, id in ipairs(appsByName[msg.appName] or {}) do
+    local job = jobs[id]
+    if job and job.orphanedAt then
+      list[#list + 1] = {id = job.id, node = job.node, status = job.status,
+        result = job.result, error = job.error}
+    elseif job then
+      keep[#keep + 1] = id
     end
-    appsByName[msg.appName] = nil
   end
+  appsByName[msg.appName] = #keep > 0 and keep or nil
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
 end
 
@@ -770,12 +964,30 @@ end
 -- to be a request, since the jobs it's asking about run on other
 -- physical nodes. Returns the same job records `jobs` holds -- a plain
 -- list, serializable as-is since each entry is only strings/numbers.
+--
+-- Summaries only (no source, no result); gmuxapi.get_process(id) (the
+-- GETPROCESS message) returns one job in full.
+local SUMMARY_FIELDS = {"id", "node", "status", "startedAt", "finishedAt", "parent", "appName",
+  "orphanPolicy", "rootId", "codePreview", "error"}
+
 local function handleGetProcesses(msg)
   local list = {}
-  for _, id in ipairs(jobOrder) do
-    list[#list + 1] = jobs[id]
+  for _, id in ipairs(orderedJobIds()) do
+    local job, summary = jobs[id], {}
+    for _, field in ipairs(SUMMARY_FIELDS) do summary[field] = job[field] end
+    list[#list + 1] = summary
   end
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
+end
+
+local function handleGetProcess(msg)
+  local job = jobs[msg.jobId]
+  if not job then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+      error = "no such job (or it has been dropped from history): " .. tostring(msg.jobId)})
+    return
+  end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = job})
 end
 
 -- Fully handle one already-reassembled, deserialized message -- a
@@ -806,7 +1018,10 @@ local function handleModemMessage(from, port, data)
     return
   end
 
-  if msg.type == "HELLO" or msg.type == "PONG" then
+  -- HELLO/PONG introduce a node; anything else from a known node just
+  -- refreshes it (an unknown sender isn't enrolled as a worker by, say,
+  -- a stray RESULT).
+  if msg.type == "HELLO" or msg.type == "PONG" or nodes[msg.from] then
     noteNode(msg.from)
   end
   if msg.to ~= selfAddr then
@@ -819,6 +1034,8 @@ local function handleModemMessage(from, port, data)
     handleInvoke(msg)
   elseif msg.type == "GETPROCESSES" then
     handleGetProcesses(msg)
+  elseif msg.type == "GETPROCESS" then
+    handleGetProcess(msg)
   elseif msg.type == "SPAWN" then
     handleSpawn(msg)
   elseif msg.type == "GETORPHANS" then
@@ -843,19 +1060,11 @@ local function handleModemMessage(from, port, data)
       -- ONLY place its completion is ever recorded).
       if (msg.type == "RESULT" or msg.type == "ERROR") and jobs[msg.id] and jobs[msg.id].status == "running"
           and jobs[msg.id].node == msg.from then
-        local job = jobs[msg.id]
-        runningJobs[msg.id] = nil
-        runningCount = runningCount - 1
-        job.finishedAt = computer.uptime()
         if msg.type == "RESULT" then
-          job.status, job.result = "done", msg.result
+          finishJob(msg.id, "done", msg.result, nil)
         else
-          job.status, job.error = "error", msg.error
+          finishJob(msg.id, "error", nil, msg.error)
         end
-        -- This job is no longer running -- apply whatever orphan
-        -- policy ITS OWN children declared at spawn time (see
-        -- dispatchJob/applyOrphanPolicyForChildrenOf above).
-        applyOrphanPolicyForChildrenOf(job.id)
       end
     end
   end
@@ -865,61 +1074,83 @@ end
 -- Forward-declared; assigned once everything it calls exists.
 local runCommand
 
--- The REPL's current input line, built up one key_down signal at a time
--- (see "Minimal built-in terminal" and handleKeyDown below) since there
--- is no io.read() to block on any more.
-local inputBuffer = ""
+local KEY_PAGEUP, KEY_PAGEDOWN = 0xC9, 0xD1
 
-local function promptLine()
-  termWrite("muxos> ")
+-- Keys typed while a command is still running. Handling them inline
+-- used to run a second command NESTED inside the first one's wait;
+-- now they're replayed, in order, once the running command returns.
+local queuedKeys = {}
+
+-- The kernal-level interrupt: bring the console up and show it alone,
+-- whatever else is going on (a stuck fullscreen app, a window covering
+-- everything). `comp` returns to normal compositing.
+local function consoleInterrupt()
+  if exclusiveFullscreenOwner then
+    print("Ctrl+Alt+C: force-releasing fullscreen grant held by " .. exclusiveFullscreenOwner)
+    exclusiveFullscreenOwner = nil
+  end
+  compositor.setSuspended(false)
+  if consoleWin then
+    compositor.setSolo(consoleWin.id)
+    compositor.setFocus(consoleWin.id)
+  end
+  scrollOffset = 0
+  consoleDirty = true
+  print("console only -- type 'comp' to show windows again")
+end
+
+local function scrollConsole(rows)
+  setScroll(scrollOffset + rows)
 end
 
 local function handleKeyDown(char, code)
   heldKeys[code] = true
-  -- Local escape hatch: Ctrl+Alt+C at the kernal force-releases the
-  -- fullscreen grant regardless of who holds it, so a crashed/
-  -- disconnected holder doesn't require restarting the kernal.
-  --
-  -- REAL CONFLICT, not hidden: Ctrl+Alt+C is OpenOS's OWN built-in
-  -- process-interrupt shortcut (see docs/PROTOCOL.md for the full
-  -- finding). That conflict no longer applies quite the same way now
-  -- that muxos doesn't run under OpenOS at all -- there is no OpenOS
-  -- process-interrupt mechanism here to collide with any more -- but
-  -- the combo is kept as specified rather than reclaimed for something
-  -- else, since it's still a reasonable "exit fullscreen" mnemonic on
-  -- its own.
+  -- Ctrl+Alt+C was OpenOS's own interrupt shortcut; muxos has no OpenOS
+  -- underneath, so it's reclaimed as the kernal's console interrupt.
   if code == KEY_C and isControlDown() and isAltDown() then
-    if exclusiveFullscreenOwner then
-      print("Ctrl+Alt+C: force-releasing fullscreen grant held by " .. exclusiveFullscreenOwner)
-      exclusiveFullscreenOwner = nil
-    end
+    consoleInterrupt()
+    return
+  end
+  -- Scrolling never waits behind a running command.
+  if code == KEY_PAGEUP then scrollConsole(termH - 1) return end
+  if code == KEY_PAGEDOWN then scrollConsole(-(termH - 1)) return end
+  if commandBusy then
+    queuedKeys[#queuedKeys + 1] = {char, code}
     return
   end
   if code == KEY_ENTER then
-    termWrite("\n")
     local line = inputBuffer
     inputBuffer = ""
-    runCommand(line)
-    promptLine()
-  elseif code == KEY_BACK then
-    if #inputBuffer > 0 then
-      inputBuffer = inputBuffer:sub(1, -2)
-      if cursorX > 1 then
-        cursorX = cursorX - 1
-        gpu.set(cursorX, cursorY, " ")
-      end
+    consoleAppend("muxos> " .. line)
+    scrollOffset = 0
+    commandBusy = true
+    consoleDirty = true
+    local ok, err = pcall(runCommand, line)
+    commandBusy = false
+    consoleDirty = true
+    if not ok then print("command error: " .. tostring(err)) end
+    while #queuedKeys > 0 and not commandBusy do
+      local key = table.remove(queuedKeys, 1)
+      handleKeyDown(key[1], key[2])
     end
+  elseif code == KEY_BACK then
+    local len = utf8.len(inputBuffer)
+    if len and len > 0 then
+      inputBuffer = inputBuffer:sub(1, utf8.offset(inputBuffer, -1) - 1)
+    elseif #inputBuffer > 0 then
+      inputBuffer = inputBuffer:sub(1, -2)
+    end
+    consoleDirty = true
   elseif char and char >= 32 then
     local ok, ch = pcall(utf8.char, char)
     if ok then
       inputBuffer = inputBuffer .. ch
-      termWrite(ch)
+      scrollOffset = 0
+      consoleDirty = true
     end
   end
   -- No arrow-key history, no cursor movement within the line, no paste
-  -- handling -- a flat append/backspace-only line editor. A real gap
-  -- against a proper shell, flagged rather than hidden, same standard
-  -- as the rest of this project.
+  -- handling -- a flat append/backspace-only line editor.
 end
 
 local function handleKeyUp(code)
@@ -951,11 +1182,16 @@ local function tick(timeout)
       handleKeyDown(a3, a4)
     elseif name == "key_up" then
       handleKeyUp(a4)
+    elseif name == "scroll" then
+      -- Mouse wheel over the screen: positive direction is up.
+      scrollConsole((a5 or 0) > 0 and 3 or -3)
     elseif name == "modem_message" then
       handleModemMessage(a3, a4, a6)
     end
     sweepStaleChunks()
     sweepStaleOrphans()
+    checkLiveness()
+    renderConsole()
     compositor.flush()
   end)
   if not ok then
@@ -1083,7 +1319,8 @@ local function listNodes()
     return
   end
   for i, addr in ipairs(nodeOrder) do
-    print(string.format("[%d] %s  (last seen %.1fs ago)", i, addr, computer.uptime() - nodes[addr].lastSeen))
+    print(string.format("[%d] %s  (last seen %.1fs ago)%s", i, addr, computer.uptime() - nodes[addr].lastSeen,
+      nodes[addr].down and " DOWN" or ""))
   end
 end
 
@@ -1102,11 +1339,12 @@ end
 -- a worker (handleGetProcesses) -- the REPL runs in the same process as
 -- `jobs` itself.
 local function printProcesses()
-  if #jobOrder == 0 then
+  local ids = orderedJobIds()
+  if #ids == 0 then
     print("no jobs dispatched yet")
     return
   end
-  for _, id in ipairs(jobOrder) do
+  for _, id in ipairs(ids) do
     local job = jobs[id]
     local parentInfo = ""
     if job.appName or job.orphanPolicy then
@@ -1179,9 +1417,11 @@ runCommand = function(line)
   elseif line:match("^runall%s") then
     local code = line:sub(8)
     for _, addr in ipairs(nodeOrder) do
+      if nodes[addr].down then goto continue end
       local result, err = submit(code, nil, addr)
       if err then print(addr .. ": error: " .. err)
       else print(addr .. ": " .. tostring(result)) end
+      ::continue::
     end
   elseif line:match("^spawn%s") then
     local node, code = line:match("^spawn%s+(%S+)%s+(.*)$")
@@ -1202,6 +1442,10 @@ runCommand = function(line)
     end
   elseif line == "windows" then
     printWindows()
+  elseif line == "comp" then
+    -- Back to normal compositing after a Ctrl+Alt+C console interrupt.
+    compositor.setSolo(nil)
+    print("compositor restored -- all windows shown")
   elseif line:match("^focus%s") then
     -- Manual stand-in for the gesture that will eventually move focus
     -- for real (there's no mouse/click component anywhere in this
@@ -1256,13 +1500,13 @@ print("  discover | nodes | ping <node> [count] | quit")
 print("  run <lua code> | runall <lua code> | processes")
 print("  spawn <node> <lua code>")
 print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
+print("  comp -- show all windows again after Ctrl+Alt+C (console only); PgUp/PgDn or the mouse wheel scroll the console")
 print("  focus <window id> -- moves keyboard focus (manual stand-in -- no mouse/click gesture exists yet)")
 print("  bitdemo <halfblock|braille> <x> <y> -- draws a test pattern as a bit window")
 print("  components <node> | call <node> <component addr> <method> [args table]")
 print("(<node> is either a [n] index from 'nodes' or a full node address)")
 discover(1)
 listNodes()
-promptLine()
 
 while true do
   tick(0.05) -- ~1 tick between idle maintenance passes (sweepStaleChunks/compositor.flush)

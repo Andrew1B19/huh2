@@ -218,15 +218,15 @@ assertScreenContains("true|nil|", "fullscreen round trip result")
 assertScreenContains("blocked", "blocked again after release")
 print("  OK -- gpu.set succeeded while the grant was held, and was blocked again after releasing it")
 
-print("test 10: Ctrl+Alt+C force-releases a stuck fullscreen grant at the kernal console")
+print("test 10: Ctrl+Alt+C is the console interrupt -- releases a stuck fullscreen grant and shows the console")
 -- worker 1 grabs the grant and deliberately never releases it (fire-and-forget spawn).
 typeLine('spawn 1 gmuxapi.request_fullscreen()')
 emu:advance(2)
--- worker 2 trying to grab it now must be denied -- confirms the grant is actually held.
+-- worker 2 trying to grab it now must be denied. The console is a
+-- compositor window, and compositing is suspended while a node owns the
+-- screen, so this denial only becomes visible after the interrupt.
 typeLine('run local g, gerr = gmuxapi.request_fullscreen() return tostring(g) .. "|" .. tostring(gerr)')
 emu:advance(2)
-assertScreenContains("already held by", "grant correctly held by worker 1")
-print("  OK -- grant confirmed held (second requester denied)")
 
 -- Inject the real Ctrl+Alt+C combo as three separate key_down signals,
 -- exactly as a human holding all three keys would generate -- matching
@@ -240,15 +240,17 @@ emu:step()
 emu:injectSignal(kernal, "key_down", screenAddr, string.byte("c"), KEY_C, "tester")
 emu:step()
 emu:advance(1)
+assertScreenContains("already held by", "second requester was denied while the grant was held")
 assertScreenContains("force-releasing fullscreen grant", "Ctrl+Alt+C release message")
-print("  OK -- Ctrl+Alt+C printed the force-release message")
+assertScreenContains("console only", "Ctrl+Alt+C put the console in solo mode")
+print("  OK -- the console came up over the stuck fullscreen app, showing the denied request and the release")
 
--- Confirm the grant is ACTUALLY free now, not just that the message
--- printed: a fresh request should succeed immediately.
-typeLine('run local g, gerr = gmuxapi.request_fullscreen() return tostring(g) .. "|" .. tostring(gerr)')
+-- Confirm the grant is ACTUALLY free now: a fresh request succeeds (and
+-- is released again in the same job, so the console stays visible).
+typeLine('run local g = gmuxapi.request_fullscreen() local r = gmuxapi.release_fullscreen() return tostring(g ~= nil) .. "|" .. tostring(r ~= nil)')
 emu:advance(2)
-assertScreenContains("true|nil", "grant actually available again after Ctrl+Alt+C")
-print("  OK -- fullscreen grant was genuinely free after the escape hatch, not just the message")
+assertScreenContains("true|true", "grant actually available again after Ctrl+Alt+C")
+print("  OK -- fullscreen grant was genuinely free after the interrupt, not just the message")
 
 print("test 11: node/runtime.lua never reassigns kernalAddr after boot (structural regression check)")
 -- An end-to-end "spoof a peer message and see if kernalAddr breaks"
@@ -557,5 +559,134 @@ for _, path in ipairs({"/node/bios.lua", "/kernal/bios.lua"}) do
   assert(size <= 4096, path .. " is " .. size .. " bytes, over the 4096-byte EEPROM limit")
   print("  OK -- " .. path:sub(2) .. " is " .. size .. " bytes")
 end
+
+print("test 20: Ctrl+Alt+C shows the console alone; `comp` restores the windows")
+-- Ctrl+Alt+C (test 10) left the console in solo mode. A window created
+-- now is drawn into its buffer but not shown until `comp`.
+typeLine('window solo 30 2 6 1 gpu.set(1,1,"SO".."LOX")')
+emu:advance(1)
+if renderScreen():gsub("\n", ""):find("SOLOX", 1, true) then
+  dumpScreenOnFailure("solo mode")
+  error("a window was shown while the console was in solo mode")
+end
+typeLine("comp")
+emu:advance(1)
+assertScreenContains("SOLOX", "window shown again after comp")
+print("  OK -- windows hidden in solo mode and shown again after `comp`")
+
+print("test 21: console scrollback with PgUp/PgDn and the mouse wheel")
+local KEY_PAGEUP, KEY_PAGEDOWN = 0xC9, 0xD1
+typeLine('run local t = {} for i = 1, 40 do t[#t + 1] = string.format("L%02d", i) end return table.concat(t, "\\n")')
+emu:advance(2)
+local function screenHas(text) return renderScreen():gsub("\n", ""):find(text, 1, true) ~= nil end
+assert(screenHas("L40") and not screenHas("L01"), "expected only the tail of the 40-line output on screen")
+emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_PAGEUP, "tester"); emu:step()
+emu:advance(0.2)
+if not (screenHas("L01") and screenHas("[scrolled")) then
+  dumpScreenOnFailure("PgUp")
+  error("PgUp did not scroll the console back")
+end
+emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_PAGEDOWN, "tester"); emu:step()
+emu:advance(0.2)
+assert(screenHas("L40") and not screenHas("L01") and not screenHas("[scrolled"), "PgDn did not return to the bottom")
+emu:injectSignal(kernal, "scroll", screenAddr, 10, 10, 1, "tester"); emu:step()
+emu:advance(0.2)
+assert(screenHas("[scrolled 3"), "mouse wheel up did not scroll the console")
+emu:injectSignal(kernal, "scroll", screenAddr, 10, 10, -1, "tester"); emu:step()
+emu:advance(0.2)
+assert(not screenHas("[scrolled"), "mouse wheel down did not scroll back")
+print("  OK -- PgUp/PgDn and the wheel scroll through earlier output and back")
+
+print("test 22: backspace works across a wrapped input line")
+local KEY_BACK_CODE = 0x0E
+for _ = 1, 60 do
+  emu:injectSignal(kernal, "key_down", screenAddr, string.byte("x"), 0, "tester"); emu:step()
+end
+for _ = 1, 15 do
+  emu:injectSignal(kernal, "key_down", screenAddr, 8, KEY_BACK_CODE, "tester"); emu:step()
+end
+emu:advance(0.2)
+if not screenHas("muxos> " .. ("x"):rep(45) .. "_") or screenHas(("x"):rep(46)) then
+  dumpScreenOnFailure("wrapped backspace")
+  error("the wrapped input line did not shrink to 45 characters")
+end
+emu:injectSignal(kernal, "key_down", screenAddr, 13, 0x1C, "tester"); emu:step()
+emu:advance(0.5)
+print("  OK -- 60 typed, 15 erased across the wrap, 45 left on screen")
+
+print("test 23: keys typed while a command runs are queued, not run nested")
+typeLine('run sleep(2) return "slow" .. 23')
+typeLine('run return "queued" .. 23')
+emu:advance(5)
+do
+  local flat = renderScreen():gsub("\n", "")
+  local slow, queued = flat:find("slow23", 1, true), flat:find("queued23", 1, true)
+  if not slow or not queued or queued < slow then
+    dumpScreenOnFailure("input buffering")
+    error("the second command did not wait for the first")
+  end
+end
+print("  OK -- the second command ran after the first finished")
+
+print("test 24: only real orphans can be claimed, finished ones with their result")
+-- P sleeps 6s with its child A registered under "orph24"; while P is
+-- alive, A isn't claimable. After P finishes, A is -- including after
+-- A itself has finished.
+typeLine('spawn 1 gmuxapi.create_headless_process({code=[[sleep(4) return "A24"]], name="orph24"}) sleep(6)')
+emu:advance(1)
+typeLine('run return "n24=" .. #gmuxapi.get_orphans("orph24")')
+emu:advance(2)
+assertScreenContains("n24=0", "a child of a still-running parent is not claimable")
+emu:advance(12)
+typeLine('run local l = gmuxapi.get_orphans("orph24") return "c24=" .. #l .. "/" .. tostring(l[1] and l[1].status) .. "/" .. tostring(l[1] and l[1].result)')
+emu:advance(2)
+assertScreenContains("c24=1/done/A24", "the finished orphan is claimable with its status and result")
+print("  OK -- unclaimable while its parent ran; claimed afterward with status and result")
+
+print("test 25: finished jobs are kept only up to the history cap, without their source")
+for i = 1, 105 do
+  typeLine("run return " .. i)
+  emu:advance(0.3)
+end
+typeLine('run local ok, err = gmuxapi.get_process(1) return "r25=" .. tostring(ok) .. "/" .. tostring(err)')
+emu:advance(2)
+assertScreenContains("r25=nil/no such job", "the oldest job was dropped from history")
+typeLine('run local p = gmuxapi.get_processes() local last = p[#p - 1] local full = gmuxapi.get_process(last.id) return "k25=" .. tostring(last.code) .. "/" .. tostring(last.codePreview) .. "/" .. tostring(full.code)')
+emu:advance(2)
+-- p[#p] is this probe itself; p[#p - 1] is the finished r25 probe above.
+assertScreenContains("k25=nil/local ok, err = gmuxapi.get_process(1) r.../nil",
+  "summaries carry a 40-char preview, not source, and a finished job's full record has dropped its source")
+print("  OK -- oldest finished job dropped; summaries and finished records carry only a preview")
+
+print("test 26: liveness -- a busy node stays up, a dead one is marked down and its job lost")
+typeLine("spawn 2 sleep(13) return 26")
+emu:advance(1)
+local sleeperId = screenAfter("spawn 2 sleep(13)"):match("spawned job %[(%d+)%]")
+emu:advance(15)
+typeLine('run return "s26=" .. gmuxapi.get_process(' .. sleeperId .. ').status')
+emu:advance(2)
+assertScreenContains("s26=done", "a node busy sleeping 13s answered probes and was not marked down")
+-- Now actually kill a worker and give it a job.
+local victim = workers[3]
+victim.status = "dead"
+typeLine("spawn " .. victim.modemAddr .. " return 1")
+emu:advance(1)
+local lostId = screenAfter("spawn " .. victim.modemAddr):match("spawned job %[(%d+)%]")
+emu:advance(14)
+assertScreenContains("stopped responding", "the dead node was marked down")
+typeLine('run return "l26=" .. gmuxapi.get_process(' .. lostId .. ').status')
+emu:advance(2)
+assertScreenContains("l26=lost", "the dead node's job is marked lost")
+typeLine('runall return "up" .. 26')
+emu:advance(4)
+do
+  local after, n = screenAfter("runall return"), 0
+  for _ in after:gmatch("up26") do n = n + 1 end
+  if n ~= 2 then
+    dumpScreenOnFailure("runall after node down")
+    error("expected runall to reach only the 2 live workers, got " .. n)
+  end
+end
+print("  OK -- a long sleeper stayed up; the dead node was marked down, its job lost, and skipped")
 
 print("ALL OK")

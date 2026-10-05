@@ -181,14 +181,21 @@ local function noteKill(port, data)
   return id
 end
 
--- Sets aside one signal pulled while waiting for something else.
--- Non-modem signals are dropped -- a worker has no use for them.
+-- Sets aside one signal pulled while waiting for something else -- a
+-- job's yield(), sleep(), or a gmuxapi call. A PING is answered on the
+-- spot: that's how the kernal knows a node busy with a job is still
+-- alive (see kernal/muxos.lua's checkLiveness) without a dedicated
+-- heartbeat. Non-modem signals are dropped -- a worker has no use for
+-- them.
 local function stashSignal(name, from, port, data)
   if name ~= "modem_message" or noteKill(port, data) then return end
   if port ~= PORT or type(data) ~= "string" then return end
   local payload = reassemble(from, data)
   local msg = payload and deserialize(payload)
-  if type(msg) == "table" then
+  if type(msg) ~= "table" then return end
+  if msg.type == "PING" and msg.from == from and (msg.to == nil or msg.to == nodeId) then
+    send({type = "PONG", from = nodeId, to = msg.from, id = msg.id})
+  else
     pendingMessages[#pendingMessages + 1] = {from = from, msg = msg}
   end
 end
@@ -317,8 +324,14 @@ gmuxapi = {
   -- gmux's api.get_processes() reads one local process table; here the
   -- kernal's own scheduler (kernal/muxos.lua's `jobs`) is the only thing
   -- that actually knows about every job across every node.
+  -- Summaries only (no source or result); get_process(id) for one job
+  -- in full.
   get_processes = function()
     return remoteRequest("GETPROCESSES")
+  end,
+
+  get_process = function(id)
+    return remoteRequest("GETPROCESS", {jobId = id})
   end,
 
   -- gmux's create_headless_process(options) takes options.main (a
@@ -456,10 +469,9 @@ gmuxapi = {
 --    expects to run long can voluntarily cooperate: calling it actually
 --    suspends the job's own coroutine (an ordinary yield from regular
 --    code, not from a hook, which works fine -- confirmed), at which
---    point yieldToStayResponsive() pulls (and immediately re-pushes,
---    the exact mechanism OpenOS's own boot code uses) any pending
---    signal, so this node keeps answering PING/other messages for as
---    long as the job keeps cooperating.
+--    point runJobCode pulls any pending signal, answers a PING on the
+--    spot and sets everything else aside for the main loop, so this
+--    node keeps answering for as long as the job keeps cooperating.
 -- 2. A hard instruction-budget circuit breaker (also `debug.sethook`,
 --    but erroring instead of yielding -- confirmed that DOES work from
 --    a hook) that kills a job outright, with a clear Lua error, if it
@@ -513,20 +525,6 @@ function sleep(seconds)
   while computer.uptime() < deadline do
     local name, _, from, port, _, data = pullSignal(deadline - computer.uptime())
     stashSignal(name, from, port, data)
-  end
-end
-
--- A brief, bounded "let other things happen" pass for a job's own
--- voluntary yield() -- pulls one real signal, if any arrived, and
--- immediately pushes it back (the exact mechanism OpenOS's own boot
--- code uses, `lib/core/boot.lua`) so the TOP-level loop still gets to
--- see and service it once this job either finishes or yields again.
--- Deliberately does NOT try to dispatch it inline here -- that's the
--- top-level loop's job, not a nested job's.
-local function yieldToStayResponsive()
-  local sig = table.pack(pullSignal(0))
-  if sig.n > 0 and sig[1] ~= nil then
-    computer.pushSignal(table.unpack(sig, 1, sig.n))
   end
 end
 
@@ -588,12 +586,15 @@ local function runJobCode(chunk, args, selfId)
       -- "kill"-policy orphan actually CAN be killed early -- a job
       -- that never yields can't be reached here any sooner than its
       -- own instruction-budget circuit breaker would catch it anyway.
+      -- Anything that arrived is set aside for the main loop (and a
+      -- PING answered) rather than pushed back onto the signal queue,
+      -- which made every later yield() re-pull the same signal.
       local sig = table.pack(pullSignal(0))
       if sig.n > 0 and sig[1] ~= nil then
         if isKillSignalFor(sig, selfId) then
           return false, "killed (orphan policy, parent no longer running)"
         end
-        computer.pushSignal(table.unpack(sig, 1, sig.n))
+        stashSignal(sig[1], sig[3], sig[4], sig[6])
       end
       armBudgetHook(co)
       ok, a = coroutine.resume(co)

@@ -163,12 +163,11 @@ in place of `component.isAvailable("gpu")`/`component.gpu`;
 `bitmap.lua` needed no changes at all -- it never touched `component`
 directly, only ever receiving a `gpu`-shaped table as a parameter.
 
-One specific consequence worth calling out: the REPL text console and
-`kernal/compositor.lua` are now the only two places in this project
-allowed to touch the real gpu. The console isn't a window the
-compositor manages -- it IS the display, drawn directly, with the
-compositor's own windows compositing on top of it in Z-order the same
-way they would over any other screen content.
+One specific consequence worth calling out: `kernal/compositor.lua` is
+the only place in this project that draws on the real screen. The REPL
+console is an ordinary compositor window -- full-screen, bottom layer
+-- that the kernal draws into through `compositor.drawInto`. See "The
+console" below.
 
 ## Message types
 
@@ -180,7 +179,8 @@ way they would over any other screen content.
 | `JOB`     | `from`, `to`, `id`, `code`, `args`                        | kernal  | run `code` (a Lua chunk) with `args`               |
 | `LIST`    | `from`, `to`, `id`                                        | either  | "list the components attached to you"             |
 | `INVOKE`  | `from`, `to`, `id`, `address`, `method`, `args`           | either  | call `component.invoke(address, method, args...)` on the receiver's own component |
-| `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, muxos-shaped) |
+| `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, muxos-shaped) -- summaries: no source, no result |
+| `GETPROCESS` | `from`, `to`, `id`, `jobId`                            | worker  | one job's full record (`gmuxapi.get_process(id)`) |
 | `SPAWN`   | `from`, `to`, `id`, `code`, `args`, `node`                | worker  | "dispatch a new job" (gmux API's `create_headless_process`/`create_graphics_process`); replies immediately with a handle, doesn't wait for the job to finish |
 | `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
 | `GETWINDOWS` | `from`, `to`, `id`                                      | worker  | "list every window you know about" (gmux API's `get_windows()`) |
@@ -330,25 +330,21 @@ blocked" instead of quietly drawing onto the kernal's live screen. Use
 `gmuxapi.create_window()` for ordinary output; reach for
 `request_fullscreen()` only when actually building a fullscreen app.
 
-**Local escape hatch for a stuck grant**: `exclusiveFullscreenOwner` is
-not released automatically if its holder disappears (see the gap flagged
-just above), so `kernal/muxos.lua` also listens for Ctrl+Alt+C at the
-kernal itself and force-releases the grant, whoever holds it, the moment
-all three keys are down -- the "Ctrl+Alt+Del equivalent" for exiting a
-stuck fullscreen app without restarting the kernal. **This is a real,
-acknowledged conflict, not an oversight**: Ctrl+Alt+C is already
-OpenOS's own built-in process-interrupt shortcut. Confirmed from
-OpenOS's own source (`lib/event.lua`): `computer.pullSignal` is
-monkey-patched there to check
-`isControlDown()+isKeyDown('c')+isAltDown()` on *every* signal pull and
-call `process.info().data.signal("interrupted", 0)` when all three are
-held -- the same mechanism as a terminal's own Ctrl+C. This is baked
-into `computer.pullSignal` itself, unconditionally, so no choice of
-listener mechanism on muxos's side avoids it: pressing this combo to
-escape fullscreen also interrupts whatever OpenOS considers the kernal's
-current process at that moment (which could be `muxos.lua`'s own REPL).
-Implemented as specified anyway; if this combo needs to stay reserved
-for OpenOS's native interrupt instead, a different one should be picked.
+**Fullscreen suspends compositing.** While a node holds the grant it
+draws on the real screen directly, so the compositor stops flushing
+(nothing, the console included, paints over it) and redraws everything
+when the grant is released.
+
+**The console interrupt (Ctrl+Alt+C).** The grant isn't released
+automatically if its holder disappears, and a fullscreen app (or a
+window covering everything) can hide the console, so Ctrl+Alt+C at the
+kernal is a kernal-level interrupt: it force-releases the grant
+(whoever holds it), resumes compositing, focuses the console, and tells
+the compositor to draw ONLY the console window. The `comp` command
+returns to normal compositing. Ctrl+Alt+C was OpenOS's own
+process-interrupt shortcut (`lib/event.lua` checks it on every signal
+pull); muxos has no OpenOS underneath, so there's nothing to conflict
+with any more and the combo is reclaimed for this.
 
 **GPU stays on the kernal -- a current hard requirement, not just the
 usual case**: today, every real `gpu.*` call anywhere in muxos happens
@@ -1052,12 +1048,17 @@ start a queued `JOB` with that id (test 17).
 ### Job environment abstraction
 
 Partially answered by what's built: a dispatched job gets the real
-global `jobId` (its own id) and, through `gmuxapi`, a way to ask for a
-child. What's still open is the harder part -- what's exposed to an
-`.mxe` app specifically, as opposed to a plain headless `JOB`, and
-whether that differs from today's shared `gpu`/`gmuxapi`/`yield`
-globals every job already gets regardless of whether it declared a
-name or any orphan policy at all.
+global `jobId` (its own id), `yield`/`sleep`, and, through `gmuxapi`, a
+way to ask for a child.
+
+**Decided, not yet built**: isolation depends on the kind of program.
+A **legacy** (OpenOS/gmux-compat) program gets gmux-style isolation --
+its own environment, the way gmux gives each process one. An **`.mxe`**
+program gets open visibility -- the shared runtime globals, which is
+what every job gets today. Building this needs a way to tell the two
+apart at dispatch, which doesn't exist yet. A kernal system bus (a
+dbus-like named-service/signal bus) is a possible later addition for
+`.mxe` programs to talk to kernal services and each other.
 
 ### App identity and orphan reclaim -- BUILT
 
@@ -1067,9 +1068,13 @@ job id (those don't survive a relaunch) and not a separately-chosen
 session id. The kernal keeps `appsByName`, a **global map: app name ->
 the job id(s) spawned under it with `orphanPolicy == "orphan"`**. A new
 message type, `GETORPHANS` (`gmuxapi.get_orphans(name)` on the worker
-side), hands back every `{id, node}` handle still registered under
-that name and **removes them from the pool** -- claimed once, not
-re-handed-out to a second caller. When an app with that name launches
+side), hands back the jobs registered under that name **whose parent is
+no longer running** -- a child whose parent is alive stays with that
+parent, so a second instance of the same app can't take it. Each comes
+back as `{id, node, status, result, error}`: an orphan that already
+finished is still returned, with its result, so the relaunched app can
+see what happened while it was gone. Claimed jobs are **removed from the
+pool** -- claimed once, not re-handed-out to a second caller. When an app with that name launches
 again -- even much later, even if every internal id involved has
 changed in between -- calling `get_orphans` with its own name gets its
 old orphans back.
@@ -1142,11 +1147,33 @@ going. This was a deliberate simplification, not an oversight: trying
 to make arbitrary in-flight state survive an actual hardware failure is
 a much bigger problem than this system needs to solve.
 
-Nodes rejoining (or new ones joining) the live pool is mostly already
-free, and needs to *stay* true as the above gets built, not be
-reinvented: `noteNode()` already fires on any `HELLO`/`PONG` at any
-time, so a worker that boots after the kernal's been running a while
-already gets discovered live, with no kernal restart needed.
+**Liveness -- BUILT, with no dedicated heartbeat.** Every verified
+message from a known node refreshes it, and workers answer `PING` at
+their jobs' yield points (`yield()`, `sleep()`, any `gmuxapi` wait), so
+a node busy with a cooperating job still answers. The kernal only
+watches nodes that have running jobs: once one has been silent for 3s
+(counting from the later of its last message and its last dispatch) it
+gets a `PING` probe, and after 10s with no reply it's marked down. Its
+running jobs become `"lost"` (and their children's orphan policies
+apply, as if the parent had finished); it's skipped by round-robin, by
+`runall`, and in the fan-out cap and scheduler-stress counts, and a
+fullscreen grant it held is released. An idle node that died is found
+out the first time a job is sent to it and goes unacknowledged. Any
+later message from it brings it back. Note the kernal does NOT receive
+a node's yields as such -- the yield points are just where the node
+answers probes, which gives the same signal without new traffic.
+`spawn` to an unknown or down node is refused.
+
+**Job history.** Running jobs are always kept. Only the last 100
+finished jobs are kept, and a finished job keeps a 40-character
+`codePreview` instead of its full source. `get_processes` returns
+summaries (no source, no result); `get_process(id)` returns one job in
+full.
+
+Nodes rejoining (or new ones joining) the live pool is free:
+`noteNode()` fires on any `HELLO`/`PONG` at any time, so a worker that
+boots after the kernal's been running a while gets discovered live,
+with no kernal restart needed.
 
 **Planned draining is a different, deliberate action** -- taking a
 node out of rotation on purpose (maintenance, say), as opposed to it
@@ -1284,6 +1311,28 @@ signal reaches the focused window's owning job over the wire, what
 shape it arrives in on the worker side, and whether a job needs to ask
 the kernal "do I currently have focus" (a new message type) or just
 reacts to whatever it's handed.
+
+### The console -- BUILT
+
+The REPL console is an ordinary compositor window: full-screen, on the
+bottom layer, drawn by the kernal through `compositor.drawInto` (the
+compositor is the only thing that touches the real screen). Output is
+kept as logical lines (the last 500) and wrapped only when rendered, at
+most once per tick, which gives:
+
+- **Scrollback**: PgUp/PgDn scroll a page; the mouse wheel scrolls 3
+  rows. A `[scrolled N -- PgDn]` tag shows while scrolled back, a
+  scrolled-back view stays put as new output arrives, and typing snaps
+  back to the bottom.
+- **Backspace across a wrapped input line**, since the line being typed
+  is one logical line.
+- **Input buffering**: keys typed while a command is still running are
+  queued and replayed once it returns, instead of running a second
+  command nested inside the first one's wait. (A different approach may
+  replace this later.) Ctrl+Alt+C and scrolling are never queued.
+
+Keyboard input still always goes to the console; focus is tracked (see
+above) but nothing delivers keys to other windows yet.
 
 ### Still open
 

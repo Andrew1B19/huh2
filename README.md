@@ -170,6 +170,7 @@ muxos> processes
 muxos> spawn 1 return 42
 muxos> window hello 5 5 20 5 gpu.set(1,1,"hi from the kernal")
 muxos> windows
+muxos> comp
 muxos> bitdemo halfblock 5 5
 muxos> bitdemo braille 30 5
 muxos> components 1
@@ -301,8 +302,9 @@ fire-and-forget `SPAWN` path, completion recorded generically either
 way) + a symmetric remote-component bridge (kernal<->worker, used by
 workers to reach kernal hardware they don't have locally, e.g. `gpu`),
 gated so direct gpu/screen access requires an exclusive fullscreen grant
-(with a Ctrl+Alt+C local escape hatch to force-release a grant whose
-holder disappeared) + a compositor module (`kernal/compositor.lua`)
+(with Ctrl+Alt+C as a kernal-level console interrupt: it force-releases
+a grant whose holder disappeared and shows the console alone until
+`comp`) + a compositor module (`kernal/compositor.lua`)
 that's the sole real gpu-touching code in the project for window
 content, with Z-order, occlusion culling, dirty tracking, and a
 persistent frame buffer flipped to the real screen with one `bitblt`
@@ -389,6 +391,14 @@ gesture anywhere in this project to move focus any other way. This is
 ONLY the tracking -- no key signal is actually forwarded to any job
 yet, `handleKeyDown` still only ever feeds the kernal's own REPL input.
 Verified in `test/emu/integration_test.lua` (test 14).
+
+The console is a compositor window now, with scrollback (PgUp/PgDn,
+mouse wheel) and input queued while a command runs. Nodes are tracked
+for liveness without a heartbeat (probes answered at job yield points;
+a silent node's jobs become `lost`), finished-job history is capped at
+100 without source, and `get_orphans` only hands out real orphans (with
+their result if they finished). Verified in `test/emu/integration_test.lua`
+(tests 20-26).
 
 **Still forward design, not yet built**: planned node draining as
 distinct from an unrecoverable node death, "semi-live" job migration
