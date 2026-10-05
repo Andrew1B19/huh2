@@ -585,13 +585,13 @@ do
   end
   assert(full == 1, "expected exactly one full-screen buffer (the frame), found " .. full)
   for idx, b in pairs(screenBuffers) do
-    assert(not (b.w == 50 and b.h == 16), "the console has a video buffer (buffer " .. idx .. ")")
+    assert(not (b.w == 50 and b.h == 15), "the console has a video buffer (buffer " .. idx .. ")")
   end
 end
 typeLine("windows")
 emu:advance(1)
-assertScreenContains('"console"  50x16 at (1,15)', "the console window is docked at the bottom, 16 rows tall")
-print("  OK -- only the frame buffer is full-screen; the 50x16 console has no video buffer at all")
+assertScreenContains('"console"  50x15 at (1,16)', "the console starts as the bottom half of the screen")
+print("  OK -- only the frame buffer is full-screen; the 50x15 console has no video buffer at all")
 
 print("test 21: console scrollback with PgUp/PgDn and the mouse wheel")
 local KEY_PAGEUP, KEY_PAGEDOWN = 0xC9, 0xD1
@@ -599,9 +599,9 @@ typeLine('run local t = {} for i = 1, 40 do t[#t + 1] = string.format("L%02d", i
 emu:advance(2)
 local function screenHas(text) return renderScreen():gsub("\n", ""):find(text, 1, true) ~= nil end
 assert(screenHas("L40") and not screenHas("L01"), "expected only the tail of the 40-line output on screen")
--- The console is a 16-row window again after `comp`, so a page is 15
+-- The console is a 15-row window again after `comp`, so a page is 14
 -- rows; line 1 of 40 sits 41 rows up (under the prompt row), so two
--- pages (offset 30, rows 31-46 in view) bring it into view.
+-- pages (offset 28, rows 29-43 in view) bring it into view.
 for _ = 1, 2 do
   emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_PAGEUP, "tester"); emu:step()
 end
@@ -621,24 +621,27 @@ assert(screenHas("[scrolled 3"), "mouse wheel up did not scroll the console")
 emu:injectSignal(kernal, "scroll", screenAddr, 10, 10, -1, "tester"); emu:step()
 emu:advance(0.2)
 assert(not screenHas("[scrolled"), "mouse wheel down did not scroll back")
--- Scrollback is three full screens (3 x 30 rows): paging far back stops
--- at most 90 rows up, less the 16-row window itself.
-for _ = 1, 20 do
-  emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_PAGEUP, "tester"); emu:step()
-end
-emu:advance(0.2)
-do
-  local n = tonumber(renderScreen():gsub("\n", ""):match("%[scrolled (%d+)"))
-  if not n or n > 90 - 16 + 1 or n < 50 then
-    dumpScreenOnFailure("scrollback cap")
-    error("expected scrollback to stop near three screens, got " .. tostring(n))
-  end
-end
-for _ = 1, 20 do
-  emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_PAGEDOWN, "tester"); emu:step()
-end
-emu:advance(0.2)
 print("  OK -- PgUp/PgDn and the wheel scroll through earlier output and back")
+
+-- The console's size isn't fixed: `console` resizes it, and output
+-- re-wraps to the new width.
+typeLine("console 30 8")
+emu:advance(0.5)
+typeLine('run return string.rep("w", 35)')
+emu:advance(2)
+if not screenHas(("w"):rep(30)) or screenHas(("w"):rep(31)) then
+  dumpScreenOnFailure("console rewrap")
+  error("output did not re-wrap to the 30-column console")
+end
+typeLine("windows")
+emu:advance(1)
+assertScreenContains('"console"  30x8 at (1,23)', "console resized and docked bottom-left")
+typeLine("console 5 2")
+emu:advance(0.5)
+assertScreenContains("console size must be between", "too-small size refused")
+typeLine("console 50 15")
+emu:advance(0.5)
+print("  OK -- `console` resizes the console window, output re-wraps, bad sizes are refused")
 
 print("test 22: backspace works across a wrapped input line")
 local KEY_BACK_CODE = 0x0E

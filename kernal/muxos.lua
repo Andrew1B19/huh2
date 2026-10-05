@@ -221,9 +221,11 @@ end
 --
 -- The console's text lives in regular memory (consoleLines) and never
 -- has a video buffer of its own. Normally it's a compositor text
--- window: bottom layer, docked at the bottom of the screen, at most
--- CONSOLE_MAX_W x CONSOLE_MAX_H, painted from its rows straight into the
--- frame buffer. In console mode (Ctrl+Alt+C) it's the compositor's
+-- window on the bottom layer, painted from its rows straight into the
+-- frame buffer. Its size isn't fixed: it starts as the bottom half of
+-- the screen and the `console <width> <height> [x y]` command changes
+-- it at any time (cheap, since there's no buffer to reallocate). In
+-- console mode (Ctrl+Alt+C) it's the compositor's
 -- exclusive owner instead and draws straight onto the real screen at
 -- full resolution.
 --
@@ -239,19 +241,16 @@ if gpu then
 end
 
 local CONSOLE_LAYER = -1000
-local CONSOLE_MAX_W, CONSOLE_MAX_H = 80, 16
--- Scrollback: three full screens' worth of rows (counted at full-screen
--- width), oldest dropped first.
-local SCROLLBACK_PAGES = 3
+local CONSOLE_MIN_W, CONSOLE_MIN_H = 10, 3
+-- Scrollback, in lines of output (oldest dropped first).
+local SCROLLBACK_LINES = 500
 local consoleLines = {}      -- committed logical lines, oldest first
-local consoleLineRows = {}   -- rows each line takes at full-screen width
-local consoleRowTotal = 0
 local consoleDirty = true
 local scrollOffset = 0       -- wrapped rows scrolled back from the bottom
 local inputBuffer = ""       -- the REPL's line being typed
 local commandBusy = false    -- a command is running; see handleKeyDown
 
-local consoleW, consoleH = math.min(termW, CONSOLE_MAX_W), math.min(termH, CONSOLE_MAX_H)
+local consoleW, consoleH = termW, math.max(CONSOLE_MIN_H, math.floor(termH / 2))
 local consoleWin = gpu and compositor.createWindow({title = "console", x = 1, y = termH - consoleH + 1,
   width = consoleW, height = consoleH, layer = CONSOLE_LAYER, text = true}) or nil
 
@@ -370,14 +369,8 @@ local function renderConsole()
 end
 
 local function consoleAppend(line)
-  local rows = #wrapLine(line, termW)
   consoleLines[#consoleLines + 1] = line
-  consoleLineRows[#consoleLineRows + 1] = rows
-  consoleRowTotal = consoleRowTotal + rows
-  while consoleRowTotal > SCROLLBACK_PAGES * termH and #consoleLines > 1 do
-    table.remove(consoleLines, 1)
-    consoleRowTotal = consoleRowTotal - table.remove(consoleLineRows, 1)
-  end
+  if #consoleLines > SCROLLBACK_LINES then table.remove(consoleLines, 1) end
   -- Keep a scrolled-back view still while new output arrives below it.
   if scrollOffset > 0 then scrollOffset = scrollOffset + #wrapLine(line, (viewSize())) end
   consoleDirty = true
@@ -1489,6 +1482,25 @@ runCommand = function(line)
     end
   elseif line == "windows" then
     printWindows()
+  elseif line:match("^console%s") then
+    local w, h, x, y = line:match("^console%s+(%d+)%s+(%d+)%s*(%d*)%s*(%d*)$")
+    w, h, x, y = tonumber(w), tonumber(h), tonumber(x), tonumber(y)
+    if not w then
+      print("usage: console <width> <height> [x y]  (default: docked bottom-left)")
+    elseif w < CONSOLE_MIN_W or h < CONSOLE_MIN_H or w > termW or h > termH then
+      print(string.format("console size must be between %dx%d and %dx%d", CONSOLE_MIN_W, CONSOLE_MIN_H, termW, termH))
+    else
+      x, y = x or 1, y or (termH - h + 1)
+      if x + w - 1 > termW or y + h - 1 > termH then
+        print("that doesn't fit on the screen")
+      else
+        compositor.setGeometry(consoleWin.id, x, y, w, h)
+        consoleW, consoleH = w, h
+        setScroll(scrollOffset)
+        consoleDirty = true
+        print(string.format("console is now %dx%d at (%d,%d)", w, h, x, y))
+      end
+    end
   elseif line == "comp" then
     -- Back to normal compositing after a Ctrl+Alt+C console interrupt.
     -- Only takes the screen back from the console, never from a node
@@ -1551,6 +1563,7 @@ print("  discover | nodes | ping <node> [count] | quit")
 print("  run <lua code> | runall <lua code> | processes")
 print("  spawn <node> <lua code>")
 print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
+print("  console <width> <height> [x y] -- resize/move the console window")
 print("  comp -- show all windows again after Ctrl+Alt+C (console only); PgUp/PgDn or the mouse wheel scroll the console")
 print("  focus <window id> -- moves keyboard focus (manual stand-in -- no mouse/click gesture exists yet)")
 print("  bitdemo <halfblock|braille> <x> <y> -- draws a test pattern as a bit window")

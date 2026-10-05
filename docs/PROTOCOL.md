@@ -1318,18 +1318,21 @@ reacts to whatever it's handed.
 The console's text lives in regular memory; it never has a video
 buffer of its own. It has two sizes:
 
-- **Normally** it's a compositor *text window* on the bottom layer,
-  docked at the bottom of the screen and capped at 80x16. A text window
-  holds rows of text instead of a gpu buffer, and the compositor paints
-  the visible part of those rows straight into the frame buffer.
+- **Normally** it's a compositor *text window* on the bottom layer. A
+  text window holds rows of text instead of a gpu buffer, and the
+  compositor paints the visible part of those rows straight into the
+  frame buffer. Its size isn't fixed: it starts as the bottom half of the
+  screen, and `console <width> <height> [x y]` resizes or moves it at
+  any time (cheap -- there's no buffer to reallocate; output re-wraps to
+  the new width).
 - **In console mode** (Ctrl+Alt+C, until `comp`) it's the compositor's
   exclusive owner -- the same mode a fullscreen node uses -- and draws
   straight onto the real screen at full resolution.
 
 So the frame buffer is the only full-screen buffer muxos allocates, and
 the console allocates none (test 20 checks both). Output is kept as
-logical lines -- three full screens' worth of rows, oldest dropped
-first -- and wrapped only when rendered, at whichever width the console
+logical lines -- the last 500 lines of output -- and wrapped only when
+rendered, at whichever width the console
 currently has, at most once per tick, which gives:
 
 - **Scrollback**: PgUp/PgDn scroll a page; the mouse wheel scrolls 3

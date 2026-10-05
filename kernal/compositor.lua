@@ -501,6 +501,19 @@ function M.drawDirect(fn)
   fn(gpu)
 end
 
+-- Moves/resizes a text window. Only text windows: a buffered window's
+-- content was drawn once into a buffer of its original size and can't
+-- be regenerated at another size.
+function M.setGeometry(id, x, y, width, height)
+  local win = windows[id]
+  if not win then return false, "no such window: " .. tostring(id) end
+  if not win.textRows then return false, "only text windows can be resized" end
+  win.x, win.y, win.width, win.height = x, y, width, height
+  -- What was behind its old outline has to show again.
+  M.invalidateAll()
+  return true
+end
+
 -- Replaces a text window's rows (strings, top to bottom) and marks it
 -- dirty.
 function M.setText(id, rows)
