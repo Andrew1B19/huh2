@@ -96,9 +96,15 @@ local function serialize(v, seen)
   elseif t == "table" then
     if seen[v] then error("cannot serialize a cyclic table") end
     seen[v] = true
+    -- The array part goes positionally (no "[i]=" per element, which
+    -- would roughly double list-heavy messages), the rest as [k]=v.
     local parts = {}
+    local n = #v
+    for i = 1, n do parts[i] = serialize(v[i], seen) end
     for k, val in pairs(v) do
-      parts[#parts + 1] = "[" .. serialize(k, seen) .. "]=" .. serialize(val, seen)
+      if not (math.type(k) == "integer" and k >= 1 and k <= n) then
+        parts[#parts + 1] = "[" .. serialize(k, seen) .. "]=" .. serialize(val, seen)
+      end
     end
     -- Only tables on the current path count as cycles; the same table
     -- referenced twice elsewhere is fine.
@@ -826,6 +832,8 @@ local function launchProgram(path, args, parent)
     program.launch, program.libs = response, libs
   else
     program.modules = prefetchModules(source)
+    -- Sizes the default resolution of its virtual gpu.
+    program.screen = {termW, termH}
   end
   local appName = path:match("([^/]+)%.%w+$")
   return dispatchJob(source, args, nil, parent, appName, nil, program)
@@ -1400,7 +1408,10 @@ local function handleCreateWindow(msg)
 end
 
 -- Redraw an existing window. Only its owner process (or an ancestor of
--- it) may draw into it.
+-- it) may draw into it. `width`/`height`, when they differ from the
+-- window's, resize it first (a legacy program's setResolution);
+-- `noReply` is for draws sent without waiting (a legacy virtual gpu's
+-- flushes).
 local function handleDrawWindow(msg)
   local caller = callerJob(msg)
   local win = compositor.getWindow(msg.windowId)
@@ -1412,15 +1423,20 @@ local function handleDrawWindow(msg)
   elseif win.ownerJobId ~= caller.id and not (win.ownerJobId and isDescendantOf(win.ownerJobId, caller.id)) then
     reply = "window " .. tostring(msg.windowId) .. " belongs to another process"
   end
+  if not reply and type(msg.width) == "number" and type(msg.height) == "number"
+      and (msg.width ~= win.width or msg.height ~= win.height) then
+    local ok, err = compositor.setGeometry(win.id, win.x, win.y, msg.width, msg.height)
+    if not ok then reply = err end
+  end
   if not reply then
     local ok, err = compositor.redrawWindow(msg.windowId, msg)
     if ok then
-      send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
+      if not msg.noReply then send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true}) end
       return
     end
     reply = err
   end
-  send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = reply})
+  if not msg.noReply then send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = reply}) end
 end
 
 local function handleGetWindows(msg)

@@ -344,8 +344,8 @@ wiped the console's own output, and a job-preemption design that could
 hang a job calling `gmuxapi.*` forever -- see docs/PROTOCOL.md's
 "Hardening found by actually running the real files together").
 Not yet built: a real scheduler (load balancing beyond round-robin, async
-futures/callbacks for `submit()` itself, not just `SPAWN`), gmux-style virtual components for legacy
-programs (see docs/PROTOCOL.md's OpenOS-compatibility
+futures/callbacks for `submit()` itself, not just `SPAWN`), more of the OpenOS userland for legacy
+programs, e.g. a filesystem face and `buffer` (see docs/PROTOCOL.md's OpenOS-compatibility
 section for the intended shape), per-job isolated drawing surfaces (so
 `create_graphics_process`'s job and its window are actually wired
 together -- true for bit windows too now), an actual toolbar/icons/
@@ -403,6 +403,14 @@ a silent node's jobs become `lost`), finished-job history is capped at
 100 without source, and `get_orphans` only hands out real orphans (with
 their result if they finished). Verified in `test/emu/integration_test.lua`
 (tests 20-26).
+
+**Legacy (OpenOS) programs -- BUILT so far.** A `.lua` program gets
+OpenOS's `require`: the common OpenOS libraries (vendored in
+`kernal/lib`, installed as `/lib`; add more by installing files there)
+plus runtime faces for `component`, `computer`, `event`, `term` and
+`unicode`. Graphics behave like gmux: the program draws on its own
+virtual gpu/screen/keyboard, and that shows up in its own decorated,
+resizable window. Tests 33-34.
 
 **Migration and draining -- BUILT.** An `.mxe` that lists the built-in
 `mux` library can opt in with `mux.migratable(save)`; `migrate <id>

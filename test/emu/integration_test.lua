@@ -80,6 +80,28 @@ print("hi " .. name .. " gmuxapi=" .. tostring(gmuxapi) .. " os.time=" .. type(o
 ]==],
   -- Legacy libraries (test 33): the vendored OpenOS ones are added below.
   ["/usr/lib/extralib.lua"] = [==[return {v = "ok"}]==],
+  -- A legacy graphics program (test 34).
+  ["/bin/paint.lua"] = [==[local component = require("component")
+local event = require("event")
+local gpu = component.gpu
+local w0, h0 = gpu.getResolution()
+gpu.setResolution(20, 4)
+gpu.setBackground(0x0000FF)
+gpu.fill(1, 1, 20, 4, " ")
+gpu.set(2, 2, "legacy gfx")
+gpu.copy(2, 2, 10, 1, 0, 1)
+local buf = gpu.allocateBuffer(5, 1)
+gpu.setActiveBuffer(buf)
+gpu.set(1, 1, "BUF!!")
+gpu.setActiveBuffer(0)
+gpu.bitblt(0, 2, 4, 5, 1, buf, 1, 1)
+print("paint default=" .. w0 .. "x" .. h0 .. " screen=" .. tostring(component.isAvailable("screen")))
+local _, addr, x, y = event.pull("touch")
+gpu.set(2, 1, "touch " .. x .. "," .. y .. " " .. tostring(addr == gpu.getScreen()))
+local _, _, nw, nh = event.pull("screen_resized")
+gpu.set(2, 1, "size " .. nw .. "x" .. nh .. " res=" .. table.concat({gpu.getResolution()}, "x"))
+sleep(0.5)
+]==],
   ["/bin/libs.lua"] = [==[local serialization = require("serialization")
 local text = require("text")
 local sides = require("sides")
@@ -1060,13 +1082,31 @@ print("  OK -- close removes the window and kills its process; touching the cons
 print("test 33: legacy require -- vendored OpenOS libraries, lazy halves, dynamic names, faces")
 typeLine("libs")
 emu:advance(3)
-assertScreenContains('libs t=1x pad=ab  | top=1 red=14 f1=59 extra=ok gpu=false avail=false same=true',
-  "shipped, lazily loaded, and fetched-on-demand modules all work, component has no primary gpu yet")
+assertScreenContains('libs t=1x pad=ab  | top=1 red=14 f1=59 extra=ok gpu=true avail=true same=true',
+  "shipped, lazily loaded, and fetched-on-demand modules all work; component has the virtual gpu")
 typeLine("q")
 emu:advance(2)
 
 assertScreenContains("got key_down q held=true", "event.pull filters by name; keyboard tracks held keys")
 assertScreenContains("missing=false nf", "a module that doesn't exist fails like OpenOS's require")
 print("  OK -- OpenOS libraries load through require, package.delay, and GETMODULE")
+
+print("test 34: legacy graphics -- a gmux-style virtual gpu drawn into the program's own window")
+typeLine("paint")
+emu:advance(2)
+assertScreenContains("paint default=50x25 screen=true", "a legacy program gets a virtual gpu and screen, sized to fit")
+assert(cellText(1, 1, 8) == "paint.lu", "its window was created on the first draw, titled after it, got " .. cellText(1, 1, 8))
+assert(cellText(2, 3, 10) == "legacy gfx" and cellText(2, 4, 10) == "legacy gfx", "set and copy reached the window")
+assert(cellText(2, 5, 5) == "BUF!!", "bitblt from a virtual buffer reached the window")
+assert(cellText(1, 1, 20):find("\u{2BC5}", 1, true), "its window is resizable (maximize button shown)")
+print("  OK -- set/fill/copy/buffers/bitblt draw into a window sized by setResolution")
+emu:injectSignal(kernal, "touch", screenAddr, 5, 3, 0, "tester")
+emu:advance(1)
+assert(cellText(2, 2, 14) == "touch 5,2 true", "touch arrives in OpenOS's shape, window coordinates, got " .. cellText(2, 2, 14))
+emu:injectSignal(kernal, "touch", screenAddr, 17, 1, 0, "tester")
+emu:advance(1)
+assert(cellText(2, 2, 20) == "size 50x29 res=50x29", "maximizing is a resolution change for the program, got " .. cellText(2, 2, 20))
+print("  OK -- touch and window resizes reach it as OpenOS signals (screen_resized), as in gmux")
+emu:advance(2)
 
 print("ALL OK")

@@ -14,7 +14,8 @@ PORT = 4477
 2. **Runtime protocol** -- everything in the Message types table below.
    Spoken by `node/runtime.lua` (what `bios.lua` fetches and runs) and
    `kernal/muxos.lua`. Every message is a Lua table, turned into text
-   with a small serializer (`[key]=value` pairs good enough for
+   with a small serializer (a Lua table constructor: the array part
+   positionally, everything else as `[key]=value`; good enough for
    nil/boolean/number/string/table -- no functions, no userdata) --
    and, since every message over the modem is chunked now, not just
    boot's `CODE`, that serialized string is itself wrapped as one or
@@ -203,7 +204,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `SPAWN`   | `from`, `to`, `id`, `code`, `args`, `node`                | worker  | "dispatch a new job" (gmux API's `create_headless_process`/`create_graphics_process`); replies immediately with a handle, doesn't wait for the job to finish |
 | `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId`, `resizable`, `decorated` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
 | `GETWINDOWS` | `from`, `to`, `id`                                      | worker  | "list every window you know about" (gmux API's `get_windows()`) |
-| `DRAWWINDOW` | `from`, `to`, `id`, `windowId`, `code`, `args`, `pixels`, `mode`, `width`, `height`, `bg`, `clear`, `caller` | worker | redraw a window the calling process owns (`gmuxapi.draw_window`) |
+| `DRAWWINDOW` | `from`, `to`, `id`, `windowId`, `code`, `args`, `pixels`, `mode`, `width`, `height`, `bg`, `clear`, `caller`, `noReply` | worker | redraw a window the calling process owns (`gmuxapi.draw_window`); with code, `width`/`height` different from the window's resize it first (resizable windows); `noReply` = sent without waiting, nothing comes back |
 | `REQUESTFULLSCREEN` | `from`, `to`, `id`                                | worker  | "let me bypass the compositor and INVOKE the real gpu/screen directly" |
 | `RELEASEFULLSCREEN` | `from`, `to`, `id`                                | worker  | give that grant back |
 | `RESULT`  | `from`, `to`, `id`, `result`                              | either  | success -- `JOB`'s return value, `LIST`'s address→type table, `INVOKE`'s list of return values, `GETPROCESSES`'s job list, `SPAWN`'s `{id, node}` handle, `CREATEWINDOW`'s window record, `GETWINDOWS`'s window list, or `REQUESTFULLSCREEN`/`RELEASEFULLSCREEN`'s `{granted/released = true}` |
@@ -420,7 +421,7 @@ provides (per-node dispatch, the compositor, multithreading awareness);
 legacy OpenOS programs get the best-effort compatibility shim, not equal
 footing.
 
-### Running OpenOS programs (decided, not yet built)
+### Running OpenOS programs (decided; libraries and virtual components built)
 
 This isn't a separate translation layer sitting on top of muxos. muxos
 itself understands OpenOS programs and runs them as a native ability of
@@ -486,8 +487,8 @@ the scheduler places it.
   `print`, `io.write`/`io.read` (console output and input), `os`
   (`sleep`, `clock`, `time`, `date`, `getenv`, `exit`), `checkArg`, and
   OpenOS's `require` (see "Legacy libraries" below), and nothing
-  muxos-specific (no `gmuxapi`). Not built yet: gmux's virtual
-  components (see "Running OpenOS programs").
+  muxos-specific (no `gmuxapi`). Its `component` is gmux-style virtual
+  components (see "Legacy virtual components").
 - **`.mxe`** declares what it expects in a header at the top of the file:
 
   ```lua
@@ -520,9 +521,11 @@ A legacy program's `require` works like OpenOS's, with its own
   - `term` (console I/O), `unicode` (the machine's), and a minimal
     `process` and `package` (including OpenOS's `package.delay`);
   - `buffer`, which doesn't work yet;
-  - `component`, which has no primary anything until the virtual
-    components exist. Accessing one gives OpenOS's own "no primary 'gpu'
-    available" error, and `isAvailable` is false.
+  - `component`: the process's own virtual gpu, screen and keyboard
+    (see "Legacy virtual components"), with OpenOS's `list`, `proxy`,
+    `invoke`, `type`, `methods`, `isAvailable`, `getPrimary` and
+    `component.<type>`, and OpenOS's "no primary 'x' available" error
+    for anything else.
 
   Input arrives in OpenOS's signal shape (`"key_down", address, char,
   code, player`). When the program has loaded OpenOS's `keyboard`
@@ -543,6 +546,43 @@ uses to load a library's lazy half), sends a `GETMODULE` request to the
 kernal. `dofile` only reaches files under `/lib` and `/usr/lib`. The
 kernal caches module sources and re-reads a file only when its
 `lastModified` changes. Test 33.
+
+## Legacy virtual components -- BUILT, forked from gmux
+
+A legacy program sees what gmux gives one: its own virtual gpu, screen
+and keyboard (`gmux/lib/gmux/backend/virtual_components/`, with the same
+addresses), and nothing else. gmux's virtual gpu draws into real gpu
+buffers on the machine it runs on. A worker has no gpu, so muxos's
+keeps the screen and its buffers as cell grids in the worker's memory,
+behind gmux's API:
+
+- `set` (vertical too), `fill`, `copy`, `get`;
+- colors, palette, depth;
+- `get`/`set`/`maxResolution` and the viewport;
+- `allocateBuffer`/`freeBuffer`/`freeAllBuffers`/`buffers`,
+  `setActiveBuffer`, `bitblt`, and memory.
+
+Its window is on the kernal:
+
+- **Created** on the first draw that's flushed, titled after the
+  program, sized to the resolution and resizable (gmux makes a vgpu
+  window resizable).
+- **Updated** with the rows that changed, as same-color runs, in one
+  `DRAWWINDOW` sent without waiting for a reply. Flushes happen at the
+  process's yield points: always before it blocks (`sleep`, waiting for
+  an event or input, ending), and at most every 0.05s otherwise, so a
+  busy draw loop doesn't flood the network.
+- **Resizing** works both ways. `setResolution` resizes the window and
+  queues `screen_resized`, as a real screen does. The user resizing or
+  maximizing the window is a resolution change for the program,
+  delivered as `screen_resized`, as in gmux.
+
+Touch, drag, drop and scroll on the window arrive in OpenOS's shape
+with the virtual screen's address and window coordinates. Keys reach the
+program when its window is focused. The default resolution fits the
+kernal's screen, up to 80x25, with room for the title bar. Text written
+with `print`/`io.write`/`term` still goes to the console; only the gpu
+draws into the window. Test 34.
 
 Every process's `print` (and a legacy program's `io.write`) goes to the
 kernal console as `OUTPUT` messages, buffered per process and sent at

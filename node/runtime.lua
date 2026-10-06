@@ -48,9 +48,15 @@ local function serialize(v, seen)
   elseif t == "table" then
     if seen[v] then error("cannot serialize a cyclic table") end
     seen[v] = true
+    -- The array part goes positionally (no "[i]=" per element, which
+    -- would roughly double list-heavy messages), the rest as [k]=v.
     local parts = {}
+    local n = #v
+    for i = 1, n do parts[i] = serialize(v[i], seen) end
     for k, val in pairs(v) do
-      parts[#parts + 1] = "[" .. serialize(k, seen) .. "]=" .. serialize(val, seen)
+      if not (math.type(k) == "integer" and k >= 1 and k <= n) then
+        parts[#parts + 1] = "[" .. serialize(k, seen) .. "]=" .. serialize(val, seen)
+      end
     end
     -- Only tables on the current path count as cycles; the same table
     -- referenced twice elsewhere is fine.
@@ -301,12 +307,20 @@ local function remoteRequest(msgType, extra)
   return nil, "timed out waiting for kernal"
 end
 
-local function flushOutput(id)
+-- id -> function(force): pushes a legacy process's virtual gpu changes
+-- to its window (see "Legacy virtual components"). Called wherever
+-- output is flushed; `force` before the process blocks, otherwise it's
+-- rate-limited.
+local graphicsFlushers = {}
+
+local function flushOutput(id, force)
   local buf = outputBuffers[id]
   if buf and #buf > 0 and kernalAddr then
     outputBuffers[id] = nil
     send({type = "OUTPUT", from = nodeId, to = kernalAddr, jobId = id, text = table.concat(buf)})
   end
+  local flushGraphics = graphicsFlushers[id]
+  if flushGraphics then flushGraphics(force) end
 end
 
 local function writeOutput(id, text)
@@ -517,7 +531,7 @@ gmuxapi = {
   -- seconds (nil timeout: wait indefinitely). Events come back as
   -- {name, ...} lists, e.g. {"key_down", char, code}.
   pull_event = function(timeout)
-    flushOutput(currentJobId)
+    flushOutput(currentJobId, true)
     local deadline = timeout and (computer.uptime() + timeout)
     while true do
       local q = eventQueues[currentJobId]
@@ -573,6 +587,7 @@ end
 -- including the JOB message for a child the kernal had just queued on
 -- this node. Everything is set aside for the main loop instead.
 function sleep(seconds)
+  if currentJobId then flushOutput(currentJobId, true) end
   local deadline = computer.uptime() + (seconds or 0)
   while computer.uptime() < deadline do
     local name, _, from, port, _, data = pullSignal(deadline - computer.uptime())
@@ -789,17 +804,19 @@ local function checkArg(n, have, ...)
   error(string.format("bad argument #%d (%s expected, got %s)", n, table.concat({...}, " or "), have), 3)
 end
 
--- What the faces report as the process's keyboard and screen (OpenOS
--- signals carry the component's address).
-local LEGACY_KEYBOARD, LEGACY_SCREEN = "keyboard-legacy", "screen-legacy"
+-- The legacy virtual components' addresses (gmux's). OpenOS signals
+-- carry the component's address.
+local VGPU_ADDRESS = "virtual0-gpu0-0000-0000-component000"
+local VSCREEN_ADDRESS = "virtual0-scre-en00-0000-component000"
+local VKEYBOARD_ADDRESS = "virtual0-keyb-oard-0000-component000"
 
 -- A muxos event ({name, ...}) in OpenOS's signal shape.
 local function toSignal(e)
   local name = e[1]
   if name == "key_down" or name == "key_up" then
-    return table.pack(name, LEGACY_KEYBOARD, e[2], e[3], "player")
+    return table.pack(name, VKEYBOARD_ADDRESS, e[2], e[3], "player")
   elseif name == "touch" or name == "drag" or name == "drop" or name == "scroll" then
-    return table.pack(name, LEGACY_SCREEN, e[2], e[3], e[4], "player")
+    return table.pack(name, VSCREEN_ADDRESS, e[2], e[3], e[4], "player")
   end
   return table.pack(table.unpack(e, 1, e.n or #e))
 end
@@ -813,6 +830,11 @@ local function legacyPull(ctx, timeout)
     local e = gmuxapi.pull_event(timeout)
     if not e then return nil end
     sig = toSignal(e)
+    -- A user resize of its window is a resolution change, as in gmux.
+    if sig[1] == "window_resized" and ctx.vgpu and sig[2] == ctx.windowId then
+      ctx.vgpu.resize(sig[3], sig[4])
+      sig = table.pack("screen_resized", VSCREEN_ADDRESS, sig[3], sig[4])
+    end
   end
   local kb = ctx.loaded.keyboard
   if type(kb) == "table" and type(kb.pressedCodes) == "table" then
@@ -859,7 +881,7 @@ local function pullMatching(ctx, timeout, accept)
 end
 
 local function legacyReadLine(ctx)
-  flushOutput(ctx.id)
+  flushOutput(ctx.id, true)
   local line = ""
   while true do
     local sig = legacyPull(ctx)
@@ -879,6 +901,339 @@ local function legacyReadLine(ctx)
 end
 
 local hostUnicode = unicode
+
+-- --- Legacy virtual components, forked from gmux ---
+--
+-- gmux's virtual_components (gpu/screen/keyboard) draw into real gpu
+-- buffers on the machine they run on. Workers have no gpu, so here the
+-- virtual gpu keeps its screen and buffers as cell grids in memory,
+-- with gmux's API, and its window lives on the kernal: created on the
+-- first draw that reaches a flush (sized to the resolution, resizable),
+-- then sent the rows that changed, as same-color runs, without waiting
+-- for a reply. Flushes happen at the process's yield points -- always
+-- before it blocks (sleep, waiting for input), at most every
+-- GRAPHICS_FLUSH_INTERVAL otherwise. setResolution resizes the window;
+-- the user resizing the window is a resolution change for the program
+-- (screen_resized), as in gmux.
+local VGPU_MAX_W, VGPU_MAX_H = 160, 50
+local VGPU_MEMORY = VGPU_MAX_W * VGPU_MAX_H * 2 -- cells, for allocateBuffer
+local GRAPHICS_FLUSH_INTERVAL = 0.05
+-- Rows arrive as {y, x, fg, bg, text, x, fg, bg, text, ...}.
+local WINDOW_DRAW_CODE = "for _, row in ipairs(args.rows) do local y = row[1] for i = 2, #row, 4 do " ..
+  "gpu.setForeground(row[i + 1]) gpu.setBackground(row[i + 2]) gpu.set(row[i], y, row[i + 3]) end end"
+
+local function newGrid(w, h, fg, bg)
+  local g = {w = w, h = h, chars = {}, fgs = {}, bgs = {}}
+  for y = 1, h do
+    local c, f, b = {}, {}, {}
+    for x = 1, w do c[x], f[x], b[x] = " ", fg, bg end
+    g.chars[y], g.fgs[y], g.bgs[y] = c, f, b
+  end
+  return g
+end
+
+-- Copies a w x h block of `src` at (sx, sy) to `dst` at (dx, dy),
+-- clipped to both (the two may be the same grid and overlap).
+-- `onRow(y)` hears about each destination row written.
+local function blit(dst, dx, dy, src, sx, sy, w, h, onRow)
+  local snapC, snapF, snapB = {}, {}, {}
+  for j = 0, h - 1 do
+    local y = sy + j
+    local cr, fr, br = src.chars[y], src.fgs[y], src.bgs[y]
+    local c, f, b = {}, {}, {}
+    if cr then
+      for i = math.max(0, 1 - sx), math.min(w - 1, src.w - sx) do
+        c[i], f[i], b[i] = cr[sx + i], fr[sx + i], br[sx + i]
+      end
+    end
+    snapC[j], snapF[j], snapB[j] = c, f, b
+  end
+  for j = 0, h - 1 do
+    local y = dy + j
+    if y >= 1 and y <= dst.h then
+      local cr, fr, br = dst.chars[y], dst.fgs[y], dst.bgs[y]
+      local c, f, b = snapC[j], snapF[j], snapB[j]
+      local wrote = false
+      for i, ch in pairs(c) do
+        local x = dx + i
+        if x >= 1 and x <= dst.w then
+          cr[x], fr[x], br[x] = ch, f[i], b[i]
+          wrote = true
+        end
+      end
+      if wrote and onRow then onRow(y) end
+    end
+  end
+end
+
+local function splitChars(value)
+  local chars = {}
+  if utf8.len(value) then
+    for ch in value:gmatch(utf8.charpattern) do chars[#chars + 1] = ch end
+  else
+    for i = 1, #value do chars[i] = value:sub(i, i) end
+  end
+  return chars
+end
+
+local function newVirtualGpu(ctx, w, h)
+  local palette = {}
+  for i = 0, 15 do palette[i] = (i + 1) * 0x0F0F0F end
+  local grids = {[0] = newGrid(w, h, 0xFFFFFF, 0x000000)}
+  local nextBuffer, active = 1, 0
+  local fg, bg, fgIndex, bgIndex = 0xFFFFFF, 0x000000, nil, nil
+  local viewW, viewH = w, h
+  local v = {dirtyRows = {}, dirty = false, lastFlush = -math.huge}
+
+  local function touchRow(gridId, y)
+    if gridId == 0 then
+      v.dirtyRows[y] = true
+      v.dirty = true
+    end
+  end
+  local function onScreenRow(y) touchRow(0, y) end
+  local function activeRowHook() return active == 0 and onScreenRow or nil end
+  function v.grid() return grids[0] end
+  function v.resize(nw, nh)
+    local old = grids[0]
+    local g = newGrid(nw, nh, 0xFFFFFF, 0x000000)
+    blit(g, 1, 1, old, 1, 1, math.min(old.w, nw), math.min(old.h, nh))
+    grids[0], viewW, viewH = g, nw, nh
+    for y = 1, nh do v.dirtyRows[y] = true end
+    v.dirty = true
+  end
+  local function usedMemory()
+    local used = 0
+    for id, g in pairs(grids) do
+      if id ~= 0 then used = used + g.w * g.h end
+    end
+    return used
+  end
+
+  local gpu = {type = "gpu", address = VGPU_ADDRESS}
+  function gpu.bind() return true end
+  function gpu.getScreen() return VSCREEN_ADDRESS end
+  function gpu.getForeground() return fgIndex or fg, fgIndex ~= nil end
+  function gpu.getBackground() return bgIndex or bg, bgIndex ~= nil end
+  function gpu.setForeground(color, isIndex)
+    checkArg(1, color, "number")
+    local old, oldIndex = fg, fgIndex
+    if isIndex then fgIndex, fg = color, palette[color] or 0 else fgIndex, fg = nil, color end
+    return old, oldIndex
+  end
+  function gpu.setBackground(color, isIndex)
+    checkArg(1, color, "number")
+    local old, oldIndex = bg, bgIndex
+    if isIndex then bgIndex, bg = color, palette[color] or 0 else bgIndex, bg = nil, color end
+    return old, oldIndex
+  end
+  function gpu.getPaletteColor(i) return palette[i] end
+  function gpu.setPaletteColor(i, color)
+    local old = palette[i]
+    palette[i] = color
+    return old
+  end
+  function gpu.maxDepth() return 8 end
+  function gpu.getDepth() return 8 end
+  function gpu.setDepth() return 8 end
+  function gpu.maxResolution() return VGPU_MAX_W, VGPU_MAX_H end
+  function gpu.getResolution() return grids[0].w, grids[0].h end
+  function gpu.setResolution(nw, nh)
+    checkArg(1, nw, "number")
+    checkArg(2, nh, "number")
+    nw, nh = math.floor(nw), math.floor(nh)
+    if nw < 1 or nh < 1 or nw > VGPU_MAX_W or nh > VGPU_MAX_H then error("unsupported resolution", 2) end
+    if nw == grids[0].w and nh == grids[0].h then return false end
+    v.resize(nw, nh)
+    ctx.pushed[#ctx.pushed + 1] = table.pack("screen_resized", VSCREEN_ADDRESS, nw, nh)
+    return true
+  end
+  function gpu.getViewport() return viewW, viewH end
+  function gpu.setViewport(vw, vh)
+    if vw > grids[0].w or vh > grids[0].h then return false end
+    viewW, viewH = vw, vh
+    return true
+  end
+  function gpu.get(x, y)
+    local g = grids[active]
+    x, y = math.floor(x), math.floor(y)
+    if x < 1 or y < 1 or x > g.w or y > g.h then error("index out of bounds", 2) end
+    return g.chars[y][x], g.fgs[y][x], g.bgs[y][x], nil, nil
+  end
+  function gpu.set(x, y, value, vertical)
+    checkArg(1, x, "number")
+    checkArg(2, y, "number")
+    checkArg(3, value, "string")
+    local g = grids[active]
+    x, y = math.floor(x), math.floor(y)
+    local chars = splitChars(value)
+    if vertical then
+      if x >= 1 and x <= g.w then
+        for i, ch in ipairs(chars) do
+          local yy = y + i - 1
+          if yy >= 1 and yy <= g.h then
+            g.chars[yy][x], g.fgs[yy][x], g.bgs[yy][x] = ch, fg, bg
+            touchRow(active, yy)
+          end
+        end
+      end
+    elseif y >= 1 and y <= g.h then
+      local cr, fr, br = g.chars[y], g.fgs[y], g.bgs[y]
+      for i = math.max(1, 2 - x), math.min(#chars, g.w - x + 1) do
+        local xx = x + i - 1
+        cr[xx], fr[xx], br[xx] = chars[i], fg, bg
+      end
+      touchRow(active, y)
+    end
+    return true
+  end
+  function gpu.fill(x, y, fw, fh, char)
+    checkArg(5, char, "string")
+    local chars = splitChars(char)
+    if #chars ~= 1 then error("invalid fill value", 2) end
+    local ch = chars[1]
+    local g = grids[active]
+    x, y, fw, fh = math.floor(x), math.floor(y), math.floor(fw), math.floor(fh)
+    for yy = math.max(1, y), math.min(g.h, y + fh - 1) do
+      local cr, fr, br = g.chars[yy], g.fgs[yy], g.bgs[yy]
+      for xx = math.max(1, x), math.min(g.w, x + fw - 1) do
+        cr[xx], fr[xx], br[xx] = ch, fg, bg
+      end
+      touchRow(active, yy)
+    end
+    return true
+  end
+  function gpu.copy(x, y, cw, ch, tx, ty)
+    local g = grids[active]
+    blit(g, x + tx, y + ty, g, x, y, cw, ch, activeRowHook())
+    return true
+  end
+  function gpu.getActiveBuffer() return active end
+  function gpu.setActiveBuffer(index)
+    index = index or 0
+    if not grids[index] then return nil, "invalid buffer index" end
+    local old = active
+    active = index
+    return old
+  end
+  function gpu.buffers()
+    local list = {}
+    for id in pairs(grids) do if id ~= 0 then list[#list + 1] = id end end
+    table.sort(list)
+    return list
+  end
+  function gpu.allocateBuffer(bw, bh)
+    bw, bh = math.floor(bw or grids[0].w), math.floor(bh or grids[0].h)
+    if bw < 1 or bh < 1 then return nil, "invalid page dimensions: must be greater than zero" end
+    if bw * bh > VGPU_MEMORY - usedMemory() then return nil, "not enough video memory" end
+    local id = nextBuffer
+    nextBuffer = nextBuffer + 1
+    grids[id] = newGrid(bw, bh, 0xFFFFFF, 0x000000)
+    return id
+  end
+  function gpu.freeBuffer(index)
+    index = index or active
+    if index == 0 or not grids[index] then return false end
+    grids[index] = nil
+    if active == index then active = 0 end
+    return true
+  end
+  function gpu.freeAllBuffers()
+    for id in pairs(grids) do if id ~= 0 then grids[id] = nil end end
+    active = 0
+  end
+  function gpu.totalMemory() return VGPU_MEMORY end
+  function gpu.freeMemory() return VGPU_MEMORY - usedMemory() end
+  function gpu.getBufferSize(index)
+    local g = grids[index or active]
+    if not g then return nil, "invalid buffer index" end
+    return g.w, g.h
+  end
+  function gpu.bitblt(dst, col, row, bw, bh, src, fromCol, fromRow)
+    dst, src = dst or 0, src or active
+    local d, sg = grids[dst], grids[src]
+    if not d or not sg then return nil, "invalid buffer index" end
+    blit(d, col or 1, row or 1, sg, fromCol or 1, fromRow or 1, bw or sg.w, bh or sg.h,
+      dst == 0 and onScreenRow or nil)
+    return true
+  end
+  v.proxy = gpu
+  return v
+end
+
+-- Sends the virtual gpu's changed rows to the process's window,
+-- creating the window on the first flush.
+local function flushVirtualGpu(ctx, force)
+  local v = ctx.vgpu
+  -- `creating`: creating the window waits for the kernal, and the
+  -- process's other flush points run meanwhile; they mustn't make a
+  -- second one.
+  if not v or not v.dirty or v.broken or v.creating then return end
+  local now = computer.uptime()
+  if not force and now - v.lastFlush < GRAPHICS_FLUSH_INTERVAL then return end
+  local g = v.grid()
+  if not ctx.windowId then
+    v.creating = true
+    local win, err = remoteRequest("CREATEWINDOW", {title = ctx.name, width = g.w, height = g.h,
+      resizable = true, caller = ctx.id})
+    v.creating = nil
+    g = v.grid() -- the resolution may have changed meanwhile
+    if not win then
+      v.broken = true
+      writeOutput(ctx.id, "no window for gpu output: " .. tostring(err) .. "\n")
+      return
+    end
+    ctx.windowId = win.id
+  end
+  local rows = {}
+  for y in pairs(v.dirtyRows) do
+    if y <= g.h then
+      local cr, fr, br = g.chars[y], g.fgs[y], g.bgs[y]
+      local row = {y}
+      local x = 1
+      while x <= g.w do
+        local f, b, start = fr[x], br[x], x
+        local text = {}
+        while x <= g.w and fr[x] == f and br[x] == b do
+          text[#text + 1] = cr[x]
+          x = x + 1
+        end
+        local n = #row
+        row[n + 1], row[n + 2], row[n + 3], row[n + 4] = start, f, b, table.concat(text)
+      end
+      rows[#rows + 1] = row
+    end
+  end
+  v.dirtyRows, v.dirty, v.lastFlush = {}, false, now
+  send({type = "DRAWWINDOW", from = nodeId, to = kernalAddr, id = nextId(), windowId = ctx.windowId,
+    code = WINDOW_DRAW_CODE, args = {rows = rows}, clear = false, width = g.w, height = g.h,
+    caller = ctx.id, noReply = true})
+end
+
+-- The process's virtual gpu, screen and keyboard: address -> proxy.
+local function virtualDevices(ctx)
+  if ctx.devices then return ctx.devices end
+  local size = ctx.screenSize or {}
+  local v = newVirtualGpu(ctx, math.min(80, size[1] or 80), math.min(25, (size[2] or 26) - 1))
+  ctx.vgpu = v
+  graphicsFlushers[ctx.id] = function(force) flushVirtualGpu(ctx, force) end
+  local isOn, precise, inverted = true, false, false
+  local screen = {
+    type = "screen", address = VSCREEN_ADDRESS,
+    isOn = function() return isOn end,
+    turnOn = function() local was = isOn isOn = true return not was end,
+    turnOff = function() local was = isOn isOn = false return was end,
+    getAspectRatio = function() return 1, 1 end,
+    getKeyboards = function() return {VKEYBOARD_ADDRESS} end,
+    isPrecise = function() return precise end,
+    setPrecise = function(p) precise = p end,
+    isTouchModeInverted = function() return inverted end,
+    setTouchModeInverted = function(i) inverted = i end,
+  }
+  local keyboard = {type = "keyboard", address = VKEYBOARD_ADDRESS}
+  ctx.devices = {[VGPU_ADDRESS] = v.proxy, [VSCREEN_ADDRESS] = screen, [VKEYBOARD_ADDRESS] = keyboard}
+  return ctx.devices
+end
 
 local function unavailable(name)
   return setmetatable({}, {__index = function(_, k)
@@ -965,19 +1320,70 @@ local LEGACY_FACES = {
   buffer = function()
     return unavailable("buffer")
   end,
-  -- Until legacy virtual components exist there is no primary anything
-  -- (the same error OpenOS gives), so programs that check
-  -- isAvailable() can fall back.
-  component = function()
-    local function none(kind) error("no primary '" .. tostring(kind) .. "' available", 3) end
-    return setmetatable({
-      list = function() return function() end end,
-      isAvailable = function() return false end,
-      getPrimary = none,
-      proxy = function() return nil, "no such component" end,
-      type = function() return nil, "no such component" end,
-      invoke = function() error("no such component", 2) end,
-    }, {__index = function(_, kind) none(kind) end})
+  -- gmux-style: the process sees its own virtual gpu, screen and
+  -- keyboard, and nothing else.
+  component = function(ctx)
+    local component = {}
+    local function devices() return virtualDevices(ctx) end
+    local function primary(kind)
+      for _, dev in pairs(devices()) do
+        if dev.type == kind then return dev end
+      end
+    end
+    function component.list(filter, exact)
+      local found = {}
+      for addr, dev in pairs(devices()) do
+        if filter == nil or (exact and dev.type == filter) or (not exact and dev.type:find(filter, 1, true)) then
+          found[addr] = dev.type
+        end
+      end
+      local key
+      return setmetatable(found, {__call = function()
+        key = next(found, key)
+        if key then return key, found[key] end
+      end})
+    end
+    function component.proxy(addr)
+      local dev = devices()[addr]
+      if not dev then return nil, "no such component" end
+      return dev
+    end
+    function component.invoke(addr, method, ...)
+      local dev = devices()[addr]
+      if not dev then error("no such component", 2) end
+      if type(dev[method]) ~= "function" then error("no such method", 2) end
+      return dev[method](...)
+    end
+    function component.type(addr)
+      local dev = devices()[addr]
+      if not dev then return nil, "no such component" end
+      return dev.type
+    end
+    function component.slot(addr)
+      if not devices()[addr] then return nil, "no such component" end
+      return -1
+    end
+    function component.methods(addr)
+      local dev = devices()[addr]
+      if not dev then return nil, "no such component" end
+      local methods = {}
+      for k, f in pairs(dev) do if type(f) == "function" then methods[k] = true end end
+      return methods
+    end
+    function component.fields() return {} end
+    function component.doc() return nil end
+    function component.isAvailable(kind) return primary(kind) ~= nil end
+    function component.getPrimary(kind)
+      local dev = primary(kind)
+      if not dev then error("no primary '" .. tostring(kind) .. "' available", 2) end
+      return dev
+    end
+    function component.setPrimary() end
+    return setmetatable(component, {__index = function(_, kind)
+      local dev = primary(kind)
+      if not dev then error("no primary '" .. tostring(kind) .. "' available", 2) end
+      return dev
+    end})
   end,
   package = function(ctx)
     return {
@@ -1010,8 +1416,9 @@ local function newLegacyEnv(id, program)
   env.computer = NATIVE.computer
   env.print = printTo(id)
   local loaded = {}
-  local ctx = {id = id, env = env, loaded = loaded, pushed = {}, listeners = {},
-    path = program and program.path}
+  local path = program and program.path
+  local ctx = {id = id, env = env, loaded = loaded, pushed = {}, listeners = {}, path = path,
+    name = path and path:match("([^/]+)$") or "legacy", screenSize = program and program.screen}
   local function write(...)
     for i = 1, select("#", ...) do writeOutput(id, tostring((select(i, ...)))) end
   end
@@ -1149,7 +1556,8 @@ local function handleMessage(from, msg)
     currentJobId = msg.id
     local ok, result, migratedState = runJobCode(entry, msg.args, msg.id)
     currentJobId = nil
-    flushOutput(msg.id)
+    flushOutput(msg.id, true)
+    graphicsFlushers[msg.id] = nil
     controlState[msg.id] = nil
     eventQueues[msg.id] = nil
     migrationHandlers[msg.id] = nil
