@@ -82,6 +82,8 @@ kernal/compositor.lua  the only file that touches the real gpu for window conten
 kernal/bitmap.lua      half-block/braille pixel-grid encoder for "bit windows" -- OC's gpu
                        hardware has no pixel API, so this is sub-cell encoding on top of the
                        same character grid. Loaded by compositor.lua via loadSibling().
+kernal/lib/            OpenOS libraries for legacy programs (vendored unchanged, MIT),
+                       installed as /lib on the kernal's disk; see kernal/lib/README.md.
 node/bios.lua         worker EEPROM image: tiny network-boot stub, fetches node/runtime.lua
 node/runtime.lua       worker's real runtime, served by the kernal (installed as its sibling,
                        NOT flashed anywhere) -- job execution, remote-component bridge, gpu
@@ -147,7 +149,8 @@ eeprom kernal/bios.lua
 Then copy `kernal/muxos.lua`, `kernal/compositor.lua`,
 `kernal/bitmap.lua`, **and** `node/runtime.lua` onto the ROOT of the
 kernal's filesystem (as `/muxos.lua`, `/compositor.lua`, `/bitmap.lua`,
-`/runtime.lua` -- fixed paths, see "Layout" above) and boot the kernal
+`/runtime.lua` -- fixed paths, see "Layout" above), copy `kernal/lib`
+to `/lib` (the OpenOS libraries legacy programs `require`), and boot the kernal
 with that filesystem attached. There is no OpenOS shell to run
 `muxos.lua` from any more -- `kernal/bios.lua` loads and runs it
 directly as the kernal's entire resident environment. Workers fetch
@@ -341,8 +344,8 @@ wiped the console's own output, and a job-preemption design that could
 hang a job calling `gmuxapi.*` forever -- see docs/PROTOCOL.md's
 "Hardening found by actually running the real files together").
 Not yet built: a real scheduler (load balancing beyond round-robin, async
-futures/callbacks for `submit()` itself, not just `SPAWN`), broader OpenOS-compatibility-shim coverage for legacy
-programs beyond `gpu` (see docs/PROTOCOL.md's OpenOS-compatibility
+futures/callbacks for `submit()` itself, not just `SPAWN`), gmux-style virtual components for legacy
+programs (see docs/PROTOCOL.md's OpenOS-compatibility
 section for the intended shape), per-job isolated drawing surfaces (so
 `create_graphics_process`'s job and its window are actually wired
 together -- true for bit windows too now), an actual toolbar/icons/

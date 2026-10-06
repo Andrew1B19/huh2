@@ -195,6 +195,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `EVENT`   | `from`, `to`, `jobId`, `event`                                | kernal  | an input event for a process on that node, read with `gmuxapi.pull_event` |
 | `OUTPUT`  | `from`, `to`, `jobId`, `text`                                 | worker  | a process's printed output, for the console |
 | `LAUNCH`  | `from`, `to`, `id`, `path`, `args`, `caller`                  | worker  | launch a program as the caller's child (`gmuxapi.launch`) |
+| `GETMODULE` | `from`, `to`, `id`, `name`, `caller`                        | worker  | a legacy process's `require`/`dofile` for a module it wasn't shipped with: a module name or a `/lib`/`/usr/lib` path; replies `{path, source}` |
 | `KILL`/`PAUSE`/`RESUME`/`MIGRATE <id> <node>` | raw, unchunked           | kernal  | process control broadcasts, acted on at the process's yield points; only the worker named by `<node>` records one, so a job id reused on another node (after a migration) isn't hit by a stale control |
 | `MIGRATABLE` | `from`, `to`, `jobId`                                  | worker  | an `.mxe` called `mux.migratable(save)`: the kernal may now move it |
 | `MIGRATED` | `from`, `to`, `jobId`, `state`                           | worker  | answer to `MIGRATE`: the process saved `state` and ended here; the kernal re-sends the same job (same id) to the target as a `JOB` with `restore = state` |
@@ -482,10 +483,11 @@ background. A process can launch a program too, with
 the scheduler places it.
 
 - **`.lua`** runs in the OpenOS environment: the standard libraries,
-  `print`, `io.write`/`io.read` (console output and input), and `os`
-  (`sleep`, `clock`, `time`, `exit`), and nothing muxos-specific (no
-  `gmuxapi`). Not built yet: the OpenOS libraries behind `require`, and
-  gmux's virtual components (see "Running OpenOS programs").
+  `print`, `io.write`/`io.read` (console output and input), `os`
+  (`sleep`, `clock`, `time`, `date`, `getenv`, `exit`), `checkArg`, and
+  OpenOS's `require` (see "Legacy libraries" below), and nothing
+  muxos-specific (no `gmuxapi`). Not built yet: gmux's virtual
+  components (see "Running OpenOS programs").
 - **`.mxe`** declares what it expects in a header at the top of the file:
 
   ```lua
@@ -504,6 +506,43 @@ the scheduler places it.
   environment, and are reached with `require(name)`. Both headers and
   libraries are deliberately minimal for now; the full `.mxe` spec comes
   later.
+
+## Legacy libraries -- BUILT
+
+A legacy program's `require` works like OpenOS's, with its own
+`package.loaded`. There are two kinds of module:
+
+- **Faces built into the worker runtime** for the machine-level modules:
+  - `computer`, with `pullSignal`/`pushSignal` over the process's own
+    events;
+  - `event`, with `pull` (OpenOS's filter: name pattern plus equal
+    arguments), `pullFiltered`, `push`, `listen` and `ignore`;
+  - `term` (console I/O), `unicode` (the machine's), and a minimal
+    `process` and `package` (including OpenOS's `package.delay`);
+  - `buffer`, which doesn't work yet;
+  - `component`, which has no primary anything until the virtual
+    components exist. Accessing one gives OpenOS's own "no primary 'gpu'
+    available" error, and `isAvailable` is false.
+
+  Input arrives in OpenOS's signal shape (`"key_down", address, char,
+  code, player`). When the program has loaded OpenOS's `keyboard`
+  library, its pressed-key tables are kept current, as OpenOS's boot
+  scripts would.
+- **Files on the kernal's disk**, found on OpenOS's package path:
+  `/lib/?.lua`, `/usr/lib/?.lua`, then `?/init.lua` in each. This is
+  where the vendored OpenOS libraries go (`kernal/lib`: `serialization`,
+  `text`, `sides`, `colors`, `keyboard`, `transforms` and their
+  `core/full_*` halves, unchanged, MIT). Expanding the legacy userland
+  is installing files there, no OS change needed.
+
+The launcher ships every module the program requires by a literal name,
+and the modules those require, up to 32, with the `JOB`
+(`program.modules`). So the usual case costs no extra round trips. Any
+other `require` (a computed name), and `dofile` (which `package.delay`
+uses to load a library's lazy half), sends a `GETMODULE` request to the
+kernal. `dofile` only reaches files under `/lib` and `/usr/lib`. The
+kernal caches module sources and re-reads a file only when its
+`lastModified` changes. Test 33.
 
 Every process's `print` (and a legacy program's `io.write`) goes to the
 kernal console as `OUTPUT` messages, buffered per process and sent at

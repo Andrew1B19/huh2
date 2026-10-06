@@ -40,7 +40,7 @@ local kernal = emu:newNode("kernal")
 emu:addModem(kernal)
 emu:addEeprom(kernal, kernalBiosSrc)
 local gpuAddr, screenAddr, screenBuffers = emu:addGpuScreen(kernal, 50, 30)
-emu:addFilesystem(kernal, {
+local kernalFiles = {
   ["/muxos.lua"] = muxosSrc,
   ["/compositor.lua"] = compositorSrc,
   ["/bitmap.lua"] = bitmapSrc,
@@ -78,7 +78,34 @@ print("counter done n=" .. state.n .. " starts=" .. state.starts)
 local name = io.read()
 print("hi " .. name .. " gmuxapi=" .. tostring(gmuxapi) .. " os.time=" .. type(os.time))
 ]==],
-})
+  -- Legacy libraries (test 33): the vendored OpenOS ones are added below.
+  ["/usr/lib/extralib.lua"] = [==[return {v = "ok"}]==],
+  ["/bin/libs.lua"] = [==[local serialization = require("serialization")
+local text = require("text")
+local sides = require("sides")
+local colors = require("colors")
+local keyboard = require("keyboard")
+local event = require("event")
+local component = require("component")
+local t = serialization.unserialize(serialization.serialize({a = 1, b = "x"}))
+local extra = require("extra" .. "lib")
+local gpuOk = pcall(function() return component.gpu end)
+print("libs t=" .. t.a .. t.b .. " pad=" .. text.padRight("ab", 4) .. "| top=" .. sides.top .. " red=" .. colors.red
+  .. " f1=" .. keyboard.keys.f1 .. " extra=" .. extra.v .. " gpu=" .. tostring(gpuOk)
+  .. " avail=" .. tostring(component.isAvailable("gpu")) .. " same=" .. tostring(require("text") == text))
+io.write("press: ")
+local name, _, char = event.pull("key_down")
+print("got " .. name .. " " .. string.char(char) .. " held=" .. tostring(keyboard.isKeyDown(string.char(char))))
+local ok, err = pcall(require, "nosuchmodule")
+print("missing=" .. tostring(ok) .. " " .. (tostring(err):match("module 'nosuchmodule' not found") and "nf" or tostring(err)))
+]==],
+}
+-- The vendored OpenOS libraries, installed as /lib on the kernal's disk.
+for _, rel in ipairs({"serialization", "text", "sides", "colors", "keyboard", "transforms",
+    "core/full_keyboard", "core/full_text", "core/full_transforms"}) do
+  kernalFiles["/lib/" .. rel .. ".lua"] = readFile(REPO_ROOT .. "/kernal/lib/" .. rel .. ".lua")
+end
+emu:addFilesystem(kernal, kernalFiles)
 
 local function renderScreen()
   local buf = screenBuffers[0]
@@ -1029,5 +1056,17 @@ typeLine('run return "s32=" .. gmuxapi.get_process(' .. decoId .. ').status')
 emu:advance(2)
 assertScreenContains("s32=killed", "closing the window killed its process, as in gmux")
 print("  OK -- close removes the window and kills its process; touching the console refocuses it")
+
+print("test 33: legacy require -- vendored OpenOS libraries, lazy halves, dynamic names, faces")
+typeLine("libs")
+emu:advance(3)
+assertScreenContains('libs t=1x pad=ab  | top=1 red=14 f1=59 extra=ok gpu=false avail=false same=true',
+  "shipped, lazily loaded, and fetched-on-demand modules all work, component has no primary gpu yet")
+typeLine("q")
+emu:advance(2)
+
+assertScreenContains("got key_down q held=true", "event.pull filters by name; keyboard tracks held keys")
+assertScreenContains("missing=false nf", "a module that doesn't exist fails like OpenOS's require")
+print("  OK -- OpenOS libraries load through require, package.delay, and GETMODULE")
 
 print("ALL OK")

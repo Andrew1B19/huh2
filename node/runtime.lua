@@ -769,18 +769,102 @@ local function newMxeEnv(id, program, restored)
 end
 
 -- A .lua program: the OpenOS environment -- the standard libraries,
--- print/io/os, and nothing muxos-specific (no gmuxapi; parent/child
--- processes are an .mxe concept). The rest of the OpenOS userland
--- (require-able libraries, virtual components) isn't built yet.
+-- print/io/os, checkArg, and OpenOS's `require`; nothing muxos-specific
+-- (no gmuxapi; parent/child processes are an .mxe concept).
+--
+-- `require` works like OpenOS's, with a per-process package.loaded.
+-- Machine-level modules are faces built in here (LEGACY_FACES); every
+-- other module is a file on the kernal's disk (/lib, /usr/lib -- the
+-- vendored OpenOS libraries and whatever else is installed), either
+-- shipped with the program (the ones it requires by a literal name) or
+-- fetched with GETMODULE. See kernal/lib/README.md.
 local EXIT = {}
 
-local function readLine(id)
-  flushOutput(id)
+-- OpenOS's checkArg (a global there, from machine.lua).
+local function checkArg(n, have, ...)
+  have = type(have)
+  for i = 1, select("#", ...) do
+    if have == select(i, ...) then return end
+  end
+  error(string.format("bad argument #%d (%s expected, got %s)", n, table.concat({...}, " or "), have), 3)
+end
+
+-- What the faces report as the process's keyboard and screen (OpenOS
+-- signals carry the component's address).
+local LEGACY_KEYBOARD, LEGACY_SCREEN = "keyboard-legacy", "screen-legacy"
+
+-- A muxos event ({name, ...}) in OpenOS's signal shape.
+local function toSignal(e)
+  local name = e[1]
+  if name == "key_down" or name == "key_up" then
+    return table.pack(name, LEGACY_KEYBOARD, e[2], e[3], "player")
+  elseif name == "touch" or name == "drag" or name == "drop" or name == "scroll" then
+    return table.pack(name, LEGACY_SCREEN, e[2], e[3], e[4], "player")
+  end
+  return table.pack(table.unpack(e, 1, e.n or #e))
+end
+
+-- The next signal for a legacy process (its own pushed ones first), or
+-- nil after `timeout`. Keeps OpenOS's keyboard library's pressed-key
+-- tables current and runs event.listen handlers, as OpenOS does.
+local function legacyPull(ctx, timeout)
+  local sig = table.remove(ctx.pushed, 1)
+  if not sig then
+    local e = gmuxapi.pull_event(timeout)
+    if not e then return nil end
+    sig = toSignal(e)
+  end
+  local kb = ctx.loaded.keyboard
+  if type(kb) == "table" and type(kb.pressedCodes) == "table" then
+    local down = sig[1] == "key_down" or nil
+    if sig[1] == "key_down" or sig[1] == "key_up" then
+      if sig[3] then kb.pressedChars[sig[3]] = down end
+      if sig[4] then kb.pressedCodes[sig[4]] = down end
+    end
+  end
+  local handlers = ctx.listeners[sig[1]]
+  if handlers then
+    for _, handler in ipairs({table.unpack(handlers)}) do
+      local ok, keep = pcall(handler, table.unpack(sig, 1, sig.n))
+      if not ok then
+        writeOutput(ctx.id, "event handler error: " .. tostring(keep) .. "\n")
+      elseif keep == false then
+        for i, h in ipairs(handlers) do
+          if h == handler then table.remove(handlers, i) break end
+        end
+      end
+    end
+  end
+  return sig
+end
+
+-- OpenOS's event filter: the name is a pattern, other arguments must be
+-- equal where given.
+local function signalMatches(sig, filter)
+  local name = filter[1]
+  if name ~= nil and not (type(sig[1]) == "string" and sig[1]:match(name)) then return false end
+  for i = 2, filter.n or #filter do
+    if filter[i] ~= nil and filter[i] ~= sig[i] then return false end
+  end
+  return true
+end
+
+local function pullMatching(ctx, timeout, accept)
+  local deadline = timeout and computer.uptime() + timeout
+  while true do
+    local sig = legacyPull(ctx, deadline and math.max(0, deadline - computer.uptime()))
+    if sig and accept(sig) then return table.unpack(sig, 1, sig.n) end
+    if not sig or (deadline and computer.uptime() >= deadline) then return nil end
+  end
+end
+
+local function legacyReadLine(ctx)
+  flushOutput(ctx.id)
   local line = ""
   while true do
-    local event = gmuxapi.pull_event()
-    if event and event[1] == "key_down" then
-      local char, code = event[2], event[3]
+    local sig = legacyPull(ctx)
+    if sig and sig[1] == "key_down" then
+      local char, code = sig[3], sig[4]
       if code == 28 then
         return line
       elseif code == 14 then
@@ -794,15 +878,140 @@ local function readLine(id)
   end
 end
 
-local function newLegacyEnv(id)
+local hostUnicode = unicode
+
+local function unavailable(name)
+  return setmetatable({}, {__index = function(_, k)
+    error(name .. "." .. tostring(k) .. " isn't available to legacy programs yet", 2)
+  end})
+end
+
+local LEGACY_FACES = {
+  computer = function(ctx)
+    return {
+      uptime = computer.uptime, address = computer.address,
+      freeMemory = computer.freeMemory, totalMemory = computer.totalMemory,
+      energy = computer.energy, maxEnergy = computer.maxEnergy, beep = computer.beep,
+      pullSignal = function(timeout)
+        local sig = legacyPull(ctx, timeout)
+        if sig then return table.unpack(sig, 1, sig.n) end
+      end,
+      pushSignal = function(...)
+        ctx.pushed[#ctx.pushed + 1] = table.pack(...)
+        return true
+      end,
+    }
+  end,
+  event = function(ctx)
+    local event = {}
+    function event.pull(...)
+      local args = table.pack(...)
+      local timeout
+      if type(args[1]) == "number" then
+        timeout = args[1]
+        args = table.pack(table.unpack(args, 2, args.n))
+      end
+      return pullMatching(ctx, timeout, function(sig) return signalMatches(sig, args) end)
+    end
+    function event.pullFiltered(timeout, filter)
+      if type(timeout) == "function" then timeout, filter = nil, timeout end
+      return pullMatching(ctx, timeout, function(sig) return filter(table.unpack(sig, 1, sig.n)) end)
+    end
+    function event.push(...)
+      ctx.pushed[#ctx.pushed + 1] = table.pack(...)
+      return true
+    end
+    function event.listen(name, handler)
+      checkArg(1, name, "string")
+      checkArg(2, handler, "function")
+      local handlers = ctx.listeners[name] or {}
+      ctx.listeners[name] = handlers
+      for _, h in ipairs(handlers) do
+        if h == handler then return false end
+      end
+      handlers[#handlers + 1] = handler
+      return true
+    end
+    function event.ignore(name, handler)
+      for i, h in ipairs(ctx.listeners[name] or {}) do
+        if h == handler then table.remove(ctx.listeners[name], i) return true end
+      end
+      return false
+    end
+    return setmetatable(event, getmetatable(unavailable("event")))
+  end,
+  term = function(ctx)
+    local noop = function() end
+    return {
+      write = function(value) writeOutput(ctx.id, tostring(value)) end,
+      read = function() return legacyReadLine(ctx) .. "\n" end,
+      pull = function(...) return ctx.require("event").pull(...) end,
+      clear = noop, clearLine = noop, setCursor = noop, setCursorBlink = noop,
+      getCursor = function() return 1, 1 end,
+      getCursorBlink = function() return false end,
+      isAvailable = function() return true end,
+    }
+  end,
+  unicode = function()
+    return readOnly(hostUnicode or {}, "unicode")
+  end,
+  process = function(ctx)
+    local info = {path = ctx.path, command = ctx.path, env = {}, data = {}}
+    return setmetatable({
+      info = function() return info end,
+      running = function() return ctx.path end,
+    }, getmetatable(unavailable("process")))
+  end,
+  buffer = function()
+    return unavailable("buffer")
+  end,
+  -- Until legacy virtual components exist there is no primary anything
+  -- (the same error OpenOS gives), so programs that check
+  -- isAvailable() can fall back.
+  component = function()
+    local function none(kind) error("no primary '" .. tostring(kind) .. "' available", 3) end
+    return setmetatable({
+      list = function() return function() end end,
+      isAvailable = function() return false end,
+      getPrimary = none,
+      proxy = function() return nil, "no such component" end,
+      type = function() return nil, "no such component" end,
+      invoke = function() error("no such component", 2) end,
+    }, {__index = function(_, kind) none(kind) end})
+  end,
+  package = function(ctx)
+    return {
+      loaded = ctx.loaded,
+      path = "/lib/?.lua;/usr/lib/?.lua;/lib/?/init.lua;/usr/lib/?/init.lua",
+      -- OpenOS's package.delay: the rest of `lib` is loaded from `file`
+      -- the first time something missing is looked up in it.
+      delay = function(lib, file)
+        local mt = {}
+        function mt.__index(tbl, key)
+          mt.__index = nil
+          ctx.env.dofile(file)
+          return tbl[key]
+        end
+        if lib.internal then setmetatable(lib.internal, mt) end
+        setmetatable(lib, mt)
+      end,
+    }
+  end,
+}
+
+local function newLegacyEnv(id, program)
   local env = {}
   for _, k in ipairs({"assert", "error", "ipairs", "next", "pairs", "pcall", "rawequal", "rawget",
       "rawlen", "rawset", "select", "setmetatable", "getmetatable", "tonumber", "tostring", "type", "xpcall"}) do
     env[k] = _ENV[k]
   end
   for _, lib in ipairs({"string", "table", "math", "utf8", "coroutine"}) do env[lib] = NATIVE[lib] end
+  env.checkArg = checkArg
   env.computer = NATIVE.computer
   env.print = printTo(id)
+  local loaded = {}
+  local ctx = {id = id, env = env, loaded = loaded, pushed = {}, listeners = {},
+    path = program and program.path}
   local function write(...)
     for i = 1, select("#", ...) do writeOutput(id, tostring((select(i, ...)))) end
   end
@@ -810,7 +1019,7 @@ local function newLegacyEnv(id)
   env.io = {
     write = write,
     read = function(format)
-      local line = readLine(id)
+      local line = legacyReadLine(ctx)
       if format == "n" or format == "*n" then return tonumber(line) end
       if format == "L" or format == "*L" then return line .. "\n" end
       return line
@@ -818,17 +1027,63 @@ local function newLegacyEnv(id)
     stdout = stream,
     stderr = stream,
   }
+  local hostOs = _ENV.os or {}
   env.os = {
     sleep = sleep,
     clock = computer.uptime,
-    time = function() return math.floor(computer.uptime()) end,
+    time = hostOs.time or function() return math.floor(computer.uptime()) end,
+    date = hostOs.date,
+    difftime = hostOs.difftime,
+    getenv = function() return nil end,
     exit = function() error(EXIT, 0) end,
   }
-  env.require = function(name)
-    error("module '" .. tostring(name) .. "' not found: muxos doesn't provide the OpenOS libraries yet", 2)
-  end
   env._G = env
   env.load = function(chunk, name, mode, e) return load(chunk, name, mode, e or env) end
+  for _, k in ipairs({"_G", "string", "table", "math", "utf8", "coroutine", "io", "os"}) do
+    loaded[k] = env[k]
+  end
+
+  local shipped = program and program.modules or {}
+  -- Source for a module name or a /lib path: shipped, else asked for.
+  local function moduleSource(name)
+    if shipped[name] then return shipped[name], name end
+    local reply, err = remoteRequest("GETMODULE", {name = name, caller = id})
+    if not reply then return nil, err end
+    return reply.source, reply.path
+  end
+  local loading = {}
+  function ctx.require(name)
+    checkArg(1, name, "string")
+    local value = loaded[name]
+    if value ~= nil then return value end
+    if loading[name] then error("module '" .. name .. "' is required while it's being loaded", 2) end
+    if LEGACY_FACES[name] then
+      value = LEGACY_FACES[name](ctx)
+    else
+      local source, pathOrErr = moduleSource(name)
+      if not source then error("module '" .. name .. "' not found:\n\t" .. tostring(pathOrErr), 2) end
+      local chunk, err = load(source, "=" .. tostring(pathOrErr), "t", env)
+      if not chunk then error(err, 2) end
+      loading[name] = true
+      local ok, result = pcall(chunk, name)
+      loading[name] = nil
+      if not ok then error(result, 0) end
+      value = result
+      if value == nil then value = loaded[name] end
+      if value == nil then value = true end
+    end
+    loaded[name] = value
+    return value
+  end
+  env.require = ctx.require
+  -- Only modules (files under /lib or /usr/lib on the kernal's disk).
+  env.dofile = function(path)
+    local source, pathOrErr = moduleSource(path)
+    if not source then error("cannot open " .. tostring(path) .. ": " .. tostring(pathOrErr), 2) end
+    local chunk, err = load(source, "=" .. tostring(pathOrErr), "t", env)
+    if not chunk then error(err, 2) end
+    return chunk()
+  end
   return env
 end
 
@@ -872,7 +1127,7 @@ local function handleMessage(from, msg)
       if program.kind == "mxe" then
         env, loadLibraries = newMxeEnv(msg.id, program, msg.restore)
       else
-        env = newLegacyEnv(msg.id)
+        env = newLegacyEnv(msg.id, program)
       end
       chunk, loadErr = load(msg.code, "=" .. tostring(program.path), "t", env)
       if chunk then

@@ -733,6 +733,76 @@ local function sameVersion(a, b)
   return true
 end
 
+-- --- Legacy (OpenOS) libraries ---
+--
+-- A legacy program's `require` finds modules the OpenOS way, on
+-- LEGACY_PACKAGE_PATH on the kernal's disk -- the vendored OpenOS
+-- libraries in kernal/lib, plus whatever else is installed there.
+-- Expanding the legacy userland is dropping files into /lib. The
+-- modules a program requires by a literal name (and theirs, in turn)
+-- are shipped with it, so the common case costs no round trips; any
+-- other require (a computed name, package.delay's lazy halves) is a
+-- GETMODULE request. Machine-level modules are faces built into the
+-- worker runtime and never looked up here.
+local LEGACY_PACKAGE_PATH = {"/lib/?.lua", "/usr/lib/?.lua", "/lib/?/init.lua", "/usr/lib/?/init.lua"}
+local LEGACY_FACES = {component = true, computer = true, event = true, term = true, unicode = true,
+  process = true, buffer = true, package = true}
+local MAX_PREFETCH = 32
+local moduleCache = {} -- path -> {source, modified}
+
+-- Re-reads a module only when the file changed.
+local function readModuleFile(path)
+  local modified = tryInvoke(fsAddr, "lastModified", path)
+  local cached = moduleCache[path]
+  if cached and modified and cached.modified == modified then return cached.source end
+  local source = readFile(path)
+  if source then moduleCache[path] = {source = source, modified = modified} end
+  return source
+end
+
+-- A module name (dots for directories), or an absolute path under
+-- /lib or /usr/lib (package.delay and dofile use paths), to its file.
+local function resolveModule(name)
+  if type(name) ~= "string" or name == "" or name:find("..", 1, true) then return nil end
+  if name:sub(1, 1) == "/" then
+    if (name:sub(1, 5) == "/lib/" or name:sub(1, 9) == "/usr/lib/") and fileExists(name) then return name end
+    return nil
+  end
+  if not name:match("^[%w_%.%-]+$") then return nil end
+  local rel = name:gsub("%.", "/")
+  for _, pattern in ipairs(LEGACY_PACKAGE_PATH) do
+    local path = pattern:gsub("%?", rel)
+    if fileExists(path) then return path end
+  end
+end
+
+local function literalRequires(source, into)
+  for name in source:gmatch("require%s*%(?%s*[\"']([^\"']+)[\"']") do into[#into + 1] = name end
+end
+
+-- name -> source for every module `source` requires by a literal name,
+-- transitively (at most MAX_PREFETCH of them).
+local function prefetchModules(source)
+  local modules, seen, queue = {}, {}, {}
+  literalRequires(source, queue)
+  local i, count = 1, 0
+  while i <= #queue and count < MAX_PREFETCH do
+    local name = queue[i]
+    i = i + 1
+    if not LEGACY_FACES[name] and not seen[name] then
+      seen[name] = true
+      local path = resolveModule(name)
+      local moduleSource = path and readModuleFile(path)
+      if moduleSource then
+        modules[name] = moduleSource
+        count = count + 1
+        literalRequires(moduleSource, queue)
+      end
+    end
+  end
+  return modules
+end
+
 local function launchProgram(path, args, parent)
   local source, err = readFile(path)
   if not source then return nil, "can't read " .. path .. ": " .. tostring(err) end
@@ -754,6 +824,8 @@ local function launchProgram(path, args, parent)
       end
     end
     program.launch, program.libs = response, libs
+  else
+    program.modules = prefetchModules(source)
   end
   local appName = path:match("([^/]+)%.%w+$")
   return dispatchJob(source, args, nil, parent, appName, nil, program)
@@ -1275,6 +1347,23 @@ local function handleLaunch(msg)
   send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = reply})
 end
 
+-- A legacy process's require/dofile asking for a module it wasn't
+-- shipped with.
+local function handleGetModule(msg)
+  if not callerJob(msg) then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "not called from a running process"})
+    return
+  end
+  local path = resolveModule(msg.name)
+  local source = path and readModuleFile(path)
+  if source then
+    send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {path = path, source = source}})
+  else
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+      error = "module '" .. tostring(msg.name) .. "' not found"})
+  end
+end
+
 local function handleGetOrphans(msg)
   local list, keep = {}, {}
   for _, id in ipairs(appsByName[msg.appName] or {}) do
@@ -1429,6 +1518,8 @@ local function handleModemMessage(from, port, data)
     handleMigrateFailed(msg)
   elseif msg.type == "MIGRATABLE" then
     handleMigratable(msg)
+  elseif msg.type == "GETMODULE" then
+    handleGetModule(msg)
   elseif msg.type == "LAUNCH" then
     handleLaunch(msg)
   elseif msg.type == "CREATEWINDOW" then
