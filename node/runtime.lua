@@ -312,6 +312,9 @@ end
 -- output is flushed; `force` before the process blocks, otherwise it's
 -- rate-limited.
 local graphicsFlushers = {}
+-- id -> function(ok, result), run when the job ends (a legacy program
+-- writes its error into its own window).
+local jobEndHooks = {}
 
 local function flushOutput(id, force)
   local buf = outputBuffers[id]
@@ -880,26 +883,6 @@ local function pullMatching(ctx, timeout, accept)
   end
 end
 
-local function legacyReadLine(ctx)
-  flushOutput(ctx.id, true)
-  local line = ""
-  while true do
-    local sig = legacyPull(ctx)
-    if sig and sig[1] == "key_down" then
-      local char, code = sig[3], sig[4]
-      if code == 28 then
-        return line
-      elseif code == 14 then
-        local len = utf8.len(line)
-        if len and len > 0 then line = line:sub(1, utf8.offset(line, -1) - 1) end
-      elseif char and char >= 32 then
-        local ok, ch = pcall(utf8.char, char)
-        if ok then line = line .. ch end
-      end
-    end
-  end
-end
-
 local hostUnicode = unicode
 
 -- --- Legacy virtual components, forked from gmux ---
@@ -1232,7 +1215,320 @@ local function virtualDevices(ctx)
   }
   local keyboard = {type = "keyboard", address = VKEYBOARD_ADDRESS}
   ctx.devices = {[VGPU_ADDRESS] = v.proxy, [VSCREEN_ADDRESS] = screen, [VKEYBOARD_ADDRESS] = keyboard}
+  -- The kernal's disk, the OS filesystem (see "Legacy filesystem").
+  if ctx.fsAddress then
+    local fsProxy = {type = "filesystem", address = ctx.fsAddress}
+    for _, op in ipairs({"exists", "isDirectory", "size", "lastModified", "list", "makeDirectory", "remove",
+        "rename", "spaceUsed", "spaceTotal", "isReadOnly", "getLabel", "open", "read", "write", "seek", "close"}) do
+      fsProxy[op] = function(...) return ctx.fsCall(op, ...) end
+    end
+    ctx.devices[ctx.fsAddress] = fsProxy
+  end
   return ctx.devices
+end
+
+-- A legacy program's terminal, drawn on its virtual gpu like gmux's tty:
+-- print/io.write/term output wraps and scrolls in its own window, and
+-- io.read/term.read echo there.
+local function newTerminal(ctx)
+  local t = {x = 1, y = 1}
+  local function gpu() return virtualDevices(ctx)[VGPU_ADDRESS] end
+  local function newline()
+    local g = gpu()
+    local w, h = g.getResolution()
+    t.x = 1
+    if t.y < h then
+      t.y = t.y + 1
+    else
+      g.copy(1, 2, w, h - 1, 0, -1)
+      g.fill(1, h, w, 1, " ")
+    end
+  end
+  function t.write(value)
+    local g = gpu()
+    local w, h = g.getResolution()
+    t.y = math.min(t.y, h)
+    for piece, ctl in tostring(value):gmatch("([^\n\r\t]*)([\n\r\t]?)") do
+      local chars = splitChars(piece)
+      local i = 1
+      while i <= #chars do
+        if t.x > w then newline() end
+        local n = math.min(#chars - i + 1, w - t.x + 1)
+        g.set(t.x, t.y, table.concat(chars, "", i, i + n - 1))
+        t.x, i = t.x + n, i + n
+      end
+      if ctl == "\n" then
+        newline()
+      elseif ctl == "\r" then
+        t.x = 1
+      elseif ctl == "\t" then
+        t.write(string.rep(" ", 8 - (t.x - 1) % 8))
+      end
+    end
+  end
+  function t.clear()
+    local g = gpu()
+    local w, h = g.getResolution()
+    g.fill(1, 1, w, h, " ")
+    t.x, t.y = 1, 1
+  end
+  function t.clearLine()
+    local g = gpu()
+    g.fill(1, t.y, (g.getResolution()), 1, " ")
+    t.x = 1
+  end
+  -- Draws (or erases) the input cursor at the current position.
+  function t.cursor(on)
+    local g = gpu()
+    local w, h = g.getResolution()
+    if t.x <= w and t.y <= h then g.set(t.x, t.y, on and "_" or " ") end
+  end
+  function t.back()
+    if t.x > 1 then
+      t.x = t.x - 1
+    elseif t.y > 1 then
+      t.x, t.y = (gpu().getResolution()), t.y - 1
+    end
+    t.cursor(false)
+  end
+  return t
+end
+
+-- One line of keyboard input, echoed in the program's window.
+local function legacyReadLine(ctx)
+  local term = ctx.term
+  local chars = {}
+  term.cursor(true)
+  while true do
+    local sig = legacyPull(ctx)
+    if sig and sig[1] == "key_down" then
+      local char, code = sig[3], sig[4]
+      if code == 28 then
+        term.cursor(false)
+        term.write("\n")
+        return table.concat(chars)
+      elseif code == 14 then
+        if #chars > 0 then
+          chars[#chars] = nil
+          term.cursor(false)
+          term.back()
+          term.cursor(true)
+        end
+      elseif char and char >= 32 then
+        local ok, ch = pcall(utf8.char, char)
+        if ok then
+          chars[#chars + 1] = ch
+          term.write(ch)
+          term.cursor(true)
+        end
+      end
+    end
+  end
+end
+
+-- --- Legacy filesystem ---
+--
+-- Like a gmux app, a legacy program uses the OS's own filesystem: the
+-- kernal's disk, through FS requests (kernal/muxos.lua's handleFs). The
+-- `filesystem` face is OpenOS's API (paths are from the root);
+-- io.open/io.lines/loadfile/dofile resolve relative paths against PWD,
+-- as OpenOS's shell does. Files are buffered here: reads fetch
+-- FS_READ_CHUNK at a time, writes go out past FS_WRITE_CHUNK or on
+-- flush/seek/close.
+local FS_READ_CHUNK = 16384
+local FS_WRITE_CHUNK = 4096
+
+local function pathSegments(path)
+  local parts = {}
+  for part in path:gmatch("[^/\\]+") do
+    if part == ".." then
+      parts[#parts] = nil
+    elseif part ~= "." then
+      parts[#parts + 1] = part
+    end
+  end
+  return parts
+end
+
+local function rootPath(path)
+  return "/" .. table.concat(pathSegments(path), "/")
+end
+
+local function newFileStream(ctx, handle)
+  local f = {}
+  local rbuf, wbuf, wsize, closed = "", {}, 0, false
+  local function flushWrites()
+    if wsize > 0 then
+      local data = table.concat(wbuf)
+      wbuf, wsize = {}, 0
+      return ctx.fsCall("write", handle, data)
+    end
+    return true
+  end
+  local function fill()
+    local data = ctx.fsCall("read", handle, FS_READ_CHUNK)
+    if type(data) ~= "string" then return false end
+    rbuf = rbuf .. data
+    return true
+  end
+  local function readLine(keep)
+    while true do
+      local i = rbuf:find("\n", 1, true)
+      if i then
+        local line = rbuf:sub(1, keep and i or i - 1)
+        rbuf = rbuf:sub(i + 1)
+        return line
+      end
+      if not fill() then
+        if rbuf == "" then return nil end
+        local line = rbuf
+        rbuf = ""
+        return line
+      end
+    end
+  end
+  local function readOne(fmt)
+    if type(fmt) == "number" then
+      while #rbuf < fmt and fill() do end
+      if rbuf == "" and fmt > 0 then return nil end
+      local data = rbuf:sub(1, fmt)
+      rbuf = rbuf:sub(fmt + 1)
+      return data
+    end
+    fmt = tostring(fmt):gsub("^%*", ""):sub(1, 1)
+    if fmt == "a" then
+      while fill() do end
+      local data = rbuf
+      rbuf = ""
+      return data
+    elseif fmt == "n" then
+      while not rbuf:find("%S%s") and fill() do end
+      local num, rest = rbuf:match("^%s*(%S+)(.*)$")
+      rbuf = rest or ""
+      return tonumber(num)
+    end
+    return readLine(fmt == "L")
+  end
+  function f:read(...)
+    if closed then return nil, "file is closed" end
+    local n = select("#", ...)
+    if n == 0 then return readOne("l") end
+    local out = {}
+    for i = 1, n do
+      out[i] = readOne((select(i, ...)))
+      if out[i] == nil then return table.unpack(out, 1, i) end
+    end
+    return table.unpack(out, 1, n)
+  end
+  function f:lines(fmt)
+    return function() return f:read(fmt or "l") end
+  end
+  function f:write(...)
+    if closed then return nil, "file is closed" end
+    for i = 1, select("#", ...) do
+      local data = tostring((select(i, ...)))
+      wbuf[#wbuf + 1] = data
+      wsize = wsize + #data
+    end
+    if wsize >= FS_WRITE_CHUNK then
+      local ok, err = flushWrites()
+      if not ok then return nil, err end
+    end
+    return self
+  end
+  function f:flush()
+    flushWrites()
+    return self
+  end
+  function f:seek(whence, offset)
+    flushWrites()
+    whence, offset = whence or "cur", offset or 0
+    if whence == "cur" then offset = offset - #rbuf end
+    rbuf = ""
+    return ctx.fsCall("seek", handle, whence, offset)
+  end
+  function f:close()
+    if closed then return nil, "file is closed" end
+    flushWrites()
+    closed = true
+    return ctx.fsCall("close", handle)
+  end
+  function f:setvbuf() return true end
+  return f
+end
+
+-- Opens `path` (already resolved) as a buffered stream.
+local function openFile(ctx, path, mode)
+  mode = (mode or "r"):gsub("[b+]", "")
+  local handle, err = ctx.fsCall("open", path, mode)
+  if not handle then return nil, err or (path .. ": no such file or directory") end
+  return newFileStream(ctx, handle)
+end
+
+local function newFilesystemFace(ctx)
+  local fs = {}
+  local call = ctx.fsCall
+  function fs.canonical(path)
+    local result = table.concat(pathSegments(path), "/")
+    return path:sub(1, 1) == "/" and "/" .. result or result
+  end
+  function fs.concat(...) return fs.canonical(table.concat({...}, "/")) end
+  function fs.segments(path) return pathSegments(path) end
+  function fs.path(path)
+    local parts = pathSegments(path)
+    local result = table.concat(parts, "/", 1, #parts - 1) .. "/"
+    return path:sub(1, 1) == "/" and "/" .. result or result
+  end
+  function fs.name(path)
+    local parts = pathSegments(path)
+    return parts[#parts]
+  end
+  function fs.realPath(path) return rootPath(path) end
+  function fs.exists(path) return call("exists", rootPath(path)) == true end
+  function fs.isDirectory(path) return call("isDirectory", rootPath(path)) == true end
+  function fs.size(path) return call("size", rootPath(path)) or 0 end
+  function fs.lastModified(path) return call("lastModified", rootPath(path)) or 0 end
+  function fs.makeDirectory(path) return call("makeDirectory", rootPath(path)) end
+  function fs.remove(path) return call("remove", rootPath(path)) end
+  function fs.rename(from, to) return call("rename", rootPath(from), rootPath(to)) end
+  function fs.isLink() return false end
+  function fs.list(path)
+    local names, err = call("list", rootPath(path))
+    if type(names) ~= "table" then return nil, err or "no such file or directory" end
+    local sorted = {}
+    for i = 1, names.n or #names do sorted[#sorted + 1] = names[i] end
+    table.sort(sorted)
+    local i = 0
+    return function()
+      i = i + 1
+      return sorted[i]
+    end
+  end
+  function fs.open(path, mode) return openFile(ctx, rootPath(path), mode) end
+  function fs.copy(from, to)
+    local src, err = fs.open(from, "rb")
+    if not src then return nil, err end
+    local dst, err2 = fs.open(to, "wb")
+    if not dst then src:close() return nil, err2 end
+    dst:write(src:read("a") or "")
+    src:close()
+    dst:close()
+    return true
+  end
+  function fs.get(path)
+    return virtualDevices(ctx)[ctx.fsAddress], "/"
+  end
+  function fs.mounts()
+    local done = false
+    return function()
+      if done then return nil end
+      done = true
+      return virtualDevices(ctx)[ctx.fsAddress], "/"
+    end
+  end
+  function fs.isAutorunEnabled() return false end
+  function fs.setAutorunEnabled() end
+  return fs
 end
 
 local function unavailable(name)
@@ -1296,16 +1592,29 @@ local LEGACY_FACES = {
     return setmetatable(event, getmetatable(unavailable("event")))
   end,
   term = function(ctx)
-    local noop = function() end
+    local t = ctx.term
+    local blink = true
     return {
-      write = function(value) writeOutput(ctx.id, tostring(value)) end,
+      write = function(value) t.write(value) end,
       read = function() return legacyReadLine(ctx) .. "\n" end,
       pull = function(...) return ctx.require("event").pull(...) end,
-      clear = noop, clearLine = noop, setCursor = noop, setCursorBlink = noop,
-      getCursor = function() return 1, 1 end,
-      getCursorBlink = function() return false end,
+      clear = t.clear, clearLine = t.clearLine,
+      getCursor = function() return t.x, t.y end,
+      setCursor = function(x, y) t.x, t.y = math.floor(x), math.floor(y) end,
+      getCursorBlink = function() return blink end,
+      setCursorBlink = function(b) blink = b end,
+      getViewport = function()
+        local w, h = virtualDevices(ctx)[VGPU_ADDRESS].getResolution()
+        return w, h, 0, 0, t.x, t.y
+      end,
+      gpu = function() return virtualDevices(ctx)[VGPU_ADDRESS] end,
+      screen = function() return VSCREEN_ADDRESS end,
+      keyboard = function() return VKEYBOARD_ADDRESS end,
       isAvailable = function() return true end,
     }
+  end,
+  filesystem = function(ctx)
+    return newFilesystemFace(ctx)
   end,
   unicode = function()
     return readOnly(hostUnicode or {}, "unicode")
@@ -1414,25 +1723,84 @@ local function newLegacyEnv(id, program)
   for _, lib in ipairs({"string", "table", "math", "utf8", "coroutine"}) do env[lib] = NATIVE[lib] end
   env.checkArg = checkArg
   env.computer = NATIVE.computer
-  env.print = printTo(id)
   local loaded = {}
   local path = program and program.path
   local ctx = {id = id, env = env, loaded = loaded, pushed = {}, listeners = {}, path = path,
-    name = path and path:match("([^/]+)$") or "legacy", screenSize = program and program.screen}
-  local function write(...)
-    for i = 1, select("#", ...) do writeOutput(id, tostring((select(i, ...)))) end
+    name = path and path:match("([^/]+)$") or "legacy", screenSize = program and program.screen,
+    fsAddress = program and program.fsAddress,
+    osEnv = {PWD = "/", HOME = "/home", PATH = "/bin:/usr/bin:/home/bin:.", TERM = "term", SHELL = "/bin/sh"}}
+  function ctx.fsCall(op, ...)
+    local result, err = remoteRequest("FS", {op = op, args = table.pack(...), caller = id})
+    if not result then return nil, err end
+    return table.unpack(result, 1, result.n or #result)
   end
-  local stream = {write = function(self, ...) write(...) return self end}
+  -- Like gmux, the program's window (its terminal) exists from the
+  -- start: it appears at the first flush even if nothing is printed.
+  local devices = virtualDevices(ctx)
+  local term = newTerminal(ctx)
+  ctx.term = term
+  term.clear()
+  local vgpu = devices[VGPU_ADDRESS]
+  local function errorWrite(text)
+    local old = vgpu.setForeground(0xFF0000)
+    term.write(text)
+    vgpu.setForeground(old)
+  end
+  jobEndHooks[id] = function(ok, result)
+    if not ok and result ~= EXIT and result ~= KILLED then errorWrite(tostring(result) .. "\n") end
+  end
+  env.print = function(...)
+    local n = select("#", ...)
+    local parts = {}
+    for i = 1, n do parts[i] = tostring((select(i, ...))) end
+    term.write(table.concat(parts, "\t") .. "\n")
+  end
+  local function resolve(p)
+    p = tostring(p)
+    if p:sub(1, 1) ~= "/" then p = (ctx.osEnv.PWD or "/") .. "/" .. p end
+    return rootPath(p)
+  end
+  local function write(...)
+    for i = 1, select("#", ...) do term.write(tostring((select(i, ...)))) end
+  end
+  local stdout = {write = function(self, ...) write(...) return self end, flush = function(self) return self end,
+    setvbuf = function() return true end}
+  local stderr = {write = function(self, ...)
+    for i = 1, select("#", ...) do errorWrite(tostring((select(i, ...)))) end
+    return self
+  end, flush = function(self) return self end, setvbuf = function() return true end}
+  local function readTerminal(format)
+    local line = legacyReadLine(ctx)
+    if format == "n" or format == "*n" then return tonumber(line) end
+    if format == "L" or format == "*L" then return line .. "\n" end
+    return line
+  end
+  local stdin = {read = function(self, format) return readTerminal(format) end,
+    lines = function(self) return function() return readTerminal("l") end end, close = function() return true end}
   env.io = {
     write = write,
-    read = function(format)
-      local line = legacyReadLine(ctx)
-      if format == "n" or format == "*n" then return tonumber(line) end
-      if format == "L" or format == "*L" then return line .. "\n" end
-      return line
+    read = readTerminal,
+    stdin = stdin,
+    stdout = stdout,
+    stderr = stderr,
+    open = function(p, mode) return openFile(ctx, resolve(p), mode) end,
+    lines = function(p, fmt)
+      if p == nil then return stdin:lines() end
+      local f, err = openFile(ctx, resolve(p), "r")
+      if not f then error(err, 2) end
+      return function()
+        local value = f:read(fmt or "l")
+        if value == nil then f:close() end
+        return value
+      end
     end,
-    stdout = stream,
-    stderr = stream,
+    input = function() return stdin end,
+    output = function() return stdout end,
+    type = function(v)
+      if v == stdin or v == stdout or v == stderr then return "file" end
+      if type(v) == "table" and v.read and v.close then return "file" end
+      return nil
+    end,
   }
   local hostOs = _ENV.os or {}
   env.os = {
@@ -1441,7 +1809,14 @@ local function newLegacyEnv(id, program)
     time = hostOs.time or function() return math.floor(computer.uptime()) end,
     date = hostOs.date,
     difftime = hostOs.difftime,
-    getenv = function() return nil end,
+    getenv = function(k)
+      if k == nil then return ctx.osEnv end
+      return ctx.osEnv[k]
+    end,
+    setenv = function(k, v) ctx.osEnv[k] = v ~= nil and tostring(v) or nil return v end,
+    remove = function(p) return ctx.fsCall("remove", resolve(p)) end,
+    rename = function(a, b) return ctx.fsCall("rename", resolve(a), resolve(b)) end,
+    tmpname = function() return "/tmp/" .. id .. "-" .. math.floor(computer.uptime() * 1000) end,
     exit = function() error(EXIT, 0) end,
   }
   env._G = env
@@ -1483,11 +1858,16 @@ local function newLegacyEnv(id, program)
     return value
   end
   env.require = ctx.require
-  -- Only modules (files under /lib or /usr/lib on the kernal's disk).
-  env.dofile = function(path)
-    local source, pathOrErr = moduleSource(path)
-    if not source then error("cannot open " .. tostring(path) .. ": " .. tostring(pathOrErr), 2) end
-    local chunk, err = load(source, "=" .. tostring(pathOrErr), "t", env)
+  env.loadfile = function(p, mode, e)
+    local resolved = resolve(p)
+    local f, err = openFile(ctx, resolved, "r")
+    if not f then return nil, err end
+    local source = f:read("a")
+    f:close()
+    return load(source or "", "=" .. resolved, mode or "t", e or env)
+  end
+  env.dofile = function(p)
+    local chunk, err = env.loadfile(p)
     if not chunk then error(err, 2) end
     return chunk()
   end
@@ -1555,6 +1935,9 @@ local function handleMessage(from, msg)
     end
     currentJobId = msg.id
     local ok, result, migratedState = runJobCode(entry, msg.args, msg.id)
+    local endHook = jobEndHooks[msg.id]
+    jobEndHooks[msg.id] = nil
+    if endHook then pcall(endHook, ok, result) end
     currentJobId = nil
     flushOutput(msg.id, true)
     graphicsFlushers[msg.id] = nil

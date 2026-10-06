@@ -752,7 +752,7 @@ end
 -- worker runtime and never looked up here.
 local LEGACY_PACKAGE_PATH = {"/lib/?.lua", "/usr/lib/?.lua", "/lib/?/init.lua", "/usr/lib/?/init.lua"}
 local LEGACY_FACES = {component = true, computer = true, event = true, term = true, unicode = true,
-  process = true, buffer = true, package = true}
+  process = true, buffer = true, package = true, filesystem = true}
 local MAX_PREFETCH = 32
 local moduleCache = {} -- path -> {source, modified}
 
@@ -834,6 +834,7 @@ local function launchProgram(path, args, parent)
     program.modules = prefetchModules(source)
     -- Sizes the default resolution of its virtual gpu.
     program.screen = {termW, termH}
+    program.fsAddress = fsAddr
   end
   local appName = path:match("([^/]+)%.%w+$")
   return dispatchJob(source, args, nil, parent, appName, nil, program)
@@ -959,8 +960,12 @@ end
 
 -- Records a job as no longer running ("done", "error", or "lost"),
 -- applies its children's orphan policies, and trims history.
+-- Defined with the FS handler below.
+local closeJobFiles
+
 local function finishJob(id, status, result, err)
   local job = jobs[id]
+  closeJobFiles(id)
   runningJobs[id] = nil
   runningCount = runningCount - 1
   local node = nodes[job.node]
@@ -1372,6 +1377,75 @@ local function handleGetModule(msg)
   end
 end
 
+-- A legacy process's filesystem access: the kernal's disk, like the
+-- OS's own filesystem is for a gmux app. `op` is a filesystem component
+-- method; `args` its arguments. Open handles get small numbers of our
+-- own (the real ones may not cross the wire) and belong to the process
+-- that opened them, closed when it ends. A read returns up to `count`
+-- bytes (capped), looping over the disk's per-call limit here so the
+-- process pays one round trip, not one per 2 KB.
+local FS_OPS = {exists = true, isDirectory = true, size = true, lastModified = true, list = true,
+  makeDirectory = true, remove = true, rename = true, spaceUsed = true, spaceTotal = true,
+  isReadOnly = true, getLabel = true, open = true, read = true, write = true, seek = true, close = true}
+local FS_READ_MAX = 65536
+local fsHandles = {} -- our handle -> {real = handle, job = id}
+local nextFsHandle = 1
+
+closeJobFiles = function(jobId)
+  for n, h in pairs(fsHandles) do
+    if h.job == jobId then
+      tryInvoke(fsAddr, "close", h.real)
+      fsHandles[n] = nil
+    end
+  end
+end
+
+local function handleFs(msg)
+  local caller = callerJob(msg)
+  local function fail(err)
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = tostring(err)})
+  end
+  if not caller then return fail("not called from a running process") end
+  local op, args = msg.op, type(msg.args) == "table" and msg.args or {n = 0}
+  if not FS_OPS[op] then return fail("no such method: " .. tostring(op)) end
+  local h
+  if op == "read" or op == "write" or op == "seek" or op == "close" then
+    h = fsHandles[args[1]]
+    if not h or h.job ~= caller.id then return fail("bad file descriptor") end
+  end
+  local result
+  if op == "read" then
+    local want = math.min(tonumber(args[2]) or FS_READ_MAX, FS_READ_MAX)
+    local parts, got = {}, 0
+    while got < want do
+      local ok, data, err = pcall(component.invoke, fsAddr, "read", h.real, want - got)
+      if not ok then return fail(data) end
+      if data == nil then
+        if err then return fail(err) end
+        break
+      end
+      parts[#parts + 1] = data
+      got = got + #data
+    end
+    result = {n = 1, got > 0 and table.concat(parts) or nil}
+  else
+    local callArgs = {table.unpack(args, 1, args.n or #args)}
+    if h then callArgs[1] = h.real end
+    result = table.pack(pcall(component.invoke, fsAddr, op, table.unpack(callArgs, 1, args.n or #args)))
+    if not result[1] then return fail(result[2]) end
+    table.remove(result, 1)
+    result.n = result.n - 1
+    if op == "open" and result[1] ~= nil then
+      fsHandles[nextFsHandle] = {real = result[1], job = caller.id}
+      result[1] = nextFsHandle
+      nextFsHandle = nextFsHandle + 1
+    elseif op == "close" then
+      fsHandles[args[1]] = nil
+    end
+  end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = result})
+end
+
 local function handleGetOrphans(msg)
   local list, keep = {}, {}
   for _, id in ipairs(appsByName[msg.appName] or {}) do
@@ -1534,6 +1608,8 @@ local function handleModemMessage(from, port, data)
     handleMigrateFailed(msg)
   elseif msg.type == "MIGRATABLE" then
     handleMigratable(msg)
+  elseif msg.type == "FS" then
+    handleFs(msg)
   elseif msg.type == "GETMODULE" then
     handleGetModule(msg)
   elseif msg.type == "LAUNCH" then
@@ -2250,7 +2326,9 @@ runCommand = function(line)
     local id, addrOrErr = launchProgram(path, {table.unpack(words, 2)})
     if not id then
       print("error: " .. addrOrErr)
-    elseif background then
+    elseif background or path:match("%.lua$") then
+      -- A legacy program has its own window (its terminal), as in
+      -- gmux, so the console doesn't wait for it.
       print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
     else
       runForeground(id)

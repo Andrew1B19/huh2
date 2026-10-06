@@ -196,6 +196,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `EVENT`   | `from`, `to`, `jobId`, `event`                                | kernal  | an input event for a process on that node, read with `gmuxapi.pull_event` |
 | `OUTPUT`  | `from`, `to`, `jobId`, `text`                                 | worker  | a process's printed output, for the console |
 | `LAUNCH`  | `from`, `to`, `id`, `path`, `args`, `caller`                  | worker  | launch a program as the caller's child (`gmuxapi.launch`) |
+| `FS`      | `from`, `to`, `id`, `op`, `args`, `caller`                    | worker  | a legacy process's filesystem call on the kernal's disk (`op` = a filesystem component method); handles are the kernal's own, per process |
 | `GETMODULE` | `from`, `to`, `id`, `name`, `caller`                        | worker  | a legacy process's `require`/`dofile` for a module it wasn't shipped with: a module name or a `/lib`/`/usr/lib` path; replies `{path, source}` |
 | `KILL`/`PAUSE`/`RESUME`/`MIGRATE <id> <node>` | raw, unchunked           | kernal  | process control broadcasts, acted on at the process's yield points; only the worker named by `<node>` records one, so a job id reused on another node (after a migration) isn't hit by a stale control |
 | `MIGRATABLE` | `from`, `to`, `jobId`                                  | worker  | an `.mxe` called `mux.migratable(save)`: the kernal may now move it |
@@ -476,19 +477,29 @@ gated on it.
 Works like OpenOS's shell: a name typed at the console that isn't a
 built-in command is looked up on `/bin` then `/usr/bin` (`.mxe` before
 `.lua`), or a path is used as given; the rest of the line is its
-arguments, passed as `...`. It runs in the foreground -- the console
-waits until it ends and feeds it typed input, echoing it like a
+arguments, passed as `...`. An `.mxe` runs in the foreground -- the
+console waits until it ends and feeds it typed input, echoing it like a
 terminal -- unless the line ends with `&`, which runs it in the
-background. A process can launch a program too, with
+background. A `.lua` program has its own window (its terminal, as in
+gmux), so the console never waits for it. A process can launch a program too, with
 `gmuxapi.launch(nameOrPath, args)`, and becomes its parent. Either way,
 the scheduler places it.
 
-- **`.lua`** runs in the OpenOS environment: the standard libraries,
-  `print`, `io.write`/`io.read` (console output and input), `os`
-  (`sleep`, `clock`, `time`, `date`, `getenv`, `exit`), `checkArg`, and
-  OpenOS's `require` (see "Legacy libraries" below), and nothing
-  muxos-specific (no `gmuxapi`). Its `component` is gmux-style virtual
-  components (see "Legacy virtual components").
+- **`.lua`** runs in the OpenOS environment, gmux-style: its own
+  window is its terminal, so `print`, `io.write`/`io.read`, `io.stderr`
+  (red) and `term` write and read there, wrapping and scrolling, and an
+  uncaught error is written there in red (the title gets ❌). The window
+  exists from the start, as in gmux; it appears at the process's first
+  flush, even if nothing is printed. It also gets:
+  - `io.open`/`io.lines`, `loadfile`/`dofile` and OpenOS's `filesystem`
+    over the kernal's disk (see "Legacy filesystem");
+  - `os` (`sleep`, `clock`, `time`, `date`, `getenv`/`setenv` with
+    `PWD`, `remove`, `rename`, `exit`), `checkArg`, and OpenOS's
+    `require` (see "Legacy libraries" below);
+  - gmux-style virtual components as its `component` (see "Legacy
+    virtual components").
+
+  Nothing muxos-specific (no `gmuxapi`).
 - **`.mxe`** declares what it expects in a header at the top of the file:
 
   ```lua
@@ -518,7 +529,8 @@ A legacy program's `require` works like OpenOS's, with its own
     events;
   - `event`, with `pull` (OpenOS's filter: name pattern plus equal
     arguments), `pullFiltered`, `push`, `listen` and `ignore`;
-  - `term` (console I/O), `unicode` (the machine's), and a minimal
+  - `term` (the program's window), `filesystem`, `unicode` (the
+    machine's), and a minimal
     `process` and `package` (including OpenOS's `package.delay`);
   - `buffer`, which doesn't work yet;
   - `component`: the process's own virtual gpu, screen and keyboard
@@ -541,10 +553,9 @@ A legacy program's `require` works like OpenOS's, with its own
 The launcher ships every module the program requires by a literal name,
 and the modules those require, up to 32, with the `JOB`
 (`program.modules`). So the usual case costs no extra round trips. Any
-other `require` (a computed name), and `dofile` (which `package.delay`
-uses to load a library's lazy half), sends a `GETMODULE` request to the
-kernal. `dofile` only reaches files under `/lib` and `/usr/lib`. The
-kernal caches module sources and re-reads a file only when its
+other `require` (a computed name) sends a `GETMODULE` request to the
+kernal (`package.delay` loads a library's lazy half with `dofile`, from
+the disk). The kernal caches module sources and re-reads a file only when its
 `lastModified` changes. Test 33.
 
 ## Legacy virtual components -- BUILT, forked from gmux
@@ -580,14 +591,36 @@ Its window is on the kernal:
 Touch, drag, drop and scroll on the window arrive in OpenOS's shape
 with the virtual screen's address and window coordinates. Keys reach the
 program when its window is focused. The default resolution fits the
-kernal's screen, up to 80x25, with room for the title bar. Text written
-with `print`/`io.write`/`term` still goes to the console; only the gpu
-draws into the window. Test 34.
+kernal's screen, up to 80x25, with room for the title bar. The
+program's terminal draws on the same virtual gpu. Test 34.
 
-Every process's `print` (and a legacy program's `io.write`) goes to the
-kernal console as `OUTPUT` messages, buffered per process and sent at
-its yield points, before it reads input, when it ends, or past 1 KB.
-Test 29 covers all of the above.
+## Legacy filesystem -- BUILT, like gmux
+
+A gmux app uses the OS's own filesystem; gmux's virtual filesystem
+component is only for its simulator. Likewise a legacy program uses the
+kernal's disk, the muxos filesystem:
+
+- OpenOS's `filesystem` library: `exists`, `isDirectory`, `size`,
+  `lastModified`, `list`, `makeDirectory`, `remove`, `rename`, `copy`,
+  `open`, and the path helpers.
+- `io.open`, `io.lines`, `loadfile`, `dofile`, `os.remove`/`rename`.
+- A `filesystem` component in `component.list()`, with the disk's real
+  address.
+
+Relative paths resolve against `PWD` for `io`/`dofile`, as OpenOS's
+shell does, and from the root for `filesystem`, as in OpenOS.
+
+Each call is an `FS` request to the kernal (filesystem component method
+plus arguments). Open files get the kernal's own small handle numbers,
+belong to the process that opened them, and are closed when it ends.
+Files are buffered on the worker: reads fetch 16 KB, and the kernal
+loops over the disk's 2 KB per-call limit, so that's one round trip.
+Writes go out past 4 KB or on `flush`/`seek`/`close`. Test 35.
+
+Every `.mxe` process's `print` goes to the kernal console as `OUTPUT`
+messages, buffered per process and sent at its yield points, before it
+reads input, when it ends, or past 1 KB. Test 29 covers all of the
+above.
 
 **Package manager**: OPM (currently an OpenOS package manager) will be
 expanded into muxos's native package manager and track installed

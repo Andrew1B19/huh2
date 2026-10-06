@@ -80,6 +80,21 @@ print("hi " .. name .. " gmuxapi=" .. tostring(gmuxapi) .. " os.time=" .. type(o
 ]==],
   -- Legacy libraries (test 33): the vendored OpenOS ones are added below.
   ["/usr/lib/extralib.lua"] = [==[return {v = "ok"}]==],
+  -- A legacy program using files (test 35).
+  ["/bin/files.lua"] = [==[local fs = require("filesystem")
+local f = io.open("/home/notes.txt", "w")
+f:write("line one\n", "line two\n", string.rep("x", 5000), "\n")
+f:close()
+local r = io.open("/home/notes.txt")
+local l1, l2, rest = r:read("l"), r:read("L"), r:read("a")
+r:close()
+fs.makeDirectory("/home/sub")
+fs.copy("/home/notes.txt", "/home/sub/copy.txt")
+local names = {} for n in fs.list("/home") do names[#names + 1] = n end
+os.setenv("PWD", "/home")
+local count = 0 for _ in io.lines("sub/copy.txt") do count = count + 1 end
+local ok = pcall(dofile, "/lib/sides.lua") print("fs " .. l1 .. "|" .. l2:gsub("\n", "N") .. "|" .. #rest .. "|" .. table.concat(names, ",") .. "|" .. count .. "|" .. fs.size("/home/sub/copy.txt") .. "|" .. tostring(fs.exists("/home/nope")) .. "|" .. tostring(ok) .. "|" .. tostring(fs.isDirectory("/home/sub"))) error("boom")
+]==],
   -- A legacy graphics program (test 34).
   ["/bin/paint.lua"] = [==[local component = require("component")
 local event = require("event")
@@ -95,12 +110,12 @@ gpu.setActiveBuffer(buf)
 gpu.set(1, 1, "BUF!!")
 gpu.setActiveBuffer(0)
 gpu.bitblt(0, 2, 4, 5, 1, buf, 1, 1)
-print("paint default=" .. w0 .. "x" .. h0 .. " screen=" .. tostring(component.isAvailable("screen")))
+gpu.set(2, 1, "d=" .. w0 .. "x" .. h0 .. " s=" .. tostring(component.isAvailable("screen")))
 local _, addr, x, y = event.pull("touch")
 gpu.set(2, 1, "touch " .. x .. "," .. y .. " " .. tostring(addr == gpu.getScreen()))
 local _, _, nw, nh = event.pull("screen_resized")
 gpu.set(2, 1, "size " .. nw .. "x" .. nh .. " res=" .. table.concat({gpu.getResolution()}, "x"))
-sleep(0.5)
+os.sleep(0.5)
 ]==],
   ["/bin/libs.lua"] = [==[local serialization = require("serialization")
 local text = require("text")
@@ -141,6 +156,23 @@ local function renderScreen()
     lines[#lines + 1] = table.concat(chars)
   end
   return table.concat(lines, "\n")
+end
+
+-- The text in screen cells [x, x+n-1] of row y.
+local function cellText(x, y, n)
+  local row = screenBuffers[0].cells[y] or {}
+  local out = {}
+  for i = 0, n - 1 do out[#out + 1] = (row[x + i] and row[x + i].char) or " " end
+  return table.concat(out)
+end
+local function touch(name, x, y)
+  emu:injectSignal(kernal, name, screenAddr, x, y, 0, "tester")
+  emu:advance(0.5)
+end
+-- Closes the window whose title bar starts at (x, 1) and is `w` wide.
+local function closeWindowAt(x, w)
+  touch("touch", x + w - 2, 1)
+  emu:advance(0.5)
 end
 
 local function dumpScreenOnFailure(label)
@@ -926,12 +958,15 @@ print("  OK -- .mxe launched by name: version response, granted/missing librarie
 
 typeLine("ask")
 emu:advance(2)
-assertScreenContains("name? _", "the legacy program's prompt is shown while it waits for input")
+assertScreenContains("/bin/ask.lua started on", "a legacy program has its own window, so the console doesn't wait")
+assert(cellText(1, 1, 7) == "ask.lua" and cellText(1, 2, 7) == "name? _", "its prompt is in its own window, got " .. cellText(1, 2, 7))
 typeLine("bob")
 emu:advance(3)
-assertScreenContains("name? bob", "typed input was echoed after the prompt")
-assertScreenContains("hi bob gmuxapi=nil os.time=function", "legacy program read the input, and sees the OpenOS environment, not gmuxapi")
-print("  OK -- a legacy .lua program runs in the foreground, writes a prompt, and reads console input")
+assert(cellText(1, 2, 9) == "name? bob", "typed input was echoed in its window")
+assert(cellText(1, 3, 35) == "hi bob gmuxapi=nil os.time=function",
+  "it read the input, and sees the OpenOS environment, not gmuxapi; got " .. cellText(1, 3, 35))
+closeWindowAt(1, 50)
+print("  OK -- a legacy .lua program writes and reads in its own window (its terminal), like gmux")
 
 typeLine("hello bg &")
 emu:advance(3)
@@ -1016,17 +1051,6 @@ assertScreenContains("counter done n=40 starts=2", "the drained process finished
 print("  OK -- drain moved the migratable process off and kept new work away")
 
 print("test 32: gmux window decorations -- touch, move, minimize, maximize, resize, close")
--- The text in screen cells [x, x+n-1] of row y.
-local function cellText(x, y, n)
-  local row = screenBuffers[0].cells[y] or {}
-  local out = {}
-  for i = 0, n - 1 do out[#out + 1] = (row[x + i] and row[x + i].char) or " " end
-  return table.concat(out)
-end
-local function touch(name, x, y)
-  emu:injectSignal(kernal, name, screenAddr, x, y, 0, "tester")
-  emu:advance(0.5)
-end
 typeLine('run local r = gmuxapi.create_graphics_process({name = "deco32", x = 20, y = 3, width = 14, height = 3, resizable = true, code = [[' ..
   'local win while not win do for _, w in ipairs(gmuxapi.get_windows()) do if w.ownerJobId == jobId then win = w.id end end if not win then sleep(0.2) end end ' ..
   'while true do local e = gmuxapi.pull_event(60) if not e then break end local t ' ..
@@ -1082,6 +1106,7 @@ print("  OK -- close removes the window and kills its process; touching the cons
 print("test 33: legacy require -- vendored OpenOS libraries, lazy halves, dynamic names, faces")
 typeLine("libs")
 emu:advance(3)
+assert(cellText(1, 1, 8) == "libs.lua", "its output is in its own window")
 assertScreenContains('libs t=1x pad=ab  | top=1 red=14 f1=59 extra=ok gpu=true avail=true same=true',
   "shipped, lazily loaded, and fetched-on-demand modules all work; component has the virtual gpu")
 typeLine("q")
@@ -1089,12 +1114,13 @@ emu:advance(2)
 
 assertScreenContains("got key_down q held=true", "event.pull filters by name; keyboard tracks held keys")
 assertScreenContains("missing=false nf", "a module that doesn't exist fails like OpenOS's require")
+closeWindowAt(1, 50)
 print("  OK -- OpenOS libraries load through require, package.delay, and GETMODULE")
 
 print("test 34: legacy graphics -- a gmux-style virtual gpu drawn into the program's own window")
 typeLine("paint")
 emu:advance(2)
-assertScreenContains("paint default=50x25 screen=true", "a legacy program gets a virtual gpu and screen, sized to fit")
+assert(cellText(2, 2, 14) == "d=50x25 s=true", "a legacy program gets a virtual gpu and screen, sized to fit, got " .. cellText(2, 2, 14))
 assert(cellText(1, 1, 8) == "paint.lu", "its window was created on the first draw, titled after it, got " .. cellText(1, 1, 8))
 assert(cellText(2, 3, 10) == "legacy gfx" and cellText(2, 4, 10) == "legacy gfx", "set and copy reached the window")
 assert(cellText(2, 5, 5) == "BUF!!", "bitblt from a virtual buffer reached the window")
@@ -1108,5 +1134,16 @@ emu:advance(1)
 assert(cellText(2, 2, 20) == "size 50x29 res=50x29", "maximizing is a resolution change for the program, got " .. cellText(2, 2, 20))
 print("  OK -- touch and window resizes reach it as OpenOS signals (screen_resized), as in gmux")
 emu:advance(2)
+closeWindowAt(1, 50)
+
+print("test 35: legacy filesystem -- the kernal's disk, like the OS filesystem for a gmux app")
+typeLine("files")
+emu:advance(4)
+assertScreenContains("fs line one|line twoN|5001|notes.txt,sub/|3|5019|false|true|true",
+  "io.open/read/write, filesystem.list/copy/size/exists/isDirectory/makeDirectory, PWD, io.lines, dofile")
+assertScreenContains("/bin/files.lua:13: boom", "an error is written into the program's own window")
+assert(cellText(1, 1, 1) == "\u{274C}", "and its title is marked as failed")
+closeWindowAt(1, 50)
+print("  OK -- files on the kernal's disk; a legacy error shows in its window")
 
 print("ALL OK")

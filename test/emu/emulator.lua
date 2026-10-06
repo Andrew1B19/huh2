@@ -301,26 +301,116 @@ end
 function Emulator:addFilesystem(node, files)
   local handles = {}
   local nextHandle = 1
+  local dirs = {["/"] = true}
+  local modified = {}
+  local clock = 0
+  local function norm(path)
+    local parts = {}
+    for part in tostring(path):gmatch("[^/]+") do parts[#parts + 1] = part end
+    return "/" .. table.concat(parts, "/")
+  end
+  local function touch(path)
+    clock = clock + 1
+    modified[path] = clock
+  end
+  local function isDir(path)
+    path = norm(path)
+    if dirs[path] then return true end
+    local prefix = path == "/" and "/" or path .. "/"
+    for f in pairs(files) do
+      if f:sub(1, #prefix) == prefix then return true end
+    end
+    return false
+  end
+  -- Real OC caps one read at 2048 bytes (maxReadBuffer).
+  local READ_CAP = 2048
   return self:addComponent(node, "filesystem", {
     open = function(path, mode)
-      if not files[path] then return nil, "file not found" end
+      path, mode = norm(path), mode or "r"
+      if mode:match("[wa]") then
+        if mode:match("w") or not files[path] then files[path] = "" end
+        touch(path)
+      elseif not files[path] then
+        return nil, path
+      end
       local h = nextHandle
       nextHandle = nextHandle + 1
-      handles[h] = {path = path, pos = 1}
+      handles[h] = {path = path, pos = mode:match("a") and #files[path] + 1 or 1, mode = mode}
       return h
     end,
     read = function(handle, n)
       local h = handles[handle]
-      if not h then return nil, "invalid handle" end
+      if not h then return nil, "bad file descriptor" end
       local content = files[h.path]
       if h.pos > #content then return nil end
-      n = math.min(n or math.huge, #content - h.pos + 1)
+      n = math.min(n or math.huge, #content - h.pos + 1, READ_CAP)
       local chunk = content:sub(h.pos, h.pos + n - 1)
       h.pos = h.pos + #chunk
       return chunk
     end,
+    write = function(handle, data)
+      local h = handles[handle]
+      if not h or not h.mode:match("[wa]") then return nil, "bad file descriptor" end
+      local content = files[h.path]
+      files[h.path] = content:sub(1, h.pos - 1) .. data .. content:sub(h.pos + #data)
+      h.pos = h.pos + #data
+      touch(h.path)
+      return true
+    end,
+    seek = function(handle, whence, offset)
+      local h = handles[handle]
+      if not h then return nil, "bad file descriptor" end
+      local base = whence == "set" and 0 or whence == "end" and #files[h.path] or h.pos - 1
+      h.pos = math.max(0, base + (offset or 0)) + 1
+      return h.pos - 1
+    end,
     close = function(handle) handles[handle] = nil; return true end,
-    exists = function(path) return files[path] ~= nil end,
+    exists = function(path) path = norm(path) return files[path] ~= nil or isDir(path) end,
+    isDirectory = function(path) return isDir(path) end,
+    size = function(path) return #(files[norm(path)] or "") end,
+    lastModified = function(path) return modified[norm(path)] or 0 end,
+    list = function(path)
+      path = norm(path)
+      if not isDir(path) then return nil, "no such file or directory" end
+      local prefix = path == "/" and "/" or path .. "/"
+      local seen, out = {}, {}
+      local function add(name)
+        if not seen[name] then seen[name] = true out[#out + 1] = name end
+      end
+      for f in pairs(files) do
+        if f:sub(1, #prefix) == prefix then
+          local rest = f:sub(#prefix + 1)
+          local first = rest:match("^[^/]+")
+          add(rest:find("/", 1, true) and first .. "/" or first)
+        end
+      end
+      for d in pairs(dirs) do
+        if d ~= path and d:sub(1, #prefix) == prefix and not d:sub(#prefix + 1):find("/", 1, true) then
+          add(d:sub(#prefix + 1) .. "/")
+        end
+      end
+      table.sort(out)
+      out.n = #out
+      return out
+    end,
+    makeDirectory = function(path) dirs[norm(path)] = true return true end,
+    remove = function(path)
+      path = norm(path)
+      if files[path] then files[path] = nil return true end
+      if dirs[path] then dirs[path] = nil return true end
+      return false
+    end,
+    rename = function(from, to)
+      from, to = norm(from), norm(to)
+      if not files[from] then return false end
+      files[to], files[from] = files[from], nil
+      touch(to)
+      return true
+    end,
+    spaceUsed = function() return 0 end,
+    spaceTotal = function() return 1048576 end,
+    isReadOnly = function() return false end,
+    getLabel = function() return "kernal" end,
   })
 end
 
