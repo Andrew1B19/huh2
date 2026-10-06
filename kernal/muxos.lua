@@ -241,7 +241,7 @@ local commandBusy = false    -- a command is running; see handleKeyDown
 
 local consoleW, consoleH = termW, math.max(CONSOLE_MIN_H, math.floor(termH / 2))
 local consoleWin = gpu and compositor.createWindow({title = "console", x = 1, y = termH - consoleH + 1,
-  width = consoleW, height = consoleH, layer = CONSOLE_LAYER, text = true}) or nil
+  width = consoleW, height = consoleH, layer = CONSOLE_LAYER, text = true, decorated = false}) or nil
 
 local function consoleOwnsScreen()
   return compositor.exclusiveOwner() == "console"
@@ -898,6 +898,12 @@ local function finishJob(id, status, result, err)
       jobs[old] = nil
       childrenOf[old] = nil
     end
+  end
+  -- Its windows stay up, marked like gmux's: ended (done or killed) or
+  -- failed (error, lost).
+  local windowStatus = (status == "done" or status == "killed") and "dead" or "error"
+  for _, winId in ipairs(compositor.windowsOwnedBy(id)) do
+    compositor.setStatus(winId, windowStatus)
   end
   -- This job is no longer running -- apply whatever orphan policy ITS
   -- OWN children declared at spawn time.
@@ -1633,6 +1639,81 @@ local function handleScroll(x, y, direction)
   end
 end
 
+-- --- Touch: window decorations and pointer input (gmux's touch_event) ---
+--
+-- A touch focuses and raises the window under it. On the title bar it
+-- hits a button (minimize, maximize, close -- close also kills the
+-- owner process, as in gmux) or starts a move that following drags
+-- carry out; on a resizable window's bottom-right body cell it starts a
+-- resize. Anything else reaches the window's owner process as
+-- {"touch"/"drag"/"drop", x, y, button} in the body's own coordinates.
+-- A resized window's owner gets {"window_resized", id, width, height}.
+-- Nothing here while one owner has the whole screen.
+local currentGrab = nil
+local MIN_WINDOW_WIDTH = 8 -- room for the title bar's buttons
+
+local function windowProcess(win)
+  local job = win.ownerJobId and jobs[win.ownerJobId]
+  if job and job.status == "running" and nodes[job.node] and not nodes[job.node].down then return job end
+end
+
+local function notifyResized(win)
+  local job = windowProcess(win)
+  if job then deliverEvent(job, {"window_resized", win.id, win.width, win.height}) end
+end
+
+local function closeWindow(win)
+  local job = windowProcess(win)
+  compositor.close(win.id)
+  if job then controlJob(job.id, "KILL", "killed (window closed)") end
+end
+
+local function handleTouch(name, x, y, button)
+  if compositor.exclusiveOwner() then currentGrab = nil return end
+  if currentGrab then
+    local grab = currentGrab
+    local win = compositor.getWindow(grab.id)
+    if name == "drop" or not win then currentGrab = nil return end
+    if name == "drag" then
+      if grab.kind == "move" then
+        compositor.move(win.id, x - grab.dx, y)
+      else
+        local w = math.max(MIN_WINDOW_WIDTH, x - win.x + 1)
+        local h = math.max(1, y - compositor.bodyTop(win) + 1)
+        if (w ~= win.width or h ~= win.height) and compositor.resize(win.id, w, h) then notifyResized(win) end
+      end
+      return
+    end
+    currentGrab = nil -- a fresh touch ends the grab and is handled below
+  end
+  local win, part, lx, ly = compositor.hitTest(x, y)
+  if not win then return end
+  if name == "touch" then
+    compositor.setFocus(win.id)
+    compositor.raise(win.id)
+  end
+  if part == "title" then
+    if name ~= "touch" then return end
+    local w = win.width
+    if lx == w - 5 or lx == w - 4 then
+      compositor.minimize(win.id)
+    elseif (lx == w - 3 or lx == w - 2) and win.resizable then
+      if compositor.maximize(win.id) then notifyResized(win) end
+    elseif lx == w - 1 or lx == w then
+      closeWindow(win)
+    else
+      currentGrab = {id = win.id, kind = "move", dx = lx - 1}
+    end
+    return
+  end
+  if name == "touch" and win.resizable and win.decorated and lx == win.width and ly == win.height then
+    currentGrab = {id = win.id, kind = "resize"}
+    return
+  end
+  local job = windowProcess(win)
+  if job then deliverEvent(job, {name, lx, ly, button}) end
+end
+
 -- Pulls and fully handles exactly one signal, or times out -- the ONE
 -- place every wait in this program funnels through, whether that's the
 -- REPL idling at its prompt or something deep in a submit()/awaitReply()
@@ -1660,6 +1741,8 @@ local function tick(timeout)
       handleKeyUp(a3, a4)
     elseif name == "scroll" then
       handleScroll(a3, a4, a5)
+    elseif name == "touch" or name == "drag" or name == "drop" then
+      handleTouch(name, a3, a4, a5)
     elseif name == "modem_message" then
       handleModemMessage(a3, a4, a6)
     end
@@ -1889,6 +1972,9 @@ local function printWindows()
     local tags = ""
     if focus and win.id == focus.id then tags = tags .. " (focused)" end
     if win.ownerJobId then tags = tags .. " (owner job " .. win.ownerJobId .. ")" end
+    if win.minimized then tags = tags .. " (minimized)" end
+    if win.maximized then tags = tags .. " (maximized)" end
+    if win.status then tags = tags .. " (process " .. win.status .. ")" end
     print(string.format("[%d] %q  %dx%d at (%d,%d)%s", win.id, win.title, win.width, win.height, win.x, win.y, tags))
   end
 end

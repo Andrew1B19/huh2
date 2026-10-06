@@ -438,7 +438,8 @@ gmuxapi = {
     -- no separate bookkeeping required. See kernal/compositor.lua's
     -- M.setFocus/M.getFocus for the tracking side of this.
     local win, winErr = remoteRequest("CREATEWINDOW", {
-      title = options.name, width = options.width, height = options.height, ownerJobId = proc.id,
+      title = options.name, x = options.x, y = options.y, width = options.width, height = options.height,
+      resizable = options.resizable, decorated = options.title_bar, ownerJobId = proc.id,
       caller = currentJobId,
     })
     if not win then return {process = proc}, winErr end
@@ -461,7 +462,7 @@ gmuxapi = {
       title = options.title, x = options.x, y = options.y,
       width = options.width, height = options.height, code = options.code,
       pixels = options.pixels, mode = options.mode, bg = options.bg, args = options.args,
-      caller = currentJobId,
+      resizable = options.resizable, decorated = options.title_bar, caller = currentJobId,
     })
   end,
 

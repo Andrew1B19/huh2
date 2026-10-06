@@ -847,8 +847,11 @@ assert(kbdId, "graphics process id not shown")
 typeLine("hi28")
 emu:advance(2)
 do
-  local firstRow = renderScreen():match("^[^\n]*")
-  if firstRow:sub(1, 4) ~= "hi28" or screenHas("muxos> hi28") then
+  -- Row 1 is its title bar (gmux decorations: Enter ended the process,
+  -- so it's marked ended, and the title is cut short of the buttons),
+  -- row 2 its body.
+  local titleRow, bodyRow = renderScreen():match("^([^\n]*)\n([^\n]*)")
+  if titleRow:sub(1, #"\u{23F9} - kb") ~= "\u{23F9} - kb" or not titleRow:find("\u{2716}", 1, true) or bodyRow:sub(1, 4) ~= "hi28" or screenHas("muxos> hi28") then
     dumpScreenOnFailure("keyboard delivery")
     error("typed keys didn't reach the focused process and its window")
   end
@@ -962,5 +965,69 @@ typeLine("undrain " .. dnode)
 emu:advance(12)
 assertScreenContains("counter done n=40 starts=2", "the drained process finished elsewhere")
 print("  OK -- drain moved the migratable process off and kept new work away")
+
+print("test 32: gmux window decorations -- touch, move, minimize, maximize, resize, close")
+-- The text in screen cells [x, x+n-1] of row y.
+local function cellText(x, y, n)
+  local row = screenBuffers[0].cells[y] or {}
+  local out = {}
+  for i = 0, n - 1 do out[#out + 1] = (row[x + i] and row[x + i].char) or " " end
+  return table.concat(out)
+end
+local function touch(name, x, y)
+  emu:injectSignal(kernal, name, screenAddr, x, y, 0, "tester")
+  emu:advance(0.5)
+end
+typeLine('run local r = gmuxapi.create_graphics_process({name = "deco32", x = 20, y = 3, width = 14, height = 3, resizable = true, code = [[' ..
+  'local win while not win do for _, w in ipairs(gmuxapi.get_windows()) do if w.ownerJobId == jobId then win = w.id end end if not win then sleep(0.2) end end ' ..
+  'while true do local e = gmuxapi.pull_event(60) if not e then break end local t ' ..
+  'if e[1] == "touch" then t = "T" .. e[2] .. "," .. e[3] elseif e[1] == "window_resized" then t = "R" .. e[3] .. "x" .. e[4] end ' ..
+  'if t then gmuxapi.draw_window(win, {code = "gpu.set(1, 1, args.t)", args = {t = t}}) end end]]}) return "w32=" .. r.process.id')
+emu:advance(2)
+local decoId = screenAfter("w32="):match("w32=(%d+)")
+assert(decoId, "graphics process didn't start")
+assert(cellText(20, 3, 6) == "deco32" and cellText(32, 3, 1) == "\u{2716}", "title bar with the close button at w-1")
+
+touch("touch", 22, 5)
+emu:advance(1)
+assert(cellText(20, 4, 4) == "T3,2", "a body touch reaches the process in the body's own coordinates, got " .. cellText(20, 4, 4))
+print("  OK -- title bar drawn; a body touch reaches the owner in window coordinates")
+
+touch("touch", 25, 3)
+touch("drag", 35, 6)
+touch("drop", 35, 6)
+assert(cellText(30, 6, 6) == "deco32" and cellText(30, 7, 4) == "T3,2", "dragging the title bar moved the window")
+assert(cellText(20, 4, 4) ~= "T3,2", "what was behind the old position shows again")
+print("  OK -- dragging the title bar moves the window")
+
+touch("touch", 38, 6)
+assert(cellText(30, 6, 6) == "deco32" and cellText(30, 7, 4) ~= "T3,2", "minimize collapses to the title bar")
+touch("touch", 38, 6)
+assert(cellText(30, 7, 4) == "T3,2", "minimize again restores the body")
+print("  OK -- minimize collapses the window to its title bar and back")
+
+touch("touch", 40, 6)
+emu:advance(1)
+assert(cellText(1, 1, 6) == "deco32" and cellText(1, 2, 6) == "R50x29", "maximize fills the screen and tells the owner, got " .. cellText(1, 2, 6))
+touch("touch", 47, 1)
+emu:advance(1)
+assert(cellText(30, 6, 6) == "deco32" and cellText(30, 7, 5) == "R14x3", "maximize again restores the old geometry, got " .. cellText(30, 7, 5))
+print("  OK -- maximize fills the screen and restores, the owner is told each time")
+
+touch("touch", 43, 9)
+touch("drag", 47, 10)
+touch("drop", 47, 10)
+emu:advance(1)
+assert(cellText(30, 7, 5) == "R18x4" and cellText(46, 6, 1) == "\u{2716}", "dragging the corner resizes, got " .. cellText(30, 7, 5))
+print("  OK -- dragging the bottom-right corner resizes the window")
+
+touch("touch", 46, 6)
+emu:advance(1)
+assert(cellText(30, 6, 6) ~= "deco32", "close removes the window")
+touch("touch", 5, 25) -- the console: keys go back to the REPL
+typeLine('run return "s32=" .. gmuxapi.get_process(' .. decoId .. ').status')
+emu:advance(2)
+assertScreenContains("s32=killed", "closing the window killed its process, as in gmux")
+print("  OK -- close removes the window and kills its process; touching the console refocuses it")
 
 print("ALL OK")

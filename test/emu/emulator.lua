@@ -364,14 +364,20 @@ function Emulator:addGpuScreen(node, screenW, screenH)
     getActiveBuffer = function() return active end,
     setForeground = function(c) local old = fg; fg = c; return old end,
     setBackground = function(c) local old = bg; bg = c; return old end,
+    -- One cell per character, like the real gpu (UTF-8 aware; raw
+    -- bytes for invalid UTF-8). Wide glyphs aren't modelled.
     set = function(x, y, text)
       local buf = buffers[active]
-      for i = 1, #text do
-        local cell = getCell(buf, x + i - 1, y)
-        cell.char, cell.fg, cell.bg = text:sub(i, i), fg, bg
+      local i = 0
+      local chars = utf8.len(text) and text:gmatch(utf8.charpattern) or text:gmatch(".")
+      for ch in chars do
+        local cell = getCell(buf, x + i, y)
+        cell.char, cell.fg, cell.bg = ch, fg, bg
+        i = i + 1
       end
       return true
     end,
+    getDepth = function() return 8 end,
     fill = function(x, y, w, h, char)
       local buf = buffers[active]
       for row = y, y + h - 1 do

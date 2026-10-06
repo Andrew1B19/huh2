@@ -288,10 +288,12 @@ answer any of them from its own state alone:
   through, for a fullscreen app that wants to bypass the compositor's
   buffer/blit indirection on purpose.
 
-See docs/PROTOCOL.md for exactly what's NOT translated: this is not
-gmux's real desktop (no layering, dragging, resizing, or input routing
--- `gmux/lib/gmux/frontend/windows.lua`/`graphics.lua` weren't ported),
-and `get_backend`/`get_graphics`/`get_process`/`show_error` don't exist
+Windows carry gmux's decorations (copied from
+`gmux/lib/gmux/frontend/windows.lua`): a title bar with the process
+status prefix, minimize, maximize (resizable windows) and close (which
+kills the process, as in gmux), title-drag to move, and corner-drag to
+resize. Touch focuses and raises a window, and pointer input reaches its
+owner process. See docs/PROTOCOL.md for what's NOT translated: `get_backend`/`get_graphics`/`get_process`/`show_error` don't exist
 here at all.
 
 ## Status
@@ -341,14 +343,11 @@ hang a job calling `gmuxapi.*` forever -- see docs/PROTOCOL.md's
 Not yet built: a real scheduler (load balancing beyond round-robin, async
 futures/callbacks for `submit()` itself, not just `SPAWN`), broader OpenOS-compatibility-shim coverage for legacy
 programs beyond `gpu` (see docs/PROTOCOL.md's OpenOS-compatibility
-section for the intended shape), dragging/resizing/input routing (still
-not gmux's full desktop), per-job isolated drawing surfaces (so
+section for the intended shape), per-job isolated drawing surfaces (so
 `create_graphics_process`'s job and its window are actually wired
 together -- true for bit windows too now), an actual toolbar/icons/
 wallpaper built with the bit-window encoder (the encoder works, nothing
-composites a desktop with it yet, and closing a window to a toolbar
-icon isn't built either -- see docs/PROTOCOL.md for the intended
-semantics), the REPL's own line editor (append/backspace only -- no
+composites a desktop with it yet), the REPL's own line editor (append/backspace only -- no
 history, no cursor movement within a line), multi-monitor support
 (explicitly deferred until the single-GPU case works end to end), and
 anything workload-specific.
@@ -385,11 +384,11 @@ optional `ownerJobId` (`create_graphics_process` sets it to the
 spawned child's own id), and `kernal/compositor.lua` tracks which
 window is focused (a new window takes focus automatically, same as it
 taking the top z-order slot) with `M.getFocus()`/`M.setFocus(id)` and a
-manual `focus <window id>` REPL command, since there's no mouse/click
-gesture anywhere in this project to move focus any other way. This is
-ONLY the tracking -- no key signal is actually forwarded to any job
-yet, `handleKeyDown` still only ever feeds the kernal's own REPL input.
-Verified in `test/emu/integration_test.lua` (test 14).
+manual `focus <window id>` REPL command; touching a window focuses it
+too. Keys, wheel and touch input go to the focused window's process
+(see docs/PROTOCOL.md's "Window focus and keyboard delivery" and
+"Window decorations"). Verified in `test/emu/integration_test.lua`
+(tests 14, 28, 32).
 
 The console keeps its text in regular memory (500 lines of scrollback)
 and has no video buffer: it's a resizable text window (`console <w> <h>`,

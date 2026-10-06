@@ -200,7 +200,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `MIGRATED` | `from`, `to`, `jobId`, `state`                           | worker  | answer to `MIGRATE`: the process saved `state` and ended here; the kernal re-sends the same job (same id) to the target as a `JOB` with `restore = state` |
 | `MIGRATEFAILED` | `from`, `to`, `jobId`, `error`                      | worker  | answer to `MIGRATE`: not moved (never opted in, save failed, or state can't be serialized); the process carries on |
 | `SPAWN`   | `from`, `to`, `id`, `code`, `args`, `node`                | worker  | "dispatch a new job" (gmux API's `create_headless_process`/`create_graphics_process`); replies immediately with a handle, doesn't wait for the job to finish |
-| `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
+| `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId`, `resizable`, `decorated` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
 | `GETWINDOWS` | `from`, `to`, `id`                                      | worker  | "list every window you know about" (gmux API's `get_windows()`) |
 | `DRAWWINDOW` | `from`, `to`, `id`, `windowId`, `code`, `args`, `pixels`, `mode`, `width`, `height`, `bg`, `clear`, `caller` | worker | redraw a window the calling process owns (`gmuxapi.draw_window`) |
 | `REQUESTFULLSCREEN` | `from`, `to`, `id`                                | worker  | "let me bypass the compositor and INVOKE the real gpu/screen directly" |
@@ -380,20 +380,16 @@ near-term plan -- for now, "GPU lives on the kernal" is a stated
 requirement of the system, the same way T3 hardware is (see "Hardware
 requirements" below), not an assumption that happens to hold today.
 
-**Closing a window does not end the program it belongs to.** This
-matches gmux's own behavior and is intentional: "close" is a compositor-
-level action (remove the window from the display) separate from
-"terminate" (kill the job). A closed window becomes an icon on the
-toolbar instead of disappearing outright, so the underlying job stays
-alive and reachable. The icon a toolbar entry uses, in priority order:
-the window's own bitmap, if it was a bit window (`options.pixels`); 
-otherwise the program's name, if the window was created via a `run`-
-style dispatch that already has a name to use; otherwise an icon
-supplied explicitly through the API when neither of those applies. None
-of this toolbar/icon compositing is built yet (see "Still not done" in
-the bitmap-windows section above) -- this is the intended semantics to
-build it against, recorded now so it isn't lost or reinvented
-differently later.
+**Closing a window ends its program -- as in gmux (BUILT).** An
+earlier note here said closing a window wouldn't end its program and
+that gmux behaves that way. It doesn't: gmux's `Window:close()` calls
+`process:kill()`. The decorations were then specified as "copy gmux",
+so close kills the owner process (see "Window decorations"), and
+minimize (collapse to the title bar) is how a window gets out of the
+way while its program keeps running. The old plan of a closed window
+becoming a toolbar icon (icon from the window's bitmap, else the
+program's name, else one supplied through the API) is kept here in case
+a toolbar is built for minimized windows later; nothing of it is built.
 
 ## Scheduler
 
@@ -1343,9 +1339,9 @@ time. Any other process is refused (test 28).
 
 **Focus**: `kernal/compositor.lua` keeps one focused window. A newly
 created window takes focus, the same convention as it taking the top
-z-order slot. There's no mouse/click gesture to move focus yet; the
-`focus <window id>` REPL command does it manually, and Ctrl+Alt+C
-focuses the console. `windows` shows the focused window and each
+z-order slot. Touching a window focuses and raises it (touching the
+console gives keys back to the REPL); the `focus <window id>` REPL
+command does it from the keyboard, and Ctrl+Alt+C focuses the console. `windows` shows the focused window and each
 window's owning process (test 14).
 
 **Delivery**: keyboard (`key_down`/`key_up`) and mouse-wheel input go to
@@ -1359,9 +1355,40 @@ always reaches the kernal (test 28). This is the `.mxe` model -- the
 kernal hands the process its input directly, no virtual keyboard
 component.
 
-**Still open**: what happens to a window (and focus) when its process
-ends, and a keyboard gesture for moving focus between windows (today
-only `focus` at the console and Ctrl+Alt+C).
+**Still open**: a keyboard gesture for moving focus between windows
+(today touch, `focus` at the console, and Ctrl+Alt+C).
+
+### Window decorations -- BUILT, copied from gmux
+
+`kernal/compositor.lua` draws gmux's decorations
+(`gmux/lib/gmux/frontend/windows.lua`): same colors (monochrome on a
+1-bit screen), glyphs and button columns. A decorated window's `x,y` is
+its title bar; its body (`width` x `height`, what the owner draws into)
+is on the rows below. The title bar is painted straight into the frame
+buffer, so it costs no video memory.
+
+- **Title**: gmux's process prefix -- the window stays up after its
+  process ends, marked ⏹ (done or killed) or ❌ (error, lost) -- then
+  the title, cut short of the buttons.
+- **Minimize** (w-5): collapses to the title bar and back.
+- **Maximize** (w-3, `resizable` windows only): fills the screen and
+  back.
+- **Close** (w-1): removes the window and kills its process, as in gmux.
+- **Title drag** moves the window; dragging a resizable window's
+  bottom-right body cell resizes it.
+
+Each button also answers on the cell to its right (the glyphs can be
+double-width). Touch, drag and drop anywhere else in a body go to the
+owner process as `{"touch"|"drag"|"drop", x, y, button}` in body
+coordinates. A resize (maximize, restore, corner drag) sends
+`{"window_resized", id, width, height}`. The buffer is reallocated
+keeping what fits, and the owner redraws.
+
+`create_window`/`create_graphics_process` take gmux's `resizable` and
+`title_bar` (`false` = undecorated) options. The console is an
+undecorated window. Windows are clipped to the screen, so one dragged
+partly off-screen is fine. Nothing reacts to touch while one owner has
+the whole screen (console mode, fullscreen). Test 32.
 
 ### The console -- BUILT
 

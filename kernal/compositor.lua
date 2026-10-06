@@ -14,9 +14,10 @@
 -- state; our windows are one-shot draws from code, possibly dispatched
 -- over the network, so "dirty" here just means "drawn since last
 -- flush", set once by createWindow rather than polled continuously).
--- Still NOT gmux's full desktop: no dragging, resizing, or input
--- routing (gmux/lib/gmux/frontend/windows.lua, 482 lines, wasn't
--- touched). What this gives: allocate a GPU buffer per window, let code
+-- Window decorations (title bar, minimize/maximize/close, title-drag
+-- moving, corner resizing) are copied from gmux's windows.lua -- see
+-- "Decorations" below; muxos.lua turns touch signals into calls here.
+-- What this gives: allocate a GPU buffer per window, let code
 -- draw into it, composite every dirty, unoccluded window into one
 -- persistent frame buffer, and flip that onto the real screen with a
 -- SINGLE bitblt -- at most once per flush() call, which muxos.lua calls
@@ -113,11 +114,25 @@ local function kernalGpu()
   return cachedGpu
 end
 
+-- The screen's own rectangle, which every window is clipped to (one
+-- dragged partly off-screen must not be blitted outside the frame
+-- buffer).
+local screenRect = nil
+
 local function ensureFrameBuffer(gpu)
   if frameBuffer then return frameBuffer end
   local w, h = gpu.getResolution()
   frameBuffer, _ = gpu.allocateBuffer(w, h)
+  screenRect = {x = 1, y = 1, w = w, h = h}
   return frameBuffer
+end
+
+local function clipToScreen(r)
+  if not screenRect then return r end
+  local x1, y1 = math.max(r.x, 1), math.max(r.y, 1)
+  local x2 = math.min(r.x + r.w, screenRect.w + 1)
+  local y2 = math.min(r.y + r.h, screenRect.h + 1)
+  return {x = x1, y = y1, w = math.max(0, x2 - x1), h = math.max(0, y2 - y1)}
 end
 
 -- --- pure geometry, no gpu calls -- adapted from gmux's graphics.lua ---
@@ -158,6 +173,94 @@ local function subtractRectangle(rect, blocker)
   return kept
 end
 
+-- Characters [first, first + count - 1] of a row (UTF-8 aware, bytes
+-- for invalid UTF-8).
+local function textSlice(row, first, count)
+  local len = utf8.len(row)
+  if not len then return row:sub(first, first + count - 1) end
+  if first > len then return "" end
+  local from = utf8.offset(row, first)
+  local to = utf8.offset(row, first + count)
+  return to and row:sub(from, to - 1) or row:sub(from)
+end
+
+-- --- Decorations, copied from gmux/lib/gmux/frontend/windows.lua ---
+--
+-- A decorated window's x,y is its title bar; its body (width x height)
+-- sits on the rows below. Same colors, glyphs and button columns as
+-- gmux: minimize at w-5, maximize at w-3 (resizable windows only),
+-- close at w-1, each also hit on the cell to its right (the glyphs can
+-- be double-width). The title bar is painted straight into the frame
+-- buffer -- no video memory of its own.
+local COLORS_MONO = {title_bg = 0xFFFFFF, title_text = 0x000000, title_active = 0x000000, button = 0x000000}
+local COLORS_COLOR = {title_bg = 0xFFFFFF, title_text = 0x888888, title_active = 0x000000, button = 0x4488FF}
+local colors, monochrome = nil, false
+
+local function titleColors(gpu)
+  if not colors then
+    local ok, depth = pcall(gpu.getDepth)
+    monochrome = ok and depth == 1
+    colors = monochrome and COLORS_MONO or COLORS_COLOR
+  end
+  return colors
+end
+
+local GLYPH_MINIMIZE = utf8.char(0x1F783)
+local GLYPH_RESTORE = utf8.char(0x20DF)
+local GLYPH_MAXIMIZE = utf8.char(0x2BC5)
+local GLYPH_CLOSE = utf8.char(0x2716)
+local GLYPH_FOCUSED = utf8.char(0x1F5AE) -- marks focus on a 1-bit screen
+-- The owner process's state, gmux's process_prefix: the window stays
+-- up after its process ends, marked.
+local STATUS_PREFIX = {dead = utf8.char(0x23F9) .. " - ", error = utf8.char(0x274C) .. " - "}
+
+local function titleRows(win)
+  return win.decorated and 1 or 0
+end
+
+local function bodyTop(win)
+  return win.y + titleRows(win)
+end
+
+-- Everything the window covers on screen: title bar plus body, or just
+-- the title bar while minimized.
+local function outerRect(win)
+  local h = win.minimized and titleRows(win) or win.height + titleRows(win)
+  return {x = win.x, y = win.y, w = win.width, h = h}
+end
+
+local function titleText(win)
+  local text = (STATUS_PREFIX[win.status] or "") .. win.title
+  if monochrome and focusedId == win.id then text = GLYPH_FOCUSED .. " " .. text end
+  -- Leave the button columns clear.
+  return textSlice(text, 1, math.max(0, win.width - 6))
+end
+
+local function titleButtons(win)
+  local w = win.width
+  return {
+    {col = w - 5, glyph = win.minimized and GLYPH_RESTORE or GLYPH_MINIMIZE},
+    win.resizable and {col = w - 3, glyph = win.maximized and GLYPH_RESTORE or GLYPH_MAXIMIZE} or nil,
+    {col = w - 1, glyph = GLYPH_CLOSE},
+  }
+end
+
+-- Paints the part of `win`'s title bar inside `box` (whose top row is
+-- the title row) into the active buffer (the frame buffer).
+local function paintTitle(gpu, win, box)
+  local c = titleColors(gpu)
+  gpu.setBackground(c.title_bg)
+  gpu.setForeground(focusedId == win.id and c.title_active or c.title_text)
+  gpu.fill(box.x, win.y, box.w, 1, " ")
+  local piece = textSlice(titleText(win), box.x - win.x + 1, box.w)
+  if piece ~= "" then gpu.set(box.x, win.y, piece) end
+  gpu.setForeground(c.button)
+  for _, b in pairs(titleButtons(win)) do
+    local sx = win.x + b.col - 1
+    if b.col >= 1 and sx >= box.x and sx < box.x + box.w then gpu.set(sx, win.y, b.glyph) end
+  end
+end
+
 -- The visible fragments of the window at `index` in windowOrder (1 =
 -- topmost): its own rectangle, with every window ABOVE it (indices
 -- 1..index-1, if shown) cut out. Can return 0 pieces (fully covered),
@@ -165,10 +268,10 @@ end
 -- overlapping a corner).
 local function visibleBoxes(order, index)
   local win = windows[order[index]]
-  local boxes = {{x = win.x, y = win.y, w = win.width, h = win.height}}
+  local boxes = {clipToScreen(outerRect(win))}
+  if boxes[1].h <= 0 or boxes[1].w <= 0 then return {} end
   for i = 1, index - 1 do
-    local blocker = windows[order[i]]
-    local blockerRect = {x = blocker.x, y = blocker.y, w = blocker.width, h = blocker.height}
+    local blockerRect = outerRect(windows[order[i]])
     local cut = {}
     for _, box in ipairs(boxes) do
       for _, piece in ipairs(subtractRectangle(box, blockerRect)) do
@@ -181,54 +284,48 @@ local function visibleBoxes(order, index)
   return boxes
 end
 
+-- A text window has no gpu buffer at all: its rows live in regular
+-- memory (win.textRows) and are drawn straight into the frame buffer
+-- here, clipped to whatever part of it is visible.
+local function paintTextBox(gpu, win, box, top)
+  gpu.setForeground(win.fg)
+  gpu.setBackground(win.bg)
+  gpu.fill(box.x, box.y, box.w, box.h, " ")
+  for y = box.y, box.y + box.h - 1 do
+    local row = win.textRows[y - top + 1]
+    if row and row ~= "" then
+      local piece = textSlice(tostring(row), box.x - win.x + 1, box.w)
+      if piece ~= "" then gpu.set(box.x, y, piece) end
+    end
+  end
+end
+
 -- Composites one window's visible fragments into the frame buffer
 -- (buffer-to-buffer bitblt -- gpu.bitblt's `dst` isn't limited to the
 -- real screen, confirmed in GraphicsCard.scala's own doc comment).
 -- Does nothing if the window isn't dirty -- this is the actual dirty-
 -- tracking half of the gmux technique: don't spend a real GPU call
 -- recompositing a window that hasn't changed.
--- Characters [first, first + count - 1] of a row (UTF-8 aware, bytes
--- for invalid UTF-8).
-local function textSlice(row, first, count)
-  local len = utf8.len(row)
-  if not len then return row:sub(first, first + count - 1) end
-  if first > len then return "" end
-  local from = utf8.offset(row, first)
-  local to = utf8.offset(row, first + count)
-  return to and row:sub(from, to - 1) or row:sub(from)
-end
-
--- A text window has no gpu buffer at all: its rows live in regular
--- memory (win.textRows) and are drawn straight into the frame buffer
--- here, clipped to whatever part of it is visible.
-local function paintTextWindow(gpu, win, boxes)
+local function compositeWindow(gpu, order, index)
+  local win = windows[order[index]]
+  if not win.dirty then return end
+  local top = bodyTop(win)
   gpu.setActiveBuffer(frameBuffer)
-  gpu.setForeground(win.fg)
-  gpu.setBackground(win.bg)
-  for _, box in ipairs(boxes) do
-    gpu.fill(box.x, box.y, box.w, box.h, " ")
-    for y = box.y, box.y + box.h - 1 do
-      local row = win.textRows[y - win.y + 1]
-      if row and row ~= "" then
-        local piece = textSlice(tostring(row), box.x - win.x + 1, box.w)
-        if piece ~= "" then gpu.set(box.x, y, piece) end
+  for _, box in ipairs(visibleBoxes(order, index)) do
+    local body = box
+    if win.decorated and box.y == win.y then
+      paintTitle(gpu, win, box)
+      body = box.h > 1 and {x = box.x, y = box.y + 1, w = box.w, h = box.h - 1} or nil
+    end
+    if body and not win.minimized then
+      if win.textRows then
+        paintTextBox(gpu, win, body, top)
+      else
+        gpu.bitblt(frameBuffer, body.x, body.y, body.w, body.h, win.buffer, body.x - win.x + 1, body.y - top + 1)
       end
     end
   end
   gpu.setActiveBuffer(0)
-end
-
-local function compositeWindow(gpu, order, index)
-  local win = windows[order[index]]
-  if not win.dirty then return end
-  local boxes = visibleBoxes(order, index)
-  if win.textRows then
-    paintTextWindow(gpu, win, boxes)
-  else
-    for _, box in ipairs(boxes) do
-      gpu.bitblt(frameBuffer, box.x, box.y, box.w, box.h, win.buffer, box.x - win.x + 1, box.y - win.y + 1)
-    end
-  end
   win.dirty = false
   frameDirty = true
 end
@@ -325,8 +422,7 @@ end
 -- first existing window whose layer is <= this one's. A freshly created
 -- window also takes focus, same convention as it taking the top
 -- z-order slot (see M.setFocus to change that later).
-local function registerWindow(win)
-  windows[win.id] = win
+local function insertInOrder(win)
   local insertAt = #windowOrder + 1
   for i, existingId in ipairs(windowOrder) do
     if windows[existingId].layer <= win.layer then
@@ -335,7 +431,29 @@ local function registerWindow(win)
     end
   end
   table.insert(windowOrder, insertAt, win.id)
-  focusedId = win.id
+end
+
+local function removeFromOrder(id)
+  for i, existingId in ipairs(windowOrder) do
+    if existingId == id then table.remove(windowOrder, i) return end
+  end
+end
+
+-- Focus moves the focused title bar's colors, so both the old and the
+-- new focused window repaint.
+local function moveFocus(id)
+  if focusedId == id then return end
+  local old = focusedId and windows[focusedId]
+  if old and old.decorated then old.dirty = true end
+  focusedId = id
+  local new = id and windows[id]
+  if new and new.decorated then new.dirty = true end
+end
+
+local function registerWindow(win)
+  windows[win.id] = win
+  insertInOrder(win)
+  moveFocus(win.id)
   return win
 end
 
@@ -408,7 +526,8 @@ function M.createWindow(options)
     local id = nextId()
     local win = {id = id, title = options.title or ("window " .. id), x = x, y = y,
       width = width, height = height, layer = options.layer or 0, dirty = true,
-      textRows = {}, fg = options.fg or 0xFFFFFF, bg = options.bg or 0x000000}
+      textRows = {}, fg = options.fg or 0xFFFFFF, bg = options.bg or 0x000000,
+      decorated = options.decorated ~= false, resizable = true}
     return registerWindow(win)
   end
 
@@ -445,7 +564,8 @@ function M.createWindow(options)
   -- fine, not an error.
   local win = {id = id, title = options.title or ("window " .. id), x = x, y = y,
     width = width, height = height, buffer = buffer, layer = options.layer or 0, dirty = true,
-    ownerJobId = options.ownerJobId, drawCache = {}, drawCacheSize = 0}
+    ownerJobId = options.ownerJobId, drawCache = {}, drawCacheSize = 0,
+    decorated = options.decorated ~= false, resizable = options.resizable == true}
   return registerWindow(win)
 end
 
@@ -454,7 +574,8 @@ end
 -- code).
 function M.describe(win)
   return {id = win.id, title = win.title, x = win.x, y = win.y, width = win.width, height = win.height,
-    layer = win.layer, ownerJobId = win.ownerJobId}
+    layer = win.layer, ownerJobId = win.ownerJobId, decorated = win.decorated, resizable = win.resizable,
+    minimized = win.minimized or false, maximized = win.maximized or false, status = win.status}
 end
 
 function M.listWindows()
@@ -488,7 +609,90 @@ function M.setFocus(id)
   if not windows[id] then
     return false, "no such window: " .. tostring(id)
   end
-  focusedId = id
+  moveFocus(id)
+  return true
+end
+
+-- Puts a window on top of the others in its layer (gmux's as_top).
+-- Only it needs repainting: nothing that was over it is any more.
+function M.raise(id)
+  local win = windows[id]
+  if not win then return false, "no such window: " .. tostring(id) end
+  removeFromOrder(id)
+  insertInOrder(win)
+  win.dirty = true
+  return true
+end
+
+-- The window and part under a screen cell, topmost first: returns the
+-- window record, "title" or "body", and the cell's column/row within
+-- that part (the body's own coordinates, as its owner draws them).
+function M.hitTest(x, y)
+  for _, id in ipairs(windowOrder) do
+    local win = windows[id]
+    local r = outerRect(win)
+    if x >= r.x and x < r.x + r.w and y >= r.y and y < r.y + r.h then
+      if win.decorated and y == win.y then return win, "title", x - win.x + 1, 1 end
+      return win, "body", x - win.x + 1, y - bodyTop(win) + 1
+    end
+  end
+end
+
+function M.bodyTop(win)
+  return bodyTop(win)
+end
+
+-- Ids of the windows a process owns.
+function M.windowsOwnedBy(jobId)
+  local ids = {}
+  for id, win in pairs(windows) do
+    if win.ownerJobId == jobId then ids[#ids + 1] = id end
+  end
+  table.sort(ids)
+  return ids
+end
+
+-- The owner process's state for the title prefix: nil (running),
+-- "dead" or "error".
+function M.setStatus(id, status)
+  local win = windows[id]
+  if not win or win.status == status then return end
+  win.status = status
+  win.dirty = true
+end
+
+-- Removes a window, freeing its buffer; focus passes to the topmost
+-- remaining window. Returns the removed record.
+function M.close(id)
+  local win = windows[id]
+  if not win then return nil, "no such window: " .. tostring(id) end
+  removeFromOrder(id)
+  windows[id] = nil
+  local gpu = kernalGpu()
+  if win.buffer and gpu then gpu.freeBuffer(win.buffer) end
+  if focusedId == id then moveFocus(windowOrder[1]) end
+  M.invalidateAll()
+  return win
+end
+
+function M.move(id, x, y)
+  local win = windows[id]
+  if not win then return false, "no such window: " .. tostring(id) end
+  if win.x == x and win.y == y then return true end
+  win.x, win.y = x, y
+  M.invalidateAll()
+  return true
+end
+
+-- Collapses a decorated window to its title bar, or expands it again
+-- (toggles when `minimized` is nil). Un-maximizes first, like gmux.
+function M.minimize(id, minimized)
+  local win = windows[id]
+  if not win or not win.decorated then return false, "window can't be minimized" end
+  if win.maximized then M.maximize(id, false) end
+  if minimized == nil then minimized = not win.minimized end
+  win.minimized = minimized or nil
+  M.invalidateAll()
   return true
 end
 
@@ -529,12 +733,57 @@ end
 -- Moves/resizes a text window. Only text windows: a buffered window's
 -- content was drawn once into a buffer of its original size and can't
 -- be regenerated at another size.
+-- A buffered window can only be resized if it was created
+-- `resizable` (its owner is told, and redraws at the new size): its
+-- buffer is reallocated, keeping whatever of the old content fits.
 function M.setGeometry(id, x, y, width, height)
   local win = windows[id]
   if not win then return false, "no such window: " .. tostring(id) end
-  if not win.textRows then return false, "only text windows can be resized" end
+  if not win.resizable then return false, "window " .. tostring(id) .. " isn't resizable" end
+  width, height = math.max(1, math.floor(width)), math.max(1, math.floor(height))
+  if win.buffer and (width ~= win.width or height ~= win.height) then
+    local gpu = kernalGpu()
+    if not gpu then return false, "kernal has no gpu component" end
+    local buffer, err = gpu.allocateBuffer(width, height)
+    if not buffer then return false, "could not allocate a gpu buffer: " .. tostring(err) end
+    gpu.bitblt(buffer, 1, 1, math.min(width, win.width), math.min(height, win.height), win.buffer, 1, 1)
+    gpu.freeBuffer(win.buffer)
+    win.buffer = buffer
+  end
   win.x, win.y, win.width, win.height = x, y, width, height
   -- What was behind its old outline has to show again.
+  M.invalidateAll()
+  return true
+end
+
+function M.resize(id, width, height)
+  local win = windows[id]
+  if not win then return false, "no such window: " .. tostring(id) end
+  return M.setGeometry(id, win.x, win.y, width, height)
+end
+
+-- gmux's maximize: a resizable window fills the screen (title bar
+-- included), or goes back to where it was (toggles when `maximized`
+-- is nil).
+function M.maximize(id, maximized)
+  local win = windows[id]
+  if not win or not win.resizable then return false, "window can't be maximized" end
+  if win.minimized then win.minimized = nil end
+  if maximized == nil then maximized = not win.maximized end
+  if maximized and not win.maximized then
+    local gpu = kernalGpu()
+    if not gpu then return false, "kernal has no gpu component" end
+    local w, h = gpu.getResolution()
+    local saved = {win.x, win.y, win.width, win.height}
+    local ok, err = M.setGeometry(id, 1, 1, w, h - titleRows(win))
+    if not ok then return false, err end
+    win.restoreGeometry, win.maximized = saved, true
+  elseif not maximized and win.maximized then
+    local g = win.restoreGeometry
+    win.maximized, win.restoreGeometry = nil, nil
+    local ok, err = M.setGeometry(id, g[1], g[2], g[3], g[4])
+    if not ok then return false, err end
+  end
   M.invalidateAll()
   return true
 end
