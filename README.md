@@ -402,10 +402,15 @@ a silent node's jobs become `lost`), finished-job history is capped at
 their result if they finished). Verified in `test/emu/integration_test.lua`
 (tests 20-26).
 
-**Still forward design, not yet built**: planned node draining as
-distinct from an unrecoverable node death, "semi-live" job migration
-(blocked: the `eris` persistence it was designed on isn't reachable
-from the sandbox -- see docs/PROTOCOL.md), and the
+**Migration and draining -- BUILT.** An `.mxe` that lists the built-in
+`mux` library can opt in with `mux.migratable(save)`; `migrate <id>
+[node]` moves it at its next yield point and it restarts on the target
+with `mux.restored()` returning its saved state. `drain <node>` takes a
+node out of rotation and moves its migratable processes off; `undrain`
+reverses it. Legacy programs aren't migrated. (Transparent migration
+isn't possible: the sandbox has no `eris`.) Test 31.
+
+**Still forward design, not yet built**: the
 rest of the general `.mxe`-vs-legacy hardware access model: the
 networking side entirely (a lightweight kernal modem kernel module for
 `.mxe`, eventual GERTi access, vs. an emulated modem for legacy). See

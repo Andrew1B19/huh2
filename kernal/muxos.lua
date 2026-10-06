@@ -494,10 +494,11 @@ local function noteNode(addr)
   end
 end
 
+-- Nodes that can take new work: up, and not being drained.
 local function liveNodeCount()
   local n = 0
   for _, addr in ipairs(nodeOrder) do
-    if not nodes[addr].down then n = n + 1 end
+    if not nodes[addr].down and not nodes[addr].draining then n = n + 1 end
   end
   return n
 end
@@ -505,13 +506,13 @@ end
 -- Round-robin with a simple multi-core balancer on top: the live node
 -- with the fewest running jobs wins, and round-robin order breaks ties
 -- (so an idle rack still rotates instead of piling onto node 1).
-local function nextLiveNode()
+local function nextLiveNode(avoid)
   local best, bestLoad
   for _ = 1, #nodeOrder do
     local addr = nodeOrder[nextNode]
     nextNode = (nextNode % #nodeOrder) + 1
     local node = nodes[addr]
-    if not node.down then
+    if not node.down and not node.draining and addr ~= avoid then
       local load = node.running or 0
       if not best or load < bestLoad then best, bestLoad = addr, load end
       if load == 0 then break end
@@ -638,7 +639,8 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
   jobs[id] = {id = id, node = targetAddr, status = "running", code = code, codePreview = codePreview(code),
     startedAt = computer.uptime(),
     parent = parent, appName = appName, orphanPolicy = parent and (orphanPolicy or "orphan") or nil,
-    rootId = rootId, path = program and program.path, kind = program and program.kind}
+    rootId = rootId, path = program and program.path, kind = program and program.kind,
+    program = program, args = args}
   runningJobs[id] = true
   runningCount = runningCount + 1
   nodes[targetAddr].running = (nodes[targetAddr].running or 0) + 1
@@ -673,6 +675,8 @@ end
 -- MXE_LIBRARY_DIR/<name>.lua on the kernal's disk and are shipped with
 -- the program. Either way, the scheduler places it.
 local PROGRAM_PATH = {"/bin", "/usr/bin"}
+-- Libraries built into the worker runtime rather than shipped from disk.
+local BUILTIN_MXE_LIBRARIES = {mux = true}
 local MXE_LIBRARY_DIR = "/lib/mxe/"
 
 local function fileExists(path)
@@ -740,7 +744,10 @@ local function launchProgram(path, args, parent)
       versionMatch = manifest.muxos == nil or sameVersion(manifest.muxos, MUXOS_VERSION)}
     local libs = {}
     for _, name in ipairs(type(manifest.libraries) == "table" and manifest.libraries or {}) do
-      if type(name) == "string" and name:match("^[%w_%.%-]+$") then
+      if BUILTIN_MXE_LIBRARIES[name] then
+        response.libraries[name] = true
+        libs[name] = true
+      elseif type(name) == "string" and name:match("^[%w_%.%-]+$") then
         local libSource = readFile(MXE_LIBRARY_DIR .. name .. ".lua")
         response.libraries[name] = libSource ~= nil
         libs[name] = libSource
@@ -799,7 +806,7 @@ local function applyOrphanPolicyForChildrenOf(parentId)
     elseif job.orphanPolicy == "kill" then
       if job.status == "running" then
         job.killReason = "killed (orphan policy, parent no longer running)"
-        modem.broadcast(PORT, "KILL " .. id)
+        modem.broadcast(PORT, "KILL " .. id .. " " .. job.node)
       end
       job.parent = nil
     elseif job.orphanPolicy == "orphan" then
@@ -862,7 +869,7 @@ local function sweepStaleOrphans()
         and now - job.orphanedAt > timeout then
       if not job.lastKillSentAt or now - job.lastKillSentAt > KILL_RETRY_INTERVAL then
         job.killReason = "killed (unclaimed orphan timed out)"
-        modem.broadcast(PORT, "KILL " .. id)
+        modem.broadcast(PORT, "KILL " .. id .. " " .. job.node)
         job.lastKillSentAt = now
         unregisterOrphanCandidate(job.appName, id)
       end
@@ -881,7 +888,7 @@ local function finishJob(id, status, result, err)
   job.paused = nil
   job.status, job.result, job.error = status, result, err
   job.finishedAt = computer.uptime()
-  job.code = nil
+  job.code, job.program, job.args, job.migrating = nil, nil, nil, nil
   finishedOrder[#finishedOrder + 1] = id
   while #finishedOrder > MAX_FINISHED_JOBS do
     local old = table.remove(finishedOrder, 1)
@@ -964,7 +971,7 @@ local function controlJob(id, verb, reason)
   else
     return false, "unknown control " .. tostring(verb)
   end
-  modem.broadcast(PORT, verb .. " " .. id)
+  modem.broadcast(PORT, verb .. " " .. id .. " " .. job.node)
   return true
 end
 
@@ -977,6 +984,85 @@ local function isDescendantOf(id, ancestorId)
     seen = seen + 1
   end
   return false
+end
+
+-- --- .mxe migration (optional, through the `mux` library) ---
+--
+-- An .mxe that called mux.migratable(save) is marked `migratable`. To
+-- move it, the kernal broadcasts a raw "MIGRATE <id>"; at the process's
+-- next yield point its worker calls `save`, sends the state back
+-- (MIGRATED) and ends it there, and the kernal starts it again on the
+-- target node under the SAME job id -- so its parent, children,
+-- windows and app identity are untouched -- where mux.restored()
+-- returns that state. A process that never opted in isn't moved; legacy
+-- programs never are.
+local function migrateJob(id, target)
+  local job = jobs[id]
+  if not job or job.status ~= "running" then return false, "no running job " .. tostring(id) end
+  if not job.migratable then return false, "job " .. id .. " isn't migratable (it never called mux.migratable)" end
+  if job.migrating then return false, "job " .. id .. " is already being migrated" end
+  if target then
+    if not nodes[target] or nodes[target].down then return false, "node isn't up: " .. tostring(target) end
+    if target == job.node then return false, "job " .. id .. " is already on " .. target end
+  else
+    target = nextLiveNode(job.node)
+    if not target then return false, "no other live node to move job " .. id .. " to" end
+  end
+  job.migrating = target
+  modem.broadcast(PORT, "MIGRATE " .. id .. " " .. job.node)
+  return true, target
+end
+
+local function handleMigrated(msg)
+  local job = jobs[msg.jobId]
+  if not job or job.status ~= "running" or job.node ~= msg.from or not job.migrating then return end
+  local from, target = job.node, job.migrating
+  if not nodes[target] or nodes[target].down then
+    target = nextLiveNode(from)
+  end
+  job.migrating = nil
+  if not target then
+    finishJob(job.id, "lost", nil, "migration had no live node to restart on")
+    return
+  end
+  if nodes[from].running then nodes[from].running = nodes[from].running - 1 end
+  job.node = target
+  nodes[target].running = (nodes[target].running or 0) + 1
+  nodes[target].lastDispatch = computer.uptime()
+  job.migrations = (job.migrations or 0) + 1
+  send({type = "JOB", from = selfAddr, to = target, id = job.id, code = job.code, args = job.args,
+    program = job.program, restore = msg.state})
+  print("job [" .. job.id .. "] migrated from " .. from .. " to " .. target)
+end
+
+local function handleMigrateFailed(msg)
+  local job = jobs[msg.jobId]
+  if not job or job.node ~= msg.from or not job.migrating then return end
+  job.migrating = nil
+  print("job [" .. job.id .. "] couldn't migrate: " .. tostring(msg.error))
+end
+
+local function handleMigratable(msg)
+  local job = jobs[msg.jobId]
+  if job and job.status == "running" and job.node == msg.from and job.kind == "mxe" then
+    job.migratable = true
+  end
+end
+
+-- Take a node out of rotation: no new work goes to it, and every
+-- migratable process on it is moved off. Others finish where they are.
+local function drainNode(addr)
+  local node = nodes[addr]
+  if not node then return false, "unknown node: " .. tostring(addr) end
+  node.draining = true
+  local moved, staying = 0, 0
+  for id in pairs(runningJobs) do
+    local job = jobs[id]
+    if job.node == addr then
+      if job.migratable and migrateJob(id) then moved = moved + 1 else staying = staying + 1 end
+    end
+  end
+  return true, moved, staying
 end
 
 local runtimeSource = nil -- loaded lazily and cached, see loadRuntime()
@@ -1255,7 +1341,7 @@ end
 -- Summaries only (no source, no result); gmuxapi.get_process(id) (the
 -- GETPROCESS message) returns one job in full.
 local SUMMARY_FIELDS = {"id", "node", "status", "startedAt", "finishedAt", "parent", "appName",
-  "orphanPolicy", "rootId", "codePreview", "error", "paused"}
+  "orphanPolicy", "rootId", "codePreview", "error", "paused", "kind", "path", "migratable", "migrations"}
 
 local function handleGetProcesses(msg)
   local list = {}
@@ -1331,6 +1417,12 @@ local function handleModemMessage(from, port, data)
     handleControl(msg)
   elseif msg.type == "OUTPUT" then
     handleOutput(msg)
+  elseif msg.type == "MIGRATED" then
+    handleMigrated(msg)
+  elseif msg.type == "MIGRATEFAILED" then
+    handleMigrateFailed(msg)
+  elseif msg.type == "MIGRATABLE" then
+    handleMigratable(msg)
   elseif msg.type == "LAUNCH" then
     handleLaunch(msg)
   elseif msg.type == "CREATEWINDOW" then
@@ -1727,7 +1819,7 @@ local function listNodes()
   end
   for i, addr in ipairs(nodeOrder) do
     print(string.format("[%d] %s  (last seen %.1fs ago)%s", i, addr, computer.uptime() - nodes[addr].lastSeen,
-      nodes[addr].down and " DOWN" or ""))
+      nodes[addr].down and " DOWN" or (nodes[addr].draining and " DRAINING" or "")))
   end
 end
 
@@ -1876,6 +1968,29 @@ runCommand = function(line)
       local ok, err = controlJob(tonumber(idStr), verb:upper(), "killed by user")
       if ok then print(verb .. " sent to job [" .. idStr .. "]") else print("error: " .. err) end
     end
+  elseif line:match("^migrate%s") then
+    local idStr, target = line:match("^migrate%s+(%d+)%s*(%S*)$")
+    if not idStr then
+      print("usage: migrate <job id> [node]")
+    else
+      local ok, result = migrateJob(tonumber(idStr), target ~= "" and resolveNode(target) or nil)
+      if ok then print("migrating job [" .. idStr .. "] to " .. result) else print("error: " .. result) end
+    end
+  elseif line:match("^drain%s") or line:match("^undrain%s") then
+    local verb, target = line:match("^(%a+)%s+(%S+)$")
+    local addr = target and resolveNode(target)
+    if not addr then
+      print("usage: drain|undrain <node>")
+    elseif verb == "undrain" then
+      if nodes[addr] then nodes[addr].draining = nil print(addr .. " takes new work again") else print("unknown node: " .. addr) end
+    else
+      local ok, moved, staying = drainNode(addr)
+      if ok then
+        print(string.format("draining %s: moving %d migratable job(s), %d will finish there", addr, moved, staying))
+      else
+        print("error: " .. moved)
+      end
+    end
   elseif line == "comp" then
     -- Back to normal compositing from console mode.
     -- Only takes the screen back from the console, never from a node
@@ -1954,6 +2069,7 @@ print("muxos kernal -- " .. selfAddr)
 print("commands:")
 print("  discover | nodes | ping <node> [count] | quit")
 print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job id>")
+print("  migrate <job id> [node] | drain|undrain <node>")
 print("  spawn <node> <lua code>")
 print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
 print("  console <width> <height> [x y] -- resize/move the console window")

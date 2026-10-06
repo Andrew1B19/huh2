@@ -172,19 +172,24 @@ end
 -- pushed-back signal in a tight loop until its deadline.
 local pendingMessages = {}
 
--- Process control from the kernal: raw, unchunked "KILL <id>",
--- "PAUSE <id>", "RESUME <id>" broadcasts (cheap to recognize at every
+-- Process control from the kernal: raw, unchunked "KILL <id> <node>",
+-- "PAUSE ...", "RESUME ...", "MIGRATE ..." broadcasts (cheap to recognize at every
 -- signal, no reassembly). Recorded per job id whether or not that job
 -- is running yet -- a control can arrive while the target is still
 -- queued here behind another job -- and acted on by runJobCode at the
 -- job's yield points, or by the main loop before a queued JOB starts.
--- id -> "KILL" | "PAUSE"
+-- id -> "KILL" | "PAUSE" | "MIGRATE"
 local controlState = {}
+local CONTROL_VERBS = {KILL = true, PAUSE = true, RESUME = true, MIGRATE = true}
 
+-- Controls are "VERB <id> <node>": every worker sees the broadcast, but
+-- only the node running (or holding queued) that job records it -- a
+-- job id can later run on another node after a migration.
 local function noteControl(port, data)
   if port ~= PORT or type(data) ~= "string" then return nil end
-  local verb, id = data:match("^(%u+) (%d+)$")
-  if verb ~= "KILL" and verb ~= "PAUSE" and verb ~= "RESUME" then return nil end
+  local verb, id, node = data:match("^(%u+) (%d+) (%S+)$")
+  if not CONTROL_VERBS[verb] then return nil end
+  if node ~= nodeId then return verb end
   id = tonumber(id)
   if verb == "RESUME" then
     if controlState[id] == "PAUSE" then controlState[id] = nil end
@@ -193,6 +198,9 @@ local function noteControl(port, data)
   end
   return verb
 end
+
+-- job id -> the save function an .mxe registered with mux.migratable.
+local migrationHandlers = {}
 
 -- Input events (keyboard, ...) the kernal has routed to a process on
 -- this node: job id -> list of packed events, oldest first. Read with
@@ -572,6 +580,32 @@ function sleep(seconds)
 end
 
 local KILLED = "killed"
+-- runJobCode's return when a process handed over its state to move.
+local MIGRATED = {}
+
+-- Acts on a MIGRATE control at a yield point: calls the process's save
+-- function and, if it produced state that can cross the wire, returns
+-- it (the process then ends here and restarts on another node).
+-- Otherwise tells the kernal why and lets the process carry on.
+local function tryMigrate(id)
+  controlState[id] = nil
+  local save = migrationHandlers[id]
+  local reason
+  if not save then
+    reason = "it never called mux.migratable"
+  else
+    local ok, state = pcall(save)
+    if ok then
+      local fine, err = pcall(serialize, state)
+      if fine then return true, state end
+      reason = "its state can't be sent: " .. tostring(err)
+    else
+      reason = "its save function failed: " .. tostring(state)
+    end
+  end
+  send({type = "MIGRATEFAILED", from = nodeId, to = kernalAddr, jobId = id, error = reason})
+  return false
+end
 
 -- Blocks while `id` is paused (answering pings and setting traffic
 -- aside meanwhile). Returns true if it was killed instead of resumed.
@@ -591,6 +625,11 @@ end
 local function runJobCode(chunk, args, selfId)
   if controlState[selfId] == "PAUSE" and waitWhilePaused(selfId) then return false, KILLED end
   if controlState[selfId] == "KILL" then return false, KILLED end
+  if controlState[selfId] == "MIGRATE" then
+    -- Never started here: restart it on the target with no state.
+    controlState[selfId] = nil
+    return false, MIGRATED, nil
+  end
   local co = coroutine.create(chunk)
   jobCoroutine = co
   local ok, a = coroutine.resume(co, args)
@@ -618,6 +657,10 @@ local function runJobCode(chunk, args, selfId)
     flushOutput(selfId)
     if controlState[selfId] == "PAUSE" and waitWhilePaused(selfId) then return false, KILLED end
     if controlState[selfId] == "KILL" then return false, KILLED end
+    if controlState[selfId] == "MIGRATE" then
+      local moved, state = tryMigrate(selfId)
+      if moved then return false, MIGRATED, state end
+    end
     ok, a = coroutine.resume(co, table.unpack(resumeWith, 1, resumeWith.n))
   end
   return ok, a
@@ -674,7 +717,25 @@ end
 -- An .mxe: the native environment, plus the launcher's response
 -- (`launch`) and `require` for the libraries it asked for and was
 -- granted. Libraries are loaded into the process's own environment.
-local function newMxeEnv(id, program)
+-- Libraries built into the runtime (the kernal ships `true` for them
+-- instead of source). `mux` is migration: mux.migratable(save) opts the
+-- process in -- `save` returns a state table whenever the kernal moves
+-- it -- and mux.restored() returns that state after a move (nil on a
+-- fresh start).
+local BUILTIN_LIBRARIES = {
+  mux = function(id, restored)
+    return {
+      migratable = function(save)
+        if type(save) ~= "function" then error("mux.migratable needs a function returning a state table", 2) end
+        migrationHandlers[id] = save
+        send({type = "MIGRATABLE", from = nodeId, to = kernalAddr, jobId = id})
+      end,
+      restored = function() return restored end,
+    }
+  end,
+}
+
+local function newMxeEnv(id, program, restored)
   local env = newProcessEnv(id)
   local launch = program.launch or {libraries = {}}
   launch.errors = {}
@@ -687,6 +748,10 @@ local function newMxeEnv(id, program)
   end
   local function loadLibraries()
     for name, source in pairs(program.libs or {}) do
+      if source == true and BUILTIN_LIBRARIES[name] then
+        loaded[name] = BUILTIN_LIBRARIES[name](id, restored)
+        goto continue
+      end
       local fn, err = load(source, "=lib:" .. name, "t", env)
       local ok, value = false, err
       if fn then ok, value = pcall(fn) end
@@ -696,6 +761,7 @@ local function newMxeEnv(id, program)
         launch.libraries[name] = false
         launch.errors[name] = tostring(value)
       end
+      ::continue::
     end
   end
   return env, loadLibraries
@@ -803,7 +869,7 @@ local function handleMessage(from, msg)
     if type(program) == "table" then
       local env, loadLibraries
       if program.kind == "mxe" then
-        env, loadLibraries = newMxeEnv(msg.id, program)
+        env, loadLibraries = newMxeEnv(msg.id, program, msg.restore)
       else
         env = newLegacyEnv(msg.id)
       end
@@ -825,11 +891,16 @@ local function handleMessage(from, msg)
       return
     end
     currentJobId = msg.id
-    local ok, result = runJobCode(entry, msg.args, msg.id)
+    local ok, result, migratedState = runJobCode(entry, msg.args, msg.id)
     currentJobId = nil
     flushOutput(msg.id)
     controlState[msg.id] = nil
     eventQueues[msg.id] = nil
+    migrationHandlers[msg.id] = nil
+    if result == MIGRATED then
+      send({type = "MIGRATED", from = nodeId, to = msg.from, jobId = msg.id, state = migratedState})
+      return
+    end
     if not ok and result == EXIT then ok, result = true, nil end
     if ok then
       sendReply({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = result}, "job result")

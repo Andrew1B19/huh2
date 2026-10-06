@@ -170,7 +170,7 @@ Java host underneath. What it means for muxos:
   -- no `debug.sethook`. Every instruction budget muxos had would have
   crashed on its first use; the machine's own deadline replaces them
   (see "JOB code and the non-yielding timeout").
-- **No `eris`** -- see "Semi-live migration".
+- **No `eris`** -- see "Transparent migration".
 - **No `print`** -- muxos never relied on the native one.
 
 The emulator used to run boot code directly against raw Lua, which hid
@@ -186,7 +186,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `HELLO`   | `from`                                                    | worker  | "I just booted, here's my address"                |
 | `PING`    | `from`                                                    | kernal  | "who's out there"                                  |
 | `PONG`    | `from`, `to`                                              | worker  | reply to `PING`                                    |
-| `JOB`     | `from`, `to`, `id`, `code`, `args`, `program`             | kernal  | run `code` (a Lua chunk) with `args`; `program` (path, kind, `.mxe` launch response and libraries) when it's a launched program |
+| `JOB`     | `from`, `to`, `id`, `code`, `args`, `program`, `restore`  | kernal  | run `code` (a Lua chunk) with `args`; `program` (path, kind, `.mxe` launch response and libraries) when it's a launched program; `restore` is a migrated process's saved state (`mux.restored()`) |
 | `LIST`    | `from`, `to`, `id`                                        | either  | "list the components attached to you"             |
 | `INVOKE`  | `from`, `to`, `id`, `address`, `method`, `args`           | either  | call `component.invoke(address, method, args...)` on the receiver's own component |
 | `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, muxos-shaped) -- summaries: no source, no result |
@@ -195,7 +195,10 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `EVENT`   | `from`, `to`, `jobId`, `event`                                | kernal  | an input event for a process on that node, read with `gmuxapi.pull_event` |
 | `OUTPUT`  | `from`, `to`, `jobId`, `text`                                 | worker  | a process's printed output, for the console |
 | `LAUNCH`  | `from`, `to`, `id`, `path`, `args`, `caller`                  | worker  | launch a program as the caller's child (`gmuxapi.launch`) |
-| `KILL`/`PAUSE`/`RESUME <id>` | raw, unchunked                             | kernal  | process control broadcasts, acted on at the process's yield points |
+| `KILL`/`PAUSE`/`RESUME`/`MIGRATE <id> <node>` | raw, unchunked           | kernal  | process control broadcasts, acted on at the process's yield points; only the worker named by `<node>` records one, so a job id reused on another node (after a migration) isn't hit by a stale control |
+| `MIGRATABLE` | `from`, `to`, `jobId`                                  | worker  | an `.mxe` called `mux.migratable(save)`: the kernal may now move it |
+| `MIGRATED` | `from`, `to`, `jobId`, `state`                           | worker  | answer to `MIGRATE`: the process saved `state` and ended here; the kernal re-sends the same job (same id) to the target as a `JOB` with `restore = state` |
+| `MIGRATEFAILED` | `from`, `to`, `jobId`, `error`                      | worker  | answer to `MIGRATE`: not moved (never opted in, save failed, or state can't be serialized); the process carries on |
 | `SPAWN`   | `from`, `to`, `id`, `code`, `args`, `node`                | worker  | "dispatch a new job" (gmux API's `create_headless_process`/`create_graphics_process`); replies immediately with a handle, doesn't wait for the job to finish |
 | `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
 | `GETWINDOWS` | `from`, `to`, `id`                                      | worker  | "list every window you know about" (gmux API's `get_windows()`) |
@@ -962,8 +965,8 @@ before implementation so it wouldn't get lost or reinvented
 differently later. Parent/child jobs, orphan policies, and app-identity
 reclaim are now BUILT and verified end to end (`test/emu/integration_test.lua`'s
 test 12) -- marked below as each piece is covered, as are persistent
-window handles and keyboard delivery. Semi-live migration is still
-forward design, not yet implemented.
+window handles and keyboard delivery. Opt-in `.mxe` migration (through `mux`) and node draining are built too.
+
 
 ### Why this exists
 
@@ -1086,7 +1089,7 @@ card.
 
 A kill-policy child can also still be QUEUED on its node (behind
 another job) when its parent finishes, so `runJobCode` never sees the
-`KILL`. Workers now record every `KILL <id>` they see and refuse to
+`KILL`. Workers now record every `KILL <id> <node>` addressed to them and refuse to
 start a queued `JOB` with that id (test 17).
 
 ### Job environment abstraction
@@ -1191,7 +1194,7 @@ a job as no longer running, for every child of that job:
   sooner precisely when capacity is actually scarce. The exact curve
   (simple inverse) is a judgment call, not measured against real
   hardware or workloads.
-- **`kill`** -- the kernal broadcasts a raw, unchunked `"KILL <id>"`
+- **`kill`** -- the kernal broadcasts a raw, unchunked `"KILL <id> <node>"`
   (same convention as boot's own `BOOT`/`CODE`, bypassing the generic
   `MSG` framing deliberately -- this needs to be checked cheaply at
   every signal a running job's cooperative loop sees, and a kill
@@ -1255,12 +1258,38 @@ Nodes rejoining (or new ones joining) the live pool is free:
 boots after the kernal's been running a while gets discovered live,
 with no kernal restart needed.
 
-**Planned draining is a different, deliberate action** -- taking a
-node out of rotation on purpose (maintenance, say), as opposed to it
-just dying. This is a real, distinct capability worth having, separate
-from crash handling.
+**Planned draining -- BUILT** -- a different, deliberate action:
+taking a node out of rotation on purpose (maintenance, say), as opposed
+to it just dying. REPL `drain <node>` marks it draining: the balancer
+and `liveNodeCount()` skip it, every migratable `.mxe` on it is moved to
+another node (see below), and everything else finishes where it is.
+`undrain <node>` puts it back. `nodes` shows `DRAINING`. Test 31.
 
-### Semi-live migration -- BLOCKED: no `eris` in the sandbox
+### Migration -- BUILT for `.mxe`, through the `mux` library
+
+The built-in `mux` library (granted to any `.mxe` that lists it in its
+header's `libraries`, never fetched from disk):
+
+- `mux.migratable(save)` -- opt in. `save` is called at a yield point
+  when the kernal wants to move the process and returns a plain table
+  (anything the serializer can send). Tells the kernal via `MIGRATABLE`.
+- `mux.restored()` -- the table `save` returned, after a move; `nil` on
+  a fresh start. The program is restarted from the top with it, so it
+  picks up where it left off.
+
+Flow: REPL `migrate <id> [node]` (or `drain`) broadcasts
+`MIGRATE <id> <node>`. At its next yield point the worker calls `save`;
+on success it ends the process and sends `MIGRATED` with the state, and
+the kernal re-dispatches the same job id (code, args, program) to the
+target with `restore`. On failure (never opted in, `save` errored,
+state not serializable) it sends `MIGRATEFAILED` and the process keeps
+running. A job still queued (never started) moves with no state. If the
+chosen target went down meanwhile, the kernal picks another live node;
+with none, the job is `lost`. Legacy programs are never migrated. Test 31.
+
+The original design below is why it's opt-in rather than transparent.
+
+### Transparent migration -- BLOCKED: no `eris` in the sandbox
 
 The design was: **pause, serialize, ship, resume** -- pause the job,
 `eris.persist` its suspended coroutine (call stack and locals) to bytes,
@@ -1279,8 +1308,8 @@ library in the Lua state for its own use (saving machines when a world
 saves), but `machine.lua`'s sandbox -- which EEPROM code, and so all of
 muxos, runs in -- doesn't expose it. Confirmed by reading the mod's
 `machine.lua` and by `test/hardware/verify.lua`, which reports it absent
-in the emulated sandbox. So this can't be built as designed. See "Still
-open" for the options.
+in the emulated sandbox. So this can't be built as designed; the opt-in `mux` version
+above replaces it.
 
 ### Compositor access for `.mxe`
 

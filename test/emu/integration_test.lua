@@ -60,6 +60,20 @@ muxos = "9.9"
 ]]
 print("old-runs v=" .. tostring(launch.versionMatch) .. " want=" .. tostring(launch.requested) .. " have=" .. launch.muxos)
 ]==],
+  ["/bin/counter.mxe"] = [==[--[[mxe
+muxos = "0.1.0"
+libraries = {"mux"}
+]]
+local mux = require("mux")
+local state = mux.restored() or {n = 0, starts = 0, target = tonumber((...)) or 20}
+state.starts = state.starts + 1
+mux.migratable(function() return state end)
+while state.n < state.target do
+  state.n = state.n + 1
+  sleep(0.25)
+end
+print("counter done n=" .. state.n .. " starts=" .. state.starts)
+]==],
   ["/bin/ask.lua"] = [==[io.write("name? ")
 local name = io.read()
 print("hi " .. name .. " gmuxapi=" .. tostring(gmuxapi) .. " os.time=" .. type(os.time))
@@ -905,5 +919,48 @@ do
   end
 end
 print("  OK -- every check in test/hardware/verify.lua passes")
+
+print("test 31: .mxe migration through the mux library, and draining a node")
+typeLine("counter 20 &")
+emu:advance(1)
+local cid = screenAfter("counter 20 &"):match("%[(%d+)%] /bin/counter.mxe started on")
+assert(cid, "counter didn't start")
+emu:advance(1)
+typeLine("migrate " .. cid)
+emu:advance(1)
+assertScreenContains("job [" .. cid .. "] migrated from", "the kernal moved the process")
+emu:advance(8)
+assertScreenContains("counter done n=20 starts=2", "it finished on the new node, continuing from its saved state")
+print("  OK -- a migratable .mxe moved mid-run and carried on from its saved state")
+
+typeLine("spawn 1 sleep(5) return 1")
+emu:advance(0.5)
+local plain = screenAfter("spawn 1 sleep(5)"):match("spawned job %[(%d+)%]")
+typeLine("migrate " .. plain)
+emu:advance(1)
+assertScreenContains("isn't migratable", "a process that never opted in isn't moved")
+print("  OK -- a process that never opted in is refused")
+
+emu:advance(5)
+typeLine("counter 40 &")
+emu:advance(1)
+local did, dnode = screenAfter("counter 40 &"):match("%[(%d+)%] /bin/counter.mxe started on (modem%-%x+)")
+assert(did, "second counter didn't start")
+emu:advance(1)
+typeLine("drain " .. dnode)
+emu:advance(2)
+assertScreenContains("draining " .. dnode .. ": moving 1 migratable job(s)", "drain moved the migratable process")
+assertScreenContains("job [" .. did .. "] migrated from " .. dnode, "it actually moved")
+-- Only one other node is up at this point (an earlier test took one
+-- down) and it's busy with the moved counter, so spawn rather than
+-- `run`: the job queues there instead of the REPL blocking on it.
+typeLine("spawn 1 return 1")
+emu:advance(0.5)
+local landed31 = screenAfter("spawn 1 return 1"):match("spawned job %[%d+%] on (modem%-%x+)")
+assert(landed31 and landed31 ~= dnode, "new work went to the draining node")
+typeLine("undrain " .. dnode)
+emu:advance(12)
+assertScreenContains("counter done n=40 starts=2", "the drained process finished elsewhere")
+print("  OK -- drain moved the migratable process off and kept new work away")
 
 print("ALL OK")
