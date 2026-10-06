@@ -304,9 +304,9 @@ fire-and-forget `SPAWN` path, completion recorded generically either
 way) + a symmetric remote-component bridge (kernal<->worker, used by
 workers to reach kernal hardware they don't have locally, e.g. `gpu`),
 gated so direct gpu/screen access requires an exclusive fullscreen grant
-(with Ctrl+Alt+C as a kernal-level console interrupt: it force-releases
-a grant whose holder disappeared and shows the console alone until
-`comp`) + a compositor module (`kernal/compositor.lua`)
+(Ctrl+Alt+C: a press exits fullscreen, force-releasing a grant whose
+holder disappeared; holding it drops into the full-screen kernal
+console until `comp`) + a compositor module (`kernal/compositor.lua`)
 that's the sole real gpu-touching code in the project for window
 content, with Z-order, occlusion culling, dirty tracking, and a
 persistent frame buffer flipped to the real screen with one `bitblt`

@@ -237,32 +237,41 @@ assertScreenContains("true|nil|", "fullscreen round trip result")
 assertScreenContains("blocked", "blocked again after release")
 print("  OK -- gpu.set succeeded while the grant was held, and was blocked again after releasing it")
 
-print("test 10: Ctrl+Alt+C is the console interrupt -- releases a stuck fullscreen grant and shows the console")
+print("test 10: Ctrl+Alt+C -- a press exits fullscreen (releasing a stuck grant), holding it enters console mode")
 -- worker 1 grabs the grant and deliberately never releases it (fire-and-forget spawn).
 typeLine('spawn 1 gmuxapi.request_fullscreen()')
 emu:advance(2)
 -- worker 2 trying to grab it now must be denied. The console is a
 -- compositor window, and compositing is suspended while a node owns the
--- screen, so this denial only becomes visible after the interrupt.
+-- screen, so this denial only becomes visible once fullscreen is exited.
 typeLine('run local g, gerr = gmuxapi.request_fullscreen() return tostring(g) .. "|" .. tostring(gerr)')
 emu:advance(2)
 
--- Inject the real Ctrl+Alt+C combo as three separate key_down signals,
--- exactly as a human holding all three keys would generate -- matching
--- the exact keycodes OpenOS's own lib/keyboard.lua uses (verified
--- against its source, see docs/PROTOCOL.md).
+-- Ctrl+Alt+C as real key_down/key_up signals (OpenOS's keycodes),
+-- held for `holdFor` seconds before the keys are released.
 local KEY_LCONTROL, KEY_LMENU, KEY_C = 0x1D, 0x38, 0x2E
-emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_LCONTROL, "tester")
-emu:step()
-emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_LMENU, "tester")
-emu:step()
-emu:injectSignal(kernal, "key_down", screenAddr, string.byte("c"), KEY_C, "tester")
-emu:step()
-emu:advance(1)
+local function pressCombo(holdFor)
+  emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_LCONTROL, "tester"); emu:step()
+  emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_LMENU, "tester"); emu:step()
+  emu:injectSignal(kernal, "key_down", screenAddr, string.byte("c"), KEY_C, "tester"); emu:step()
+  emu:advance(holdFor or 0.2)
+  emu:injectSignal(kernal, "key_up", screenAddr, string.byte("c"), KEY_C, "tester"); emu:step()
+  emu:injectSignal(kernal, "key_up", screenAddr, 0, KEY_LMENU, "tester"); emu:step()
+  emu:injectSignal(kernal, "key_up", screenAddr, 0, KEY_LCONTROL, "tester"); emu:step()
+  emu:advance(0.5)
+end
+
+pressCombo()
 assertScreenContains("already held by", "second requester was denied while the grant was held")
-assertScreenContains("force-releasing fullscreen grant", "Ctrl+Alt+C release message")
-assertScreenContains("console only", "Ctrl+Alt+C put the console in solo mode")
-print("  OK -- the console came up over the stuck fullscreen app, showing the denied request and the release")
+assertScreenContains("force-releasing fullscreen grant", "a press force-released the stuck grant")
+if renderScreen():gsub("\n", ""):find("console only", 1, true) then
+  dumpScreenOnFailure("press vs hold")
+  error("a short press entered console mode; only holding should")
+end
+print("  OK -- a press exited fullscreen, releasing the stuck grant, without entering console mode")
+pressCombo(1.5)
+assertScreenContains("console only", "holding Ctrl+Alt+C entered console mode")
+print("  OK -- holding Ctrl+Alt+C dropped into the full-screen kernal console")
 
 -- Confirm the grant is ACTUALLY free now: a fresh request succeeds (and
 -- is released again in the same job, so the console stays visible).
@@ -499,10 +508,7 @@ end
 print("  OK -- each worker reported the bad result as an error and still answered the next job")
 
 print("test 16: a forged `from` can't release someone else's fullscreen grant")
-emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_LCONTROL, "tester"); emu:step()
-emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_LMENU, "tester"); emu:step()
-emu:injectSignal(kernal, "key_down", screenAddr, string.byte("c"), KEY_C, "tester"); emu:step()
-emu:advance(1)
+pressCombo() -- leave console mode
 typeLine("spawn 1 gmuxapi.request_fullscreen()")
 emu:advance(2)
 local holder = screenAfter("spawn 1 gmuxapi"):match("spawned job %[%d+%] on (modem%-%x+)")
@@ -518,8 +524,7 @@ emu:injectSignal(kernal, "modem_message", kernal.modemAddr, forger, 4477, 0, for
 emu:advance(1)
 typeLine('run return "MARK16"')
 emu:advance(2)
-emu:injectSignal(kernal, "key_down", screenAddr, string.byte("c"), KEY_C, "tester"); emu:step()
-emu:advance(1)
+pressCombo()
 if not screenAfter("MARK16"):find("force-releasing fullscreen grant held by " .. holder, 1, true) then
   dumpScreenOnFailure("forged release")
   error("the forged RELEASEFULLSCREEN released the real holder's grant")
@@ -586,8 +591,9 @@ for _, path in ipairs({"/node/bios.lua", "/kernal/bios.lua"}) do
 end
 
 print("test 20: Ctrl+Alt+C shows the console alone; `comp` restores the windows")
--- Ctrl+Alt+C (test 10) left the console in solo mode. A window created
--- now is drawn into its buffer but not shown until `comp`.
+-- Hold Ctrl+Alt+C for console mode: a window created now is drawn into
+-- its buffer but not shown until `comp`.
+pressCombo(1.5)
 typeLine('window solo 30 2 6 1 gpu.set(1,1,"SO".."LOX")')
 emu:advance(1)
 if renderScreen():gsub("\n", ""):find("SOLOX", 1, true) then

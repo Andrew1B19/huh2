@@ -213,7 +213,7 @@ end
 -- frame buffer. Its size isn't fixed: it starts as the bottom half of
 -- the screen and the `console <width> <height> [x y]` command changes
 -- it at any time (cheap, since there's no buffer to reallocate). In
--- console mode (Ctrl+Alt+C) it's the compositor's
+-- console mode (hold Ctrl+Alt+C) it's the compositor's
 -- exclusive owner instead and draws straight onto the real screen at
 -- full resolution.
 --
@@ -1382,11 +1382,25 @@ local queuedKeys = {}
 -- The kernal-level interrupt: bring the console up and show it alone,
 -- whatever else is going on (a stuck fullscreen app, a window covering
 -- everything). `comp` returns to normal compositing.
-local function consoleInterrupt()
+-- Ctrl+Alt+C, pressed: exit whatever is fullscreen -- a node's
+-- fullscreen grant (force-released, so a crashed holder can't trap the
+-- screen), or console mode.
+local function exitFullscreen()
   if exclusiveFullscreenOwner then
     print("Ctrl+Alt+C: force-releasing fullscreen grant held by " .. exclusiveFullscreenOwner)
     exclusiveFullscreenOwner = nil
   end
+  compositor.setExclusive(nil)
+  consoleDirty = true
+end
+
+-- Ctrl+Alt+C, held for CONSOLE_HOLD_SECONDS: the kernal-level
+-- interrupt that drops into the full-screen kernal console.
+local CONSOLE_HOLD_SECONDS = 1
+local comboPressedAt, comboHoldFired = nil, false
+
+local function consoleInterrupt()
+  exitFullscreen()
   compositor.setExclusive("console")
   if consoleWin then compositor.setFocus(consoleWin.id) end
   scrollOffset = 0
@@ -1452,7 +1466,12 @@ local function handleKeyDown(char, code)
   -- Ctrl+Alt+C was OpenOS's own interrupt shortcut; muxos has no OpenOS
   -- underneath, so it's reclaimed as the kernal's console interrupt.
   if code == KEY_C and isControlDown() and isAltDown() then
-    consoleInterrupt()
+    -- Key repeat sends more key_downs while it's held; only the first
+    -- one is a press.
+    if not comboPressedAt then
+      comboPressedAt, comboHoldFired = computer.uptime(), false
+      exitFullscreen()
+    end
     return
   end
   local target = focusedProcess()
@@ -1505,6 +1524,9 @@ end
 
 local function handleKeyUp(char, code)
   heldKeys[code] = nil
+  if code == KEY_C or not (isControlDown() and isAltDown()) then
+    comboPressedAt = nil
+  end
   local target = focusedProcess()
   if target then deliverEvent(target, {"key_up", char, code}) end
 end
@@ -1548,6 +1570,11 @@ local function tick(timeout)
       handleScroll(a3, a4, a5)
     elseif name == "modem_message" then
       handleModemMessage(a3, a4, a6)
+    end
+    if comboPressedAt and not comboHoldFired and heldKeys[KEY_C] and isControlDown() and isAltDown()
+        and computer.uptime() - comboPressedAt >= CONSOLE_HOLD_SECONDS then
+      comboHoldFired = true
+      consoleInterrupt()
     end
     sweepStaleChunks()
     sweepStaleOrphans()
@@ -1850,7 +1877,7 @@ runCommand = function(line)
       if ok then print(verb .. " sent to job [" .. idStr .. "]") else print("error: " .. err) end
     end
   elseif line == "comp" then
-    -- Back to normal compositing after a Ctrl+Alt+C console interrupt.
+    -- Back to normal compositing from console mode.
     -- Only takes the screen back from the console, never from a node
     -- holding the fullscreen grant.
     if consoleOwnsScreen() then compositor.setExclusive(nil) end
@@ -1930,7 +1957,7 @@ print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job
 print("  spawn <node> <lua code>")
 print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
 print("  console <width> <height> [x y] -- resize/move the console window")
-print("  comp -- show all windows again after Ctrl+Alt+C (console only); PgUp/PgDn or the mouse wheel scroll the console")
+print("  comp -- leave console mode (hold Ctrl+Alt+C to enter it; a press exits fullscreen); PgUp/PgDn or the wheel scroll")
 print("  focus <window id> -- moves keyboard focus (manual stand-in -- no mouse/click gesture exists yet)")
 print("  bitdemo <halfblock|braille> <x> <y> -- draws a test pattern as a bit window")
 print("  components <node> | call <node> <component addr> <method> [args table]")

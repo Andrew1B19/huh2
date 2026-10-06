@@ -352,14 +352,13 @@ the fullscreen grant, or the kernal's console (console mode, below).
 Leaving the mode redraws the composited picture from the window
 buffers.
 
-**The console interrupt (Ctrl+Alt+C).** The grant isn't released
-automatically if its holder disappears, and a fullscreen app (or a
-window covering everything) can hide the console, so Ctrl+Alt+C at the
-kernal is a kernal-level interrupt: it force-releases the grant
-(whoever holds it), focuses the console, and makes the console the
-compositor's exclusive owner -- it then draws straight onto the real
-screen at full resolution. The `comp` command returns to normal
-compositing. Ctrl+Alt+C was OpenOS's own
+**Ctrl+Alt+C.** A **press** exits fullscreen: it force-releases the
+fullscreen grant (whoever holds it -- a crashed holder can't trap the
+screen) and leaves console mode. **Holding** it for a second is the
+kernal-level interrupt that drops into the full-screen kernal console:
+the console becomes the compositor's exclusive owner, focused, drawing
+straight onto the real screen. The `comp` command (or another press)
+returns to normal compositing (test 10). Ctrl+Alt+C was OpenOS's own
 process-interrupt shortcut (`lib/event.lua` checks it on every signal
 pull); muxos has no OpenOS underneath, so there's nothing to conflict
 with any more and the combo is reclaimed for this.
@@ -1270,7 +1269,12 @@ the job never knowing. The mechanism itself works (confirmed against
 the real upstream `eris` library earlier, including a cross-process
 round trip).
 
-**But sandboxed code can't reach `eris`.** The mod opens the ERIS
+**Decided instead**: no migration for legacy programs. For an `.mxe`
+it's an optional feature, through a `mux` library: an app that wants
+to be movable hands over a state table and is restarted from it on the
+new node; one that doesn't simply isn't migrated.
+
+**Why not the original design: sandboxed code can't reach `eris`.** The mod opens the ERIS
 library in the Lua state for its own use (saving machines when a world
 saves), but `machine.lua`'s sandbox -- which EEPROM code, and so all of
 muxos, runs in -- doesn't expose it. Confirmed by reading the mod's
@@ -1342,7 +1346,7 @@ buffer of its own. It has two sizes:
   screen, and `console <width> <height> [x y]` resizes or moves it at
   any time (cheap -- there's no buffer to reallocate; output re-wraps to
   the new width).
-- **In console mode** (Ctrl+Alt+C, until `comp`) it's the compositor's
+- **In console mode** (hold Ctrl+Alt+C; `comp` or a press leaves it) it's the compositor's
   exclusive owner -- the same mode a fullscreen node uses -- and draws
   straight onto the real screen at full resolution.
 
@@ -1375,13 +1379,8 @@ Collected in one place:
   the `jobId` global and `gmuxapi` every job already gets today.
 - "promote"'s self-dependence requirement isn't enforced -- the kernal
   takes the declared policy at face value.
-- **Semi-live migration needs a new mechanism** -- `eris` isn't
-  reachable from the sandbox (see "Semi-live migration"). Options:
-  cooperative checkpointing (an `.mxe` hands the kernal a state table at
-  its yield points and is restarted from it on the new node -- `.mxe`
-  only, legacy programs can't); restart-from-scratch for jobs marked
-  restartable; or no migration, with draining simply waiting for a
-  node's jobs to finish while giving it no new ones.
+- **OPM's interface to the kernal** -- undecided (what OPM needs from
+  the kernal beyond reading/writing the disk).
 - The general `.mxe`-vs-legacy hardware access model: `.mxe` apps make
   direct kernel calls for every subsystem (the `gmuxapi` pattern
   already built for windows/gpu, generalized) and never see
