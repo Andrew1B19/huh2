@@ -20,8 +20,16 @@ PORT = 4477
    and, since every message over the modem is chunked now, not just
    boot's `CODE`, that serialized string is itself wrapped as one or
    more `MSG <id> <i>/<n> <chunk>` wire frames (`CHUNK_SIZE` = 7000
-   bytes/chunk, same convention as boot's `BOOT_CHUNK_SIZE`) rather than
-   sent as a single `modem.broadcast(PORT, text)` call. Even a message
+   bytes/chunk, same convention as boot's `BOOT_CHUNK_SIZE`). A message
+   with a destination (`to`) is sent to that network card only
+   (`modem.send`); only discovery (`HELLO`, and the kernal's `PING` with
+   no `to`) is broadcast, so a node never receives, reassembles or parses
+   traffic meant for another. Decoding uses `load()`, so a payload must
+   be only data first: outside string literals, nothing but what the
+   serializer writes (letters, digits, whitespace, `{}[]=,.-+/`). A
+   function, a call, a comment or a long string is refused before
+   `load()` sees it, so a stray or hostile packet can't run code on a
+   node. Even a message
    that fits in one chunk still gets this framing (`i=1, n=1`) -- one
    wire shape, always, rather than two depending on size. `<id>` is a
    per-sender counter; reassembly is keyed by `(sender's real network
@@ -63,14 +71,13 @@ nothing about the real wire protocol yet -- it just needs to get
 
 1. Worker broadcasts `BOOT <its own address>`.
 2. Kernal's `serveBoot()` reads `runtime.lua` off its own disk (a sibling
-   file of `muxos.lua`, cached after the first read) and broadcasts it as
+   file of `muxos.lua`, cached after the first read) and sends it to that
+   worker as
    a sequence of `CODE <i>/<n> <chunk>` messages (`BOOT_CHUNK_SIZE` =
    7000 bytes each, comfortably under `maxNetworkPacketSize` even with
    the `CODE <i>/<n> ` prefix -- `runtime.lua` is well past the
-   8192-byte single-message budget, see "EEPROM size" below). Every
-   worker still waiting on its own BOOT picks up these same broadcasts,
-   not just the one that asked -- they all need the identical payload,
-   so one set of broadcasts serves all of them.
+   8192-byte single-message budget, see "EEPROM size" below). Only the
+   worker that asked receives it.
 3. Worker collects chunks by index (`chunks[i] = chunk`, not by arrival
    order -- delivery order isn't assumed), and once all `n` are present,
    `table.concat`s them, `load()`s the result, and calls it.
@@ -204,7 +211,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `FS`      | `from`, `to`, `id`, `op`, `args`, `caller`                    | worker  | a legacy process's filesystem call on the kernal's disk (`op` = a filesystem component method); handles are the kernal's own, per process |
 | `ISFOREGROUND` | `from`, `to`, `id`, `caller`                         | worker  | `readLine`: is the caller the console's foreground program? RESULT true, or ERROR |
 | `GETMODULE` | `from`, `to`, `id`, `name`, `caller`                        | worker  | a legacy process's `require`/`dofile` for a module it wasn't shipped with: a module name or a `/lib`/`/usr/lib` path; replies `{path, source}` |
-| `KILL`/`PAUSE`/`RESUME`/`MIGRATE <id> <node>` | raw, unchunked           | kernal  | process control broadcasts, acted on at the process's yield points; only the worker named by `<node>` records one, so a job id reused on another node (after a migration) isn't hit by a stale control |
+| `KILL`/`PAUSE`/`RESUME`/`MIGRATE <id> <node>` | raw, unchunked           | kernal  | process controls, sent to the job's node and applied when its scheduler would next run the job; the node also checks `<node>` is itself, so a job id reused elsewhere (after a migration) isn't hit by a stale control |
 | `MIGRATABLE` | `from`, `to`, `jobId`                                  | worker  | an `.mxe` called `mux.migratable(save)`: the kernal may now move it |
 | `MIGRATED` | `from`, `to`, `jobId`, `state`                           | worker  | answer to `MIGRATE`: the process saved `state` and ended here; the kernal re-sends the same job (same id) to the target as a `JOB` with `restore = state` |
 | `MIGRATEFAILED` | `from`, `to`, `jobId`, `error`                      | worker  | answer to `MIGRATE`: not moved (never opted in, save failed, or state can't be serialized); the process carries on |
@@ -765,9 +772,11 @@ the full mechanism (z-order, occlusion culling via rectangle
 subtraction, dirty tracking, a persistent frame buffer composited into
 and flipped to the real screen with one `bitblt` per `flush()`, adapted
 from `gmux/lib/gmux/frontend/graphics.lua`'s `Block`/`get_boxes`/
-`subtract_rectangle`). **Still not gmux's full desktop**: no dragging,
-no resizing, no input routing (`gmux/lib/gmux/frontend/windows.lua`, 482
-lines, wasn't touched) -- and still character-cell only, like gmux
+`subtract_rectangle`). Only what changed is repainted: a moved, resized,
+minimized or closed window exposes just its old outline, which the
+windows under it repaint, and the flip copies only the bounding box of
+the changes. Windows carry gmux's decorations and take input (see
+"Window decorations"). Still character-cell only, like gmux
 itself and like the real GPU hardware (`get`/`set`/`copy`/`fill`/
 `bitblt` all operate on an `api.internal.TextBuffer` in
 `GraphicsCard.scala` -- there is no pixel/framebuffer API in OC at all).
@@ -1067,15 +1076,18 @@ duration either way.
   afterwards (test 6). There is no tighter muxos-side budget: the
   sandbox has no `debug.sethook`, and a Lua 5.3 hook can't yield anyway,
   so forced preemption isn't possible.
-- **`yield()`** -- exposed to job code -- is how a long job cooperates:
-  it suspends the job, and `runJobCode` does a real zero-timeout
-  `computer.pullSignal` (which resets the machine's deadline), answers
-  a PING, sets other traffic aside, acts on pause/kill, then resumes it.
-- **`yield()` yields a sentinel (`"__cooperate"`)** because a job's own
-  waits (`sleep`, a `gmuxapi` call, `pull_event`) also yield to
-  `runJobCode`, with their timeout; the sentinel tells the two apart, so
-  a voluntary `yield()` gets a brief pass while a wait gets a real
-  signal handed back to it.
+- **Workers multitask.** Each process is a coroutine, and the node's
+  scheduler resumes whichever can run, round-robin. A process gives up
+  the node when it waits (`sleep`, `pull_event`, `readLine`, any kernal
+  RPC), yielding a *condition*: a deadline, an RPC reply, an input event.
+  The scheduler checks those conditions itself. Every signal is received
+  in one place (`receive`), which answers PINGs, files RPC replies for
+  whoever awaits them, queues input events and handles kernal requests,
+  so nothing is set aside or lost whichever process is waiting.
+- **`yield()`** -- exposed to job code -- is how a long computation
+  cooperates: the scheduler runs the node's other processes and handles
+  what arrived (a real `computer.pullSignal`, which resets the machine's
+  deadline), then resumes it.
 - **`sleep(seconds)`** is the way for job code to wait on time. A job
   that waited with a bare `coroutine.yield(timeout)` would be handed --
   and silently consume -- every signal that arrived meanwhile, including
@@ -1222,50 +1234,17 @@ total while it's still running (mid-spawn, waiting on its own children),
 so with 3 nodes a parent can have at most 2 live children before the
 3rd spawn attempt is rejected.
 
-**The "what happens when every worker is busy" question turned out to
-already have an answer, implicitly, in the existing design**: a worker
-only ever runs one job at a time (`runJobCode` blocks that worker's own
-main loop until the job finishes, is killed, or hits the instruction
-budget), so round-robin dispatch to an already-busy worker just means
-the new `JOB` message waits in that worker's own signal queue until
-it's free -- not denied, not queued at the kernal, just delayed at the
-target. This is true for a child exactly the same as for a top-level
-job, including the edge case of a child landing (round-robin) on the
-SAME node as its own still-running parent -- which surfaced a real,
-separate bug while building this (see "A real bug this surfaced" below).
-A real load-aware balancer (preferring the least-busy worker) is still
-"not yet built" -- that's a quality-of-placement question, not the
-correctness question this needed answered first.
+**When a worker already has jobs**, a new one just starts alongside
+them: workers multitask (see "JOB code and the non-yielding timeout").
+The balancer still sends new work to the least-busy live node. This is
+true for a child exactly as for a top-level job, including a child
+placed on its own parent's node: the parent waits for its `SPAWN` reply
+as a condition, so the child's `JOB` is received and started meanwhile.
 
-**A real bug this surfaced**: `node/runtime.lua`'s `remoteRequest()`
-(the nested wait `gmuxapi.*` calls use) used to silently discard any
-fully-reassembled message that wasn't the specific reply it was
-waiting for. Harmless as long as nothing but that reply could ever
-arrive mid-wait -- which stopped being true the instant a child could
-be placed on its own parent's node: the kernal's fresh `JOB` message
-for the child would arrive at that node while it was still blocked
-inside `remoteRequest`, waiting for its own unrelated `SPAWN` reply,
-and got dropped on the floor -- the child's own `JOB` message simply
-vanished, and it never started. Fixed by keeping anything that isn't
-the awaited reply for the main loop. Verified via
-`test/emu/integration_test.lua`'s test 12 (confirmed by reverting the
-fix and watching a child land on its own parent's node and never
-start). The first version of the fix pushed the raw frame back with
-`computer.pushSignal`, which couldn't replay a multi-chunk message
-(its earlier chunks were already consumed) and made the waiter re-pull
-its own pushed-back signal in a tight loop until its reply arrived;
-it now queues the already-reassembled message instead
-(`pendingMessages`, drained by the main loop first). The match itself
-was also too loose: the kernal's job ids and a worker's RPC ids are
-independent counters, so a `JOB` for a child placed on this node could
-carry the same id as the reply being waited for, match, and be
-dropped. A reply now has to be a `RESULT`/`ERROR` from the kernal's
-card.
-
-A kill-policy child can also still be QUEUED on its node (behind
-another job) when its parent finishes, so `runJobCode` never sees the
-`KILL`. Workers now record every `KILL <id> <node>` addressed to them and refuse to
-start a queued `JOB` with that id (test 17).
+Controls (`KILL`, `PAUSE`, `RESUME`, `MIGRATE`) are recorded per job id
+even before that job's `JOB` arrives, and applied when the scheduler
+would next run it: a killed process is ended, a paused one isn't
+resumed, a migrating one is moved (test 17).
 
 ### Job environment abstraction
 
@@ -1302,10 +1281,9 @@ The difference is what each sees:
 - The kernal can pause, resume, or end any process (`pause`/`resume`/
   `kill <id>` at the REPL), and a process can do the same to its own
   descendants (`gmuxapi.pause_process`/`resume_process`/
-  `kill_process`). Controls are raw broadcasts acted on at the
-  process's yield points; a paused process keeps answering liveness
-  probes, and a process still queued on its node is held or refused
-  before it starts. Ended processes get status `"killed"` with the
+  `kill_process`). Controls are raw messages to the process's node,
+  acted on when its scheduler would next run it. A paused process's node
+  keeps answering liveness probes and running its other processes. Ended processes get status `"killed"` with the
   reason (user, parent, orphan policy, orphan timeout).
 - Each process has its own environment: its globals never leak into
   another process on the same node. The native API it sees through it
@@ -1352,30 +1330,29 @@ a job as no longer running, for every child of that job:
   parent finishes) -- not when it was originally spawned, which could
   have been long before. **Stale-orphan cleanup -- BUILT**:
   `sweepStaleOrphans()`, called once per tick alongside the existing
-  `sweepStaleChunks()`, kills (same best-effort raw `KILL <id>`
-  broadcast as the `kill` policy below, same cooperative-yield-point
-  limitation) any `orphan`-policy job that's sat unreclaimed longer
-  than `orphanTimeoutSeconds()` -- re-broadcasting at most once per
-  `KILL_RETRY_INTERVAL` (10s) in case the first broadcast missed a job
-  that wasn't at a yield point yet. **The timeout is dynamic, per the
+  `sweepStaleChunks()`, kills (same best-effort raw `KILL <id> <node>`
+  as the `kill` policy below, same cooperative-yield-point limitation)
+  any `orphan`-policy job that's sat unreclaimed longer than
+  `orphanTimeoutSeconds()` -- resending at most once per
+  `KILL_RETRY_INTERVAL` (10s) in case the first was lost. **The timeout is dynamic, per the
   design decision it was built against ("dependent on scheduler
   stress")**: `orphanTimeoutSeconds() = BASE_ORPHAN_TIMEOUT / (1 +
   schedulerStress())`, where `BASE_ORPHAN_TIMEOUT = 300` and
   `schedulerStress() = (count of every job across the whole system
   with status "running") / #nodeOrder` -- a real backlog measure, not
-  just "is anything happening," since it can exceed 1 when jobs are
-  queued behind busy workers. An idle system gives an unreclaimed
+  just "is anything happening," since it can exceed 1 when nodes run
+  several jobs each. An idle system gives an unreclaimed
   orphan the full 300s; as load climbs, that shrinks, freeing a slot
   sooner precisely when capacity is actually scarce. The exact curve
   (simple inverse) is a judgment call, not measured against real
   hardware or workloads.
-- **`kill`** -- the kernal broadcasts a raw, unchunked `"KILL <id> <node>"`
+- **`kill`** -- the kernal sends the job's node a raw, unchunked `"KILL <id> <node>"`
   (same convention as boot's own `BOOT`/`CODE`, bypassing the generic
   `MSG` framing deliberately -- this needs to be checked cheaply at
   every signal a running job's cooperative loop sees, and a kill
   message is tiny enough to never need chunking anyway). **Best-effort
-  only**: `node/runtime.lua`'s `runJobCode` only checks for a matching
-  `KILL` at the job's own cooperative `yield()` points -- a child that
+  only**: a worker's scheduler acts on it the next time it would resume
+  the job, i.e. at the job's own yield and wait points -- a child that
   never yields can't be killed early this way, no sooner than its own
   instruction-budget circuit breaker would catch it anyway (see "JOB
   code and the non-yielding timeout"). This is the same fundamental
@@ -1452,7 +1429,7 @@ header's `libraries`, never fetched from disk):
   a fresh start. The program is restarted from the top with it, so it
   picks up where it left off.
 
-Flow: REPL `migrate <id> [node]` (or `drain`) broadcasts
+Flow: REPL `migrate <id> [node]` (or `drain`) sends the job's node
 `MIGRATE <id> <node>`. At its next yield point the worker calls `save`;
 on success it ends the process and sends `MIGRATED` with the state, and
 the kernal re-dispatches the same job id (code, args, program) to the

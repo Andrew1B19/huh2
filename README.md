@@ -380,7 +380,7 @@ console until `comp`) + a compositor module (`kernal/compositor.lua`)
 that's the sole real gpu-touching code in the project for window
 content, with Z-order, occlusion culling, dirty tracking, and a
 persistent frame buffer flipped to the real screen with one `bitblt`
-per flush, adapted from gmux's real `graphics.lua` + a single-coroutine
+per flush (of just the changed area), adapted from gmux's real `graphics.lua` + a single-coroutine
 event loop (`tick()`) that every wait in the program funnels through,
 replacing OpenOS's thread library entirely now that the kernal is
 bare-metal + every message over the modem generically chunked (not
