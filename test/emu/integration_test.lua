@@ -506,7 +506,7 @@ print("test 12: parent/child jobs -- orphan/promote/kill policies, applied for r
 -- applyOrphanPolicyForChildrenOf fires for real -- this is the actual
 -- mechanism from docs/PROTOCOL.md's ".mxe process model", not a mock
 -- of it.
-typeLine('run local a=gmuxapi.create_headless_process({code="local t=0 for i=1,2000 do t=t+1 if i%50==0 then yield() end end return t", name="testapp", orphan_policy="orphan"}); local b=gmuxapi.create_headless_process({code="return 123", name="testapp", orphan_policy="promote"}); local c=gmuxapi.create_headless_process({code="local t=0 for i=1,2000 do t=t+1 if i%50==0 then yield() end end return t", name="testapp", orphan_policy="kill"}); return tostring(a.process.id) .. "," .. tostring(b.process.id) .. "," .. tostring(c.process.id)')
+typeLine('run local a=gmuxapi.create_headless_process({code="local t=0 for i=1,2000 do t=t+1 if i%50==0 then yield() end end return t", name="testapp", orphan_policy="orphan"}); local b=gmuxapi.create_headless_process({code="return 123", name="testapp", orphan_policy="promote"}); local c=gmuxapi.create_headless_process({code="for i=1,400 do sleep(0.05) end return 1", name="testapp", orphan_policy="kill"}); return tostring(a.process.id) .. "," .. tostring(b.process.id) .. "," .. tostring(c.process.id)')
 emu:advance(3)
 
 local childIds
@@ -1309,5 +1309,15 @@ typeLine("opm " .. base .. " update")
 emu:advance(3)
 assertScreenContains("no opm-mxe package", "self-update needs the opm-mxe package in the catalog")
 print("  OK -- opm installs, updates and bundles packages on muxos")
+
+print("test 39: a worker runs its processes side by side")
+for i = 1, 3 do
+  typeLine("spawn " .. workerModems[1] .. " sleep(2) print('mt39-" .. i .. "') return " .. i)
+end
+emu:advance(3)
+for i = 1, 3 do
+  assertScreenContains("mt39-" .. i, "three 2s sleepers on one node all finish within 3s (they'd take 6s queued)")
+end
+print("  OK -- processes on one node wait concurrently instead of queueing")
 
 print("ALL OK")

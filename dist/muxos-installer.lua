@@ -413,10 +413,10 @@ return main()
 
 --[=[MUXOS-PAYLOAD 0.1.0
 @@MANIFEST 19
-104249 /muxos.lua
+104111 /muxos.lua
 35776 /compositor.lua
 6492 /bitmap.lua
-92280 /runtime.lua
+89085 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 460 /lib/colors.lua
 4881 /lib/core/full_keyboard.lua
@@ -432,7 +432,7 @@ return main()
 5892 /lib/mxe/opm_core.lua
 2601 /eeprom/kernal.lua
 2443 /eeprom/worker.lua
-@@ 104249 /muxos.lua
+@@ 104111 /muxos.lua
 -- muxos kernal "init" for huh2. This REPLACES OpenOS on the kernal --
 -- it is the entire resident environment, not a program that runs under
 -- one. kernal/bios.lua (this node's own tiny EEPROM image, mirroring
@@ -1375,11 +1375,11 @@ end
 -- - "promote": it's now a top-level job in every sense -- clear
 --   `parent` and stop tracking it as reclaimable (nobody declared by
 --   this name will ever "come back" for it; it's independent now).
--- - "kill": best-effort only -- broadcasts a raw, unchunked "KILL
---   <id>" (same convention as boot's BOOT/CODE, bypassing the generic
---   MSG framing since this needs to be checked cheaply and can't wait
---   on reassembly) that node/runtime.lua's runJobCode checks for at
---   the job's own cooperative yield points. A job that never yields
+-- - "kill": best-effort only -- sends the job's node a raw, unchunked
+--   "KILL <id> <node>" (same convention as boot's BOOT/CODE, bypassing
+--   the generic MSG framing since this needs to be checked cheaply and
+--   can't wait on reassembly), which the node's scheduler acts on the
+--   next time the job would run. A job that never yields
 --   can't be killed early this way -- same fundamental limit as the
 --   instruction-budget circuit breaker (see "JOB code and the
 --   non-yielding timeout"), not a gap specific to this feature.
@@ -1410,10 +1410,8 @@ end
 
 -- How loaded the scheduler is right now: running jobs per worker node.
 -- Can exceed 1 -- "running" counts every job the kernal has dispatched
--- and not yet seen finish, including ones still queued behind another
--- job at the same busy worker (see dispatchJob's own comment on why a
--- busy target just queues rather than being denied) -- so this is a
--- real backlog measure, not just "is anything happening at all."
+-- and not yet seen finish (a worker runs all of its jobs side by side),
+-- so this is a real load measure, not just "is anything happening."
 local function schedulerStress()
   local live = liveNodeCount()
   if live == 0 then return 0 end
@@ -4080,7 +4078,7 @@ end
 
 return M
 
-@@ 92280 /runtime.lua
+@@ 89085 /runtime.lua
 -- Worker runtime for huh2. NOT flashed anywhere -- this lives on the
 -- KERNAL's filesystem (as a sibling file of kernal/muxos.lua) and gets
 -- served, as plain source text, to each worker over the modem at boot
@@ -4102,9 +4100,8 @@ local MUXOS_VERSION = "0.1.0"
 -- node/bios.lua passes this in: the address of whoever's CODE chunks
 -- actually completed the boot handshake -- the ONE place a worker ever
 -- learns which node is "the kernal". Kept authoritative for this
--- node's whole lifetime; the main loop below no longer re-derives it
--- from arbitrary incoming messages (see the real bug this fixes, noted
--- where kernalAddr used to be reassigned, further down).
+-- node's whole lifetime: nothing re-derives it from incoming messages
+-- (it once did, which let any node pose as the kernal).
 local kernalAddr = ...
 
 -- tostring() would round floats to 14 significant digits and turn
@@ -4158,22 +4155,22 @@ local function deserialize(s)
   return v
 end
 
--- Waiting for a signal. At the top level this is the sandbox's
--- computer.pullSignal, which yields to the machine. Inside a running
--- job (sleep, a gmuxapi call, pull_event) it yields the timeout to
--- runJobCode instead, which does the real wait and hands the job the
--- signal -- so controls (pause/kill) and liveness probes are handled
--- in one place. (A bare coroutine.yield(timeout) at the top level would
--- NOT work: the sandbox wraps coroutine.yield as a user yield and the
--- timeout is lost.)
-local jobCoroutine = nil
-
-local function pullSignal(timeout)
-  if jobCoroutine and coroutine.running() == jobCoroutine then
-    return coroutine.yield(timeout)
-  end
-  return computer.pullSignal(timeout)
-end
+-- --- Processes ---
+--
+-- A worker runs every process placed on it side by side: each is a
+-- coroutine, and the scheduler at the bottom of this file resumes
+-- whichever can run, round-robin. A process gives up the node only when
+-- it waits (sleep, pull_event, readLine, any kernal call) or yields;
+-- what it's waiting for is a condition (a deadline, an RPC reply, an
+-- input event), checked by the scheduler, so one waiting process never
+-- holds the node. Every signal is received in one place (`receive`),
+-- whoever happens to be waiting.
+local procs, procOrder = {}, {} -- id -> process; ids in round-robin order
+local current = nil             -- the process being resumed right now
+local WAIT = {}                 -- what a process yields with, plus its condition
+local COOPERATE = {cooperate = true}
+local rpcWaiting, rpcReplies = {}, {} -- RPC id -> true while awaited; -> reply
+local receive, handleMessage    -- defined below
 
 local function findModem()
   for addr in component.list("modem") do
@@ -4186,7 +4183,7 @@ if not modemAddr then
   -- No network/wireless card present -- there is no way to receive jobs.
   -- Beep and halt rather than spin silently.
   computer.beep(200, 0.5)
-  while true do pullSignal() end
+  while true do computer.pullSignal() end
 end
 
 component.invoke(modemAddr, "open", PORT)
@@ -4217,11 +4214,7 @@ local function send(msg)
 end
 
 -- senderAddr:msgId -> {chunks = {[i] = chunkString}, total = n, startedAt}.
--- Shared by the main dispatch loop AND remoteRequest()'s own nested wait
--- loop below (that one bypasses the main loop entirely while waiting on
--- a specific reply, so it needs its own reassembly, not just the main
--- loop's). Swept for abandoned entries by the main loop -- see its
--- pullSignal(10) timeout, below.
+-- Filled by `receive`; abandoned entries are swept by the scheduler.
 local incomingChunks = {}
 
 local function reassemble(senderAddr, data)
@@ -4251,22 +4244,12 @@ local function sweepStaleChunks()
   end
 end
 
--- Fully reassembled messages ({from = sending card, msg = table}) that
--- arrived while this node was waiting on something else -- a
--- remoteRequest() reply, or a job's sleep(). The main loop handles
--- these before pulling anything new. Stashing the reassembled message,
--- rather than computer.pushSignal-ing the raw frame back, is what lets
--- a multi-chunk message survive (its earlier chunks are already gone
--- from the signal queue) and keeps a waiter from re-pulling its own
--- pushed-back signal in a tight loop until its deadline.
-local pendingMessages = {}
 
 -- Process control from the kernal: raw, unchunked "KILL <id> <node>",
 -- "PAUSE ...", "RESUME ...", "MIGRATE ..." broadcasts (cheap to recognize at every
 -- signal, no reassembly). Recorded per job id whether or not that job
--- is running yet -- a control can arrive while the target is still
--- queued here behind another job -- and acted on by runJobCode at the
--- job's yield points, or by the main loop before a queued JOB starts.
+-- is running yet (a control can arrive before its JOB) -- and acted on by
+-- the scheduler the next time it would resume that process.
 -- id -> "KILL" | "PAUSE" | "MIGRATE"
 local controlState = {}
 local CONTROL_VERBS = {KILL = true, PAUSE = true, RESUME = true, MIGRATE = true}
@@ -4400,42 +4383,62 @@ local function reportComponents()
   send({type = "COMPONENTS", from = nodeId, to = kernalAddr, components = list})
 end
 
--- Kernal requests a node answers at once, even mid-job. True if `msg`
--- was one (and is handled).
-local function serviceInline(from, msg)
-  if from ~= kernalAddr or msg.from ~= from or msg.to ~= nodeId then return false end
-  if msg.type == "EVENT" then
-    queueEvent(msg.jobId, msg.event)
-  elseif msg.type == "INVOKE" or msg.type == "VALUECALL" then
-    serviceBusCall(msg)
-  elseif msg.type == "GETCOMPONENTS" then
-    reportComponents()
-  else
-    return false
-  end
-  return true
-end
-
--- Sets aside one signal pulled while waiting for something else -- a
--- job's yield(), sleep(), or a gmuxapi call. A PING is answered on the
--- spot: that's how the kernal knows a node busy with a job is still
--- alive (see kernal/muxos.lua's checkLiveness) without a dedicated
--- heartbeat. Non-modem signals are dropped -- a worker has no use for
--- them.
-local function stashSignal(name, from, port, data)
+-- Receives one signal, whoever is waiting: the scheduler, or a wait
+-- outside any process. A PING is answered on the spot (that's how the
+-- kernal knows a busy node is alive, with no heartbeat); a reply to an
+-- RPC is kept for the process awaiting it; everything else from the
+-- kernal is handled at once (handleMessage).
+receive = function(name, _, from, port, _, data)
   if name == "component_added" or name == "component_removed" then reportComponents() return end
   if name ~= "modem_message" or noteControl(port, data) then return end
   if port ~= PORT or type(data) ~= "string" then return end
   local payload = reassemble(from, data)
   local msg = payload and deserialize(payload)
-  if type(msg) ~= "table" then return end
-  if msg.type == "PING" and msg.from == from and (msg.to == nil or msg.to == nodeId) then
+  if type(msg) ~= "table" or msg.from ~= from then return end
+  if msg.to ~= nil and msg.to ~= nodeId then return end
+  if msg.type == "PING" then
     send({type = "PONG", from = nodeId, to = msg.from, id = msg.id})
-  elseif serviceInline(from, msg) then
-    -- handled
-  else
-    pendingMessages[#pendingMessages + 1] = {from = from, msg = msg}
+    return
   end
+  -- Everything else runs code or touches hardware on this node, so it's
+  -- only accepted from the kernal itself, never from a peer.
+  if from ~= kernalAddr then return end
+  if msg.type == "RESULT" or msg.type == "ERROR" then
+    if rpcWaiting[msg.id] then rpcReplies[msg.id] = msg end
+    return
+  end
+  handleMessage(msg)
+end
+
+local function satisfied(w)
+  if w.cooperate then return true end
+  if w.rpc and rpcReplies[w.rpc] then return true end
+  if w.events then
+    local q = eventQueues[w.events]
+    if q and #q > 0 then return true end
+  end
+  return w.deadline ~= nil and computer.uptime() >= w.deadline
+end
+
+-- Waits for condition `w` ({deadline}, {rpc}, {events = process id},
+-- COOPERATE). A process yields it to the scheduler. Anywhere else (the
+-- scheduler itself finishing a process, or a coroutine a program made
+-- for itself) it waits right here, receiving meanwhile -- other
+-- processes on the node don't run until it's done.
+local function wait(w)
+  if current and coroutine.running() == current.co then
+    coroutine.yield(WAIT, w)
+    return
+  end
+  repeat
+    local timeout = nil
+    if w.cooperate then
+      timeout = 0
+    elseif w.deadline then
+      timeout = math.max(0, w.deadline - computer.uptime())
+    end
+    receive(computer.pullSignal(timeout))
+  until w.cooperate or satisfied(w)
 end
 
 -- Announce ourselves so the kernal can pick up our HELLO (it already
@@ -4467,33 +4470,17 @@ local function remoteRequest(msgType, extra)
   local msg = {type = msgType, from = nodeId, to = kernalAddr, id = id}
   for k, v in pairs(extra or {}) do msg[k] = v end
   send(msg)
-
-  local deadline = computer.uptime() + RPC_TIMEOUT
-  while computer.uptime() < deadline do
-    local name, _, from, port, _, data = pullSignal(deadline - computer.uptime())
-    if name == "modem_message" and from == kernalAddr and port == PORT
-        and type(data) == "string" and data:sub(1, 4) == "MSG " then
-      local payload = reassemble(from, data)
-      local reply = payload and deserialize(payload)
-      -- The type check matters: the kernal's own JOB ids and this
-      -- node's RPC ids are independent counters, so a JOB for a child
-      -- placed on this node can carry the same id as the reply being
-      -- waited for -- it used to match here and be silently dropped.
-      if type(reply) == "table" and reply.id == id and reply.to == nodeId
-          and (reply.type == "RESULT" or reply.type == "ERROR") then
-        if reply.type == "RESULT" then return reply.result end
-        return nil, reply.error
-      elseif type(reply) == "table" and not serviceInline(from, reply) then
-        -- Anything else (most importantly a JOB for a child the kernal
-        -- placed on this same node) is kept for the main loop rather
-        -- than dropped.
-        pendingMessages[#pendingMessages + 1] = {from = from, msg = reply}
-      end
-    else
-      stashSignal(name, from, port, data)
-    end
-  end
-  return nil, "timed out waiting for kernal"
+  -- RPC ids are this node's own counter; the kernal's JOB ids are a
+  -- different counter, but only RESULT/ERROR count as replies.
+  rpcWaiting[id] = true
+  local w = {rpc = id, deadline = computer.uptime() + RPC_TIMEOUT}
+  while not satisfied(w) do wait(w) end
+  rpcWaiting[id] = nil
+  local reply = rpcReplies[id]
+  rpcReplies[id] = nil
+  if not reply then return nil, "timed out waiting for kernal" end
+  if reply.type == "RESULT" then return reply.result end
+  return nil, reply.error
 end
 
 -- id -> function(force): pushes a legacy process's virtual gpu changes
@@ -4570,9 +4557,9 @@ gpu = setmetatable({}, {
   end,
 })
 
--- The job this node is running right now (a worker runs one at a
--- time), so gmuxapi calls can tell the kernal "I am job X" -- e.g. as
--- the parent when asking for a child. The job itself sees its own id as
+-- The process being resumed right now (the scheduler sets it), so
+-- gmuxapi calls can tell the kernal "I am job X" -- e.g. as the parent
+-- when asking for a child. The job itself sees its own id as
 -- `jobId` in its process environment.
 local currentJobId = nil
 
@@ -4868,14 +4855,14 @@ gmuxapi = {
   -- seconds (nil timeout: wait indefinitely). Events come back as
   -- {name, ...} lists, e.g. {"key_down", char, code}.
   pull_event = function(timeout)
-    flushOutput(currentJobId, true)
-    local deadline = timeout and (computer.uptime() + timeout)
+    local id = currentJobId
+    flushOutput(id, true)
+    local w = {events = id, deadline = timeout and (computer.uptime() + timeout)}
     while true do
-      local q = eventQueues[currentJobId]
+      local q = eventQueues[id]
       if q and #q > 0 then return table.remove(q, 1) end
-      if deadline and computer.uptime() >= deadline then return nil end
-      local name, _, from, port, _, data = pullSignal(deadline and (deadline - computer.uptime()) or nil)
-      stashSignal(name, from, port, data)
+      if w.deadline and computer.uptime() >= w.deadline then return nil end
+      wait(w)
     end
   end,
 
@@ -4895,45 +4882,26 @@ gmuxapi = {
 -- Long-running jobs. OpenComputers ends any coroutine that runs longer
 -- than system.timeout() (5s by default) without the machine getting a
 -- yield -- the sandbox's coroutine.resume enforces it on every
--- coroutine with a debug hook ("too long without yielding"). A job runs
--- in its own coroutine, so one that never yields is ended that way and
--- comes back as an ordinary ERROR; this node survives as long as it
--- yields to the machine promptly afterwards, which the main loop does.
--- (The sandbox has no debug.sethook of its own to build a tighter
--- budget with, and a Lua 5.3 hook can't yield anyway, so there is no
--- forced preemption.)
+-- coroutine. A process runs in its own coroutine, so one that never
+-- yields is ended that way and comes back as an ordinary ERROR; the node
+-- survives. There's no preemption (no debug.sethook in the sandbox), so
+-- until it yields, nothing else on its node runs either.
 --
--- `yield()` is how a long job cooperates: it suspends the job, and
--- runJobCode does a real (zero-timeout) wait -- which is what resets the
--- machine's deadline -- answers a PING, sets other traffic aside, acts
--- on pause/kill, then resumes the job.
---
--- It yields a distinct sentinel because a job's own waits (sleep, a
--- gmuxapi call) also yield to runJobCode, with their timeout: the
--- sentinel tells the two apart, so a voluntary yield() gets a brief
--- pass while a wait gets a real signal handed back to it.
-local YIELD_COOPERATE = "__cooperate"
-
+-- `yield()` is how a long computation cooperates: the scheduler runs the
+-- node's other processes and handles what arrived, then resumes it.
+-- `sleep(seconds)` waits, letting everything else run meanwhile.
 function yield()
-  coroutine.yield(YIELD_COOPERATE)
+  wait(COOPERATE)
 end
 
--- Exposed to JOB code: wait `seconds` without losing what arrives
--- meanwhile. A job that waited with a bare coroutine.yield(timeout)
--- would be handed (and silently consume) every signal that came in --
--- including the JOB message for a child the kernal had just queued on
--- this node. Everything is set aside for the main loop instead.
 function sleep(seconds)
   if currentJobId then flushOutput(currentJobId, true) end
-  local deadline = computer.uptime() + (seconds or 0)
-  while computer.uptime() < deadline do
-    local name, _, from, port, _, data = pullSignal(deadline - computer.uptime())
-    stashSignal(name, from, port, data)
-  end
+  local w = {deadline = computer.uptime() + (seconds or 0)}
+  repeat wait(w) until computer.uptime() >= w.deadline
 end
 
 local KILLED = "killed"
--- runJobCode's return when a process handed over its state to move.
+-- A process's end when it handed over its state to move.
 local MIGRATED = {}
 
 -- Acts on a MIGRATE control at a yield point: calls the process's save
@@ -4958,65 +4926,6 @@ local function tryMigrate(id)
   end
   send({type = "MIGRATEFAILED", from = nodeId, to = kernalAddr, jobId = id, error = reason})
   return false
-end
-
--- Blocks while `id` is paused (answering pings and setting traffic
--- aside meanwhile). Returns true if it was killed instead of resumed.
-local function waitWhilePaused(id)
-  while controlState[id] == "PAUSE" do
-    local name, _, from, port, _, data = pullSignal()
-    stashSignal(name, from, port, data)
-  end
-  return controlState[id] == "KILL"
-end
-
--- `selfId` is this job's own id, used to pick out controls addressed at
--- it among the broadcasts every worker sees. Controls are acted on at
--- the job's yield points -- a job that never yields can't be paused or
--- ended early, no sooner than its instruction-budget circuit breaker
--- would catch it anyway.
-local function runJobCode(chunk, args, selfId)
-  if controlState[selfId] == "PAUSE" and waitWhilePaused(selfId) then return false, KILLED end
-  if controlState[selfId] == "KILL" then return false, KILLED end
-  if controlState[selfId] == "MIGRATE" then
-    -- Never started here: restart it on the target with no state.
-    controlState[selfId] = nil
-    return false, MIGRATED, nil
-  end
-  local co = coroutine.create(chunk)
-  jobCoroutine = co
-  local ok, a = coroutine.resume(co, args)
-  while ok and coroutine.status(co) ~= "dead" do
-    local resumeWith
-    if a == YIELD_COOPERATE then
-      -- The job's own voluntary yield(): a brief pass over whatever
-      -- arrived (a PING answered, everything else set aside for the main
-      -- loop), then resume with nothing.
-      local sig = table.pack(pullSignal(0))
-      if sig.n > 0 and sig[1] ~= nil then
-        stashSignal(sig[1], sig[3], sig[4], sig[6])
-      end
-      resumeWith = {n = 0}
-    else
-      -- The job's own wait (sleep, a gmuxapi call, pull_event): hand it
-      -- the real signal, unless it's a control, which is handled here.
-      local sig = table.pack(pullSignal(type(a) == "number" and a or nil))
-      if sig[1] == "modem_message" and noteControl(sig[4], sig[6]) then
-        resumeWith = {n = 0}
-      else
-        resumeWith = sig
-      end
-    end
-    flushOutput(selfId)
-    if controlState[selfId] == "PAUSE" and waitWhilePaused(selfId) then return false, KILLED end
-    if controlState[selfId] == "KILL" then return false, KILLED end
-    if controlState[selfId] == "MIGRATE" then
-      local moved, state = tryMigrate(selfId)
-      if moved then return false, MIGRATED, state end
-    end
-    ok, a = coroutine.resume(co, table.unpack(resumeWith, 1, resumeWith.n))
-  end
-  return ok, a
 end
 
 -- --- Process environments ---
@@ -6346,79 +6255,123 @@ local function sendReply(msg, what)
   end
 end
 
-local function handleMessage(from, msg)
-  if msg.to ~= nil and msg.to ~= nodeId then return end
-  -- The payload's `from` has to be the card that actually sent it.
-  if msg.from ~= from then return end
-  -- Real bug, fixed: this used to do `kernalAddr = msg.from` here,
-  -- treating whoever just messaged this node as "the kernal". kernalAddr
-  -- is seeded once from the boot handshake (see the top of this file)
-  -- and only ever compared against from then on.
-  if msg.type == "PING" then
-    send({type = "PONG", from = nodeId, to = msg.from, id = msg.id})
+-- --- The scheduler ---
+
+local function removeProc(p)
+  procs[p.id] = nil
+  for i, id in ipairs(procOrder) do
+    if id == p.id then table.remove(procOrder, i) break end
+  end
+end
+
+-- A process ended: clean up after it and tell the kernal how.
+local function finishProc(p, ok, result, migratedState)
+  removeProc(p)
+  local id = p.id
+  local endHook = jobEndHooks[id]
+  jobEndHooks[id] = nil
+  if endHook then pcall(endHook, ok, result) end
+  flushOutput(id, true)
+  graphicsFlushers[id] = nil
+  controlState[id] = nil
+  eventQueues[id] = nil
+  migrationHandlers[id] = nil
+  if result == MIGRATED then
+    send({type = "MIGRATED", from = nodeId, to = kernalAddr, jobId = id, state = migratedState})
     return
   end
-  -- Everything else runs code or touches hardware on this node, so it's
-  -- only accepted from the kernal itself, never from a peer.
-  if from ~= kernalAddr then return end
+  if not ok and result == EXIT then ok, result = true, nil end
+  if ok then
+    sendReply({type = "RESULT", from = nodeId, to = kernalAddr, id = id, result = result}, "job result")
+  else
+    send({type = "ERROR", from = nodeId, to = kernalAddr, id = id, error = tostring(result)})
+  end
+end
 
+-- Can `p` run now? Controls are acted on when it's next resumed: a
+-- killed or migrating process is "runnable" so that happens; a paused
+-- one isn't.
+local function runnable(p)
+  local state = controlState[p.id]
+  if state == "KILL" or state == "MIGRATE" then return true end
+  if state == "PAUSE" then return false end
+  return not p.started or p.wait == nil or satisfied(p.wait)
+end
+
+-- Runs `p` until it next waits, yields or ends.
+local function stepProc(p)
+  local state = controlState[p.id]
+  if state == "KILL" then return finishProc(p, false, KILLED) end
+  if state == "MIGRATE" then
+    if not p.started then
+      -- Never ran here: it restarts on the target with no state.
+      controlState[p.id] = nil
+      return finishProc(p, false, MIGRATED, nil)
+    end
+    local moved, saved = tryMigrate(p.id)
+    if moved then return finishProc(p, false, MIGRATED, saved) end
+  end
+  local first = not p.started
+  p.started, p.wait = true, nil
+  current, currentJobId = p, p.id
+  local ok, a, b
+  if first then
+    ok, a, b = coroutine.resume(p.co, p.args)
+  else
+    ok, a, b = coroutine.resume(p.co)
+  end
+  current, currentJobId = nil, nil
+  if not ok then return finishProc(p, false, a) end
+  if coroutine.status(p.co) == "dead" then return finishProc(p, true, a) end
+  -- A bare coroutine.yield() from the program is a cooperative yield.
+  p.wait = (a == WAIT and type(b) == "table") and b or COOPERATE
+  flushOutput(p.id)
+end
+
+-- A JOB from the kernal becomes a process: compiled in the environment
+-- for its kind, then left for the scheduler to start. A launched
+-- program (msg.program) gets its arguments as `...`; plain code gets
+-- the native environment and `args`. `msg.id` is the job's id.
+local function spawnProc(msg)
+  if procs[msg.id] then return end
+  local program, chunk, loadErr, entry = msg.program
+  if type(program) == "table" then
+    local env, loadLibraries
+    if program.kind == "mxe" then
+      env, loadLibraries = newMxeEnv(msg.id, program, msg.restore)
+    else
+      env = newLegacyEnv(msg.id, program)
+    end
+    chunk, loadErr = load(msg.code, "=" .. tostring(program.path), "t", env)
+    if chunk then
+      local args = type(msg.args) == "table" and msg.args or {}
+      entry = function()
+        if loadLibraries then loadLibraries() end
+        return chunk(table.unpack(args, 1, args.n or #args))
+      end
+    end
+  else
+    chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t", newProcessEnv(msg.id))
+    entry = chunk
+  end
+  if not chunk then
+    send({type = "ERROR", from = nodeId, to = kernalAddr, id = msg.id, error = loadErr})
+    return
+  end
+  local p = {id = msg.id, co = coroutine.create(entry), args = msg.args}
+  procs[p.id] = p
+  procOrder[#procOrder + 1] = p.id
+end
+
+-- What the kernal asks of this node (anything from the kernal that isn't
+-- an RPC reply; see `receive`).
+handleMessage = function(msg)
   if msg.type == "JOB" then
-    -- `msg.id` is the job's own id (dispatchJob uses one id as both the
-    -- job's identity and this message's RPC id). A launched program
-    -- (msg.program) gets the environment for its kind and its arguments
-    -- as `...`; plain code gets the native environment and `args`.
-    local program, chunk, loadErr, entry = msg.program
-    if type(program) == "table" then
-      local env, loadLibraries
-      if program.kind == "mxe" then
-        env, loadLibraries = newMxeEnv(msg.id, program, msg.restore)
-      else
-        env = newLegacyEnv(msg.id, program)
-      end
-      chunk, loadErr = load(msg.code, "=" .. tostring(program.path), "t", env)
-      if chunk then
-        local args = type(msg.args) == "table" and msg.args or {}
-        if loadLibraries then
-          entry = function() loadLibraries() return chunk(table.unpack(args, 1, args.n or #args)) end
-        else
-          entry = function() return chunk(table.unpack(args, 1, args.n or #args)) end
-        end
-      end
-    else
-      chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t", newProcessEnv(msg.id))
-      entry = chunk
-    end
-    if not chunk then
-      send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = loadErr})
-      return
-    end
-    currentJobId = msg.id
-    local ok, result, migratedState = runJobCode(entry, msg.args, msg.id)
-    local endHook = jobEndHooks[msg.id]
-    jobEndHooks[msg.id] = nil
-    if endHook then pcall(endHook, ok, result) end
-    currentJobId = nil
-    flushOutput(msg.id, true)
-    graphicsFlushers[msg.id] = nil
-    controlState[msg.id] = nil
-    eventQueues[msg.id] = nil
-    migrationHandlers[msg.id] = nil
-    if result == MIGRATED then
-      send({type = "MIGRATED", from = nodeId, to = msg.from, jobId = msg.id, state = migratedState})
-      return
-    end
-    if not ok and result == EXIT then ok, result = true, nil end
-    if ok then
-      sendReply({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = result}, "job result")
-    else
-      send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = tostring(result)})
-    end
+    spawnProc(msg)
   elseif msg.type == "EVENT" then
-    -- For a process still queued on this node; it reads it once it runs.
     queueEvent(msg.jobId, msg.event)
   elseif msg.type == "LIST" then
-    -- Expose this node's own components to the kernal, so it can
-    -- address them without us having to write custom JOB code for it.
+    -- This node's own components, for the kernal's `components` command.
     local list = {}
     for addr, ctype in component.list() do
       list[addr] = ctype
@@ -6426,32 +6379,45 @@ local function handleMessage(from, msg)
     send({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = list})
   elseif msg.type == "INVOKE" or msg.type == "VALUECALL" then
     -- The bus: a call on one of this node's components (or a value one
-    -- returned) on the kernal's behalf. Results keep an explicit `n` so
-    -- a nil in the middle doesn't shift what follows.
+    -- returned) on the kernal's behalf.
     serviceBusCall(msg)
   elseif msg.type == "GETCOMPONENTS" then
     reportComponents()
   end
 end
 
+-- The scheduler: a round over every process that can run, then the
+-- signals that arrived -- without waiting if something is runnable,
+-- otherwise until the nearest deadline (at most SWEEP_EVERY, so stale
+-- partial messages still get swept).
+local SWEEP_EVERY = 10
+local MAX_SIGNALS_PER_ROUND = 32
+local lastSweep = computer.uptime()
 while true do
-  local pending = table.remove(pendingMessages, 1)
-  if pending then
-    handleMessage(pending.from, pending.msg)
-  else
-    -- A bounded timeout (rather than blocking indefinitely) so stale,
-    -- abandoned partial reassemblies get swept out periodically even if
-    -- nothing else arrives for a while.
-    local name, _, from, port, _, data = pullSignal(10)
-    sweepStaleChunks()
-    if name == "component_added" or name == "component_removed" then reportComponents() end
-    if name == "modem_message" and not noteControl(port, data) and port == PORT and type(data) == "string" then
-      local payload = reassemble(from, data)
-      local msg = payload and deserialize(payload)
-      if type(msg) == "table" then
-        handleMessage(from, msg)
-      end
+  for _, id in ipairs({table.unpack(procOrder)}) do
+    local p = procs[id]
+    if p and runnable(p) then stepProc(p) end
+  end
+  local timeout = SWEEP_EVERY
+  for _, id in ipairs(procOrder) do
+    local p = procs[id]
+    if runnable(p) then
+      timeout = 0
+      break
     end
+    -- (A paused process's deadline doesn't count: it can't run until
+    -- resumed, and its passed deadline would make this spin.)
+    local deadline = controlState[p.id] ~= "PAUSE" and p.wait and p.wait.deadline
+    if deadline then timeout = math.min(timeout, math.max(0, deadline - computer.uptime())) end
+  end
+  for n = 1, MAX_SIGNALS_PER_ROUND do
+    local name, a, b, c, d, e = computer.pullSignal(n == 1 and timeout or 0)
+    if not name then break end
+    receive(name, a, b, c, d, e)
+  end
+  if computer.uptime() - lastSweep >= SWEEP_EVERY then
+    sweepStaleChunks()
+    lastSweep = computer.uptime()
   end
 end
 

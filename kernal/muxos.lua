@@ -940,11 +940,11 @@ end
 -- - "promote": it's now a top-level job in every sense -- clear
 --   `parent` and stop tracking it as reclaimable (nobody declared by
 --   this name will ever "come back" for it; it's independent now).
--- - "kill": best-effort only -- broadcasts a raw, unchunked "KILL
---   <id>" (same convention as boot's BOOT/CODE, bypassing the generic
---   MSG framing since this needs to be checked cheaply and can't wait
---   on reassembly) that node/runtime.lua's runJobCode checks for at
---   the job's own cooperative yield points. A job that never yields
+-- - "kill": best-effort only -- sends the job's node a raw, unchunked
+--   "KILL <id> <node>" (same convention as boot's BOOT/CODE, bypassing
+--   the generic MSG framing since this needs to be checked cheaply and
+--   can't wait on reassembly), which the node's scheduler acts on the
+--   next time the job would run. A job that never yields
 --   can't be killed early this way -- same fundamental limit as the
 --   instruction-budget circuit breaker (see "JOB code and the
 --   non-yielding timeout"), not a gap specific to this feature.
@@ -975,10 +975,8 @@ end
 
 -- How loaded the scheduler is right now: running jobs per worker node.
 -- Can exceed 1 -- "running" counts every job the kernal has dispatched
--- and not yet seen finish, including ones still queued behind another
--- job at the same busy worker (see dispatchJob's own comment on why a
--- busy target just queues rather than being denied) -- so this is a
--- real backlog measure, not just "is anything happening at all."
+-- and not yet seen finish (a worker runs all of its jobs side by side),
+-- so this is a real load measure, not just "is anything happening."
 local function schedulerStress()
   local live = liveNodeCount()
   if live == 0 then return 0 end
