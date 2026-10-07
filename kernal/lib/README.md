@@ -8,7 +8,7 @@ Vendored unchanged from OpenOS (MightyPirates/OpenComputers,
 `loot/openos/lib`, branch master-MC1.12), MIT licensed, see
 `OPENOS_LICENSE`:
 
-- `serialization.lua`, `text.lua`, `sides.lua`, `colors.lua`, `keyboard.lua`,
+- `serialization.lua`, `text.lua`, `sides.lua`, `colors.lua`, `keyboard.lua`, `internet.lua`,
   `transforms.lua`
 - `core/full_keyboard.lua`, `core/full_text.lua`, `core/full_transforms.lua`
   (loaded lazily by the above through `package.delay`)

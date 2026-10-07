@@ -189,7 +189,12 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `PONG`    | `from`, `to`                                              | worker  | reply to `PING`                                    |
 | `JOB`     | `from`, `to`, `id`, `code`, `args`, `program`, `restore`  | kernal  | run `code` (a Lua chunk) with `args`; `program` (path, kind, `.mxe` launch response and libraries) when it's a launched program; `restore` is a migrated process's saved state (`mux.restored()`) |
 | `LIST`    | `from`, `to`, `id`                                        | either  | "list the components attached to you"             |
-| `INVOKE`  | `from`, `to`, `id`, `address`, `method`, `args`           | either  | call `component.invoke(address, method, args...)` on the receiver's own component |
+| `INVOKE`  | `from`, `to`, `id`, `address`, `method`, `args`           | either  | call `component.invoke(address, method, args...)` on the receiver's own component (also the bus's relayed call; results that can't cross the wire come back as value references) |
+| `COMPONENTS` | `from`, `to`, `components`                             | worker  | this node's components for the cluster bus (address -> type and methods): at boot, on `GETCOMPONENTS`, and when one is added or removed |
+| `GETCOMPONENTS` | `from`, `to`                                        | kernal  | "report your components" (sent to a node the kernal hasn't seen before) |
+| `BUSLIST` | `from`, `to`, `id`, `caller`                              | worker  | a process listing the cluster bus: address -> {type, node, methods} |
+| `BUSINVOKE` | `from`, `to`, `id`, `address`, `method`, `args`, `caller` | worker | a process calling a component on another node: the kernal calls its own, or relays an `INVOKE` to the owning worker and passes its answer back |
+| `VALUECALL` | `from`, `to`, `id`, `node`, `value`, `method`, `args`, `caller` | either | a method call on a value a component call returned (an internet request handle, ...), which stays on `node`; the kernal relays it there |
 | `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, muxos-shaped) -- summaries: no source, no result |
 | `GETPROCESS` | `from`, `to`, `id`, `jobId`                            | worker  | one job's full record (`gmuxapi.get_process(id)`) |
 | `CONTROL` | `from`, `to`, `id`, `jobId`, `verb`, `caller`                | worker  | pause/resume/kill one of the caller's own descendants (`gmuxapi.pause_process`/`resume_process`/`kill_process`) |
@@ -534,10 +539,11 @@ A legacy program's `require` works like OpenOS's, with its own
     `process` and `package` (including OpenOS's `package.delay`);
   - `buffer`, which doesn't work yet;
   - `component`: the process's own virtual gpu, screen and keyboard
-    (see "Legacy virtual components"), with OpenOS's `list`, `proxy`,
-    `invoke`, `type`, `methods`, `isAvailable`, `getPrimary` and
-    `component.<type>`, and OpenOS's "no primary 'x' available" error
-    for anything else.
+    (see "Legacy virtual components"), the OS filesystem, and every
+    other component in the cluster over the bus (see "Cluster component
+    bus"), gmux-style. It has OpenOS's `list`, `proxy`, `invoke`,
+    `type`, `methods`, `isAvailable`, `getPrimary` and
+    `component.<type>`, and OpenOS's "no primary 'x' available" error.
 
   Input arrives in OpenOS's signal shape (`"key_down", address, char,
   code, player`). When the program has loaded OpenOS's `keyboard`
@@ -593,6 +599,67 @@ with the virtual screen's address and window coordinates. Keys reach the
 program when its window is focused. The default resolution fits the
 kernal's screen, up to 80x25, with room for the title bar. The
 program's terminal draws on the same virtual gpu. Test 34.
+
+## Cluster component bus -- BUILT
+
+The original design point: four computers on one component bus, each
+seeing the others' components. OpenComputers gives every computer
+(every rack server too) its own isolated component bus, and the only
+link between computers is network messages (see "Why there's a
+"remote component" layer at all" above). So muxos emulates one bus over the network.
+
+**Registry.** Each worker reports its components to the kernal
+(`COMPONENTS`) at boot, when the kernal first sees it
+(`GETCOMPONENTS`), and whenever one is added or removed. The kernal adds
+its own, refreshed on its `component_added`/`component_removed`. The
+`bus` console command lists the registry.
+
+**Who sees it.**
+- Native processes and `.mxe` programs get `component` over the bus:
+  open visibility.
+- Legacy programs get it too, after their virtual gpu/screen/keyboard
+  and the OS filesystem, as gmux exposes real components behind its
+  virtual ones.
+- `component.<type>` and `getPrimary` prefer the program's virtual
+  devices, then components on its own node, then the rest of the
+  cluster. The listing is cached for 1s.
+
+**Calls.**
+- A component on the caller's own node is called directly, with no
+  network hop.
+- Anything else is a `BUSINVOKE` to the kernal. The kernal calls its own
+  components itself, and relays the call as an `INVOKE` to the worker
+  that owns the component, passing the answer back under the caller's
+  request id. Relays expire after 10s.
+- Workers answer `INVOKE` (and `VALUECALL`, `GETCOMPONENTS` and input
+  events) at their jobs' yield points, so a call doesn't wait for the
+  other node's job to finish. A job that never yields can't answer until
+  it does; that's the same limit as everything else here.
+
+**Values.** A call can return something that can't cross the wire, like
+an internet card's request handle or a socket. That value stays on its
+node: the caller gets a reference, and a proxy whose methods are
+`VALUECALL`s, relayed by the kernal to that node. `close` frees it; past
+64 values per node, the oldest is closed and dropped. So OpenOS's own
+`internet` library, vendored in `kernal/lib`, works unchanged against
+an internet card on any node.
+
+**Not on the bus:**
+- gpu, screen and keyboard: the compositor owns them, and programs get
+  windows and input instead;
+- network cards and tunnels: the cluster's own link (networking for
+  programs is still deferred);
+- EEPROMs and computer components: node firmware and power control;
+- the kernal's boot disk: programs reach it as the OS filesystem (`FS`),
+  with its own handle bookkeeping.
+
+**Not yet:** a remote component's signals (`redstone_changed`, an
+internet card's events, ...) don't reach programs on other nodes yet.
+
+Test 36 covers the registry, a relayed call (worker 2 to worker 1's
+redstone card), a direct call on the owning node, an internet request
+handle used remotely, and a legacy program fetching through OpenOS's
+`internet` library with the kernal's internet card.
 
 ## Legacy filesystem -- BUILT, like gmux
 

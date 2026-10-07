@@ -412,16 +412,17 @@ end
 return main()
 
 --[=[MUXOS-PAYLOAD 0.1.0
-@@MANIFEST 16
-93348 /muxos.lua
+@@MANIFEST 17
+100888 /muxos.lua
 35776 /compositor.lua
 6492 /bitmap.lua
-77785 /runtime.lua
+85243 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 460 /lib/colors.lua
 4881 /lib/core/full_keyboard.lua
 8205 /lib/core/full_text.lua
 2733 /lib/core/full_transforms.lua
+3092 /lib/internet.lua
 2021 /lib/keyboard.lua
 4545 /lib/serialization.lua
 1016 /lib/sides.lua
@@ -429,7 +430,7 @@ return main()
 1832 /lib/transforms.lua
 2601 /eeprom/kernal.lua
 2443 /eeprom/worker.lua
-@@ 93348 /muxos.lua
+@@ 100888 /muxos.lua
 -- muxos kernal "init" for huh2. This REPLACES OpenOS on the kernal --
 -- it is the entire resident environment, not a program that runs under
 -- one. kernal/bios.lua (this node's own tiny EEPROM image, mirroring
@@ -922,6 +923,9 @@ local function noteNode(addr)
   if not nodes[addr] then
     nodes[addr] = {}
     nodeOrder[#nodeOrder + 1] = addr
+    -- Its components join the cluster bus (it also reports them itself
+    -- when it boots; this covers one that was running before us).
+    send({type = "GETCOMPONENTS", from = selfAddr, to = addr})
   end
   local node = nodes[addr]
   node.lastSeen = computer.uptime()
@@ -1623,6 +1627,151 @@ end
 -- components. This is the reverse direction of the "remote component"
 -- bridge in node/bios.lua: a worker with no screen/disk of its own asks
 -- the kernal to act on its behalf, same wire shape either direction.
+-- --- Cluster component bus ---
+--
+-- Every node's components, visible to processes anywhere in the cluster
+-- (the original design: one component bus across the rack). OpenComputers
+-- gives each computer its own component bus, so this is the cluster's
+-- emulation of one, over the network: each worker reports its components
+-- (COMPONENTS), the kernal keeps the registry with its own, and a process
+-- lists it (BUSLIST) and calls into it (BUSINVOKE). A component on the
+-- caller's own node it calls directly; one on the kernal the kernal calls;
+-- one on another worker the kernal relays to that worker. Values a call
+-- returns that can't cross the wire stay on their node and are used
+-- through VALUECALL. Not on the bus: the display and keyboard (the
+-- compositor's), network cards, EEPROMs and computer components -- and
+-- the kernal's boot disk, which processes reach as the OS filesystem.
+local bus = {
+  components = {}, -- address -> {type, node, methods}
+  relays = {},     -- our request id -> {to, id, node, expires}
+}
+do
+  local EXCLUDED = {gpu = true, screen = true, keyboard = true, modem = true, tunnel = true,
+    eeprom = true, computer = true}
+  local RELAY_TIMEOUT = 10
+  local components, relays = bus.components, bus.relays
+
+  function bus.setNodeComponents(node, list)
+    for addr, c in pairs(components) do
+      if c.node == node then components[addr] = nil end
+    end
+    for addr, c in pairs(type(list) == "table" and list or {}) do
+      if type(addr) == "string" and type(c) == "table" and type(c.type) == "string" and not EXCLUDED[c.type] then
+        components[addr] = {type = c.type, node = node, methods = type(c.methods) == "table" and c.methods or {}}
+      end
+    end
+  end
+
+  function bus.refreshOwn()
+    local list = {}
+    for addr, ctype in component.list() do
+      if addr ~= fsAddr then
+        local ok, methods = pcall(component.methods, addr)
+        list[addr] = {type = ctype, methods = ok and methods or {}}
+      end
+    end
+    bus.setNodeComponents(selfAddr, list)
+  end
+
+  -- Values from the kernal's own components that can't cross the wire
+  -- (same scheme as node/runtime.lua's).
+  local values, valueCount, nextValue = {}, 0, 1
+  local MAX_VALUES = 64
+
+  local function isPlain(v, depth)
+    local t = type(v)
+    if t == "nil" or t == "boolean" or t == "number" or t == "string" then return true end
+    if t ~= "table" or depth > 8 then return false end
+    for k, x in pairs(v) do
+      if not isPlain(k, depth + 1) or not isPlain(x, depth + 1) then return false end
+    end
+    return true
+  end
+
+  local function exportValue(v)
+    if isPlain(v, 0) then return v end
+    if valueCount >= MAX_VALUES then
+      local oldest = math.huge
+      for k in pairs(values) do if k < oldest then oldest = k end end
+      local old = values[oldest]
+      values[oldest], valueCount = nil, valueCount - 1
+      pcall(function() old.close() end)
+    end
+    local n = nextValue
+    nextValue, valueCount = n + 1, valueCount + 1
+    values[n] = v
+    return {__busValue = n, node = selfAddr}
+  end
+
+  local function reply(msg, packed)
+    if packed[1] then
+      local returns = {n = packed.n - 1}
+      for i = 2, packed.n do returns[i - 1] = exportValue(packed[i]) end
+      if pcall(send, {type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = returns}) then return end
+      packed = {false, "the result can't be sent"}
+    end
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = tostring(packed[2])})
+  end
+
+  function bus.fail(msg, err)
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
+  end
+
+  -- Passes a request on to the worker that owns the component (or
+  -- value); its answer goes back to the caller under the caller's id.
+  local function relay(node, msg, fields)
+    local id = nextId()
+    relays[id] = {to = msg.from, id = msg.id, node = node, expires = computer.uptime() + RELAY_TIMEOUT}
+    fields.from, fields.to, fields.id = selfAddr, node, id
+    send(fields)
+  end
+
+  function bus.sweep()
+    local now = computer.uptime()
+    for id, r in pairs(relays) do
+      if now > r.expires then relays[id] = nil end
+    end
+  end
+
+  local function nodeUp(node)
+    return node == selfAddr or (nodes[node] and not nodes[node].down)
+  end
+
+  function bus.list(msg)
+    local list = {}
+    for addr, c in pairs(components) do
+      if nodeUp(c.node) then list[addr] = {type = c.type, node = c.node, methods = c.methods} end
+    end
+    send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
+  end
+
+  function bus.invoke(msg)
+    local c = components[msg.address]
+    if not c or not nodeUp(c.node) then return bus.fail(msg, "no such component") end
+    local args = type(msg.args) == "table" and msg.args or {n = 0}
+    if c.node == selfAddr then
+      reply(msg, table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(args, 1, args.n or #args))))
+    else
+      relay(c.node, msg, {type = "INVOKE", address = msg.address, method = msg.method, args = args})
+    end
+  end
+
+  function bus.valueCall(msg)
+    local args = type(msg.args) == "table" and msg.args or {n = 0}
+    if msg.node == selfAddr then
+      local v = values[msg.value]
+      if v == nil then return bus.fail(msg, "that value is gone (closed, or its node restarted)") end
+      reply(msg, table.pack(pcall(function() return v[msg.method](table.unpack(args, 1, args.n or #args)) end)))
+      if msg.method == "close" then values[msg.value], valueCount = nil, valueCount - 1 end
+    elseif msg.node ~= nil and nodeUp(msg.node) then
+      relay(msg.node, msg, {type = "VALUECALL", value = msg.value, method = msg.method, args = args})
+    else
+      bus.fail(msg, "that value's node is gone")
+    end
+  end
+end
+bus.refreshOwn()
+
 local function handleList(msg)
   local list = {}
   for addr, ctype in component.list() do
@@ -2022,6 +2171,18 @@ local function handleModemMessage(from, port, data)
     handleList(msg)
   elseif msg.type == "INVOKE" then
     handleInvoke(msg)
+  elseif msg.type == "COMPONENTS" then
+    bus.setNodeComponents(msg.from, msg.components)
+  elseif msg.type == "BUSLIST" or msg.type == "BUSINVOKE" or msg.type == "VALUECALL" then
+    if not callerJob(msg) then
+      bus.fail(msg, "not called from a running process")
+    elseif msg.type == "BUSLIST" then
+      bus.list(msg)
+    elseif msg.type == "BUSINVOKE" then
+      bus.invoke(msg)
+    else
+      bus.valueCall(msg)
+    end
   elseif msg.type == "GETPROCESSES" then
     handleGetProcesses(msg)
   elseif msg.type == "GETPROCESS" then
@@ -2057,6 +2218,12 @@ local function handleModemMessage(from, port, data)
   elseif msg.type == "RELEASEFULLSCREEN" then
     handleReleaseFullscreen(msg)
   elseif msg.type == "PONG" or msg.type == "RESULT" or msg.type == "ERROR" then
+    local relay = msg.id and bus.relays[msg.id]
+    if relay and relay.node == msg.from and msg.type ~= "PONG" then
+      bus.relays[msg.id] = nil
+      send({type = msg.type, from = selfAddr, to = relay.to, id = relay.id, result = msg.result, error = msg.error})
+      return
+    end
     if msg.id then
       if awaiting[msg.id] == msg.from then
         replyBox[msg.id] = msg
@@ -2358,6 +2525,8 @@ local function tick(timeout)
       handleScroll(a3, a4, a5)
     elseif name == "touch" or name == "drag" or name == "drop" then
       handleTouch(name, a3, a4, a5)
+    elseif name == "component_added" or name == "component_removed" then
+      bus.refreshOwn()
     elseif name == "modem_message" then
       handleModemMessage(a3, a4, a6)
     end
@@ -2367,6 +2536,7 @@ local function tick(timeout)
       consoleInterrupt()
     end
     sweepStaleChunks()
+    bus.sweep()
     sweepStaleOrphans()
     checkLiveness()
     renderConsole()
@@ -2723,6 +2893,21 @@ runCommand = function(line)
         pixels = demoPixels(16), width = 16, height = 16, mode = mode, bg = 0x000000})
       if err then print("error: " .. err) else print("created bit window [" .. win.id .. "] (" .. win.width .. "x" .. win.height .. " cells)") end
     end
+  elseif line == "bus" then
+    local addrs = {}
+    for addr in pairs(bus.components) do addrs[#addrs + 1] = addr end
+    table.sort(addrs, function(a, b)
+      local x, y = bus.components[a], bus.components[b]
+      if x.type ~= y.type then return x.type < y.type end
+      return a < b
+    end)
+    if #addrs == 0 then print("no components on the bus") end
+    for _, addr in ipairs(addrs) do
+      local c = bus.components[addr]
+      local where = c.node == selfAddr and "kernal" or c.node
+      if c.node ~= selfAddr and nodes[c.node] and nodes[c.node].down then where = where .. " (DOWN)" end
+      print(string.format("%-14s %s  on %s", c.type, addr, where))
+    end
   elseif line:match("^components%s") then
     printComponents(resolveNode(line:match("^components%s+(%S+)")))
   elseif line:match("^call%s") then
@@ -2779,7 +2964,7 @@ print("  console <width> <height> [x y] -- resize/move the console window")
 print("  comp -- leave console mode (hold Ctrl+Alt+C to enter it; a press exits fullscreen); PgUp/PgDn or the wheel scroll")
 print("  focus <window id> -- moves keyboard focus (manual stand-in -- no mouse/click gesture exists yet)")
 print("  bitdemo <halfblock|braille> <x> <y> -- draws a test pattern as a bit window")
-print("  components <node> | call <node> <component addr> <method> [args table]")
+print("  bus (every component in the cluster) | components <node> | call <node> <component addr> <method> [args table]")
 print("(<node> is either a [n] index from 'nodes' or a full node address)")
 discover(1)
 listNodes()
@@ -3819,7 +4004,7 @@ end
 
 return M
 
-@@ 77785 /runtime.lua
+@@ 85243 /runtime.lua
 -- Worker runtime for huh2. NOT flashed anywhere -- this lives on the
 -- KERNAL's filesystem (as a sibling file of kernal/muxos.lua) and gets
 -- served, as plain source text, to each worker over the modem at boot
@@ -4051,6 +4236,110 @@ end
 local outputBuffers = {}
 local OUTPUT_FLUSH_AT = 1024
 
+-- --- Cluster component bus: this node's side ---
+--
+-- Every node's components are visible to processes anywhere in the
+-- cluster (see docs/PROTOCOL.md, "Cluster component bus"). This node
+-- reports its components to the kernal (COMPONENTS: at boot, when asked,
+-- and when one is added or removed) and services calls on them that the
+-- kernal relays (INVOKE, and VALUECALL for values a call returned) --
+-- at its jobs' yield points too, so a caller never waits for a whole job
+-- to finish. Never on the bus: the display and keyboard (the kernal's
+-- compositor owns them), network cards (the cluster's own link), and
+-- EEPROMs/computer components (node firmware and power).
+local BUS_EXCLUDED = {gpu = true, screen = true, keyboard = true, modem = true, tunnel = true,
+  eeprom = true, computer = true}
+
+-- Values a component call returned that can't cross the wire (an
+-- internet request handle, a socket, ...) stay here; the caller gets
+-- {__busValue = n, node = this node} and calls its methods through
+-- VALUECALL. Capped: the oldest is closed and dropped.
+local busValues, busValueCount, nextBusValue = {}, 0, 1
+local MAX_BUS_VALUES = 64
+
+local function isPlain(v, depth)
+  local t = type(v)
+  if t == "nil" or t == "boolean" or t == "number" or t == "string" then return true end
+  if t ~= "table" or depth > 8 then return false end
+  for k, x in pairs(v) do
+    if not isPlain(k, depth + 1) or not isPlain(x, depth + 1) then return false end
+  end
+  return true
+end
+
+local function exportValue(v)
+  if isPlain(v, 0) then return v end
+  if busValueCount >= MAX_BUS_VALUES then
+    local oldest = math.huge
+    for k in pairs(busValues) do if k < oldest then oldest = k end end
+    local old = busValues[oldest]
+    busValues[oldest], busValueCount = nil, busValueCount - 1
+    pcall(function() old.close() end)
+  end
+  local n = nextBusValue
+  nextBusValue, busValueCount = n + 1, busValueCount + 1
+  busValues[n] = v
+  return {__busValue = n, node = nodeId}
+end
+
+-- Calls a method on one of this node's components (INVOKE) or on a value
+-- one returned (VALUECALL) for the kernal, and replies.
+local function serviceBusCall(msg)
+  local args = type(msg.args) == "table" and msg.args or {n = 0}
+  local n = args.n or #args
+  local packed
+  if msg.type == "INVOKE" then
+    packed = table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(args, 1, n)))
+  else
+    local v = busValues[msg.value]
+    if v == nil then
+      packed = {false, "that value is gone (closed, or its node restarted)", n = 2}
+    else
+      packed = table.pack(pcall(function() return v[msg.method](table.unpack(args, 1, n)) end))
+      if msg.method == "close" then busValues[msg.value], busValueCount = nil, busValueCount - 1 end
+    end
+  end
+  local reply
+  if packed[1] then
+    local returns = {n = packed.n - 1}
+    for i = 2, packed.n do returns[i - 1] = exportValue(packed[i]) end
+    reply = {type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = returns}
+  else
+    reply = {type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = tostring(packed[2])}
+  end
+  if not pcall(send, reply) then
+    send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = "the result can't be sent"})
+  end
+end
+
+local function reportComponents()
+  if not kernalAddr then return end
+  local list = {}
+  for addr, ctype in component.list() do
+    if not BUS_EXCLUDED[ctype] then
+      local ok, methods = pcall(component.methods, addr)
+      list[addr] = {type = ctype, methods = ok and methods or {}}
+    end
+  end
+  send({type = "COMPONENTS", from = nodeId, to = kernalAddr, components = list})
+end
+
+-- Kernal requests a node answers at once, even mid-job. True if `msg`
+-- was one (and is handled).
+local function serviceInline(from, msg)
+  if from ~= kernalAddr or msg.from ~= from or msg.to ~= nodeId then return false end
+  if msg.type == "EVENT" then
+    queueEvent(msg.jobId, msg.event)
+  elseif msg.type == "INVOKE" or msg.type == "VALUECALL" then
+    serviceBusCall(msg)
+  elseif msg.type == "GETCOMPONENTS" then
+    reportComponents()
+  else
+    return false
+  end
+  return true
+end
+
 -- Sets aside one signal pulled while waiting for something else -- a
 -- job's yield(), sleep(), or a gmuxapi call. A PING is answered on the
 -- spot: that's how the kernal knows a node busy with a job is still
@@ -4058,6 +4347,7 @@ local OUTPUT_FLUSH_AT = 1024
 -- heartbeat. Non-modem signals are dropped -- a worker has no use for
 -- them.
 local function stashSignal(name, from, port, data)
+  if name == "component_added" or name == "component_removed" then reportComponents() return end
   if name ~= "modem_message" or noteControl(port, data) then return end
   if port ~= PORT or type(data) ~= "string" then return end
   local payload = reassemble(from, data)
@@ -4065,8 +4355,8 @@ local function stashSignal(name, from, port, data)
   if type(msg) ~= "table" then return end
   if msg.type == "PING" and msg.from == from and (msg.to == nil or msg.to == nodeId) then
     send({type = "PONG", from = nodeId, to = msg.from, id = msg.id})
-  elseif msg.type == "EVENT" and from == kernalAddr and msg.from == from and msg.to == nodeId then
-    queueEvent(msg.jobId, msg.event)
+  elseif serviceInline(from, msg) then
+    -- handled
   else
     pendingMessages[#pendingMessages + 1] = {from = from, msg = msg}
   end
@@ -4077,6 +4367,7 @@ end
 -- for the kernal's own discovery bookkeeping, not for learning
 -- anything on our end).
 send({type = "HELLO", from = nodeId})
+reportComponents()
 
 local nextRpcId = 1
 local function nextId()
@@ -4116,7 +4407,7 @@ local function remoteRequest(msgType, extra)
           and (reply.type == "RESULT" or reply.type == "ERROR") then
         if reply.type == "RESULT" then return reply.result end
         return nil, reply.error
-      elseif type(reply) == "table" then
+      elseif type(reply) == "table" and not serviceInline(from, reply) then
         -- Anything else (most importantly a JOB for a child the kernal
         -- placed on this same node) is kept for the main loop rather
         -- than dropped.
@@ -4208,6 +4499,151 @@ gpu = setmetatable({}, {
 -- the parent when asking for a child. The job itself sees its own id as
 -- `jobId` in its process environment.
 local currentJobId = nil
+
+-- --- Cluster component bus: the client side ---
+--
+-- What a process's `component` sees: every node's components (the
+-- kernal's registry, BUSLIST, cached for BUS_LIST_TTL), called directly
+-- when they're on this node and through the kernal (BUSINVOKE) when not.
+-- A returned value that can't cross the wire comes back as a proxy whose
+-- methods are VALUECALLs to the node holding it.
+local BUS_LIST_TTL = 1
+local busCache, busCacheAt = nil, -math.huge
+
+local function busList()
+  if busCache and computer.uptime() - busCacheAt < BUS_LIST_TTL then return busCache end
+  local list = remoteRequest("BUSLIST", {caller = currentJobId})
+  if type(list) ~= "table" then return busCache or {} end
+  busCache, busCacheAt = list, computer.uptime()
+  return list
+end
+
+local importValues
+
+local function valueProxy(ref)
+  return setmetatable({}, {__index = function(_, method)
+    return function(...)
+      local reply, err = remoteRequest("VALUECALL", {node = ref.node, value = ref.__busValue, method = method,
+        args = table.pack(...), caller = currentJobId})
+      if not reply then error(err, 2) end
+      return importValues(reply)
+    end
+  end})
+end
+
+importValues = function(results)
+  results = type(results) == "table" and results or {n = 0}
+  local n = results.n or #results
+  for i = 1, n do
+    local v = results[i]
+    if type(v) == "table" and v.__busValue then results[i] = valueProxy(v) end
+  end
+  return table.unpack(results, 1, n)
+end
+
+local function busInvoke(addr, method, ...)
+  local ok, localType = pcall(component.type, addr)
+  if ok and localType and not BUS_EXCLUDED[localType] then return component.invoke(addr, method, ...) end
+  local reply, err = remoteRequest("BUSINVOKE", {address = addr, method = method, args = table.pack(...),
+    caller = currentJobId})
+  if not reply then error(err, 2) end
+  return importValues(reply)
+end
+
+-- OpenOS's `component` API over the bus. `extra()`, if given, returns
+-- address -> device for devices that aren't on the bus (a legacy
+-- program's virtual gpu/screen/keyboard); they come first for "primary",
+-- then this node's own components, then the rest of the cluster's.
+local function newBusComponentFace(extra)
+  local proxies = {}
+  local function busProxy(addr, info)
+    local p = proxies[addr]
+    if p and p.type == info.type then return p end
+    local methods = info.methods
+    p = setmetatable({address = addr, type = info.type, slot = -1}, {__index = function(_, m)
+      if type(methods) == "table" and next(methods) ~= nil and methods[m] == nil then return nil end
+      return function(...) return busInvoke(addr, m, ...) end
+    end})
+    proxies[addr] = p
+    return p
+  end
+  local function devices()
+    local all = {}
+    for addr, info in pairs(busList()) do all[addr] = {type = info.type, node = info.node, info = info} end
+    for addr, dev in pairs(extra and extra() or {}) do all[addr] = {type = dev.type, device = dev} end
+    return all
+  end
+  local function deviceOf(entry, addr) return entry.device or busProxy(addr, entry.info) end
+  local function primary(kind)
+    local all, bestRank, bestAddr = devices(), nil, nil
+    for addr, e in pairs(all) do
+      if e.type == kind then
+        local rank = e.device and 0 or (e.node == nodeId and 1 or 2)
+        if not bestRank or rank < bestRank or (rank == bestRank and addr < bestAddr) then
+          bestRank, bestAddr = rank, addr
+        end
+      end
+    end
+    return bestAddr and deviceOf(all[bestAddr], bestAddr)
+  end
+  local face = {}
+  function face.list(filter, exact)
+    local found = {}
+    for addr, e in pairs(devices()) do
+      if filter == nil or (exact and e.type == filter) or (not exact and e.type:find(filter, 1, true)) then
+        found[addr] = e.type
+      end
+    end
+    local key
+    return setmetatable(found, {__call = function()
+      key = next(found, key)
+      if key then return key, found[key] end
+    end})
+  end
+  function face.proxy(addr)
+    local e = devices()[addr]
+    if not e then return nil, "no such component" end
+    return deviceOf(e, addr)
+  end
+  function face.invoke(addr, method, ...)
+    local dev = face.proxy(addr)
+    if not dev then error("no such component", 2) end
+    local fn = dev[method]
+    if type(fn) ~= "function" then error("no such method", 2) end
+    return fn(...)
+  end
+  function face.type(addr)
+    local e = devices()[addr]
+    if not e then return nil, "no such component" end
+    return e.type
+  end
+  function face.slot(addr)
+    if not devices()[addr] then return nil, "no such component" end
+    return -1
+  end
+  function face.methods(addr)
+    local e = devices()[addr]
+    if not e then return nil, "no such component" end
+    if e.info then return e.info.methods or {} end
+    local methods = {}
+    for k, f in pairs(e.device) do if type(f) == "function" then methods[k] = true end end
+    return methods
+  end
+  function face.fields() return {} end
+  function face.doc() return nil end
+  function face.isAvailable(kind) return primary(kind) ~= nil end
+  function face.getPrimary(kind)
+    local dev = primary(kind)
+    if not dev then error("no primary '" .. tostring(kind) .. "' available", 2) end
+    return dev
+  end
+  function face.setPrimary() end
+  return setmetatable(face, {__index = function(_, kind)
+    local dev = primary(kind)
+    if not dev then error("no primary '" .. tostring(kind) .. "' available", 2) end
+    return dev
+  end})
+end
 
 -- Muxos-shaped gmux application API. Every one of these is necessarily
 -- a remote call to the kernal, never local-first like `gpu` -- a
@@ -4534,6 +4970,10 @@ for _, lib in ipairs({"string", "table", "math", "utf8", "coroutine"}) do
 end
 NATIVE.computer = readOnly({uptime = computer.uptime, address = computer.address}, "computer")
 NATIVE.gpu = gpu
+-- A native process's (and an .mxe's) view of hardware: the whole
+-- cluster's components, over the bus -- open visibility, minus what the
+-- kernal keeps to itself (display, network, firmware).
+NATIVE.component = readOnly(newBusComponentFace(nil), "component")
 NATIVE.gmuxapi = readOnly(gmuxapi, "gmuxapi")
 NATIVE.yield = yield
 NATIVE.sleep = sleep
@@ -5451,70 +5891,11 @@ local LEGACY_FACES = {
   buffer = function()
     return unavailable("buffer")
   end,
-  -- gmux-style: the process sees its own virtual gpu, screen and
-  -- keyboard, and nothing else.
+  -- gmux-style: the process's own virtual gpu, screen and keyboard,
+  -- the OS filesystem, and every other component in the cluster over
+  -- the bus.
   component = function(ctx)
-    local component = {}
-    local function devices() return virtualDevices(ctx) end
-    local function primary(kind)
-      for _, dev in pairs(devices()) do
-        if dev.type == kind then return dev end
-      end
-    end
-    function component.list(filter, exact)
-      local found = {}
-      for addr, dev in pairs(devices()) do
-        if filter == nil or (exact and dev.type == filter) or (not exact and dev.type:find(filter, 1, true)) then
-          found[addr] = dev.type
-        end
-      end
-      local key
-      return setmetatable(found, {__call = function()
-        key = next(found, key)
-        if key then return key, found[key] end
-      end})
-    end
-    function component.proxy(addr)
-      local dev = devices()[addr]
-      if not dev then return nil, "no such component" end
-      return dev
-    end
-    function component.invoke(addr, method, ...)
-      local dev = devices()[addr]
-      if not dev then error("no such component", 2) end
-      if type(dev[method]) ~= "function" then error("no such method", 2) end
-      return dev[method](...)
-    end
-    function component.type(addr)
-      local dev = devices()[addr]
-      if not dev then return nil, "no such component" end
-      return dev.type
-    end
-    function component.slot(addr)
-      if not devices()[addr] then return nil, "no such component" end
-      return -1
-    end
-    function component.methods(addr)
-      local dev = devices()[addr]
-      if not dev then return nil, "no such component" end
-      local methods = {}
-      for k, f in pairs(dev) do if type(f) == "function" then methods[k] = true end end
-      return methods
-    end
-    function component.fields() return {} end
-    function component.doc() return nil end
-    function component.isAvailable(kind) return primary(kind) ~= nil end
-    function component.getPrimary(kind)
-      local dev = primary(kind)
-      if not dev then error("no primary '" .. tostring(kind) .. "' available", 2) end
-      return dev
-    end
-    function component.setPrimary() end
-    return setmetatable(component, {__index = function(_, kind)
-      local dev = primary(kind)
-      if not dev then error("no primary '" .. tostring(kind) .. "' available", 2) end
-      return dev
-    end})
+    return newBusComponentFace(function() return virtualDevices(ctx) end)
   end,
   package = function(ctx)
     return {
@@ -5787,19 +6168,13 @@ local function handleMessage(from, msg)
       list[addr] = ctype
     end
     send({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = list})
-  elseif msg.type == "INVOKE" then
-    -- The "remote component" bridge: call a method on one of this
-    -- node's own components on the kernal's behalf. Results keep an
-    -- explicit `n` so a nil in the middle doesn't shift what follows.
-    local args = msg.args or {}
-    local packed = table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(args, 1, args.n or #args)))
-    if packed[1] then
-      local returns = {n = packed.n - 1}
-      for i = 2, packed.n do returns[i - 1] = packed[i] end
-      sendReply({type = "RESULT", from = nodeId, to = msg.from, id = msg.id, result = returns}, "invoke result")
-    else
-      send({type = "ERROR", from = nodeId, to = msg.from, id = msg.id, error = tostring(packed[2])})
-    end
+  elseif msg.type == "INVOKE" or msg.type == "VALUECALL" then
+    -- The bus: a call on one of this node's components (or a value one
+    -- returned) on the kernal's behalf. Results keep an explicit `n` so
+    -- a nil in the middle doesn't shift what follows.
+    serviceBusCall(msg)
+  elseif msg.type == "GETCOMPONENTS" then
+    reportComponents()
   end
 end
 
@@ -5813,6 +6188,7 @@ while true do
     -- nothing else arrives for a while.
     local name, _, from, port, _, data = pullSignal(10)
     sweepStaleChunks()
+    if name == "component_added" or name == "component_removed" then reportComponents() end
     if name == "modem_message" and not noteControl(port, data) and port == PORT and type(data) == "string" then
       local payload = reassemble(from, data)
       local msg = payload and deserialize(payload)
@@ -6446,6 +6822,137 @@ function lib.at(tbl, index)
   return nil, current_index - 1 -- went one too far
 end
 
+@@ 3092 /lib/internet.lua
+local buffer = require("buffer")
+local component = require("component")
+
+local internet = {}
+
+-------------------------------------------------------------------------------
+
+function internet.request(url, data, headers, method)
+  checkArg(1, url, "string")
+  checkArg(2, data, "string", "table", "nil")
+  checkArg(3, headers, "table", "nil")
+  checkArg(4, method, "string", "nil")
+
+  if not component.isAvailable("internet") then
+    error("no primary internet card found", 2)
+  end
+  local inet = component.internet
+
+  local post
+  if type(data) == "string" then
+    post = data
+  elseif type(data) == "table" then
+    for k, v in pairs(data) do
+      post = post and (post .. "&") or ""
+      post = post .. tostring(k) .. "=" .. tostring(v)
+    end
+  end
+
+  local request, reason = inet.request(url, post, headers, method)
+  if not request then
+    error(reason, 2)
+  end
+
+  return setmetatable(
+  {
+    ["()"] = "function():string -- Tries to read data from the socket stream and return the read byte array.",
+    close = setmetatable({},
+    {
+      __call = request.close,
+      __tostring = function() return "function() -- closes the connection" end
+    })
+  },
+  {
+    __call = function()
+      while true do
+        local data, reason = request.read()
+        if not data then
+          request.close()
+          if reason then
+            error(reason, 2)
+          else
+            return nil -- eof
+          end
+        elseif #data > 0 then
+          return data
+        end
+        -- else: no data, block
+        os.sleep(0)
+      end
+    end,
+    __index = request,
+  })
+end
+
+-------------------------------------------------------------------------------
+
+local socketStream = {}
+
+function socketStream:close()
+  if self.socket then
+    self.socket.close()
+    self.socket = nil
+  end
+end
+
+function socketStream:seek()
+  return nil, "bad file descriptor"
+end
+
+function socketStream:read(n)
+  if not self.socket then
+    return nil, "connection is closed"
+  end
+  return self.socket.read(n)
+end
+
+function socketStream:write(value)
+  if not self.socket then
+    return nil, "connection is closed"
+  end
+  while #value > 0 do
+    local written, reason = self.socket.write(value)
+    if not written then
+      return nil, reason
+    end
+    value = string.sub(value, written + 1)
+  end
+  return true
+end
+
+function internet.socket(address, port)
+  checkArg(1, address, "string")
+  checkArg(2, port, "number", "nil")
+  if port then
+    address = address .. ":" .. port
+  end
+
+  local inet = component.internet
+  local socket, reason = inet.connect(address)
+  if not socket then
+    return nil, reason
+  end
+
+  local stream = {inet = inet, socket = socket}
+  local metatable = {__index = socketStream,
+                     __metatable = "socketstream"}
+  return setmetatable(stream, metatable)
+end
+
+function internet.open(address, port)
+  local stream, reason = internet.socket(address, port)
+  if not stream then
+    return nil, reason
+  end
+  return buffer.new("rwb", stream)
+end
+
+-------------------------------------------------------------------------------
+
+return internet
 @@ 2021 /lib/keyboard.lua
 local keyboard = {pressedChars = {}, pressedCodes = {}}
 

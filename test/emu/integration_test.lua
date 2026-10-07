@@ -95,6 +95,12 @@ os.setenv("PWD", "/home")
 local count = 0 for _ in io.lines("sub/copy.txt") do count = count + 1 end
 local ok = pcall(dofile, "/lib/sides.lua") print("fs " .. l1 .. "|" .. l2:gsub("\n", "N") .. "|" .. #rest .. "|" .. table.concat(names, ",") .. "|" .. count .. "|" .. fs.size("/home/sub/copy.txt") .. "|" .. tostring(fs.exists("/home/nope")) .. "|" .. tostring(ok) .. "|" .. tostring(fs.isDirectory("/home/sub"))) error("boom")
 ]==],
+  -- A legacy program using an internet card elsewhere in the cluster (test 36).
+  ["/bin/fetch.lua"] = [==[local internet = require("internet")
+local body = ""
+for chunk in internet.request("http://example/x") do body = body .. chunk end
+print("fetched " .. body .. " via " .. require("component").internet.address:sub(1, 8))
+]==],
   -- A legacy graphics program (test 34).
   ["/bin/paint.lua"] = [==[local component = require("component")
 local event = require("event")
@@ -138,7 +144,7 @@ print("missing=" .. tostring(ok) .. " " .. (tostring(err):match("module 'nosuchm
 ]==],
 }
 -- The vendored OpenOS libraries, installed as /lib on the kernal's disk.
-for _, rel in ipairs({"serialization", "text", "sides", "colors", "keyboard", "transforms",
+for _, rel in ipairs({"serialization", "text", "sides", "colors", "keyboard", "transforms", "internet",
     "core/full_keyboard", "core/full_text", "core/full_transforms"}) do
   kernalFiles["/lib/" .. rel .. ".lua"] = readFile(REPO_ROOT .. "/kernal/lib/" .. rel .. ".lua")
 end
@@ -188,11 +194,39 @@ end
 emu:boot(kernal)
 assert(kernal.status == "running", "kernal failed to boot: see log")
 
+-- Hardware for the cluster component bus (test 36): an internet card on
+-- the kernal, a redstone card on worker 1.
+local function fakeInternet()
+  return {
+    request = function(url)
+      local chunks = {"hello ", "", "bus"}
+      return {
+        finishConnect = function() return true end,
+        response = function() return 200, "OK", {} end,
+        read = function() return table.remove(chunks, 1) end,
+        close = function() chunks = {} return true end,
+      }
+    end,
+    isHttpEnabled = function() return true end,
+  }
+end
+local internetAddr = emu:addComponent(kernal, "internet", fakeInternet())
+-- Added after the kernal booted: it hears about it, as on real hardware.
+emu:injectSignal(kernal, "component_added", internetAddr, "internet")
+
 -- --- Build 3 workers ---
-local workers = {}
+local workers, workerModems, redstoneAddr = {}, {}, nil
 for i = 1, 3 do
   local w = emu:newNode("worker")
-  emu:addModem(w)
+  workerModems[i] = emu:addModem(w)
+  if i == 1 then
+    local outputs = {}
+    redstoneAddr = emu:addComponent(w, "redstone", {
+      getInput = function(side) return side * 10 end,
+      setOutput = function(side, v) local old = outputs[side] or 0 outputs[side] = v return old end,
+      getOutput = function(side) return outputs[side] or 0 end,
+    })
+  end
   emu:addEeprom(w, workerBiosSrc)
   emu:boot(w)
   assert(w.status == "running", "worker " .. i .. " failed to boot: see log")
@@ -873,8 +907,10 @@ do
   assert(n == 2 and not after:find("g27=leaked", 1, true), "a process's globals leaked into a later process")
 end
 typeLine('run local ok = pcall(function() string.x27 = 1 end) return "e27=" .. tostring(debug) .. "/" .. tostring(component) .. "/" .. tostring(ok)')
+-- (component is now the cluster bus face; test 36 covers it)
 emu:advance(2)
-assertScreenContains("e27=nil/nil/false", "no debug, no raw component, read-only libraries")
+assertScreenContains("e27=nil/table: ", "no debug; `component` is the cluster bus, not the raw one")
+assertScreenContains("/false", "read-only libraries")
 print("  OK -- per-process globals; no debug or raw component; libraries are read-only")
 
 typeLine("spawn 1 for i = 1, 6 do sleep(0.5) end return \"slept27\"")
@@ -1145,5 +1181,37 @@ assertScreenContains("/bin/files.lua:13: boom", "an error is written into the pr
 assert(cellText(1, 1, 1) == "\u{274C}", "and its title is marked as failed")
 closeWindowAt(1, 50)
 print("  OK -- files on the kernal's disk; a legacy error shows in its window")
+
+print("test 36: the cluster component bus -- every node's components, from any process")
+local w1, w2 = workerModems[1], workerModems[2]
+typeLine("bus")
+emu:advance(1)
+assertScreenContains(string.format("%-14s %s  on kernal", "internet", internetAddr), "the kernal's internet card is on the bus")
+assertScreenContains(string.format("%-14s %s  on %s", "redstone", redstoneAddr, w1), "worker 1's redstone card is on the bus")
+do
+  local after = screenAfter("muxos> bus")
+  assert(not after:find("gpu ", 1, true) and not after:find("modem ", 1, true) and not after:find("eeprom ", 1, true),
+    "the display, network cards and firmware stay off the bus")
+end
+print("  OK -- the kernal keeps a registry of every node's components")
+
+typeLine("spawn " .. w2 .. " print('rs2=' .. component.redstone.getInput(2) .. '/' .. tostring(component.isAvailable('gpu')) .. '/' .. tostring(component.redstone.setOutput(3, 9)))")
+emu:advance(2)
+assertScreenContains("rs2=20/false/0", "worker 2 calls worker 1's redstone card through the kernal")
+typeLine("spawn " .. w1 .. " print('rs1=' .. component.redstone.getOutput(3) .. '/' .. component.type('" .. redstoneAddr .. "'))")
+emu:advance(2)
+assertScreenContains("rs1=9/redstone", "on worker 1 the same card is called directly, and sees worker 2's write")
+print("  OK -- a component on another worker is relayed; one on the caller's own node is called directly")
+
+typeLine("spawn " .. w2 .. " local h = component.internet.request('http://x') h.finishConnect() local b = '' for i = 1, 5 do local d = h.read() if not d then break end b = b .. d end h.close() print('net=' .. b .. '/' .. tostring(select(2, pcall(h.read))))")
+emu:advance(3)
+assertScreenContains("net=hello bus/that value is gone", "a request handle stays on the kernal and is used through VALUECALL; closing frees it")
+print("  OK -- values a call returns (an internet request handle) are used remotely, and freed on close")
+
+typeLine("fetch")
+emu:advance(4)
+assertScreenContains("fetched hello bus via " .. internetAddr:sub(1, 8), "OpenOS's internet library works over the bus")
+closeWindowAt(1, 50)
+print("  OK -- a legacy program uses OpenOS's internet library with the kernal's internet card")
 
 print("ALL OK")

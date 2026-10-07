@@ -476,6 +476,15 @@ decorated, resizable window that is its terminal (`print`/`io.read`)
 and its virtual gpu/screen/keyboard, and it uses the OS filesystem
 (the kernal's disk) through `io`/`filesystem`. Tests 29, 33-35.
 
+**Cluster component bus -- BUILT.** Every node's components are visible
+to programs anywhere in the cluster. Each node reports its components to
+the kernal, and programs use them through the normal `component` API:
+calls to their own node's components are direct, others go through the
+kernal. Values a call returns, like an internet request handle, work
+remotely too. OpenComputers gives each computer its own component bus,
+so this is emulated over the network. The display, network cards and
+firmware stay off it. `bus` at the console lists it. Test 36.
+
 **Migration and draining -- BUILT.** An `.mxe` that lists the built-in
 `mux` library can opt in with `mux.migratable(save)`; `migrate <id>
 [node]` moves it at its next yield point and it restarts on the target
