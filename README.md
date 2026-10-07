@@ -92,6 +92,7 @@ node/bios.lua         worker EEPROM image: tiny network-boot stub, fetches node/
 node/runtime.lua       worker's real runtime, served by the kernal (installed as its sibling,
                        NOT flashed anywhere) -- job execution, remote-component bridge, gpu
                        face, gmuxapi (muxos's own, gmux-API-shaped)
+docs/MXE.md           the .mxe program format: the spec programs written for muxos target
 docs/PROTOCOL.md      shared wire format: the boot handshake + the main message protocol +
                        the gmux API translation + the bare-metal kernal design
 test/emu/              a 4-node (1 kernal + 3 workers) test environment, emulating this
