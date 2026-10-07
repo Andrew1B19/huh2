@@ -23,7 +23,7 @@ local component = require("component")
 local computer = require("computer")
 local filesystem = require("filesystem")
 
-local VERSION = "0.1.0" -- set by tools/build.lua
+local VERSION = "0.1.1" -- set by tools/build.lua
 local CHUNK = 8192
 
 local options, positional = {}, {}
@@ -411,7 +411,7 @@ end
 
 return main()
 
---[=[MUXOS-PAYLOAD 0.1.0
+--[=[MUXOS-PAYLOAD 0.1.1
 @@MANIFEST 19
 105317 /muxos.lua
 37750 /compositor.lua
@@ -467,7 +467,7 @@ return main()
 -- actually load.
 
 local PORT = 4477
-local MUXOS_VERSION = "0.1.0"
+local MUXOS_VERSION = "0.1.1"
 local TIMEOUT = 5 -- seconds to wait for a worker reply before giving up
 
 -- Every blocking wait goes through the sandbox's computer.pullSignal,
@@ -4185,7 +4185,7 @@ return M
 -- hand.
 
 local PORT = 4477
-local MUXOS_VERSION = "0.1.0"
+local MUXOS_VERSION = "0.1.1"
 
 -- node/bios.lua passes this in: the address of whoever's CODE chunks
 -- actually completed the boot handshake -- the ONE place a worker ever

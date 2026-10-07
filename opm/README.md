@@ -26,16 +26,6 @@ under `/usr` by default, which the launcher (`/usr/bin`) and legacy
 
 ## Making `opm update` work
 
-Put `opm/opm.mxe` and `opm/opm_core.lua` in the oc-programs repository,
-and add to its `programs.cfg`:
-
-```lua
-["opm-mxe"] = {
-  files = {
-    ["master/opm/opm.mxe"] = "/bin",
-    ["master/opm/opm_core.lua"] = "/lib/mxe",
-  },
-  name = "opm-mxe",
-  description = "opm for muxos",
-},
-```
+Copy this repository into oc-programs as `muxos/`, and merge the
+`opm-mxe` entry from `dist/programs.cfg` into the catalog's
+`programs.cfg`. That file also has the `muxos-installer` entry.

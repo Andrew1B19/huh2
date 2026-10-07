@@ -47,7 +47,7 @@ local kernalFiles = {
   ["/runtime.lua"] = runtimeSrc,
   -- Sample programs for the launcher (test 29).
   ["/bin/hello.mxe"] = [==[--[[mxe
-muxos = "0.1.0"
+muxos = "0.1.1"
 libraries = {"greeting", "nosuchlib"}
 ]]
 local greeting = require("greeting")
@@ -1034,7 +1034,7 @@ emu:advance(3)
 assertScreenContains("hello mxe v=true g=true n=false a=world", ".mxe got its header response, its library, and its args")
 typeLine("old")
 emu:advance(3)
-assertScreenContains("old-runs v=false want=9.9 have=0.1.0", "a version mismatch is reported but the program still runs")
+assertScreenContains("old-runs v=false want=9.9 have=0.1.1", "a version mismatch is reported but the program still runs")
 print("  OK -- .mxe launched by name: version response, granted/missing libraries, require, args")
 
 typeLine("ask")

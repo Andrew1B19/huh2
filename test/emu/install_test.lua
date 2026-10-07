@@ -133,12 +133,12 @@ print("install 3: the single-file installer upgrades the kernal's disk and flash
 do
   local code, out = runInstaller(BUNDLE, kernalOs, nil, "kernal", "--yes")
   assert(code == 0, "kernal install failed:\n" .. out)
-  assert(out:find("Upgrading muxos 0.0.9 to 0.1.0", 1, true), "it noticed the old version:\n" .. out)
+  assert(out:find("Upgrading muxos 0.0.9 to 0.1.1", 1, true), "it noticed the old version:\n" .. out)
   assert(out:find("warning", 1, true) == nil, "no hardware warnings on a complete kernal:\n" .. out)
   assert(disk["/muxos.lua"] == readFile(REPO_ROOT .. "/kernal/muxos.lua"), "muxos.lua installed")
   assert(disk["/runtime.lua"] == readFile(REPO_ROOT .. "/node/runtime.lua"), "runtime.lua installed")
   assert(disk["/lib/core/full_text.lua"] == readFile(REPO_ROOT .. "/kernal/lib/core/full_text.lua"), "libraries installed")
-  assert(disk["/.muxos-version"] == "0.1.0\n" and disk["/home/keep.txt"] == "mine", "version recorded, user files kept")
+  assert(disk["/.muxos-version"] == "0.1.1\n" and disk["/home/keep.txt"] == "mine", "version recorded, user files kept")
   assert(not disk["/eeprom/kernal.lua"], "BIOS images aren't disk files")
   assert(disk["/bin/opm.mxe"] == readFile(REPO_ROOT .. "/opm/opm.mxe")
     and disk["/lib/mxe/opm_core.lua"] == readFile(REPO_ROOT .. "/opm/opm_core.lua"), "opm ships with muxos")
@@ -160,7 +160,7 @@ do
   emu:addEeprom(node, "-- the OpenOS BIOS")
   local code, out = runInstaller(FLOPPY .. "/install.lua", openosFor(node, floppyMedium), {"1", "y"}, "kernal")
   assert(code == 0, "floppy install failed:\n" .. out)
-  assert(out:find("Installing muxos 0.1.0", 1, true), "a fresh install:\n" .. out)
+  assert(out:find("Installing muxos 0.1.1", 1, true), "a fresh install:\n" .. out)
   for path, data in pairs(disk) do
     if path ~= "/.muxos-version" and path ~= "/home/keep.txt" then
       assert(files[path] == data, "floppy install differs at " .. path)
@@ -237,6 +237,27 @@ do
   typeLine("run return 6 * 7")
   emu:advance(2)
   assert(screen():find("42", 1, true), "a job didn't run:\n" .. screen())
+end
+print("  OK")
+
+print("install 7: the catalog entries put the installer on a floppy with a launcher, and opm where muxos looks")
+do
+  local core = dofile(REPO_ROOT .. "/opm/opm_core.lua")
+  local text = readFile(REPO_ROOT .. "/dist/programs.cfg"):gsub("^%-%-[^\n]*\n", ""):gsub("\n%-%-[^\n]*", "")
+  local cfg = assert(core.parse_cfg(text))
+  local function concat(...) return (table.concat({...}, "/"):gsub("//+", "/")) end
+  local target = core.resolve_target("abc")
+  local plan = core.file_plan(cfg, core.order(cfg, "muxos-installer"), target, concat)
+  assert(#plan == 1 and plan[1].path == "muxos/dist/muxos-installer.lua"
+    and plan[1].file == "/mnt/abc/bin/muxos-installer.lua", "installer lands in the floppy's bin")
+  assert(readFile(REPO_ROOT .. "/" .. plan[1].path:gsub("^muxos/", "")) == readFile(BUNDLE), "the entry names the built installer")
+  local launcher = core.launcher_text(cfg["muxos-installer"], "muxos-installer", target, concat)
+  assert(launcher:find('loadfile("/mnt/abc/bin/muxos-installer.lua")', 1, true), "the launcher runs it")
+  local selfPlan = core.file_plan(cfg, core.order(cfg, "opm-mxe"), "/", concat)
+  local dests = {}
+  for _, p in ipairs(selfPlan) do dests[p.file] = p.path end
+  assert(dests["/bin/opm.mxe"] == "muxos/opm/opm.mxe" and dests["/lib/mxe/opm_core.lua"] == "muxos/opm/opm_core.lua",
+    "opm-mxe updates the copy muxos ships")
 end
 print("  OK")
 

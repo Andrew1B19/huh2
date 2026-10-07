@@ -161,6 +161,12 @@ Either way, the installer runs on an OpenOS computer:
   `wget https://raw.githubusercontent.com/<owner>/<repo>/<branch>/dist/muxos-installer.lua`.
   On a private repository, download it from GitHub yourself and use one
   of the options below.
+- **With opm, from the LewisHost.Net catalog:** copy this repository
+  into oc-programs as `muxos/` and merge `dist/programs.cfg`'s entries
+  into the catalog. Then, on an OpenOS computer,
+  `opm pull muxos-installer <floppy>` puts the installer on that floppy
+  with a `muxos` launcher: run `/mnt/<floppy>/muxos worker`, then
+  `/mnt/<floppy>/muxos kernal`.
 - **Copy it onto a disk:** put `muxos-installer.lua` (or the floppy
   layout's contents) into the disk's folder in your world save,
   `saves/<world>/opencomputers/<disk address>/`, while the disk is in a
