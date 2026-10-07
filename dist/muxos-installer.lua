@@ -413,10 +413,10 @@ return main()
 
 --[=[MUXOS-PAYLOAD 0.1.0
 @@MANIFEST 19
-104111 /muxos.lua
+105436 /muxos.lua
 35776 /compositor.lua
 6492 /bitmap.lua
-89085 /runtime.lua
+90428 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 460 /lib/colors.lua
 4881 /lib/core/full_keyboard.lua
@@ -432,7 +432,7 @@ return main()
 5892 /lib/mxe/opm_core.lua
 2601 /eeprom/kernal.lua
 2443 /eeprom/worker.lua
-@@ 104111 /muxos.lua
+@@ 105436 /muxos.lua
 -- muxos kernal "init" for huh2. This REPLACES OpenOS on the kernal --
 -- it is the entire resident environment, not a program that runs under
 -- one. kernal/bios.lua (this node's own tiny EEPROM image, mirroring
@@ -550,12 +550,46 @@ local function serialize(v, seen)
   end
 end
 
-local function deserialize(s)
-  local chunk = load("return " .. s, "=msg", "t", {})
-  if not chunk then return nil end
-  local ok, v = pcall(chunk)
-  if not ok then return nil end
-  return v
+local deserialize
+do
+  -- Messages are decoded with load(), so a message must be only data
+  -- first. Outside string literals our serializer writes nothing but
+  -- letters, digits, whitespace and { } [ ] = , . - + / -- so anything else
+  -- (a function, a call, a method call like ("x"):rep(1e9), a comment, a
+  -- long string that could hide a quote) is refused before load() sees it.
+  -- That leaves table constructors of literals, which can't run code.
+  local function isData(s)
+    local i, n = 1, #s
+    while i <= n do
+      local q = s:find('"', i, true)
+      local outside = s:sub(i, (q or n + 1) - 1)
+      if outside:find("[^%w%s{}%[%]=,%.%-%+/]") or outside:find("%[[%[=]") or outside:find("%-%-") then
+        return false
+      end
+      if not q then return true end
+      i = q + 1
+      while true do -- to the end of the string literal
+        local c = s:find('[\\"]', i)
+        if not c then return false end
+        if s:byte(c) == 92 then
+          i = c + 2
+        else
+          i = c + 1
+          break
+        end
+      end
+    end
+    return true
+  end
+
+  deserialize = function(s)
+    if not isData(s) then return nil end
+    local chunk = load("return " .. s, "=msg", "t", {})
+    if not chunk then return nil end
+    local ok, v = pcall(chunk)
+    if not ok then return nil end
+    return v
+  end
 end
 
 local modem, modemAddr = primaryComponent("modem")
@@ -882,7 +916,9 @@ local function send(msg)
   local total = math.ceil(#payload / CHUNK_SIZE)
   for i = 1, total do
     local chunk = payload:sub((i - 1) * CHUNK_SIZE + 1, i * CHUNK_SIZE)
-    modem.broadcast(PORT, "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk)
+    local frame = "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk
+    -- Addressed messages go to that card only; only discovery broadcasts.
+    if msg.to then modem.send(msg.to, PORT, frame) else modem.broadcast(PORT, frame) end
   end
 end
 
@@ -1394,7 +1430,7 @@ local function applyOrphanPolicyForChildrenOf(parentId)
     elseif job.orphanPolicy == "kill" then
       if job.status == "running" then
         job.killReason = "killed (orphan policy, parent no longer running)"
-        modem.broadcast(PORT, "KILL " .. id .. " " .. job.node)
+        modem.send(job.node, PORT, "KILL " .. id .. " " .. job.node)
       end
       job.parent = nil
     elseif job.orphanPolicy == "orphan" then
@@ -1455,7 +1491,7 @@ local function sweepStaleOrphans()
         and now - job.orphanedAt > timeout then
       if not job.lastKillSentAt or now - job.lastKillSentAt > KILL_RETRY_INTERVAL then
         job.killReason = "killed (unclaimed orphan timed out)"
-        modem.broadcast(PORT, "KILL " .. id .. " " .. job.node)
+        modem.send(job.node, PORT, "KILL " .. id .. " " .. job.node)
         job.lastKillSentAt = now
         unregisterOrphanCandidate(job.appName, id)
       end
@@ -1567,7 +1603,7 @@ local function controlJob(id, verb, reason)
   else
     return false, "unknown control " .. tostring(verb)
   end
-  modem.broadcast(PORT, verb .. " " .. id .. " " .. job.node)
+  modem.send(job.node, PORT, verb .. " " .. id .. " " .. job.node)
   return true
 end
 
@@ -1605,7 +1641,7 @@ local function migrateJob(id, target)
     if not target then return false, "no other live node to move job " .. id .. " to" end
   end
   job.migrating = target
-  modem.broadcast(PORT, "MIGRATE " .. id .. " " .. job.node)
+  modem.send(job.node, PORT, "MIGRATE " .. id .. " " .. job.node)
   return true, target
 end
 
@@ -1688,7 +1724,7 @@ local function serveBoot(workerAddr)
   local total = math.ceil(#source / BOOT_CHUNK_SIZE)
   for i = 1, total do
     local chunk = source:sub((i - 1) * BOOT_CHUNK_SIZE + 1, i * BOOT_CHUNK_SIZE)
-    modem.broadcast(PORT, "CODE " .. i .. "/" .. total .. " " .. chunk)
+    modem.send(workerAddr, PORT, "CODE " .. i .. "/" .. total .. " " .. chunk)
   end
 end
 
@@ -4078,7 +4114,7 @@ end
 
 return M
 
-@@ 89085 /runtime.lua
+@@ 90428 /runtime.lua
 -- Worker runtime for huh2. NOT flashed anywhere -- this lives on the
 -- KERNAL's filesystem (as a sibling file of kernal/muxos.lua) and gets
 -- served, as plain source text, to each worker over the modem at boot
@@ -4147,12 +4183,46 @@ local function serialize(v, seen)
   end
 end
 
-local function deserialize(s)
-  local chunk = load("return " .. s, "=msg", "t", {})
-  if not chunk then return nil end
-  local ok, v = pcall(chunk)
-  if not ok then return nil end
-  return v
+local deserialize
+do
+  -- Messages are decoded with load(), so a message must be only data
+  -- first. Outside string literals our serializer writes nothing but
+  -- letters, digits, whitespace and { } [ ] = , . - + / -- so anything else
+  -- (a function, a call, a method call like ("x"):rep(1e9), a comment, a
+  -- long string that could hide a quote) is refused before load() sees it.
+  -- That leaves table constructors of literals, which can't run code.
+  local function isData(s)
+    local i, n = 1, #s
+    while i <= n do
+      local q = s:find('"', i, true)
+      local outside = s:sub(i, (q or n + 1) - 1)
+      if outside:find("[^%w%s{}%[%]=,%.%-%+/]") or outside:find("%[[%[=]") or outside:find("%-%-") then
+        return false
+      end
+      if not q then return true end
+      i = q + 1
+      while true do -- to the end of the string literal
+        local c = s:find('[\\"]', i)
+        if not c then return false end
+        if s:byte(c) == 92 then
+          i = c + 2
+        else
+          i = c + 1
+          break
+        end
+      end
+    end
+    return true
+  end
+
+  deserialize = function(s)
+    if not isData(s) then return nil end
+    local chunk = load("return " .. s, "=msg", "t", {})
+    if not chunk then return nil end
+    local ok, v = pcall(chunk)
+    if not ok then return nil end
+    return v
+  end
 end
 
 -- --- Processes ---
@@ -4209,7 +4279,13 @@ local function send(msg)
   local total = math.ceil(#payload / CHUNK_SIZE)
   for i = 1, total do
     local chunk = payload:sub((i - 1) * CHUNK_SIZE + 1, i * CHUNK_SIZE)
-    component.invoke(modemAddr, "broadcast", PORT, "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk)
+    local frame = "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk
+    -- Addressed messages go to that card only; only discovery broadcasts.
+    if msg.to then
+      component.invoke(modemAddr, "send", msg.to, PORT, frame)
+    else
+      component.invoke(modemAddr, "broadcast", PORT, frame)
+    end
   end
 end
 

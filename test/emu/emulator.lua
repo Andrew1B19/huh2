@@ -276,6 +276,17 @@ function Emulator:addModem(node)
       end
       return true
     end,
+    -- To one card only, like the real network card's send.
+    send = function(address, port, ...)
+      for _, otherAddr in ipairs(node.emu.nodeOrder) do
+        local other = node.emu.nodes[otherAddr]
+        if otherAddr ~= node.address and other.modemAddr == address and other.modemOpenPorts[port] then
+          other.signalQueue[#other.signalQueue + 1] =
+            {"modem_message", other.modemAddr, node.modemAddr, port, 0, ...}
+        end
+      end
+      return true
+    end,
   })
   node.modemAddr = addr
   return addr

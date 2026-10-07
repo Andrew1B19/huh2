@@ -66,12 +66,46 @@ local function serialize(v, seen)
   end
 end
 
-local function deserialize(s)
-  local chunk = load("return " .. s, "=msg", "t", {})
-  if not chunk then return nil end
-  local ok, v = pcall(chunk)
-  if not ok then return nil end
-  return v
+local deserialize
+do
+  -- Messages are decoded with load(), so a message must be only data
+  -- first. Outside string literals our serializer writes nothing but
+  -- letters, digits, whitespace and { } [ ] = , . - + / -- so anything else
+  -- (a function, a call, a method call like ("x"):rep(1e9), a comment, a
+  -- long string that could hide a quote) is refused before load() sees it.
+  -- That leaves table constructors of literals, which can't run code.
+  local function isData(s)
+    local i, n = 1, #s
+    while i <= n do
+      local q = s:find('"', i, true)
+      local outside = s:sub(i, (q or n + 1) - 1)
+      if outside:find("[^%w%s{}%[%]=,%.%-%+/]") or outside:find("%[[%[=]") or outside:find("%-%-") then
+        return false
+      end
+      if not q then return true end
+      i = q + 1
+      while true do -- to the end of the string literal
+        local c = s:find('[\\"]', i)
+        if not c then return false end
+        if s:byte(c) == 92 then
+          i = c + 2
+        else
+          i = c + 1
+          break
+        end
+      end
+    end
+    return true
+  end
+
+  deserialize = function(s)
+    if not isData(s) then return nil end
+    local chunk = load("return " .. s, "=msg", "t", {})
+    if not chunk then return nil end
+    local ok, v = pcall(chunk)
+    if not ok then return nil end
+    return v
+  end
 end
 
 -- --- Processes ---
@@ -128,7 +162,13 @@ local function send(msg)
   local total = math.ceil(#payload / CHUNK_SIZE)
   for i = 1, total do
     local chunk = payload:sub((i - 1) * CHUNK_SIZE + 1, i * CHUNK_SIZE)
-    component.invoke(modemAddr, "broadcast", PORT, "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk)
+    local frame = "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk
+    -- Addressed messages go to that card only; only discovery broadcasts.
+    if msg.to then
+      component.invoke(modemAddr, "send", msg.to, PORT, frame)
+    else
+      component.invoke(modemAddr, "broadcast", PORT, frame)
+    end
   end
 end
 
