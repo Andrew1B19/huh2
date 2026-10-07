@@ -82,6 +82,10 @@ kernal/compositor.lua  the only file that touches the real gpu for window conten
 kernal/bitmap.lua      half-block/braille pixel-grid encoder for "bit windows" -- OC's gpu
                        hardware has no pixel API, so this is sub-cell encoding on top of the
                        same character grid. Loaded by compositor.lua via loadSibling().
+installer/install.lua  the installer (runs on OpenOS): installs the kernal, flashes EEPROMs.
+tools/build.lua        builds it, with everything it installs, into dist/ (see "Installing").
+dist/muxos-installer.lua  the built single-file installer.
+test/emu/install_test.lua runs that installer on emulated hardware and boots the result.
 kernal/lib/            OpenOS libraries for legacy programs (vendored unchanged, MIT),
                        installed as /lib on the kernal's disk; see kernal/lib/README.md.
 node/bios.lua         worker EEPROM image: tiny network-boot stub, fetches node/runtime.lua
@@ -123,40 +127,99 @@ resolve. `smux/test/test_gertinet.lua` fails on `require` as a result;
 everything else (33 of smux's own tests: framing, session, job_console,
 serve, the installer) passes standalone.
 
-## Flashing a worker
+## Installing
 
-From an OpenOS shell that has an EEPROM component available (either the
-worker's own, before you've wiped its default BIOS, or via an EEPROM
-programmer):
+### Hardware
 
-```
-eeprom node/bios.lua
-```
+- **Kernal:** one computer with a tier 3 GPU, a screen, a keyboard, a
+  network card and a hard disk. It runs no OpenOS once installed.
+- **Workers:** three computers, each with a network card and an EEPROM.
+  No disk is needed.
+- **Network:** all four computers on the same network (cables or
+  wireless) so their network cards can reach each other.
 
-Then boot that node with no filesystem attached -- it never looks for
-one. It will sit broadcasting `BOOT` every 5 seconds until the kernal
-answers; that's expected, not a hang.
-
-## Running the kernal
-
-`kernal/bios.lua` is the kernal's EEPROM image -- flash it the same way
-as a worker's:
+### Build the installer (on your PC)
 
 ```
-eeprom kernal/bios.lua
+lua5.3 tools/build.lua                    # dist/muxos-installer.lua
+lua5.3 tools/build.lua --floppy <dir>     # also a floppy layout: install.lua + files/
 ```
 
-Then copy `kernal/muxos.lua`, `kernal/compositor.lua`,
-`kernal/bitmap.lua`, **and** `node/runtime.lua` onto the ROOT of the
-kernal's filesystem (as `/muxos.lua`, `/compositor.lua`, `/bitmap.lua`,
-`/runtime.lua` -- fixed paths, see "Layout" above), copy `kernal/lib`
-to `/lib` (the OpenOS libraries legacy programs `require`), and boot the kernal
-with that filesystem attached. There is no OpenOS shell to run
-`muxos.lua` from any more -- `kernal/bios.lua` loads and runs it
-directly as the kernal's entire resident environment. Workers fetch
-`runtime.lua`'s source from the kernal's disk at boot -- it is never
-installed on a worker itself; `compositor.lua`/`bitmap.lua` likewise
-never leave the kernal.
+The build checks everything compiles, that both BIOS images fit an EEPROM
+(4096 bytes), and that the kernal and worker versions match.
+`dist/muxos-installer.lua` is committed, so you can skip building.
+`lua5.3 test/emu/install_test.lua` runs that exact installer against
+emulated hardware and boots the result.
+
+### Get it into the game
+
+Either way, the installer runs on an OpenOS computer:
+
+- **One file, with an internet card:**
+  `wget https://raw.githubusercontent.com/<owner>/<repo>/<branch>/dist/muxos-installer.lua`.
+  On a private repository, download it from GitHub yourself and use one
+  of the options below.
+- **Copy it onto a disk:** put `muxos-installer.lua` (or the floppy
+  layout's contents) into the disk's folder in your world save,
+  `saves/<world>/opencomputers/<disk address>/`, while the disk is in a
+  computer.
+
+The single file is about 260 KB. OpenOS reads a program whole before
+running it, so the computer running it needs plenty of memory (two tier
+3 sticks are comfortable). The floppy layout copies file by file and
+needs far less.
+
+### 1. Flash the workers
+
+On any OpenOS computer:
+
+```
+muxos-installer.lua worker
+```
+
+It flashes the worker BIOS onto the EEPROM in that computer, then asks
+you to swap in the next one: take the EEPROM out, put the next one in,
+and press Enter. Type `q` when done. Put each flashed EEPROM in a worker,
+and put this computer's own EEPROM back. `--count=3` stops after three.
+
+### 2. Install the kernal
+
+On the kernal computer, booted into OpenOS (from a floppy, or OpenOS on
+its hard disk):
+
+```
+muxos-installer.lua kernal
+```
+
+It:
+
+- lists the writable disks and asks which one to use (the installer's
+  own disk isn't offered);
+- checks the space and warns about missing hardware (tier 3 GPU, screen,
+  network card);
+- writes muxos and the OpenOS libraries for legacy programs. Each file
+  goes in as `<name>.new` and they're all swapped in at the end, so a
+  disk that fills up mid-install changes nothing;
+- flashes this computer's EEPROM with the kernal BIOS, pointed at that
+  disk.
+
+Running it again upgrades in place and keeps your own files. Take the
+OpenOS floppy out, reboot, and muxos starts. Workers boot from the
+network as soon as they're powered on, in any order.
+
+Options: `--disk=<address prefix or label>`, `--yes` (no questions),
+`--reboot`.
+
+### Installing by hand
+
+- Flash `node/bios.lua` onto each worker's EEPROM and `kernal/bios.lua`
+  onto the kernal's (`flash -q <file>` in OpenOS).
+- Copy `kernal/muxos.lua`, `kernal/compositor.lua`, `kernal/bitmap.lua`
+  and `node/runtime.lua` to the root of the kernal's disk, and
+  `kernal/lib` to `/lib`.
+
+The kernal BIOS boots the first disk with `/muxos.lua` on it. Workers
+never need a disk: they fetch `runtime.lua` from the kernal at boot.
 
 It discovers workers automatically, then drops into a prompt:
 

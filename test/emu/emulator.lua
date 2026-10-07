@@ -284,8 +284,8 @@ end
 -- EEPROM: holds the node's boot code (machine.lua's bootstrap reads it
 -- with `get`) and the small data area kernal/bios.lua uses to remember
 -- its boot filesystem.
-function Emulator:addEeprom(node, code)
-  local data = ""
+function Emulator:addEeprom(node, code, data)
+  data = data or ""
   return self:addComponent(node, "eeprom", {
     get = function() return code end,
     set = function(c) code = c; return true end,
@@ -468,6 +468,7 @@ function Emulator:addGpuScreen(node, screenW, screenH)
       return true
     end,
     getDepth = function() return 8 end,
+    maxDepth = function() return 8 end,
     fill = function(x, y, w, h, char)
       local buf = buffers[active]
       for row = y, y + h - 1 do
