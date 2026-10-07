@@ -11,10 +11,10 @@
 -- pattern, same "try the remembered boot device first, then scan every
 -- filesystem component for a bootable one" fallback, same gpu/screen
 -- auto-bind -- except it loads /muxos.lua instead of /init.lua, because
--- muxos IS the init here. Like all EEPROM code, it runs in the mod's
--- sandbox (machine.lua); what OpenOS would add on top (event, thread,
--- keyboard, io, ...) isn't there, so kernal/muxos.lua builds what it
--- needs itself.
+-- muxos IS the init here, and falls back to the muxos installer. Like
+-- all EEPROM code, it runs in the mod's sandbox (machine.lua); what
+-- OpenOS would add on top (event, thread, keyboard, io, ...) isn't
+-- there, so kernal/muxos.lua builds what it needs itself.
 
 local component_invoke = component.invoke
 local function boot_invoke(address, method, ...)
@@ -42,8 +42,8 @@ do
   end
 end
 
-local function tryLoadFrom(address)
-  local handle, reason = boot_invoke(address, "open", "/muxos.lua")
+local function tryLoadFrom(address, path)
+  local handle, reason = boot_invoke(address, "open", path)
   if not handle then
     return nil, reason
   end
@@ -56,20 +56,33 @@ local function tryLoadFrom(address)
     buffer = buffer .. (data or "")
   until not data
   boot_invoke(address, "close", handle)
-  return load(buffer, "=muxos")
+  return load(buffer, "=" .. path)
 end
 
+-- Boot order: the disk the EEPROM remembers, then any disk with
+-- /muxos.lua, then a disk with the muxos installer (a floppy made by
+-- opm or the build), which runs here with no OpenOS. An installed system
+-- always wins, so a forgotten installer floppy doesn't reinstall.
 local init, reason
 if getBootAddress() then
-  init, reason = tryLoadFrom(getBootAddress())
+  init, reason = tryLoadFrom(getBootAddress(), "/muxos.lua")
 end
 if not init then
   setBootAddress()
   for address in component.list("filesystem") do
-    init, reason = tryLoadFrom(address)
+    init, reason = tryLoadFrom(address, "/muxos.lua")
     if init then
       setBootAddress(address)
       break
+    end
+  end
+end
+if not init then
+  for address in component.list("filesystem") do
+    local installer = tryLoadFrom(address, "/muxos-installer.lua")
+    if installer then
+      computer.beep(800, 0.2)
+      return installer(address, "/muxos-installer.lua")
     end
   end
 end

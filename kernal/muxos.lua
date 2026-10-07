@@ -32,7 +32,7 @@
 -- actually load.
 
 local PORT = 4477
-local MUXOS_VERSION = "0.1.1"
+local MUXOS_VERSION = "0.1.2"
 local TIMEOUT = 5 -- seconds to wait for a worker reply before giving up
 
 -- Every blocking wait goes through the sandbox's computer.pullSignal,

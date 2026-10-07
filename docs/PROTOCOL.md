@@ -101,6 +101,16 @@ muxos **replaces** OpenOS on the kernal; it does not run under one.
 filesystem -- there is no OpenOS `/init.lua` anywhere in this picture,
 the same way a worker never has one.
 
+The kernal BIOS boots, in order: the disk the EEPROM remembers, any disk
+with `/muxos.lua`, then any disk with `/muxos-installer.lua` at its root.
+That last one is the installer floppy; the BIOS runs it as
+`installer(diskAddress, path)` with no OpenOS. The installer detects that
+it's bare (no `require`), draws its own console on the GPU, reads its
+payload through the floppy's filesystem component, and points the EEPROM
+at the disk it installs to. So an empty computer needs nothing but the
+kernal BIOS and the floppy, and an installed system always wins over a
+forgotten floppy (`test/emu/install_test.lua`, install 9).
+
 This matters because a surprising amount of what looks like "the Lua
 sandbox" in OpenComputers is actually OpenOS, not the mod. Verified
 directly against the mod's own Scala source

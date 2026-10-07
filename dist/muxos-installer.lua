@@ -1,50 +1,132 @@
--- muxos installer. Runs on OpenOS.
---
---   install.lua                     menu
---   install.lua kernal [options]    install muxos on a disk and flash this
---                                   computer's EEPROM with the kernal BIOS
---   install.lua worker [options]    flash worker EEPROMs (swap them in one
---                                   after another)
---
--- Options: --disk=<address prefix or label> (kernal target), --yes (don't
--- ask; take the only disk), --count=<n> (worker: flash n EEPROMs),
--- --reboot (kernal: reboot when done).
+-- muxos installer. Runs two ways:
+--   * booted bare by the kernal BIOS from a disk that has no muxos on it
+--     yet -- a floppy with this file at its root, as /muxos-installer.lua
+--     (no OpenOS anywhere): it draws its own console and reads the keyboard;
+--   * as a program on OpenOS:
+--       muxos-installer.lua                     menu
+--       muxos-installer.lua kernal [options]    install muxos on a disk and
+--                                               flash this computer's EEPROM
+--       muxos-installer.lua worker [options]    flash worker EEPROMs (swap
+--                                               them in one after another)
+--       muxos-installer.lua bios [options]      flash kernal BIOS EEPROMs, for
+--                                               computers that will boot this
+--                                               installer from a floppy
+--     Options: --disk=<address prefix or label> (kernal target), --yes
+--     (don't ask; take the only disk), --count=<n> (worker: flash n
+--     EEPROMs), --reboot (kernal: reboot when done).
 --
 -- tools/build.lua makes two forms of this file: dist/muxos-installer.lua,
 -- with every file it installs carried in a comment at its end (one file
--- to wget or copy), and a floppy layout, install.lua next to a files/
--- directory. Either way the files are streamed from where they are,
--- never all held in memory. On the target disk each file is first
--- written as <name>.new and only swapped in once all of them are
+-- to wget, copy or opm onto a floppy), and a floppy layout, install.lua
+-- next to a files/ directory. Either way the files are streamed from
+-- where they are, never all held in memory. On the target disk each file
+-- is first written as <name>.new and only swapped in once all of them are
 -- written, so a disk that fills up mid-install leaves the old system
 -- untouched.
 
-local component = require("component")
-local computer = require("computer")
-local filesystem = require("filesystem")
-
-local VERSION = "0.1.1" -- set by tools/build.lua
+local VERSION = "0.1.2" -- set by tools/build.lua
 local CHUNK = 8192
 
+-- --- Platform: OpenOS, or bare from the kernal BIOS ---
+
+local launchArgs = table.pack(...)
+local bare = type(require) ~= "function"
+local component, computer = component, computer
+local osfs
+if not bare then
+  component, computer, osfs = require("component"), require("computer"), require("filesystem")
+end
+
 local options, positional = {}, {}
-for _, a in ipairs({...}) do
-  local k, v = tostring(a):match("^%-%-([%w%-]+)=(.*)$")
-  if k then
-    options[k] = v
-  elseif tostring(a):match("^%-%-") then
-    options[tostring(a):sub(3)] = true
-  else
-    positional[#positional + 1] = a
+if not bare then
+  for _, a in ipairs(launchArgs) do
+    local k, v = tostring(a):match("^%-%-([%w%-]+)=(.*)$")
+    if k then
+      options[k] = v
+    elseif tostring(a):match("^%-%-") then
+      options[tostring(a):sub(3)] = true
+    else
+      positional[#positional + 1] = a
+    end
   end
 end
 local assumeYes = options.yes == true
 
-local function say(...) print(...) end
+local function trim(s) return s and s:match("^%s*(.-)%s*$") or nil end
 
-local function ask(prompt)
-  io.write(prompt)
-  local line = io.read()
-  return line and line:match("^%s*(.-)%s*$") or nil
+-- Lets the machine breathe during long work: OpenComputers ends a
+-- program that runs too long without yielding.
+local function breathe()
+  if bare then computer.pullSignal(0) else os.sleep(0) end
+end
+
+local say, ask
+if not bare then
+  say = function(...) print(...) end
+  ask = function(prompt)
+    io.write(prompt)
+    return trim(io.read())
+  end
+else
+  -- A minimal console on the GPU: text that wraps and scrolls, and a line
+  -- editor on the keyboard (printable characters, backspace, Enter).
+  local gpuAddr, screenAddr = component.list("gpu")(), component.list("screen")()
+  local gpu = gpuAddr and component.proxy(gpuAddr)
+  local w, h, x, y = 80, 25, 1, 1
+  if gpu then
+    if screenAddr then gpu.bind(screenAddr) end
+    w, h = gpu.getResolution()
+    gpu.setBackground(0x000000)
+    gpu.setForeground(0xFFFFFF)
+    gpu.fill(1, 1, w, h, " ")
+  end
+  local function newline()
+    x = 1
+    if y < h then
+      y = y + 1
+    elseif gpu then
+      gpu.copy(1, 2, w, h - 1, 0, -1)
+      gpu.fill(1, h, w, 1, " ")
+    end
+  end
+  local function write(text)
+    for piece, nl in text:gmatch("([^\n]*)(\n?)") do
+      while #piece > 0 do
+        if x > w then newline() end
+        local part = piece:sub(1, w - x + 1)
+        if gpu then gpu.set(x, y, part) end
+        x, piece = x + #part, piece:sub(#part + 1)
+      end
+      if nl ~= "" then newline() end
+    end
+  end
+  say = function(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+    write(table.concat(parts, "\t") .. "\n")
+  end
+  ask = function(prompt)
+    write(prompt)
+    local line = ""
+    while true do
+      local name, _, char, code = computer.pullSignal()
+      if name == "key_down" then
+        if code == 28 then
+          write("\n")
+          return trim(line)
+        elseif code == 14 then
+          if #line > 0 then
+            line = line:sub(1, -2)
+            if x > 1 then x = x - 1 elseif y > 1 then x, y = w, y - 1 end
+            if gpu then gpu.set(x, y, " ") end
+          end
+        elseif char and char >= 32 and char < 127 then
+          line = line .. string.char(char)
+          write(string.char(char))
+        end
+      end
+    end
+  end
 end
 
 local function confirm(prompt)
@@ -60,105 +142,154 @@ end
 
 -- --- Where the files come from ---
 
-local function selfPath()
+-- The disk this installer is on and its path there: the BIOS says when
+-- booted bare; on OpenOS it's found from the program's own path.
+local function findMedium()
+  if bare then
+    local address, path = launchArgs[1], launchArgs[2]
+    if type(address) ~= "string" or type(path) ~= "string" then return nil, "booted without its disk's address" end
+    return {address = address, fs = component.proxy(address), path = path}
+  end
   local info = debug and debug.getinfo and debug.getinfo(1, "S")
-  local p = info and info.source and info.source:match("^[@=](.+)$")
-  if p and filesystem.exists(p) then return p end
-  local fromEnv = os.getenv and os.getenv("_")
-  if fromEnv and filesystem.exists(fromEnv) then return fromEnv end
-  return nil
+  local full = info and info.source and info.source:match("^[@=](.+)$")
+  if not (full and osfs.exists(full)) then
+    full = os.getenv and os.getenv("_")
+    if not (full and osfs.exists(full)) then return nil, "can't tell where this installer is" end
+  end
+  local fs, mount = osfs.get(full)
+  if not fs then return nil, "can't tell which disk " .. full .. " is on" end
+  local rel = full:sub(#mount + 1):gsub("^/*", "/")
+  return {address = fs.address, fs = fs, path = rel}
+end
+
+-- A buffered reader over a file on a filesystem component: line() and
+-- bytes(n), nil at the end.
+local function openReader(fs, path)
+  local handle = fs.open(path, "r")
+  if not handle then return nil end
+  local buf, eof = "", false
+  local function fill()
+    if eof then return false end
+    local data = fs.read(handle, CHUNK)
+    if not data then eof = true return false end
+    buf = buf .. data
+    return true
+  end
+  local r = {}
+  function r.line()
+    while true do
+      local i = buf:find("\n", 1, true)
+      if i then
+        local line = buf:sub(1, i - 1)
+        buf = buf:sub(i + 1)
+        return line
+      end
+      if not fill() then
+        if buf == "" then return nil end
+        local line = buf
+        buf = ""
+        return line
+      end
+    end
+  end
+  function r.bytes(n)
+    while #buf < n and fill() do end
+    if buf == "" then return nil end
+    local data = buf:sub(1, n)
+    buf = buf:sub(n + 1)
+    return data
+  end
+  function r.close() fs.close(handle) end
+  return r
 end
 
 -- A payload: `files`, a list of {path, size}, and each(fn), calling
 -- fn(path, size, read) for every file in order, where read(n) returns up
 -- to n more bytes of it (nil at its end).
-local function bundledPayload(path)
-  local f = io.open(path, "rb")
+local function bundledPayload(fs, path)
+  local f = openReader(fs, path)
   if not f then return nil end
   while true do
-    local line = f:read("l")
-    if not line then f:close() return nil end
+    local line = f.line()
+    if not line then f.close() return nil end
     if line:match("^%-%-%[=*%[MUXOS%-PAYLOAD") then
       if line:sub(-1) == "\r" then
-        f:close()
+        f.close()
         return nil, "this installer's line endings were converted to CRLF, which breaks it -- "
           .. "download it again as-is (raw, not through a converting checkout)"
       end
       break
     end
   end
-  local count = tonumber((f:read("l") or ""):match("^@@MANIFEST (%d+)$"))
-  if not count then f:close() return nil, "damaged payload (no manifest)" end
+  local count = tonumber((f.line() or ""):match("^@@MANIFEST (%d+)$"))
+  if not count then f.close() return nil, "damaged payload (no manifest)" end
   local files = {}
   for i = 1, count do
-    local size, name = (f:read("l") or ""):match("^(%d+) (.+)$")
-    if not size then f:close() return nil, "damaged payload (manifest)" end
+    local size, name = (f.line() or ""):match("^(%d+) (.+)$")
+    if not size then f.close() return nil, "damaged payload (manifest)" end
     files[i] = {path = name, size = tonumber(size)}
   end
-  f:close()
+  f.close()
   local payload = {files = files}
   function payload.each(fn)
-    local g = assert(io.open(path, "rb"))
-    repeat local line = g:read("l") until not line or line:match("^@@MANIFEST")
-    for _ = 1, count do g:read("l") end
+    local g = assert(openReader(fs, path))
+    repeat local line = g.line() until not line or line:match("^@@MANIFEST")
+    for _ = 1, count do g.line() end
     for i = 1, count do
-      local size, name = (g:read("l") or ""):match("^@@ (%d+) (.+)$")
+      local size, name = (g.line() or ""):match("^@@ (%d+) (.+)$")
       size = tonumber(size)
       if not size or name ~= files[i].path or size ~= files[i].size then
-        g:close()
+        g.close()
         error("damaged payload at " .. tostring(files[i].path), 0)
       end
       local remaining = size
       local function read(n)
         if remaining <= 0 then return nil end
-        local data = g:read(math.min(n, remaining))
+        local data = g.bytes(math.min(n, remaining))
         if not data or data == "" then error("damaged payload: " .. name .. " is cut short", 0) end
         remaining = remaining - #data
         return data
       end
       fn(name, size, read)
       while remaining > 0 do read(CHUNK) end
-      g:read(1) -- the newline after each file
+      g.bytes(1) -- the newline after each file
     end
-    g:close()
+    g.close()
   end
   return payload
 end
 
-local function floppyPayload(dir)
-  local m = io.open(dir .. "/files/MANIFEST", "r")
+local function floppyPayload(fs, dir)
+  local m = openReader(fs, dir .. "/files/MANIFEST")
   if not m then return nil end
   local files = {}
-  for line in m:lines() do
+  for line in m.line do
     local size, name = line:match("^(%d+) (.+)$")
     if size then files[#files + 1] = {path = name, size = tonumber(size)} end
   end
-  m:close()
+  m.close()
   local payload = {files = files}
   function payload.each(fn)
     for _, file in ipairs(files) do
-      local g = io.open(dir .. "/files" .. file.path, "rb")
+      local g = openReader(fs, dir .. "/files" .. file.path)
       if not g then error("missing from the installer: " .. file.path, 0) end
-      fn(file.path, file.size, function(n)
-        local data = g:read(n)
-        if data == "" then return nil end
-        return data
-      end)
-      g:close()
+      fn(file.path, file.size, g.bytes)
+      g.close()
     end
   end
   return payload
 end
 
+local medium, mediumErr = findMedium()
+
 local function findPayload()
-  local me = selfPath()
-  if not me then return nil, "can't tell where this installer is" end
-  local payload, err = bundledPayload(me)
+  if not medium then return nil, mediumErr end
+  local payload, err = bundledPayload(medium.fs, medium.path)
   if payload then return payload end
   if err then return nil, err end
-  payload = floppyPayload(me:match("^(.*)/[^/]*$") or ".")
+  payload = floppyPayload(medium.fs, (medium.path:match("^(.*)/[^/]*$")))
   if payload then return payload end
-  return nil, "no files to install next to " .. me
+  return nil, "no files to install next to " .. medium.path
 end
 
 -- Reads one (small) file of the payload whole.
@@ -270,8 +401,6 @@ local function writeText(fs, path, text)
 end
 
 local function installKernal(payload)
-  local me = selfPath()
-  local medium = me and filesystem.get(me)
   local disk, err = chooseDisk(diskList(medium and medium.address))
   if not disk then return nil, err end
   local target = disk.fs
@@ -318,10 +447,12 @@ local function installKernal(payload)
         error("can't write " .. tmp .. ": " .. tostring(writeErr or "disk full?"), 0)
       end
       written = written + #data
+      if written % (CHUNK * 4) == 0 then breathe() end
     end
     target.close(h)
     if written ~= size or target.size(tmp) ~= size then error("short write: " .. path, 0) end
     say("  " .. path)
+    breathe()
   end)
   if not ok or not kernalBios then
     for _, path in ipairs(staged) do target.remove(path .. ".new") end
@@ -344,14 +475,24 @@ local function installKernal(payload)
   return true
 end
 
--- --- Workers ---
+-- --- Flashing EEPROMs ---
 
-local function flashWorkers(payload)
-  local code = readPayloadFile(payload, "/eeprom/worker.lua")
-  if not code then return nil, "the worker BIOS is missing from the installer" end
-  say("Flashes the muxos worker BIOS (" .. #code .. " bytes) onto EEPROMs, one after another:")
-  say("put a worker's EEPROM in this computer, flash it, swap in the next.")
-  say("Put this computer's own EEPROM back when you're done.")
+-- Flashes a BIOS onto EEPROMs one after another, as they're swapped into
+-- this computer: the worker BIOS for the workers, or the kernal BIOS for
+-- a kernal that will boot this installer (an empty computer has nothing
+-- else to start it with).
+local BIOSES = {
+  worker = {path = "/eeprom/worker.lua", label = "muxos worker", name = "worker"},
+  kernal = {path = "/eeprom/kernal.lua", label = "muxos kernal", name = "kernal"},
+}
+
+local function flashEeproms(payload, bios)
+  local code = readPayloadFile(payload, bios.path)
+  if not code then return nil, "the " .. bios.name .. " BIOS is missing from the installer" end
+  say("Flashes the muxos " .. bios.name .. " BIOS (" .. #code .. " bytes) onto EEPROMs, one after another:")
+  say("put an EEPROM in this computer, flash it, swap in the next.")
+  say(bare and "Put the kernal BIOS EEPROM back in when you're done."
+    or "Put this computer's own EEPROM back when you're done.")
   local want = tonumber(options.count)
   local count, last = 0, nil
   while true do
@@ -360,11 +501,11 @@ local function flashWorkers(payload)
       say("No EEPROM in this computer.")
     elseif eeprom.address == last then
       say("That's the EEPROM that was just flashed -- swap in the next one.")
-    elseif confirm("Flash EEPROM " .. eeprom.address:sub(1, 8) .. " as a muxos worker?") then
-      local addr, err = flash(code, "muxos worker", "")
+    elseif confirm("Flash EEPROM " .. eeprom.address:sub(1, 8) .. " as a muxos " .. bios.name .. "?") then
+      local addr, err = flash(code, bios.label, "")
       if addr then
         count, last = count + 1, addr
-        say("Flashed worker EEPROM " .. count .. " (" .. addr:sub(1, 8) .. ").")
+        say("Flashed " .. bios.name .. " EEPROM " .. count .. " (" .. addr:sub(1, 8) .. ").")
       else
         say("Couldn't flash it: " .. err)
       end
@@ -374,14 +515,14 @@ local function flashWorkers(payload)
     local answer = ask("Swap in the next EEPROM and press Enter, or q to finish: ")
     if not answer or answer:lower() == "q" then break end
   end
-  say(count .. " worker EEPROM(s) flashed.")
+  say(count .. " " .. bios.name .. " EEPROM(s) flashed.")
   return true
 end
 
 -- --- Main ---
 
 local function main()
-  say("muxos " .. VERSION .. " installer")
+  say("muxos " .. VERSION .. " installer" .. (bare and " (booted from " .. tostring(medium and medium.address or "?"):sub(1, 8) .. ")" or ""))
   local payload, err = findPayload()
   if not payload then
     say("error: " .. tostring(err))
@@ -391,9 +532,10 @@ local function main()
   if not mode then
     say("  1) install the kernal on this computer")
     say("  2) flash worker EEPROMs")
-    say("  3) quit")
+    say("  3) flash kernal BIOS EEPROMs (for computers that will boot this installer)")
+    say("  4) quit")
     local pick = ask("> ")
-    mode = ({["1"] = "kernal", ["2"] = "worker"})[pick or ""]
+    mode = ({["1"] = "kernal", ["2"] = "worker", ["3"] = "bios"})[pick or ""]
     if not mode then return 0 end
   end
   local ok, failure
@@ -402,11 +544,14 @@ local function main()
     if ok then
       if options.reboot or (not assumeYes and confirm("Reboot into muxos now?")) then computer.shutdown(true) end
       say("Reboot this computer to start muxos. Workers boot from the network once flashed.")
+      if bare then say("(The EEPROM now boots the installed disk first; the floppy can stay in.)") end
     end
   elseif mode == "worker" then
-    ok, failure = flashWorkers(payload)
+    ok, failure = flashEeproms(payload, BIOSES.worker)
+  elseif mode == "bios" then
+    ok, failure = flashEeproms(payload, BIOSES.kernal)
   else
-    say("usage: install.lua [kernal|worker] [--disk=<address|label>] [--yes] [--count=<n>] [--reboot]")
+    say("usage: muxos-installer.lua [kernal|worker|bios] [--disk=<address|label>] [--yes] [--count=<n>] [--reboot]")
     return 1
   end
   if not ok then
@@ -416,9 +561,16 @@ local function main()
   return 0
 end
 
+-- Booted bare there's nothing to return to: wait, then restart.
+if bare then
+  local ok, err = pcall(main)
+  if not ok then say("error: " .. tostring(err)) end
+  ask("Press Enter to restart.")
+  computer.shutdown(true)
+end
 return main()
 
---[=[MUXOS-PAYLOAD 0.1.1
+--[=[MUXOS-PAYLOAD 0.1.2
 @@MANIFEST 19
 105317 /muxos.lua
 37750 /compositor.lua
@@ -437,7 +589,7 @@ return main()
 1832 /lib/transforms.lua
 7328 /bin/opm.mxe
 5892 /lib/mxe/opm_core.lua
-2601 /eeprom/kernal.lua
+3204 /eeprom/kernal.lua
 2443 /eeprom/worker.lua
 @@ 105317 /muxos.lua
 -- muxos kernal "init" for huh2. This REPLACES OpenOS on the kernal --
@@ -474,7 +626,7 @@ return main()
 -- actually load.
 
 local PORT = 4477
-local MUXOS_VERSION = "0.1.1"
+local MUXOS_VERSION = "0.1.2"
 local TIMEOUT = 5 -- seconds to wait for a worker reply before giving up
 
 -- Every blocking wait goes through the sandbox's computer.pullSignal,
@@ -4192,7 +4344,7 @@ return M
 -- hand.
 
 local PORT = 4477
-local MUXOS_VERSION = "0.1.1"
+local MUXOS_VERSION = "0.1.2"
 
 -- node/bios.lua passes this in: the address of whoever's CODE chunks
 -- actually completed the boot handshake -- the ONE place a worker ever
@@ -8115,7 +8267,7 @@ end
 
 return M
 
-@@ 2601 /eeprom/kernal.lua
+@@ 3204 /eeprom/kernal.lua
 -- The kernal's own EEPROM image. muxos REPLACES OpenOS on the kernal --
 -- it is not a program that runs on top of it -- so there is no stock
 -- OpenOS /init.lua in this picture at all, and this is not a thin
@@ -8129,10 +8281,10 @@ return M
 -- pattern, same "try the remembered boot device first, then scan every
 -- filesystem component for a bootable one" fallback, same gpu/screen
 -- auto-bind -- except it loads /muxos.lua instead of /init.lua, because
--- muxos IS the init here. Like all EEPROM code, it runs in the mod's
--- sandbox (machine.lua); what OpenOS would add on top (event, thread,
--- keyboard, io, ...) isn't there, so kernal/muxos.lua builds what it
--- needs itself.
+-- muxos IS the init here, and falls back to the muxos installer. Like
+-- all EEPROM code, it runs in the mod's sandbox (machine.lua); what
+-- OpenOS would add on top (event, thread, keyboard, io, ...) isn't
+-- there, so kernal/muxos.lua builds what it needs itself.
 
 local component_invoke = component.invoke
 local function boot_invoke(address, method, ...)
@@ -8160,8 +8312,8 @@ do
   end
 end
 
-local function tryLoadFrom(address)
-  local handle, reason = boot_invoke(address, "open", "/muxos.lua")
+local function tryLoadFrom(address, path)
+  local handle, reason = boot_invoke(address, "open", path)
   if not handle then
     return nil, reason
   end
@@ -8174,20 +8326,33 @@ local function tryLoadFrom(address)
     buffer = buffer .. (data or "")
   until not data
   boot_invoke(address, "close", handle)
-  return load(buffer, "=muxos")
+  return load(buffer, "=" .. path)
 end
 
+-- Boot order: the disk the EEPROM remembers, then any disk with
+-- /muxos.lua, then a disk with the muxos installer (a floppy made by
+-- opm or the build), which runs here with no OpenOS. An installed system
+-- always wins, so a forgotten installer floppy doesn't reinstall.
 local init, reason
 if getBootAddress() then
-  init, reason = tryLoadFrom(getBootAddress())
+  init, reason = tryLoadFrom(getBootAddress(), "/muxos.lua")
 end
 if not init then
   setBootAddress()
   for address in component.list("filesystem") do
-    init, reason = tryLoadFrom(address)
+    init, reason = tryLoadFrom(address, "/muxos.lua")
     if init then
       setBootAddress(address)
       break
+    end
+  end
+end
+if not init then
+  for address in component.list("filesystem") do
+    local installer = tryLoadFrom(address, "/muxos-installer.lua")
+    if installer then
+      computer.beep(800, 0.2)
+      return installer(address, "/muxos-installer.lua")
     end
   end
 end

@@ -61,9 +61,22 @@ local function openosFor(node, medium, eepromOf)
     end,
   }
   local computer = {tmpAddress = function() return nil end, shutdown = function() error("shutdown called") end}
+  -- The installer's own disk: the host's files, mounted at "/".
+  local handles, nextHandle = {}, 1
+  local mediumFs = {
+    address = medium,
+    open = function(path)
+      local f = io.open(path, "rb")
+      if not f then return nil, path end
+      handles[nextHandle], nextHandle = f, nextHandle + 1
+      return nextHandle - 1
+    end,
+    read = function(h, n) return handles[h]:read(math.min(n, 2048)) end,
+    close = function(h) handles[h]:close() handles[h] = nil end,
+  }
   local filesystem = {
     exists = function(p) local f = io.open(p, "rb") if f then f:close() return true end return false end,
-    get = function() return {address = medium}, "/mnt/installer" end,
+    get = function() return mediumFs, "/" end,
   }
   return {component = component, computer = computer, filesystem = filesystem}
 end
@@ -75,6 +88,7 @@ local function runInstaller(path, openos, answers, ...)
   local out = {}
   local env = setmetatable({}, {__index = _G})
   env.require = function(name) return assert(openos[name], "installer required " .. name) end
+  env.os = setmetatable({sleep = function() end}, {__index = os}) -- OpenOS's os.sleep
   env.print = function(...)
     local parts = {}
     for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
@@ -133,12 +147,12 @@ print("install 3: the single-file installer upgrades the kernal's disk and flash
 do
   local code, out = runInstaller(BUNDLE, kernalOs, nil, "kernal", "--yes")
   assert(code == 0, "kernal install failed:\n" .. out)
-  assert(out:find("Upgrading muxos 0.0.9 to 0.1.1", 1, true), "it noticed the old version:\n" .. out)
+  assert(out:find("Upgrading muxos 0.0.9 to 0.1.2", 1, true), "it noticed the old version:\n" .. out)
   assert(out:find("warning", 1, true) == nil, "no hardware warnings on a complete kernal:\n" .. out)
   assert(disk["/muxos.lua"] == readFile(REPO_ROOT .. "/kernal/muxos.lua"), "muxos.lua installed")
   assert(disk["/runtime.lua"] == readFile(REPO_ROOT .. "/node/runtime.lua"), "runtime.lua installed")
   assert(disk["/lib/core/full_text.lua"] == readFile(REPO_ROOT .. "/kernal/lib/core/full_text.lua"), "libraries installed")
-  assert(disk["/.muxos-version"] == "0.1.1\n" and disk["/home/keep.txt"] == "mine", "version recorded, user files kept")
+  assert(disk["/.muxos-version"] == "0.1.2\n" and disk["/home/keep.txt"] == "mine", "version recorded, user files kept")
   assert(not disk["/eeprom/kernal.lua"], "BIOS images aren't disk files")
   assert(disk["/bin/opm.mxe"] == readFile(REPO_ROOT .. "/opm/opm.mxe")
     and disk["/lib/mxe/opm_core.lua"] == readFile(REPO_ROOT .. "/opm/opm_core.lua"), "opm ships with muxos")
@@ -160,7 +174,7 @@ do
   emu:addEeprom(node, "-- the OpenOS BIOS")
   local code, out = runInstaller(FLOPPY .. "/install.lua", openosFor(node, floppyMedium), {"1", "y"}, "kernal")
   assert(code == 0, "floppy install failed:\n" .. out)
-  assert(out:find("Installing muxos 0.1.1", 1, true), "a fresh install:\n" .. out)
+  assert(out:find("Installing muxos 0.1.2", 1, true), "a fresh install:\n" .. out)
   for path, data in pairs(disk) do
     if path ~= "/.muxos-version" and path ~= "/home/keep.txt" then
       assert(files[path] == data, "floppy install differs at " .. path)
@@ -195,6 +209,22 @@ do
     assert(w.node.components[w.eeprom].methods.get() == readFile(REPO_ROOT .. "/node/bios.lua"),
       "worker " .. i .. " wasn't flashed")
   end
+end
+print("  OK")
+
+print("install 5b: a kernal BIOS EEPROM, for an empty computer to boot the installer floppy with")
+do
+  local spare = emu:newNode("spare")
+  local spareEeprom = emu:addEeprom(spare, "-- blank")
+  local function eepromOf(asProxy)
+    if not asProxy then return spareEeprom end
+    local p = {address = spareEeprom, type = "eeprom"}
+    for name, fn in pairs(spare.components[spareEeprom].methods) do p[name] = fn end
+    return p
+  end
+  local code, out = runInstaller(BUNDLE, openosFor(kernal, medium, eepromOf), {"y", "q"}, "bios")
+  assert(code == 0 and out:find("1 kernal EEPROM(s) flashed.", 1, true), "kernal BIOS flashing:\n" .. out)
+  assert(spare.components[spareEeprom].methods.get() == readFile(REPO_ROOT .. "/kernal/bios.lua"), "it holds the kernal BIOS")
 end
 print("  OK")
 
@@ -240,7 +270,7 @@ do
 end
 print("  OK")
 
-print("install 7: the catalog entries put the installer on a floppy with a launcher, and opm where muxos looks")
+print("install 7: the catalog entries put the installer at a floppy's root, and opm where muxos looks")
 do
   local core = dofile(REPO_ROOT .. "/opm/opm_core.lua")
   local text = readFile(REPO_ROOT .. "/dist/programs.cfg"):gsub("^%-%-[^\n]*\n", ""):gsub("\n%-%-[^\n]*", "")
@@ -249,10 +279,9 @@ do
   local target = core.resolve_target("abc")
   local plan = core.file_plan(cfg, core.order(cfg, "muxos-installer"), target, concat)
   assert(#plan == 1 and plan[1].path == "muxos/dist/muxos-installer.lua"
-    and plan[1].file == "/mnt/abc/bin/muxos-installer.lua", "installer lands in the floppy's bin")
+    and plan[1].file == "/mnt/abc/muxos-installer.lua", "the installer lands at the floppy's root, where the BIOS looks")
   assert(readFile(REPO_ROOT .. "/" .. plan[1].path:gsub("^muxos/", "")) == readFile(BUNDLE), "the entry names the built installer")
-  local launcher = core.launcher_text(cfg["muxos-installer"], "muxos-installer", target, concat)
-  assert(launcher:find('loadfile("/mnt/abc/bin/muxos-installer.lua")', 1, true), "the launcher runs it")
+  assert(not cfg["muxos-installer"].launcher, "no launcher: a /muxos.lua on the floppy would be booted as the kernal")
   local selfPlan = core.file_plan(cfg, core.order(cfg, "opm-mxe"), "/", concat)
   local dests = {}
   for _, p in ipairs(selfPlan) do dests[p.file] = p.path end
@@ -280,6 +309,53 @@ do
   local code, outText = runInstaller(converted, openosFor(node, nil), nil, "kernal", "--yes")
   assert(code == 1 and outText:find("line endings were converted to CRLF", 1, true),
     "a CRLF-converted installer explains itself:\n" .. outText)
+end
+print("  OK")
+
+print("install 9: an empty computer boots the installer floppy with the kernal BIOS -- no OpenOS -- and installs")
+do
+  local node = emu:newNode("bare")
+  emu:addModem(node)
+  local _, screen, bufs = emu:addGpuScreen(node, 80, 25)
+  local hdd = {}
+  local hddAddr = emu:addFilesystem(node, hdd)
+  emu:addFilesystem(node, {["/muxos-installer.lua"] = readFile(BUNDLE)})
+  local eeprom = emu:addEeprom(node, readFile(REPO_ROOT .. "/kernal/bios.lua"))
+  local function screenText()
+    local rows = {}
+    for y = 1, bufs[0].h do
+      local row, chars = bufs[0].cells[y] or {}, {}
+      for x = 1, bufs[0].w do chars[x] = (row[x] and row[x].char) or " " end
+      rows[#rows + 1] = table.concat(chars)
+    end
+    return table.concat(rows, "\n")
+  end
+  local function typeLine(text)
+    for i = 1, #text do
+      emu:injectSignal(node, "key_down", screen, text:byte(i), 0, "tester")
+      emu:step()
+    end
+    emu:injectSignal(node, "key_down", screen, 13, 0x1C, "tester")
+    emu:advance(1)
+  end
+  emu:boot(node)
+  emu:advance(2)
+  assert(screenText():find("muxos 0.1.2 installer (booted from", 1, true), "the BIOS booted the installer:\n" .. screenText())
+  typeLine("1")
+  assert(screenText():find("Install muxos on which disk?", 1, true), "it offers the hard disk:\n" .. screenText())
+  typeLine("1")
+  typeLine("y")
+  emu:advance(5)
+  assert(screenText():find("muxos 0.1.2 is installed.", 1, true), "it installed:\n" .. screenText())
+  assert(hdd["/muxos.lua"] == readFile(REPO_ROOT .. "/kernal/muxos.lua") and hdd["/bin/opm.mxe"], "the files are on the hard disk")
+  assert(node.components[eeprom].methods.getData() == hddAddr, "the EEPROM boots the hard disk now")
+  typeLine("y")
+  assert(node.status == "dead", "it rebooted")
+
+  -- The floppy is still in: the installed system boots first.
+  emu:boot(node)
+  emu:advance(3)
+  assert(screenText():find("muxos> _", 1, true), "muxos booted from the hard disk:\n" .. screenText())
 end
 print("  OK")
 

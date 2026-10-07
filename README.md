@@ -134,72 +134,68 @@ serve, the installer) passes standalone.
 ### Hardware
 
 - **Kernal:** one computer with a tier 3 GPU, a screen, a keyboard, a
-  network card and a hard disk. It runs no OpenOS once installed.
+  network card, a hard disk and a floppy drive (for the installer). It
+  never needs OpenOS.
 - **Workers:** three computers, each with a network card and an EEPROM.
   No disk is needed.
 - **Network:** all four computers on the same network (cables or
   wireless) so their network cards can reach each other.
 
-### Build the installer (on your PC)
+### How it fits together
+
+The kernal computer never needs OpenOS. Its EEPROM holds the muxos kernal
+BIOS, which boots, in order:
+
+1. the disk it remembers;
+2. any disk with `/muxos.lua` (an installed muxos);
+3. any disk with `/muxos-installer.lua` at its root (the installer
+   floppy).
+
+So a computer with nothing but the kernal BIOS and the installer floppy
+boots straight into the installer. Once muxos is installed it boots
+first, so the floppy can stay in.
+
+The installer also runs as an ordinary program on OpenOS, with the same
+menu. That's how the first EEPROMs get flashed: any OpenOS computer can
+flash a kernal BIOS onto an EEPROM, and worker BIOSes onto the rest.
+
+### 1. Make the installer floppy
+
+- **With opm (LewisHost.Net catalog):** copy this repository into
+  oc-programs as `muxos/` and merge `dist/programs.cfg`'s entries into
+  the catalog. On an OpenOS computer, `opm pull muxos-installer <floppy>`
+  puts the installer at the floppy's root.
+- **With an internet card:** `wget` `dist/muxos-installer.lua` from the
+  repository's raw URL onto a floppy's root.
+- **By copying:** put `dist/muxos-installer.lua` at the root of the
+  floppy's folder in your world save,
+  `saves/<world>/opencomputers/<disk address>/`.
+
+The file is about 310 KB and fits on a floppy. Running it on OpenOS
+loads it whole, so that computer needs plenty of memory (two tier 3
+sticks is comfortable). `lua5.3 tools/build.lua --floppy <dir>` makes a
+file-by-file layout that needs much less, but it only runs on OpenOS.
+
+### 2. Flash the EEPROMs (on an OpenOS computer, with the floppy in)
 
 ```
-lua5.3 tools/build.lua                    # dist/muxos-installer.lua
-lua5.3 tools/build.lua --floppy <dir>     # also a floppy layout: install.lua + files/
+/mnt/<floppy>/muxos-installer.lua bios     one kernal BIOS EEPROM
+/mnt/<floppy>/muxos-installer.lua worker   the three worker EEPROMs
 ```
 
-The build checks everything compiles, that both BIOS images fit an EEPROM
-(4096 bytes), and that the kernal and worker versions match.
-`dist/muxos-installer.lua` is committed, so you can skip building.
-`lua5.3 test/emu/install_test.lua` runs that exact installer against
-emulated hardware and boots the result.
+Each mode flashes the EEPROM in that computer, then asks you to swap in
+the next one: take the EEPROM out, put the next one in, and press Enter.
+Type `q` when done. `--count=<n>` stops after n. Put this computer's own
+EEPROM back afterwards.
 
-### Get it into the game
+(A kernal booted from the installer floppy can flash worker EEPROMs the
+same way, from its menu. Put the kernal BIOS EEPROM back in afterwards.)
 
-Either way, the installer runs on an OpenOS computer:
+### 3. Install the kernal
 
-- **One file, with an internet card:**
-  `wget https://raw.githubusercontent.com/<owner>/<repo>/<branch>/dist/muxos-installer.lua`.
-  On a private repository, download it from GitHub yourself and use one
-  of the options below.
-- **With opm, from the LewisHost.Net catalog:** copy this repository
-  into oc-programs as `muxos/` and merge `dist/programs.cfg`'s entries
-  into the catalog. Then, on an OpenOS computer,
-  `opm pull muxos-installer <floppy>` puts the installer on that floppy
-  with a `muxos` launcher: run `/mnt/<floppy>/muxos worker`, then
-  `/mnt/<floppy>/muxos kernal`.
-- **Copy it onto a disk:** put `muxos-installer.lua` (or the floppy
-  layout's contents) into the disk's folder in your world save,
-  `saves/<world>/opencomputers/<disk address>/`, while the disk is in a
-  computer.
-
-The single file is about 260 KB. OpenOS reads a program whole before
-running it, so the computer running it needs plenty of memory (two tier
-3 sticks are comfortable). The floppy layout copies file by file and
-needs far less.
-
-### 1. Flash the workers
-
-On any OpenOS computer:
-
-```
-muxos-installer.lua worker
-```
-
-It flashes the worker BIOS onto the EEPROM in that computer, then asks
-you to swap in the next one: take the EEPROM out, put the next one in,
-and press Enter. Type `q` when done. Put each flashed EEPROM in a worker,
-and put this computer's own EEPROM back. `--count=3` stops after three.
-
-### 2. Install the kernal
-
-On the kernal computer, booted into OpenOS (from a floppy, or OpenOS on
-its hard disk):
-
-```
-muxos-installer.lua kernal
-```
-
-It:
+Put the kernal BIOS EEPROM and the installer floppy in the kernal
+computer and turn it on. The installer starts; choose **1) install the
+kernal**. It:
 
 - lists the writable disks and asks which one to use (the installer's
   own disk isn't offered);
@@ -208,15 +204,21 @@ It:
 - writes muxos and the OpenOS libraries for legacy programs. Each file
   goes in as `<name>.new` and they're all swapped in at the end, so a
   disk that fills up mid-install changes nothing;
-- flashes this computer's EEPROM with the kernal BIOS, pointed at that
-  disk.
+- points the EEPROM at that disk.
 
-Running it again upgrades in place and keeps your own files. Take the
-OpenOS floppy out, reboot, and muxos starts. Workers boot from the
-network as soon as they're powered on, in any order.
+Reboot and muxos starts. Workers boot from the network as soon as
+they're powered on, in any order. Running the installer again (from
+OpenOS: `muxos-installer.lua kernal`) upgrades in place and keeps your
+own files.
 
-Options: `--disk=<address prefix or label>`, `--yes` (no questions),
-`--reboot`.
+OpenOS options: `--disk=<address prefix or label>`, `--yes` (no
+questions), `--count=<n>`, `--reboot`.
+
+The build (`lua5.3 tools/build.lua`) checks everything compiles, that
+both BIOS images fit an EEPROM (4096 bytes), and that the kernal and
+worker versions and wire code match. `lua5.3 test/emu/install_test.lua`
+runs the built installer against emulated hardware, including booting
+an empty computer from the installer floppy, and boots the result.
 
 ### Installing by hand
 
