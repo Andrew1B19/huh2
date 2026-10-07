@@ -1273,9 +1273,8 @@ local function loadRuntime()
 end
 
 -- Answer a worker's BOOT request (node/bios.lua's network-boot stub) with
--- its real runtime, broadcast once -- any OTHER worker still waiting on
--- its own BOOT picks up the same reply for free, since they all need the
--- identical payload. Not wrapped in the serialized-table protocol: BOOT
+-- its real runtime, sent to that worker only. Not wrapped in the
+-- serialized-table protocol: BOOT
 -- happens before a worker has that runtime loaded at all, so it uses its
 -- own plain "WORD <payload>" convention (see node/bios.lua).
 local BOOT_CHUNK_SIZE = 7000

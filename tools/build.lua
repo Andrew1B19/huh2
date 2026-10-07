@@ -66,6 +66,18 @@ local function build()
       errors[#errors + 1] = entry[2] .. " is " .. #data .. " bytes; an EEPROM holds " .. EEPROM_SIZE
     end
   end
+  -- The wire codec is duplicated by hand in the kernal and the worker
+  -- runtime (neither can require a shared file); the two must not drift.
+  local function codec(text)
+    local a = text:find("local function serializeNumber", 1, true)
+    local b = a and text:find("\n  deserialize = function", a, true)
+    local e = b and text:find("\nend\n", b, true)
+    return e and text:sub(a, e)
+  end
+  local kernalCodec, runtimeCodec = codec(readFile("kernal/muxos.lua")), codec(readFile("node/runtime.lua"))
+  if not kernalCodec or kernalCodec ~= runtimeCodec then
+    errors[#errors + 1] = "the wire codec (serialize/deserialize) differs between kernal/muxos.lua and node/runtime.lua"
+  end
   local version = readFile("kernal/muxos.lua"):match('local MUXOS_VERSION = "([^"]+)"')
   local runtimeVersion = readFile("node/runtime.lua"):match('local MUXOS_VERSION = "([^"]+)"')
   if not version or version ~= runtimeVersion then

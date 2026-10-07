@@ -413,7 +413,7 @@ return main()
 
 --[=[MUXOS-PAYLOAD 0.1.0
 @@MANIFEST 19
-105436 /muxos.lua
+105317 /muxos.lua
 37750 /compositor.lua
 6492 /bitmap.lua
 90428 /runtime.lua
@@ -432,7 +432,7 @@ return main()
 5892 /lib/mxe/opm_core.lua
 2601 /eeprom/kernal.lua
 2443 /eeprom/worker.lua
-@@ 105436 /muxos.lua
+@@ 105317 /muxos.lua
 -- muxos kernal "init" for huh2. This REPLACES OpenOS on the kernal --
 -- it is the entire resident environment, not a program that runs under
 -- one. kernal/bios.lua (this node's own tiny EEPROM image, mirroring
@@ -1708,9 +1708,8 @@ local function loadRuntime()
 end
 
 -- Answer a worker's BOOT request (node/bios.lua's network-boot stub) with
--- its real runtime, broadcast once -- any OTHER worker still waiting on
--- its own BOOT picks up the same reply for free, since they all need the
--- identical payload. Not wrapped in the serialized-table protocol: BOOT
+-- its real runtime, sent to that worker only. Not wrapped in the
+-- serialized-table protocol: BOOT
 -- happens before a worker has that runtime loaded at all, so it uses its
 -- own plain "WORD <payload>" convention (see node/bios.lua).
 local BOOT_CHUNK_SIZE = 7000
