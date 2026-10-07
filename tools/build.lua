@@ -46,6 +46,9 @@ local FILES = {
 for _, rel in ipairs(listDir("kernal/lib")) do
   if rel ~= "README.md" then FILES[#FILES + 1] = {"/lib/" .. rel, "kernal/lib/" .. rel} end
 end
+-- OPM, the package manager, ships with muxos.
+FILES[#FILES + 1] = {"/bin/opm.mxe", "opm/opm.mxe"}
+FILES[#FILES + 1] = {"/lib/mxe/opm_core.lua", "opm/opm_core.lua"}
 FILES[#FILES + 1] = {"/eeprom/kernal.lua", "kernal/bios.lua"}
 FILES[#FILES + 1] = {"/eeprom/worker.lua", "node/bios.lua"}
 
@@ -55,7 +58,7 @@ local function build()
   for i, entry in ipairs(FILES) do
     local data = readFile(entry[2])
     contents[i] = data
-    if entry[2]:match("%.lua$") then
+    if entry[2]:match("%.lua$") or entry[2]:match("%.mxe$") then
       local ok, err = load(data, "=" .. entry[2], "t")
       if not ok then errors[#errors + 1] = err end
     end

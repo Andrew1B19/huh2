@@ -1,0 +1,190 @@
+--[[mxe
+muxos = "0.1.0"
+name = "opm"
+version = "0.5.0"
+description = "Open Computers Pull Manager, the muxos port"
+author = "LewisHost.Net"
+libraries = {"mux", "http", "opm_core"}
+requires = {"internet"}
+]]
+-- opm for muxos: installs oppm-style packages from the LewisHost.Net Gitea
+-- monorepo, like OpenOS's opm 0.4.0 (ocpull/opm.lua), whose logic it shares
+-- unchanged (opm_core). What's different on muxos:
+--   * files go to the kernal's disk through `fs`; HTTP goes through the `http`
+--     library, over whichever internet card the cluster has;
+--   * --from=DIR installs offline from an `opm bundle` directory (opmf's job);
+--   * `opm update` (no argument) reinstalls opm from the catalog's "opm-mxe"
+--     package; `opm hook` is gone (the muxos console has no tab completion).
+local mux = require("mux")
+local http = require("http")
+local core = require("opm_core")
+
+local DEFAULT_BASE = "http://192.168.1.131:3001/LewisHost.Net/oc-programs/raw/branch/main/"
+local SELF_PACKAGE = "opm-mxe"
+local CACHE = "/etc/opm.cache"         -- the last programs.cfg seen
+local INSTALLED = "/etc/opm.installed" -- { [lowercase name] = target }
+local args, opts = mux.parseArgs(...)
+
+local USAGE = [==[
+opm [--base=URL] list
+opm [--base=URL] [--autorun[=ARGS]] pull <package> [target]
+opm [--base=URL] bundle <package> <dir>   a package and its dependencies, for offline use
+opm update                                reinstall opm itself (the catalog's opm-mxe)
+opm [--base=URL] update -a                re-pull every package installed here, at its target
+opm [--base=URL] update <package>         re-pull one package, at its recorded target
+opm --from=DIR ...                        use a bundle in DIR instead of the network
+
+<package> and its dependencies go under target (default /usr). File destinations
+follow oppm: "/bin" -> <target>/bin, "//etc" -> absolute /etc.
+]==]
+
+local function concat(...)
+  local path = table.concat({...}, "/"):gsub("//+", "/")
+  if #path > 1 then path = path:gsub("/$", "") end
+  return path
+end
+
+local function basename(path) return path:match("([^/]+)/?$") end
+
+local function write(file, body)
+  local ok, err = fs.write(file, body)
+  if not ok then error("can't write " .. file .. ": " .. tostring(err), 0) end
+end
+
+local function http_source(base)
+  base = base:gsub("/*$", "/")
+  return {label = base, get = function(path)
+    local body, err = http.get(base .. path)
+    if not body then error(base .. path .. ": " .. tostring(err), 0) end
+    if body == "" then error("empty response from " .. base .. path, 0) end
+    return body
+  end}
+end
+
+-- An `opm bundle` directory: offline, what opmf does on OpenOS.
+local function dir_source(dir)
+  return {label = dir, get = function(path)
+    local body = fs.read(concat(dir, "files", path))
+    if not body then error(concat(dir, "files", path) .. " not found", 0) end
+    return body
+  end}
+end
+
+local function load_installed()
+  local text = fs.read(INSTALLED)
+  if not text then return {} end
+  local fn = load("return " .. text, "=opm.installed", "t", {})
+  if not fn then return {} end
+  local ok, t = pcall(fn)
+  return (ok and type(t) == "table") and t or {}
+end
+
+local function record_installed(name, target)
+  local t = load_installed()
+  t[name] = target
+  local lines = {"{"}
+  for n, tgt in pairs(t) do lines[#lines + 1] = string.format("[%q]=%q,", n, tgt) end
+  lines[#lines + 1] = "}"
+  pcall(write, INSTALLED, table.concat(lines, "\n"))
+end
+
+local function load_cfg(src)
+  local text = src.get("programs.cfg")
+  local cfg, err = core.parse_cfg(text)
+  if not cfg then error(err, 0) end
+  pcall(write, CACHE, text)
+  return cfg
+end
+
+local function pull(src, cfg, name, target)
+  local plan = core.file_plan(cfg, core.order(cfg, name), target, concat)
+  -- a "payload" folder (a floppy installer's) is replaced, not merged
+  local keep, dirs = {}, {}
+  for _, p in ipairs(plan) do keep[p.file] = true; dirs[p.dir] = true end
+  for dir in pairs(dirs) do
+    if basename(dir) == "payload" and fs.isDirectory(dir) then
+      for _, n in ipairs(fs.list(dir) or {}) do
+        local f = concat(dir, (n:gsub("/$", "")))
+        if not keep[f] then fs.remove(f); print("removed stale " .. f) end
+      end
+    end
+  end
+  for _, p in ipairs(plan) do
+    local body = src.get(p.path)
+    write(p.file, body)
+    local v = core.find_version(body)
+    print(p.path .. " -> " .. p.file .. "  " .. #body .. " bytes" .. (v and ("  version " .. v) or ""))
+  end
+  local pkg = cfg[name]
+  if pkg.launcher then
+    write(concat(target, pkg.launcher .. ".lua"), core.launcher_text(pkg, name, target, concat))
+    print("launcher: " .. concat(target, pkg.launcher))
+  end
+  local autorun = opts.autorun or opts.a
+  if autorun then
+    local text, line = core.autorun_text(pkg, name, target, autorun, concat)
+    write(concat(target, "autorun.lua"), text)
+    print("autorun.lua -> " .. line)
+  end
+end
+
+-- programs.cfg and the package closure, so `opm --from=<dir>` (or opmf on
+-- OpenOS) can install offline.
+local function bundle(src, cfg, name, dir)
+  local plan = core.file_plan(cfg, core.order(cfg, name), "/", concat)
+  plan[#plan + 1] = {path = "programs.cfg"}
+  for _, p in ipairs(plan) do
+    local body = src.get(p.path)
+    local file = concat(dir, "files", p.path)
+    write(file, body)
+    if fs.read(file) ~= body then error("write check failed for " .. file .. " (disk full?)", 0) end
+    print(p.path .. " " .. #body .. " bytes")
+  end
+  -- opmf too, for OpenOS machines, when the source has it.
+  for _, own in ipairs({"opmf.lua", "opm_core.lua"}) do
+    local ok, body = pcall(src.get, "ocpull/" .. own)
+    if ok then write(concat(dir, own), body) end
+  end
+  print("bundle ready: on muxos run  opm --from=" .. dir .. " pull " .. name)
+end
+
+local ok, err = pcall(function()
+  local cmd = args[1]
+  if not cmd then print(USAGE) return end
+  if cmd == "hook" then
+    print("opm hook: the muxos console has no tab completion")
+    return
+  end
+  local src = opts.from and dir_source(opts.from) or http_source(opts.base or DEFAULT_BASE)
+  local cfg = load_cfg(src)
+  if cmd == "update" and not args[2] then
+    if not cfg[SELF_PACKAGE] then
+      error("the catalog has no " .. SELF_PACKAGE .. " package (muxos's opm/ directory) to update from", 0)
+    end
+    pull(src, cfg, SELF_PACKAGE, "/")
+    print("opm updated")
+  elseif cmd == "update" then
+    local plan, skipped = core.plan_update(load_installed(), cfg, args[2])
+    for _, s in ipairs(skipped) do print("skip " .. s.name .. ": " .. s.reason) end
+    if #plan == 0 then print("nothing to update") end
+    for _, p in ipairs(plan) do
+      print("updating " .. p.name .. " -> " .. p.target)
+      pull(src, cfg, p.name, p.target)
+    end
+  elseif cmd == "list" then
+    local names = {}
+    for n in pairs(cfg) do names[#names + 1] = n end
+    table.sort(names)
+    for _, n in ipairs(names) do print(string.format("%-18s %s", n, cfg[n].description or "")) end
+  elseif cmd == "pull" and args[2] then
+    local name, target = args[2]:lower(), core.resolve_target(args[3])
+    pull(src, cfg, name, target)
+    record_installed(name, target)
+    print("done")
+  elseif cmd == "bundle" and args[2] and args[3] then
+    bundle(src, cfg, args[2]:lower(), core.resolve_target(args[3]))
+  else
+    print(USAGE)
+  end
+end)
+if not ok then error("opm: " .. tostring(err), 0) end

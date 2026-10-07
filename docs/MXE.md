@@ -1,16 +1,15 @@
 # The `.mxe` program format -- specification
 
-Status: **draft, muxos 0.1.0**. Sections marked **BUILT** describe what
-muxos does today (tests named). Sections marked **PROPOSED** are not
-built: each is a decision to make, with a recommendation. Nothing
-proposed should be relied on until it's marked built.
+Status: **muxos 0.1.0, built**. Everything here is implemented and
+tested (tests named; `test/emu/integration_test.lua`). OPM (`opm/`) is
+the reference program written against it.
 
 This is the contract for programs written for muxos itself. OpenOS
 programs (`.lua`) don't need any of it: muxos runs them in an OpenOS
 environment, gmux-style (see docs/PROTOCOL.md, "Running OpenOS
 programs").
 
-## 1. What an `.mxe` is -- BUILT
+## 1. What an `.mxe` is
 
 An `.mxe` is a Lua 5.3 source file with the `.mxe` extension. The
 extension tells the launcher to run it as a native muxos program rather
@@ -26,19 +25,25 @@ Native means:
   picks. Code must not assume which node, or that it stays on one node
   (see "Migration").
 - **The wider API.** It talks to the OS directly (`gmuxapi`, the
-  compositor, the cluster component bus), with no virtual hardware in
-  between.
+  compositor, the cluster component bus, the filesystem), with no
+  virtual hardware in between.
 - **Parent and child processes.** Only `.mxe` programs have them.
 
-## 2. File layout -- BUILT
+## 2. File layout
 
 ```lua
 --[[mxe
 muxos = "0.1.0"
-libraries = {"mux", "mylib"}
+name = "hello"
+version = "1.0"
+description = "says hello"
+author = "me"
+libraries = {"mux", "http", "mylib"}
+requires = {"internet"}
 ]]
-local mylib = require("mylib")
-print("hello", ...)
+local mux = require("mux")
+local args, options = mux.parseArgs(...)
+print("hello", args[1])
 ```
 
 The header must be the first thing in the file (leading whitespace
@@ -48,17 +53,19 @@ code, and it can't call anything. A file without a header is an `.mxe`
 with no requirements. A header that doesn't parse stops the launch with
 an error.
 
-Header fields:
+Header fields (all optional):
 
 | field | type | meaning |
 |---|---|---|
-| `muxos` | string | the muxos version the program was written for |
-| `libraries` | list of strings | libraries it wants, beyond the native API (section 5) |
+| `muxos` | string | the muxos version the program was written for (section 3) |
+| `libraries` | list of strings | libraries it wants beyond the native API (section 5) |
+| `requires` | list of strings | component types it uses; reported, never enforced (section 3) |
+| `name`, `version`, `description`, `author` | strings | its identity, for package managers and process listings |
 
 Unknown fields are ignored, so new fields can be added without breaking
 old launchers.
 
-## 3. Launching -- BUILT
+## 3. Launching
 
 A program is started by:
 - typing its name at the console (looked up on `/bin` then `/usr/bin`,
@@ -68,7 +75,7 @@ A program is started by:
   process becomes its parent.
 
 - **Arguments** are the rest of the console line, split on whitespace,
-  passed as `...`, all strings.
+  passed as `...`, all strings. `mux.parseArgs` parses them (section 5).
 - **Foreground or background.** From the console the program runs in
   the foreground: the console waits until it ends and feeds it typed
   keys. A trailing `&` runs it in the background.
@@ -81,17 +88,30 @@ the global `launch`:
 |---|---|
 | `muxos` | the running muxos version |
 | `requested` | the program's `muxos` field (or nil) |
-| `versionMatch` | true if they're the same version (or none was requested) |
-| `libraries` | name -> true (granted) or false (not found / failed to load) |
+| `compatible` | the running version satisfies the requested one (below) |
+| `versionMatch` | exactly the same version (or none requested) |
+| `libraries` | name -> true (granted) or false (not found / failed to load), dependencies included |
 | `errors` | name -> error text, for libraries that failed to load |
+| `components` | for each type in `requires`: true if one is on the cluster bus right now |
+| `name`, `version`, `description`, `author` | the header's own fields |
 
-**A version mismatch never stops a program from running.** The program
-decides what to do about it (test 29).
+**Compatibility follows semantic versioning.** The major versions must
+be equal, and within that major the running version must be at least the
+requested one. Before 1.0, the minor version counts as the major, so
+`0.1.x` is compatible with a request for `0.1.y` when `x >= y`, but not
+with `0.2`.
 
-## 4. The native API -- BUILT
+**Nothing here ever stops a program from running:** not a version
+mismatch, not a missing library, not a missing component. The program
+decides (tests 29, 37).
 
-Every `.mxe` sees these globals, read-only. Its own
-globals are its own.
+The header's `name` and `version` show in process listings
+(`gmuxapi.get_processes`/`get_process`, as `programName` and
+`programVersion`).
+
+## 4. The native API
+
+Every `.mxe` sees these globals, read-only. Its own globals are its own.
 
 - **Lua:** `assert error ipairs next pairs pcall rawequal rawget rawlen
   rawset select setmetatable getmetatable tonumber tostring type
@@ -103,9 +123,30 @@ globals are its own.
 - `jobId`: this process's id.
 - `print(...)`: output to the kernal console, buffered and sent at yield
   points, before input, at exit, or past 1 KB.
+- `readLine([prompt])`: one typed line, for the console's foreground
+  program. It prints the prompt; the console echoes what's typed. Called
+  from anything else (background, `run`, a child process), it returns
+  nil and `"not in the foreground at the console"`.
 - `yield()`: let the node do other work (see "Cooperation").
   `sleep(seconds)` waits without losing events.
 - `muxos.version`, and `computer.uptime()`, `computer.address()`.
+- `fs`: the OS filesystem, the kernal's disk (the same one legacy
+  programs and gmux apps use). Paths are absolute.
+
+  | call | returns |
+  |---|---|
+  | `fs.exists(p)`, `fs.isDirectory(p)` | boolean |
+  | `fs.size(p)`, `fs.lastModified(p)` | number (0 if missing) |
+  | `fs.list(dir)` | sorted table of names (directories end in `/`), or nil, err |
+  | `fs.makeDirectory(p)`, `fs.remove(p)`, `fs.rename(from, to)` | true, or false/nil, err |
+  | `fs.read(p)` | the whole file, or nil, err |
+  | `fs.write(p, text)` | true, or nil, err; makes the directory if needed |
+  | `fs.copy(from, to)` | true, or nil, err |
+  | `fs.open(p, mode)` | a stream (`"r"`, `"w"`, `"a"`): `:read(...)` (`"l"`, `"L"`, `"n"`, `"a"`, or a byte count), `:lines()`, `:write(...)`, `:seek(whence, offset)`, `:flush()`, `:close()` |
+
+  Streams are buffered: reads fetch 16 KB per network round trip, and
+  writes go out past 4 KB or on flush/seek/close. Files a process leaves
+  open are closed when it ends (test 37).
 - `gmuxapi`, the gmux application API, muxos-shaped:
   - **processes:** `get_processes()`, `get_process(id)`,
     `create_headless_process{code, name, orphan_policy, args, node}`,
@@ -123,38 +164,62 @@ globals are its own.
   - **display:** `request_fullscreen()`, `release_fullscreen()`.
 - `component`: every component in the cluster over the bus, with
   OpenOS's API (`list`, `proxy`, `invoke`, `type`, `methods`,
-  `isAvailable`, `getPrimary`, `component.<type>`). Open visibility, minus
-  the display, network cards and firmware (docs/PROTOCOL.md, "Cluster
-  component bus"; test 36).
+  `isAvailable`, `getPrimary`, `component.<type>`). Primary prefers the
+  program's own node. Open visibility, minus the display, network cards
+  and firmware (docs/PROTOCOL.md, "Cluster component bus"; test 36).
 - `gpu`: drawing calls on the kernal's GPU. Refused unless the program
   holds the fullscreen grant; windows are the normal way to draw.
 
 **Cooperation.** A process runs until it yields. One that doesn't yield
 for the machine's limit (5 s by default) is ended with an error. Its
 node does nothing else meanwhile: no input, no answering the kernal.
-Long loops should call `yield()`. Waiting (`sleep`, `pull_event`, any
-`gmuxapi` or bus call) yields automatically.
+Long loops should call `yield()`. Waiting (`sleep`, `pull_event`,
+`readLine`, any `gmuxapi`, `fs` or bus call) yields automatically.
 
 **Ending.** Returning ends the process: the return value is its
 `result` (`gmuxapi.get_process`), and it must be plain data. An error
-ends it with status `error`. Its windows stay up, marked, until closed.
-Its children follow their `orphan_policy` (`orphan`, `kill`,
-`promote`).
+ends it with status `error`, and the console shows the message. There's
+no other exit code: `error("...")` is failure. Its windows stay up,
+marked, until closed. Its children follow their `orphan_policy`
+(`orphan`, `kill`, `promote`).
 
-## 5. Libraries -- BUILT
+## 5. Libraries
 
-A name in `libraries` is looked up as `/lib/mxe/<name>.lua` on the
-kernal's disk, or as a library built into the runtime. Granted libraries
-are shipped with the program and loaded into its own environment before
-it starts, so `require(name)` returns them. `require` of anything not
-granted is an error.
+**Search.** A name in `libraries` is a library built into the runtime,
+or a file `<name>.lua` in `/lib/mxe` (system) then `/usr/lib/mxe`
+(installed, OPM's default), on the kernal's disk.
 
-- **A library file** is a chunk returning its value. It runs in the
-  program's environment, so it sees the same native API.
-- **Built-in libraries:**
-  - `mux`: `mux.migratable(save)` and `mux.restored()` (section 6).
+**Loading.** Granted libraries are shipped with the program and loaded
+into its own environment before it starts, dependencies first, so
+`require(name)` returns them. `require` of anything not granted is an
+error.
 
-## 6. Migration -- BUILT, optional
+**A library file** is a chunk returning its value. It runs in the
+program's environment, so it sees the same native API. It may start with
+its own `--[[mxe libraries = {...} ]]` header: those libraries are
+granted too, transitively, and loaded before it (test 37).
+
+**Built-in libraries:**
+
+- `mux`:
+  - `mux.parseArgs(...)` returns `args, options`, with OpenOS's
+    `shell.parse` rules: `-abc` sets `a`, `b`, `c` to true;
+    `--name` sets `name` to true; `--name=value` sets `name` to
+    `"value"`; `--` ends options; `-` and everything else is
+    positional.
+  - `mux.migratable(save)`, `mux.restored()`: migration (section 6).
+- `http`, over whichever internet card the bus offers (this node's
+  first):
+  - `http.get(url[, headers[, timeout]])` returns `body, status,
+    headers`, or nil, err;
+  - `http.request(url[, data[, headers[, method]]])` returns a stream
+    with `finishConnect()`, `response()`, `read([n])` (nil at the end)
+    and `close()`. `data` may be a string or a table, which is
+    form-encoded.
+
+  The internet card can be on any node in the cluster (test 37).
+
+## 6. Migration (optional)
 
 A program that wants to be movable between nodes:
 
@@ -170,101 +235,22 @@ starts again from the top on the new node, where `mux.restored()`
 returns the saved table. The state must be plain data. Without
 `migratable`, a program is never moved (test 31).
 
-## 7. PROPOSED -- what's missing
+## 7. Packages and OPM
 
-Each item below is a gap a real program (OPM first) will hit. The
-recommendation comes first; it needs your decision.
+Where things live:
+- programs on `/bin` (shipped with muxos) or `/usr/bin` (installed);
+- `.mxe` libraries in `/lib/mxe` or `/usr/lib/mxe`;
+- OpenOS libraries for legacy programs in `/lib` or `/usr/lib`.
 
-### 7.1 Files
+OPM (`/bin/opm.mxe`, see `opm/README.md`) installs oppm-format packages
+from the LewisHost.Net catalog into `/usr` by default:
 
-**Gap:** an `.mxe` has no file access at all. OPM installs files.
+- `opm list`, `opm pull <package> [target]`;
+- `opm update -a` or `opm update <package>`;
+- `opm bundle <package> <dir>`, and `opm --from=<dir> ...` to install
+  from a bundle offline;
+- `opm update`, which reinstalls OPM from the catalog's `opm-mxe`
+  package.
 
-**Recommendation:** a native global `fs`, always present, over the OS
-filesystem (the kernal's disk), using the `FS` requests legacy programs
-already use:
-
-- path functions: `fs.exists`, `fs.isDirectory`, `fs.size`,
-  `fs.lastModified`, `fs.list(path)` (a sorted table), `fs.makeDirectory`,
-  `fs.remove`, `fs.rename`, `fs.copy`;
-- whole files: `fs.read(path)` and `fs.write(path, text)`;
-- streams: `fs.open(path, mode)` for big files.
-
-Paths are absolute. Native, not a library: files are an OS service, like
-windows. Same reach as gmux apps (the whole disk), no sandbox per
-program.
-
-### 7.2 Console input
-
-**Gap:** a foreground program receives keys only as raw `pull_event`
-events; there's no line input.
-
-**Recommendation:** a native `readLine([prompt])`. In the foreground at
-the console it reads a line with echo, as the console does now for
-legacy programs. Called from the background or a window, it returns nil
-and an error.
-
-### 7.3 Arguments and exit status
-
-**Gap:** arguments are raw strings; the only exit status is
-result/error.
-
-**Recommendation:**
-- Keep `...` as is.
-- Add `mux.parseArgs(...)` -> `args, options`, the same rules as
-  OpenOS's `shell.parse`: `-abc`, `--name`, `--name=value`, positional.
-- Exit status stays result/error. `error()` with a message is a failure,
-  and the console shows it.
-
-### 7.4 Version compatibility
-
-**Gap:** `versionMatch` is exact equality, which is too strict to be
-useful.
-
-**Recommendation:**
-- Semantic versioning: `launch.compatible` is true when the major
-  versions are equal and the running minor is at least the requested
-  minor. Before 1.0, minor counts as major.
-- `versionMatch` stays as is. Neither ever blocks a launch.
-
-### 7.5 Where programs and libraries live
-
-**Gap:** `.mxe` libraries are only looked for in `/lib/mxe`. OPM
-installs to `/usr` by default.
-
-**Recommendation:**
-- Programs go on `/bin` (system) or `/usr/bin` (installed), as now.
-- Libraries are searched in `/lib/mxe` then `/usr/lib/mxe`.
-- A library may itself list `libraries` in a header, resolved
-  transitively at launch.
-
-### 7.6 HTTP
-
-**Gap:** a program can use an internet card through `component` (any
-node's, over the bus), but only through the raw request API.
-
-**Recommendation:** a built-in library `http`:
-- `http.get(url[, headers])` returns `body, status, headers`;
-- `http.request(url, data, headers, method)` returns a streaming handle.
-
-It's built on whichever internet card `component` finds, preferring one
-on the program's own node. A built-in library, not native: few programs
-need it, and it says so in the header.
-
-### 7.7 Header fields for packages
-
-**Gap:** OPM needs a program's identity.
-
-**Recommendation:**
-- Optional header fields `name`, `version`, `description` and `author`,
-  shown in `launch` and in process listings.
-- `requires = {"internet"}`, a list of component types: the launcher
-  reports in `launch.components` which are present on the bus. It never
-  blocks.
-
-### 7.8 OPM as an `.mxe`
-
-**Depends on 7.1-7.7.** OPM keeps its catalog format, oppm's
-`programs.cfg`, and `opm_core` as is (it's pure logic). Its I/O moves to
-`fs`, `http` and `readLine`. Installed `.mxe` programs and their
-libraries land on `/usr/bin` and `/usr/lib/mxe`. `opm hook` goes away:
-it's OpenOS shell tab completion, and the muxos console has none.
+A package for muxos is an oppm entry whose files land in those places.
+Its `.mxe` programs should fill in `name` and `version` (test 38).

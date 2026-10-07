@@ -140,6 +140,8 @@ do
   assert(disk["/lib/core/full_text.lua"] == readFile(REPO_ROOT .. "/kernal/lib/core/full_text.lua"), "libraries installed")
   assert(disk["/.muxos-version"] == "0.1.0\n" and disk["/home/keep.txt"] == "mine", "version recorded, user files kept")
   assert(not disk["/eeprom/kernal.lua"], "BIOS images aren't disk files")
+  assert(disk["/bin/opm.mxe"] == readFile(REPO_ROOT .. "/opm/opm.mxe")
+    and disk["/lib/mxe/opm_core.lua"] == readFile(REPO_ROOT .. "/opm/opm_core.lua"), "opm ships with muxos")
   for path in pairs(disk) do assert(not path:match("%.new$"), "left a staged file behind: " .. path) end
   local eeprom = kernal.components[kernalEeprom].methods
   assert(eeprom.get() == readFile(REPO_ROOT .. "/kernal/bios.lua") and eeprom.getData() == diskAddr,

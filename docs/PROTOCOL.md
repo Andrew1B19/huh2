@@ -202,6 +202,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `OUTPUT`  | `from`, `to`, `jobId`, `text`                                 | worker  | a process's printed output, for the console |
 | `LAUNCH`  | `from`, `to`, `id`, `path`, `args`, `caller`                  | worker  | launch a program as the caller's child (`gmuxapi.launch`) |
 | `FS`      | `from`, `to`, `id`, `op`, `args`, `caller`                    | worker  | a legacy process's filesystem call on the kernal's disk (`op` = a filesystem component method); handles are the kernal's own, per process |
+| `ISFOREGROUND` | `from`, `to`, `id`, `caller`                         | worker  | `readLine`: is the caller the console's foreground program? RESULT true, or ERROR |
 | `GETMODULE` | `from`, `to`, `id`, `name`, `caller`                        | worker  | a legacy process's `require`/`dofile` for a module it wasn't shipped with: a module name or a `/lib`/`/usr/lib` path; replies `{path, source}` |
 | `KILL`/`PAUSE`/`RESUME`/`MIGRATE <id> <node>` | raw, unchunked           | kernal  | process control broadcasts, acted on at the process's yield points; only the worker named by `<node>` records one, so a job id reused on another node (after a migration) isn't hit by a stale control |
 | `MIGRATABLE` | `from`, `to`, `jobId`                                  | worker  | an `.mxe` called `mux.migratable(save)`: the kernal may now move it |
@@ -518,11 +519,10 @@ the scheduler places it.
   budget). The program gets the launcher's response as the global
   `launch`: `muxos` (the actual version), `requested`, `versionMatch`
   (a mismatch never stops it from running), `libraries` (name ->
-  found or not) and `errors`. Libraries live at `/lib/mxe/<name>.lua` on
+  found or not) and `errors`. Libraries live at `/lib/mxe/<name>.lua` or `/usr/lib/mxe/<name>.lua` on
   the kernal's disk, are shipped with the program, load into its own
   environment, and are reached with `require(name)`. Both headers and
-  libraries are deliberately minimal for now; the full `.mxe` spec comes
-  later.
+  libraries are specified in docs/MXE.md.
 
 ## Legacy libraries -- BUILT
 

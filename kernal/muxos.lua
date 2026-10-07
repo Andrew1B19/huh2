@@ -181,6 +181,13 @@ end
 -- boot handshake.
 local selfAddr = modemAddr
 local nodes = {}      -- address -> {lastSeen = computer.uptime()}
+-- The cluster component bus (see "Cluster component bus" below).
+local bus = {
+  components = {}, -- address -> {type, node, methods}
+  relays = {},     -- our request id -> {to, id, node, expires}
+}
+-- The program running in the foreground at the console (runForeground).
+local foregroundJob = nil
 local nodeOrder = {}  -- address list, stable iteration/round-robin order
 local nextJobId = 1
 local nextNode = 1
@@ -681,12 +688,13 @@ end
 -- and gets a response (the global `launch` in its environment): the
 -- actual version, whether it matches (a mismatch never stops it from
 -- running), and which libraries were found. Libraries live at
--- MXE_LIBRARY_DIR/<name>.lua on the kernal's disk and are shipped with
+-- <dir>/<name>.lua (MXE_LIBRARY_DIRS) on the kernal's disk and are shipped with
 -- the program. Either way, the scheduler places it.
 local PROGRAM_PATH = {"/bin", "/usr/bin"}
 -- Libraries built into the worker runtime rather than shipped from disk.
-local BUILTIN_MXE_LIBRARIES = {mux = true}
-local MXE_LIBRARY_DIR = "/lib/mxe/"
+local BUILTIN_MXE_LIBRARIES = {mux = true, http = true}
+-- Searched in order (docs/MXE.md section 5).
+local MXE_LIBRARY_DIRS = {"/lib/mxe/", "/usr/lib/mxe/"}
 
 local function fileExists(path)
   return tryInvoke(fsAddr, "exists", path) == true
@@ -725,7 +733,8 @@ local function readManifest(source)
   local co = coroutine.create(chunk)
   local ok, runErr = coroutine.resume(co)
   if not ok then return nil, "bad .mxe header: " .. tostring(runErr) end
-  return {muxos = env.muxos, libraries = env.libraries}
+  return {muxos = env.muxos, libraries = env.libraries, requires = env.requires, name = env.name,
+    version = env.version, description = env.description, author = env.author}
 end
 
 local function versionParts(v)
@@ -812,35 +821,95 @@ local function prefetchModules(source)
   return modules
 end
 
-local function launchProgram(path, args, parent)
-  local source, err = readFile(path)
-  if not source then return nil, "can't read " .. path .. ": " .. tostring(err) end
-  local program = {path = path, kind = path:match("%.mxe$") and "mxe" or "legacy"}
-  if program.kind == "mxe" then
-    local manifest, manifestErr = readManifest(source)
-    if not manifest then return nil, manifestErr end
-    local response = {muxos = MUXOS_VERSION, requested = manifest.muxos, libraries = {},
-      versionMatch = manifest.muxos == nil or sameVersion(manifest.muxos, MUXOS_VERSION)}
-    local libs = {}
-    for _, name in ipairs(type(manifest.libraries) == "table" and manifest.libraries or {}) do
-      if BUILTIN_MXE_LIBRARIES[name] then
-        response.libraries[name] = true
-        libs[name] = true
-      elseif type(name) == "string" and name:match("^[%w_%.%-]+$") then
-        local libSource = readFile(MXE_LIBRARY_DIR .. name .. ".lua")
-        response.libraries[name] = libSource ~= nil
-        libs[name] = libSource
-      end
+local launchProgram
+do
+  -- docs/MXE.md section 3: same major, and the running version at least
+  -- the requested one within it; before 1.0 the minor counts as the major.
+  local function compatibleVersion(requested, running)
+    if requested == nil then return true end
+    local r, h = versionParts(requested), versionParts(running)
+    local function at(t, i) return t[i] or 0 end
+    if at(r, 1) ~= at(h, 1) then return false end
+    if at(h, 1) == 0 then
+      return at(r, 2) == at(h, 2) and at(h, 3) >= at(r, 3)
     end
-    program.launch, program.libs = response, libs
-  else
-    program.modules = prefetchModules(source)
-    -- Sizes the default resolution of its virtual gpu.
-    program.screen = {termW, termH}
-    program.fsAddress = fsAddr
+    return at(h, 2) > at(r, 2) or (at(h, 2) == at(r, 2) and at(h, 3) >= at(r, 3))
   end
-  local appName = path:match("([^/]+)%.%w+$")
-  return dispatchJob(source, args, nil, parent, appName, nil, program)
+
+  -- The libraries an .mxe asked for, and theirs in turn (a library may
+  -- have its own header): name -> source (or true for a built-in), and
+  -- the order to load them in, dependencies first.
+  local function resolveMxeLibraries(names, response)
+    local libs, order, visiting = {}, {}, {}
+    local function visit(name)
+      if type(name) ~= "string" or not name:match("^[%w_%.%-]+$") or libs[name] ~= nil or visiting[name] then return end
+      visiting[name] = true
+      if BUILTIN_MXE_LIBRARIES[name] then
+        libs[name] = true
+      else
+        local source
+        for _, dir in ipairs(MXE_LIBRARY_DIRS) do
+          source = readFile(dir .. name .. ".lua")
+          if source then break end
+        end
+        if source then
+          local manifest = readManifest(source)
+          for _, dep in ipairs(manifest and type(manifest.libraries) == "table" and manifest.libraries or {}) do
+            visit(dep)
+          end
+        end
+        libs[name] = source or false
+      end
+      response.libraries[name] = libs[name] ~= false
+      if libs[name] then order[#order + 1] = name end
+    end
+    for _, name in ipairs(names) do visit(name) end
+    for name, v in pairs(libs) do
+      if v == false then libs[name] = nil end
+    end
+    return libs, order
+  end
+
+  -- Is a component of this type anywhere on the bus (a node that's up)?
+  function bus.has(ctype)
+    for _, c in pairs(bus.components) do
+      if c.type == ctype and (c.node == selfAddr or (nodes[c.node] and not nodes[c.node].down)) then return true end
+    end
+    return false
+  end
+
+  launchProgram = function(path, args, parent)
+    local source, err = readFile(path)
+    if not source then return nil, "can't read " .. path .. ": " .. tostring(err) end
+    local program = {path = path, kind = path:match("%.mxe$") and "mxe" or "legacy"}
+    if program.kind == "mxe" then
+      local manifest, manifestErr = readManifest(source)
+      if not manifest then return nil, manifestErr end
+      local response = {muxos = MUXOS_VERSION, requested = manifest.muxos, libraries = {},
+        versionMatch = manifest.muxos == nil or sameVersion(manifest.muxos, MUXOS_VERSION),
+        compatible = compatibleVersion(manifest.muxos, MUXOS_VERSION), components = {}}
+      for _, field in ipairs({"name", "version", "description", "author"}) do
+        if type(manifest[field]) == "string" then response[field] = manifest[field] end
+      end
+      for _, ctype in ipairs(type(manifest.requires) == "table" and manifest.requires or {}) do
+        if type(ctype) == "string" then response.components[ctype] = bus.has(ctype) end
+      end
+      program.launch = response
+      program.libs, program.libOrder = resolveMxeLibraries(
+        type(manifest.libraries) == "table" and manifest.libraries or {}, response)
+    else
+      program.modules = prefetchModules(source)
+      -- Sizes the default resolution of its virtual gpu.
+      program.screen = {termW, termH}
+      program.fsAddress = fsAddr
+    end
+    local appName = path:match("([^/]+)%.%w+$")
+    local id, addrOrErr = dispatchJob(source, args, nil, parent, appName, nil, program)
+    if id and program.launch then
+      jobs[id].programName, jobs[id].programVersion = program.launch.name, program.launch.version
+    end
+    return id, addrOrErr
+  end
 end
 
 -- Fan-out/depth cap on recursive spawning: "for as many nodes as
@@ -1208,10 +1277,6 @@ end
 -- through VALUECALL. Not on the bus: the display and keyboard (the
 -- compositor's), network cards, EEPROMs and computer components -- and
 -- the kernal's boot disk, which processes reach as the OS filesystem.
-local bus = {
-  components = {}, -- address -> {type, node, methods}
-  relays = {},     -- our request id -> {to, id, node, expires}
-}
 do
   local EXCLUDED = {gpu = true, screen = true, keyboard = true, modem = true, tunnel = true,
     eeprom = true, computer = true}
@@ -1674,7 +1739,8 @@ end
 -- Summaries only (no source, no result); gmuxapi.get_process(id) (the
 -- GETPROCESS message) returns one job in full.
 local SUMMARY_FIELDS = {"id", "node", "status", "startedAt", "finishedAt", "parent", "appName",
-  "orphanPolicy", "rootId", "codePreview", "error", "paused", "kind", "path", "migratable", "migrations"}
+  "orphanPolicy", "rootId", "codePreview", "error", "paused", "kind", "path", "migratable", "migrations",
+  "programName", "programVersion"}
 
 local function handleGetProcesses(msg)
   local list = {}
@@ -1738,6 +1804,15 @@ local function handleModemMessage(from, port, data)
     handleList(msg)
   elseif msg.type == "INVOKE" then
     handleInvoke(msg)
+  elseif msg.type == "ISFOREGROUND" then
+    -- readLine (docs/MXE.md): only the console's foreground program reads typed lines.
+    local caller = callerJob(msg)
+    if caller and foregroundJob == caller.id then
+      send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
+    else
+      send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+        error = "not in the foreground at the console"})
+    end
   elseif msg.type == "COMPONENTS" then
     bus.setNodeComponents(msg.from, msg.components)
   elseif msg.type == "BUSLIST" or msg.type == "BUSINVOKE" or msg.type == "VALUECALL" then
@@ -1879,7 +1954,6 @@ end
 -- runForeground), which gets the console's typed input. The kernal
 -- echoes it like a terminal: printable characters, backspace (only over
 -- what was typed since the last Enter), and Enter.
-local foregroundJob = nil
 local foregroundTyped = ""
 
 local function feedForeground(char, code)

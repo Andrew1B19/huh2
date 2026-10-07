@@ -1005,7 +1005,92 @@ local BUILTIN_LIBRARIES = {
         send({type = "MIGRATABLE", from = nodeId, to = kernalAddr, jobId = id})
       end,
       restored = function() return restored end,
+      -- OpenOS's shell.parse rules: -abc, --name, --name=value; "--"
+      -- ends options; everything else is positional.
+      parseArgs = function(...)
+        local args, options, ended = {}, {}, false
+        for i = 1, select("#", ...) do
+          local a = tostring((select(i, ...)))
+          if ended or a == "-" or a:sub(1, 1) ~= "-" then
+            args[#args + 1] = a
+          elseif a == "--" then
+            ended = true
+          elseif a:sub(1, 2) == "--" then
+            local k, v = a:match("^%-%-([^=]+)=(.*)$")
+            if k then options[k] = v else options[a:sub(3)] = true end
+          else
+            for c in a:sub(2):gmatch(".") do options[c] = true end
+          end
+        end
+        return args, options
+      end,
     }
+  end,
+  -- HTTP over whichever internet card the bus offers, this node's first
+  -- (docs/MXE.md section 7.6).
+  http = function()
+    local function card()
+      if not NATIVE.component.isAvailable("internet") then error("there's no internet card in the cluster", 3) end
+      return NATIVE.component.getPrimary("internet")
+    end
+    local function encode(data)
+      if type(data) ~= "table" then return data end
+      local parts = {}
+      for k, v in pairs(data) do parts[#parts + 1] = tostring(k) .. "=" .. tostring(v) end
+      table.sort(parts)
+      return table.concat(parts, "&")
+    end
+    local http = {}
+    -- A streaming handle: finishConnect(), response() -> status, message,
+    -- headers, read([n]) -> data or nil at the end, close().
+    function http.request(url, data, headers, method)
+      if type(url) ~= "string" then error("bad argument #1 (string expected)", 2) end
+      local req, reason = card().request(url, encode(data), headers, method)
+      if not req then return nil, reason end
+      local h = {}
+      function h.finishConnect() return req.finishConnect() end
+      function h.response() return req.response() end
+      function h.close() return req.close() end
+      function h.read(n)
+        while true do
+          local d, err = req.read(n)
+          if d == nil then return nil, err end
+          if #d > 0 then return d end
+          sleep(0.05)
+        end
+      end
+      return h
+    end
+    -- The whole body: body, status, headers -- or nil, error.
+    function http.get(url, headers, timeout)
+      local h, err = http.request(url, nil, headers)
+      if not h then return nil, err end
+      local ok, result = pcall(function()
+        local deadline = computer.uptime() + (timeout or 30)
+        while true do
+          local connected, reason = h.finishConnect()
+          if connected then break end
+          if connected == nil then error(reason or "connection failed", 0) end
+          if computer.uptime() > deadline then error("timed out connecting to " .. url, 0) end
+          sleep(0.05)
+        end
+        local parts = {}
+        while true do
+          local d, readErr = h.read(65536)
+          if not d then
+            if readErr then error(readErr, 0) end
+            break
+          end
+          parts[#parts + 1] = d
+        end
+        local status, _, responseHeaders = h.response()
+        return {table.concat(parts), status, responseHeaders}
+      end)
+      pcall(h.close)
+      if not ok then return nil, tostring(result) end
+      return result[1], result[2], result[3]
+    end
+    return http
   end,
 }
 
@@ -1020,13 +1105,21 @@ local function newMxeEnv(id, program, restored)
     if value == nil then error("library '" .. tostring(name) .. "' wasn't granted at launch", 2) end
     return value
   end
+  -- Dependencies first (program.libOrder, from the launcher).
+  local order = program.libOrder
+  if type(order) ~= "table" then
+    order = {}
+    for name in pairs(program.libs or {}) do order[#order + 1] = name end
+  end
   local function loadLibraries()
-    for name, source in pairs(program.libs or {}) do
+    for _, name in ipairs(order) do
+      local source = (program.libs or {})[name]
       if source == true and BUILTIN_LIBRARIES[name] then
         loaded[name] = BUILTIN_LIBRARIES[name](id, restored)
         goto continue
       end
-      local fn, err = load(source, "=lib:" .. name, "t", env)
+      local fn, err = nil, "library source missing"
+      if type(source) == "string" then fn, err = load(source, "=lib:" .. name, "t", env) end
       local ok, value = false, err
       if fn then ok, value = pcall(fn) end
       if ok then
@@ -1784,6 +1877,93 @@ local function newFilesystemFace(ctx)
   function fs.isAutorunEnabled() return false end
   function fs.setAutorunEnabled() end
   return fs
+end
+
+-- --- Native file and console APIs (docs/MXE.md) ---
+--
+-- `fs`: the OS filesystem (the kernal's disk) for native processes and
+-- .mxe programs, over the same FS requests and buffered streams as a
+-- legacy program's. Paths are absolute. `readLine([prompt])`: a typed
+-- line, for the console's foreground program only.
+do
+  local nativeCtx = {}
+  function nativeCtx.fsCall(op, ...)
+    local result, err = remoteRequest("FS", {op = op, args = table.pack(...), caller = currentJobId})
+    if not result then return nil, err end
+    return table.unpack(result, 1, result.n or #result)
+  end
+  local call = nativeCtx.fsCall
+  local function abs(path)
+    if type(path) ~= "string" then error("bad argument (path expected, got " .. type(path) .. ")", 3) end
+    return rootPath(path)
+  end
+  local api = {}
+  function api.exists(path) return call("exists", abs(path)) == true end
+  function api.isDirectory(path) return call("isDirectory", abs(path)) == true end
+  function api.size(path) return call("size", abs(path)) or 0 end
+  function api.lastModified(path) return call("lastModified", abs(path)) or 0 end
+  function api.makeDirectory(path) return call("makeDirectory", abs(path)) end
+  function api.remove(path) return call("remove", abs(path)) end
+  function api.rename(from, to) return call("rename", abs(from), abs(to)) end
+  -- Names in a directory, sorted; directories end with "/".
+  function api.list(path)
+    local names, err = call("list", abs(path))
+    if type(names) ~= "table" then return nil, err or "no such directory" end
+    local out = {}
+    for i = 1, names.n or #names do out[#out + 1] = names[i] end
+    table.sort(out)
+    return out
+  end
+  function api.open(path, mode) return openFile(nativeCtx, abs(path), mode) end
+  function api.read(path)
+    local f, err = api.open(path, "r")
+    if not f then return nil, err end
+    local data = f:read("a")
+    f:close()
+    return data
+  end
+  -- Writes a whole file, making its directory if needed.
+  function api.write(path, text)
+    local full = abs(path)
+    local dir = full:match("^(.*)/[^/]*$")
+    if dir and dir ~= "" and not api.isDirectory(dir) then api.makeDirectory(dir) end
+    local f, err = openFile(nativeCtx, full, "w")
+    if not f then return nil, err end
+    local ok, writeErr = f:write(tostring(text))
+    f:close()
+    if not ok then return nil, writeErr end
+    return true
+  end
+  function api.copy(from, to)
+    local data, err = api.read(from)
+    if not data then return nil, err end
+    return api.write(to, data)
+  end
+  NATIVE.fs = readOnly(api, "fs")
+
+  -- The console echoes what's typed (kernal/muxos.lua's feedForeground);
+  -- this collects it up to Enter.
+  NATIVE.readLine = function(prompt)
+    local id = currentJobId
+    local ok, err = remoteRequest("ISFOREGROUND", {caller = id})
+    if not ok then return nil, err end
+    if prompt ~= nil then writeOutput(id, tostring(prompt)) end
+    local chars = {}
+    while true do
+      local e = gmuxapi.pull_event()
+      if e and e[1] == "key_down" then
+        local char, code = e[2], e[3]
+        if code == 28 then
+          return table.concat(chars)
+        elseif code == 14 then
+          chars[#chars] = nil
+        elseif char and char >= 32 then
+          local fine, ch = pcall(utf8.char, char)
+          if fine then chars[#chars + 1] = ch end
+        end
+      end
+    end
+  end
 end
 
 local function unavailable(name)

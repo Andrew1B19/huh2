@@ -412,11 +412,11 @@ end
 return main()
 
 --[=[MUXOS-PAYLOAD 0.1.0
-@@MANIFEST 17
-100888 /muxos.lua
+@@MANIFEST 19
+104249 /muxos.lua
 35776 /compositor.lua
 6492 /bitmap.lua
-85243 /runtime.lua
+92280 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 460 /lib/colors.lua
 4881 /lib/core/full_keyboard.lua
@@ -428,9 +428,11 @@ return main()
 1016 /lib/sides.lua
 3148 /lib/text.lua
 1832 /lib/transforms.lua
+7328 /bin/opm.mxe
+5892 /lib/mxe/opm_core.lua
 2601 /eeprom/kernal.lua
 2443 /eeprom/worker.lua
-@@ 100888 /muxos.lua
+@@ 104249 /muxos.lua
 -- muxos kernal "init" for huh2. This REPLACES OpenOS on the kernal --
 -- it is the entire resident environment, not a program that runs under
 -- one. kernal/bios.lua (this node's own tiny EEPROM image, mirroring
@@ -614,6 +616,13 @@ end
 -- boot handshake.
 local selfAddr = modemAddr
 local nodes = {}      -- address -> {lastSeen = computer.uptime()}
+-- The cluster component bus (see "Cluster component bus" below).
+local bus = {
+  components = {}, -- address -> {type, node, methods}
+  relays = {},     -- our request id -> {to, id, node, expires}
+}
+-- The program running in the foreground at the console (runForeground).
+local foregroundJob = nil
 local nodeOrder = {}  -- address list, stable iteration/round-robin order
 local nextJobId = 1
 local nextNode = 1
@@ -1114,12 +1123,13 @@ end
 -- and gets a response (the global `launch` in its environment): the
 -- actual version, whether it matches (a mismatch never stops it from
 -- running), and which libraries were found. Libraries live at
--- MXE_LIBRARY_DIR/<name>.lua on the kernal's disk and are shipped with
+-- <dir>/<name>.lua (MXE_LIBRARY_DIRS) on the kernal's disk and are shipped with
 -- the program. Either way, the scheduler places it.
 local PROGRAM_PATH = {"/bin", "/usr/bin"}
 -- Libraries built into the worker runtime rather than shipped from disk.
-local BUILTIN_MXE_LIBRARIES = {mux = true}
-local MXE_LIBRARY_DIR = "/lib/mxe/"
+local BUILTIN_MXE_LIBRARIES = {mux = true, http = true}
+-- Searched in order (docs/MXE.md section 5).
+local MXE_LIBRARY_DIRS = {"/lib/mxe/", "/usr/lib/mxe/"}
 
 local function fileExists(path)
   return tryInvoke(fsAddr, "exists", path) == true
@@ -1158,7 +1168,8 @@ local function readManifest(source)
   local co = coroutine.create(chunk)
   local ok, runErr = coroutine.resume(co)
   if not ok then return nil, "bad .mxe header: " .. tostring(runErr) end
-  return {muxos = env.muxos, libraries = env.libraries}
+  return {muxos = env.muxos, libraries = env.libraries, requires = env.requires, name = env.name,
+    version = env.version, description = env.description, author = env.author}
 end
 
 local function versionParts(v)
@@ -1245,35 +1256,95 @@ local function prefetchModules(source)
   return modules
 end
 
-local function launchProgram(path, args, parent)
-  local source, err = readFile(path)
-  if not source then return nil, "can't read " .. path .. ": " .. tostring(err) end
-  local program = {path = path, kind = path:match("%.mxe$") and "mxe" or "legacy"}
-  if program.kind == "mxe" then
-    local manifest, manifestErr = readManifest(source)
-    if not manifest then return nil, manifestErr end
-    local response = {muxos = MUXOS_VERSION, requested = manifest.muxos, libraries = {},
-      versionMatch = manifest.muxos == nil or sameVersion(manifest.muxos, MUXOS_VERSION)}
-    local libs = {}
-    for _, name in ipairs(type(manifest.libraries) == "table" and manifest.libraries or {}) do
-      if BUILTIN_MXE_LIBRARIES[name] then
-        response.libraries[name] = true
-        libs[name] = true
-      elseif type(name) == "string" and name:match("^[%w_%.%-]+$") then
-        local libSource = readFile(MXE_LIBRARY_DIR .. name .. ".lua")
-        response.libraries[name] = libSource ~= nil
-        libs[name] = libSource
-      end
+local launchProgram
+do
+  -- docs/MXE.md section 3: same major, and the running version at least
+  -- the requested one within it; before 1.0 the minor counts as the major.
+  local function compatibleVersion(requested, running)
+    if requested == nil then return true end
+    local r, h = versionParts(requested), versionParts(running)
+    local function at(t, i) return t[i] or 0 end
+    if at(r, 1) ~= at(h, 1) then return false end
+    if at(h, 1) == 0 then
+      return at(r, 2) == at(h, 2) and at(h, 3) >= at(r, 3)
     end
-    program.launch, program.libs = response, libs
-  else
-    program.modules = prefetchModules(source)
-    -- Sizes the default resolution of its virtual gpu.
-    program.screen = {termW, termH}
-    program.fsAddress = fsAddr
+    return at(h, 2) > at(r, 2) or (at(h, 2) == at(r, 2) and at(h, 3) >= at(r, 3))
   end
-  local appName = path:match("([^/]+)%.%w+$")
-  return dispatchJob(source, args, nil, parent, appName, nil, program)
+
+  -- The libraries an .mxe asked for, and theirs in turn (a library may
+  -- have its own header): name -> source (or true for a built-in), and
+  -- the order to load them in, dependencies first.
+  local function resolveMxeLibraries(names, response)
+    local libs, order, visiting = {}, {}, {}
+    local function visit(name)
+      if type(name) ~= "string" or not name:match("^[%w_%.%-]+$") or libs[name] ~= nil or visiting[name] then return end
+      visiting[name] = true
+      if BUILTIN_MXE_LIBRARIES[name] then
+        libs[name] = true
+      else
+        local source
+        for _, dir in ipairs(MXE_LIBRARY_DIRS) do
+          source = readFile(dir .. name .. ".lua")
+          if source then break end
+        end
+        if source then
+          local manifest = readManifest(source)
+          for _, dep in ipairs(manifest and type(manifest.libraries) == "table" and manifest.libraries or {}) do
+            visit(dep)
+          end
+        end
+        libs[name] = source or false
+      end
+      response.libraries[name] = libs[name] ~= false
+      if libs[name] then order[#order + 1] = name end
+    end
+    for _, name in ipairs(names) do visit(name) end
+    for name, v in pairs(libs) do
+      if v == false then libs[name] = nil end
+    end
+    return libs, order
+  end
+
+  -- Is a component of this type anywhere on the bus (a node that's up)?
+  function bus.has(ctype)
+    for _, c in pairs(bus.components) do
+      if c.type == ctype and (c.node == selfAddr or (nodes[c.node] and not nodes[c.node].down)) then return true end
+    end
+    return false
+  end
+
+  launchProgram = function(path, args, parent)
+    local source, err = readFile(path)
+    if not source then return nil, "can't read " .. path .. ": " .. tostring(err) end
+    local program = {path = path, kind = path:match("%.mxe$") and "mxe" or "legacy"}
+    if program.kind == "mxe" then
+      local manifest, manifestErr = readManifest(source)
+      if not manifest then return nil, manifestErr end
+      local response = {muxos = MUXOS_VERSION, requested = manifest.muxos, libraries = {},
+        versionMatch = manifest.muxos == nil or sameVersion(manifest.muxos, MUXOS_VERSION),
+        compatible = compatibleVersion(manifest.muxos, MUXOS_VERSION), components = {}}
+      for _, field in ipairs({"name", "version", "description", "author"}) do
+        if type(manifest[field]) == "string" then response[field] = manifest[field] end
+      end
+      for _, ctype in ipairs(type(manifest.requires) == "table" and manifest.requires or {}) do
+        if type(ctype) == "string" then response.components[ctype] = bus.has(ctype) end
+      end
+      program.launch = response
+      program.libs, program.libOrder = resolveMxeLibraries(
+        type(manifest.libraries) == "table" and manifest.libraries or {}, response)
+    else
+      program.modules = prefetchModules(source)
+      -- Sizes the default resolution of its virtual gpu.
+      program.screen = {termW, termH}
+      program.fsAddress = fsAddr
+    end
+    local appName = path:match("([^/]+)%.%w+$")
+    local id, addrOrErr = dispatchJob(source, args, nil, parent, appName, nil, program)
+    if id and program.launch then
+      jobs[id].programName, jobs[id].programVersion = program.launch.name, program.launch.version
+    end
+    return id, addrOrErr
+  end
 end
 
 -- Fan-out/depth cap on recursive spawning: "for as many nodes as
@@ -1641,10 +1712,6 @@ end
 -- through VALUECALL. Not on the bus: the display and keyboard (the
 -- compositor's), network cards, EEPROMs and computer components -- and
 -- the kernal's boot disk, which processes reach as the OS filesystem.
-local bus = {
-  components = {}, -- address -> {type, node, methods}
-  relays = {},     -- our request id -> {to, id, node, expires}
-}
 do
   local EXCLUDED = {gpu = true, screen = true, keyboard = true, modem = true, tunnel = true,
     eeprom = true, computer = true}
@@ -2107,7 +2174,8 @@ end
 -- Summaries only (no source, no result); gmuxapi.get_process(id) (the
 -- GETPROCESS message) returns one job in full.
 local SUMMARY_FIELDS = {"id", "node", "status", "startedAt", "finishedAt", "parent", "appName",
-  "orphanPolicy", "rootId", "codePreview", "error", "paused", "kind", "path", "migratable", "migrations"}
+  "orphanPolicy", "rootId", "codePreview", "error", "paused", "kind", "path", "migratable", "migrations",
+  "programName", "programVersion"}
 
 local function handleGetProcesses(msg)
   local list = {}
@@ -2171,6 +2239,15 @@ local function handleModemMessage(from, port, data)
     handleList(msg)
   elseif msg.type == "INVOKE" then
     handleInvoke(msg)
+  elseif msg.type == "ISFOREGROUND" then
+    -- readLine (docs/MXE.md): only the console's foreground program reads typed lines.
+    local caller = callerJob(msg)
+    if caller and foregroundJob == caller.id then
+      send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
+    else
+      send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+        error = "not in the foreground at the console"})
+    end
   elseif msg.type == "COMPONENTS" then
     bus.setNodeComponents(msg.from, msg.components)
   elseif msg.type == "BUSLIST" or msg.type == "BUSINVOKE" or msg.type == "VALUECALL" then
@@ -2312,7 +2389,6 @@ end
 -- runForeground), which gets the console's typed input. The kernal
 -- echoes it like a terminal: printable characters, backspace (only over
 -- what was typed since the last Enter), and Enter.
-local foregroundJob = nil
 local foregroundTyped = ""
 
 local function feedForeground(char, code)
@@ -4004,7 +4080,7 @@ end
 
 return M
 
-@@ 85243 /runtime.lua
+@@ 92280 /runtime.lua
 -- Worker runtime for huh2. NOT flashed anywhere -- this lives on the
 -- KERNAL's filesystem (as a sibling file of kernal/muxos.lua) and gets
 -- served, as plain source text, to each worker over the modem at boot
@@ -5012,7 +5088,92 @@ local BUILTIN_LIBRARIES = {
         send({type = "MIGRATABLE", from = nodeId, to = kernalAddr, jobId = id})
       end,
       restored = function() return restored end,
+      -- OpenOS's shell.parse rules: -abc, --name, --name=value; "--"
+      -- ends options; everything else is positional.
+      parseArgs = function(...)
+        local args, options, ended = {}, {}, false
+        for i = 1, select("#", ...) do
+          local a = tostring((select(i, ...)))
+          if ended or a == "-" or a:sub(1, 1) ~= "-" then
+            args[#args + 1] = a
+          elseif a == "--" then
+            ended = true
+          elseif a:sub(1, 2) == "--" then
+            local k, v = a:match("^%-%-([^=]+)=(.*)$")
+            if k then options[k] = v else options[a:sub(3)] = true end
+          else
+            for c in a:sub(2):gmatch(".") do options[c] = true end
+          end
+        end
+        return args, options
+      end,
     }
+  end,
+  -- HTTP over whichever internet card the bus offers, this node's first
+  -- (docs/MXE.md section 7.6).
+  http = function()
+    local function card()
+      if not NATIVE.component.isAvailable("internet") then error("there's no internet card in the cluster", 3) end
+      return NATIVE.component.getPrimary("internet")
+    end
+    local function encode(data)
+      if type(data) ~= "table" then return data end
+      local parts = {}
+      for k, v in pairs(data) do parts[#parts + 1] = tostring(k) .. "=" .. tostring(v) end
+      table.sort(parts)
+      return table.concat(parts, "&")
+    end
+    local http = {}
+    -- A streaming handle: finishConnect(), response() -> status, message,
+    -- headers, read([n]) -> data or nil at the end, close().
+    function http.request(url, data, headers, method)
+      if type(url) ~= "string" then error("bad argument #1 (string expected)", 2) end
+      local req, reason = card().request(url, encode(data), headers, method)
+      if not req then return nil, reason end
+      local h = {}
+      function h.finishConnect() return req.finishConnect() end
+      function h.response() return req.response() end
+      function h.close() return req.close() end
+      function h.read(n)
+        while true do
+          local d, err = req.read(n)
+          if d == nil then return nil, err end
+          if #d > 0 then return d end
+          sleep(0.05)
+        end
+      end
+      return h
+    end
+    -- The whole body: body, status, headers -- or nil, error.
+    function http.get(url, headers, timeout)
+      local h, err = http.request(url, nil, headers)
+      if not h then return nil, err end
+      local ok, result = pcall(function()
+        local deadline = computer.uptime() + (timeout or 30)
+        while true do
+          local connected, reason = h.finishConnect()
+          if connected then break end
+          if connected == nil then error(reason or "connection failed", 0) end
+          if computer.uptime() > deadline then error("timed out connecting to " .. url, 0) end
+          sleep(0.05)
+        end
+        local parts = {}
+        while true do
+          local d, readErr = h.read(65536)
+          if not d then
+            if readErr then error(readErr, 0) end
+            break
+          end
+          parts[#parts + 1] = d
+        end
+        local status, _, responseHeaders = h.response()
+        return {table.concat(parts), status, responseHeaders}
+      end)
+      pcall(h.close)
+      if not ok then return nil, tostring(result) end
+      return result[1], result[2], result[3]
+    end
+    return http
   end,
 }
 
@@ -5027,13 +5188,21 @@ local function newMxeEnv(id, program, restored)
     if value == nil then error("library '" .. tostring(name) .. "' wasn't granted at launch", 2) end
     return value
   end
+  -- Dependencies first (program.libOrder, from the launcher).
+  local order = program.libOrder
+  if type(order) ~= "table" then
+    order = {}
+    for name in pairs(program.libs or {}) do order[#order + 1] = name end
+  end
   local function loadLibraries()
-    for name, source in pairs(program.libs or {}) do
+    for _, name in ipairs(order) do
+      local source = (program.libs or {})[name]
       if source == true and BUILTIN_LIBRARIES[name] then
         loaded[name] = BUILTIN_LIBRARIES[name](id, restored)
         goto continue
       end
-      local fn, err = load(source, "=lib:" .. name, "t", env)
+      local fn, err = nil, "library source missing"
+      if type(source) == "string" then fn, err = load(source, "=lib:" .. name, "t", env) end
       local ok, value = false, err
       if fn then ok, value = pcall(fn) end
       if ok then
@@ -5791,6 +5960,93 @@ local function newFilesystemFace(ctx)
   function fs.isAutorunEnabled() return false end
   function fs.setAutorunEnabled() end
   return fs
+end
+
+-- --- Native file and console APIs (docs/MXE.md) ---
+--
+-- `fs`: the OS filesystem (the kernal's disk) for native processes and
+-- .mxe programs, over the same FS requests and buffered streams as a
+-- legacy program's. Paths are absolute. `readLine([prompt])`: a typed
+-- line, for the console's foreground program only.
+do
+  local nativeCtx = {}
+  function nativeCtx.fsCall(op, ...)
+    local result, err = remoteRequest("FS", {op = op, args = table.pack(...), caller = currentJobId})
+    if not result then return nil, err end
+    return table.unpack(result, 1, result.n or #result)
+  end
+  local call = nativeCtx.fsCall
+  local function abs(path)
+    if type(path) ~= "string" then error("bad argument (path expected, got " .. type(path) .. ")", 3) end
+    return rootPath(path)
+  end
+  local api = {}
+  function api.exists(path) return call("exists", abs(path)) == true end
+  function api.isDirectory(path) return call("isDirectory", abs(path)) == true end
+  function api.size(path) return call("size", abs(path)) or 0 end
+  function api.lastModified(path) return call("lastModified", abs(path)) or 0 end
+  function api.makeDirectory(path) return call("makeDirectory", abs(path)) end
+  function api.remove(path) return call("remove", abs(path)) end
+  function api.rename(from, to) return call("rename", abs(from), abs(to)) end
+  -- Names in a directory, sorted; directories end with "/".
+  function api.list(path)
+    local names, err = call("list", abs(path))
+    if type(names) ~= "table" then return nil, err or "no such directory" end
+    local out = {}
+    for i = 1, names.n or #names do out[#out + 1] = names[i] end
+    table.sort(out)
+    return out
+  end
+  function api.open(path, mode) return openFile(nativeCtx, abs(path), mode) end
+  function api.read(path)
+    local f, err = api.open(path, "r")
+    if not f then return nil, err end
+    local data = f:read("a")
+    f:close()
+    return data
+  end
+  -- Writes a whole file, making its directory if needed.
+  function api.write(path, text)
+    local full = abs(path)
+    local dir = full:match("^(.*)/[^/]*$")
+    if dir and dir ~= "" and not api.isDirectory(dir) then api.makeDirectory(dir) end
+    local f, err = openFile(nativeCtx, full, "w")
+    if not f then return nil, err end
+    local ok, writeErr = f:write(tostring(text))
+    f:close()
+    if not ok then return nil, writeErr end
+    return true
+  end
+  function api.copy(from, to)
+    local data, err = api.read(from)
+    if not data then return nil, err end
+    return api.write(to, data)
+  end
+  NATIVE.fs = readOnly(api, "fs")
+
+  -- The console echoes what's typed (kernal/muxos.lua's feedForeground);
+  -- this collects it up to Enter.
+  NATIVE.readLine = function(prompt)
+    local id = currentJobId
+    local ok, err = remoteRequest("ISFOREGROUND", {caller = id})
+    if not ok then return nil, err end
+    if prompt ~= nil then writeOutput(id, tostring(prompt)) end
+    local chars = {}
+    while true do
+      local e = gmuxapi.pull_event()
+      if e and e[1] == "key_down" then
+        local char, code = e[2], e[3]
+        if code == 28 then
+          return table.concat(chars)
+        elseif code == 14 then
+          chars[#chars] = nil
+        elseif char and char >= 32 then
+          local fine, ch = pcall(utf8.char, char)
+          if fine then chars[#chars + 1] = ch end
+        end
+      end
+    end
+  end
 end
 
 local function unavailable(name)
@@ -7420,6 +7676,341 @@ end
 require("package").delay(lib, "/lib/core/full_transforms.lua")
 
 return lib
+
+@@ 7328 /bin/opm.mxe
+--[[mxe
+muxos = "0.1.0"
+name = "opm"
+version = "0.5.0"
+description = "Open Computers Pull Manager, the muxos port"
+author = "LewisHost.Net"
+libraries = {"mux", "http", "opm_core"}
+requires = {"internet"}
+]]
+-- opm for muxos: installs oppm-style packages from the LewisHost.Net Gitea
+-- monorepo, like OpenOS's opm 0.4.0 (ocpull/opm.lua), whose logic it shares
+-- unchanged (opm_core). What's different on muxos:
+--   * files go to the kernal's disk through `fs`; HTTP goes through the `http`
+--     library, over whichever internet card the cluster has;
+--   * --from=DIR installs offline from an `opm bundle` directory (opmf's job);
+--   * `opm update` (no argument) reinstalls opm from the catalog's "opm-mxe"
+--     package; `opm hook` is gone (the muxos console has no tab completion).
+local mux = require("mux")
+local http = require("http")
+local core = require("opm_core")
+
+local DEFAULT_BASE = "http://192.168.1.131:3001/LewisHost.Net/oc-programs/raw/branch/main/"
+local SELF_PACKAGE = "opm-mxe"
+local CACHE = "/etc/opm.cache"         -- the last programs.cfg seen
+local INSTALLED = "/etc/opm.installed" -- { [lowercase name] = target }
+local args, opts = mux.parseArgs(...)
+
+local USAGE = [==[
+opm [--base=URL] list
+opm [--base=URL] [--autorun[=ARGS]] pull <package> [target]
+opm [--base=URL] bundle <package> <dir>   a package and its dependencies, for offline use
+opm update                                reinstall opm itself (the catalog's opm-mxe)
+opm [--base=URL] update -a                re-pull every package installed here, at its target
+opm [--base=URL] update <package>         re-pull one package, at its recorded target
+opm --from=DIR ...                        use a bundle in DIR instead of the network
+
+<package> and its dependencies go under target (default /usr). File destinations
+follow oppm: "/bin" -> <target>/bin, "//etc" -> absolute /etc.
+]==]
+
+local function concat(...)
+  local path = table.concat({...}, "/"):gsub("//+", "/")
+  if #path > 1 then path = path:gsub("/$", "") end
+  return path
+end
+
+local function basename(path) return path:match("([^/]+)/?$") end
+
+local function write(file, body)
+  local ok, err = fs.write(file, body)
+  if not ok then error("can't write " .. file .. ": " .. tostring(err), 0) end
+end
+
+local function http_source(base)
+  base = base:gsub("/*$", "/")
+  return {label = base, get = function(path)
+    local body, err = http.get(base .. path)
+    if not body then error(base .. path .. ": " .. tostring(err), 0) end
+    if body == "" then error("empty response from " .. base .. path, 0) end
+    return body
+  end}
+end
+
+-- An `opm bundle` directory: offline, what opmf does on OpenOS.
+local function dir_source(dir)
+  return {label = dir, get = function(path)
+    local body = fs.read(concat(dir, "files", path))
+    if not body then error(concat(dir, "files", path) .. " not found", 0) end
+    return body
+  end}
+end
+
+local function load_installed()
+  local text = fs.read(INSTALLED)
+  if not text then return {} end
+  local fn = load("return " .. text, "=opm.installed", "t", {})
+  if not fn then return {} end
+  local ok, t = pcall(fn)
+  return (ok and type(t) == "table") and t or {}
+end
+
+local function record_installed(name, target)
+  local t = load_installed()
+  t[name] = target
+  local lines = {"{"}
+  for n, tgt in pairs(t) do lines[#lines + 1] = string.format("[%q]=%q,", n, tgt) end
+  lines[#lines + 1] = "}"
+  pcall(write, INSTALLED, table.concat(lines, "\n"))
+end
+
+local function load_cfg(src)
+  local text = src.get("programs.cfg")
+  local cfg, err = core.parse_cfg(text)
+  if not cfg then error(err, 0) end
+  pcall(write, CACHE, text)
+  return cfg
+end
+
+local function pull(src, cfg, name, target)
+  local plan = core.file_plan(cfg, core.order(cfg, name), target, concat)
+  -- a "payload" folder (a floppy installer's) is replaced, not merged
+  local keep, dirs = {}, {}
+  for _, p in ipairs(plan) do keep[p.file] = true; dirs[p.dir] = true end
+  for dir in pairs(dirs) do
+    if basename(dir) == "payload" and fs.isDirectory(dir) then
+      for _, n in ipairs(fs.list(dir) or {}) do
+        local f = concat(dir, (n:gsub("/$", "")))
+        if not keep[f] then fs.remove(f); print("removed stale " .. f) end
+      end
+    end
+  end
+  for _, p in ipairs(plan) do
+    local body = src.get(p.path)
+    write(p.file, body)
+    local v = core.find_version(body)
+    print(p.path .. " -> " .. p.file .. "  " .. #body .. " bytes" .. (v and ("  version " .. v) or ""))
+  end
+  local pkg = cfg[name]
+  if pkg.launcher then
+    write(concat(target, pkg.launcher .. ".lua"), core.launcher_text(pkg, name, target, concat))
+    print("launcher: " .. concat(target, pkg.launcher))
+  end
+  local autorun = opts.autorun or opts.a
+  if autorun then
+    local text, line = core.autorun_text(pkg, name, target, autorun, concat)
+    write(concat(target, "autorun.lua"), text)
+    print("autorun.lua -> " .. line)
+  end
+end
+
+-- programs.cfg and the package closure, so `opm --from=<dir>` (or opmf on
+-- OpenOS) can install offline.
+local function bundle(src, cfg, name, dir)
+  local plan = core.file_plan(cfg, core.order(cfg, name), "/", concat)
+  plan[#plan + 1] = {path = "programs.cfg"}
+  for _, p in ipairs(plan) do
+    local body = src.get(p.path)
+    local file = concat(dir, "files", p.path)
+    write(file, body)
+    if fs.read(file) ~= body then error("write check failed for " .. file .. " (disk full?)", 0) end
+    print(p.path .. " " .. #body .. " bytes")
+  end
+  -- opmf too, for OpenOS machines, when the source has it.
+  for _, own in ipairs({"opmf.lua", "opm_core.lua"}) do
+    local ok, body = pcall(src.get, "ocpull/" .. own)
+    if ok then write(concat(dir, own), body) end
+  end
+  print("bundle ready: on muxos run  opm --from=" .. dir .. " pull " .. name)
+end
+
+local ok, err = pcall(function()
+  local cmd = args[1]
+  if not cmd then print(USAGE) return end
+  if cmd == "hook" then
+    print("opm hook: the muxos console has no tab completion")
+    return
+  end
+  local src = opts.from and dir_source(opts.from) or http_source(opts.base or DEFAULT_BASE)
+  local cfg = load_cfg(src)
+  if cmd == "update" and not args[2] then
+    if not cfg[SELF_PACKAGE] then
+      error("the catalog has no " .. SELF_PACKAGE .. " package (muxos's opm/ directory) to update from", 0)
+    end
+    pull(src, cfg, SELF_PACKAGE, "/")
+    print("opm updated")
+  elseif cmd == "update" then
+    local plan, skipped = core.plan_update(load_installed(), cfg, args[2])
+    for _, s in ipairs(skipped) do print("skip " .. s.name .. ": " .. s.reason) end
+    if #plan == 0 then print("nothing to update") end
+    for _, p in ipairs(plan) do
+      print("updating " .. p.name .. " -> " .. p.target)
+      pull(src, cfg, p.name, p.target)
+    end
+  elseif cmd == "list" then
+    local names = {}
+    for n in pairs(cfg) do names[#names + 1] = n end
+    table.sort(names)
+    for _, n in ipairs(names) do print(string.format("%-18s %s", n, cfg[n].description or "")) end
+  elseif cmd == "pull" and args[2] then
+    local name, target = args[2]:lower(), core.resolve_target(args[3])
+    pull(src, cfg, name, target)
+    record_installed(name, target)
+    print("done")
+  elseif cmd == "bundle" and args[2] and args[3] then
+    bundle(src, cfg, args[2]:lower(), core.resolve_target(args[3]))
+  else
+    print(USAGE)
+  end
+end)
+if not ok then error("opm: " .. tostring(err), 0) end
+
+@@ 5892 /lib/mxe/opm_core.lua
+-- opm_core: the pure logic of opm (Open Computers Pull Manager). No I/O, so it runs under plain
+-- lua5.3 in tests. opm.lua supplies the filesystem and the package sources.
+local M = {}
+
+function M.parse_cfg(text)
+  local fn, err = load("return " .. text, "=programs.cfg", "t", {})
+  if not fn then return nil, "programs.cfg: " .. tostring(err) end
+  local ok, cfg = pcall(fn)
+  if not ok then return nil, "programs.cfg: " .. tostring(cfg) end
+  return cfg
+end
+
+local SYSTEM_DIRS = { usr = true, home = true, bin = true, lib = true, etc = true, tmp = true, mnt = true, boot = true }
+
+-- No target = /usr. A path under a system dir is taken as is; anything else is a floppy name under /mnt.
+function M.resolve_target(t)
+  if not t then return "/usr" end
+  local first = t:match("^/?([^/]+)")
+  if not first then return "/usr" end
+  if first == "mnt" or SYSTEM_DIRS[first] then return "/" .. t:gsub("^/+", "") end
+  return "/mnt/" .. t:gsub("^/+", "")
+end
+
+-- Package names to install, dependencies first, each once. Cycles are tolerated.
+function M.order(cfg, name)
+  local out, state = {}, {}
+  local function visit(n)
+    n = n:lower()
+    if state[n] then return end
+    local pkg = cfg[n]
+    if not pkg then error("unknown package '" .. n .. "'", 0) end
+    state[n] = true
+    for k, v in pairs(pkg.dependencies or {}) do visit(type(k) == "number" and v or k) end
+    out[#out + 1] = n
+  end
+  visit(name)
+  return out
+end
+
+-- A package's own `target` (e.g. /home/refinery) overrides the one asked for.
+-- Every file to copy for the given packages: { package, path (repo path without the branch dir), dir, file }.
+-- `concat` is filesystem.concat.
+function M.file_plan(cfg, names, target, concat)
+  local plan = {}
+  for _, n in ipairs(names) do
+    local files, keys = cfg[n].files or {}, {}
+    local tgt = cfg[n].target or target
+    for key in pairs(files) do keys[#keys + 1] = key end
+    table.sort(keys)
+    for _, key in ipairs(keys) do
+      if key:sub(1, 1) == ":" then error("folder entries (':') are not supported: " .. key, 0) end
+      local path = key:match("^[^/]+/(.+)$")
+      if not path then error("bad file key " .. key, 0) end
+      local dest = files[key]
+      local dir = dest:sub(1, 2) == "//" and dest:sub(2) or concat(tgt, dest)
+      plan[#plan + 1] = { package = n, path = path, dir = dir, file = concat(dir, path:match("([^/]+)$")) }
+    end
+  end
+  return plan
+end
+
+function M.launcher_text(pkg, name, target, concat)
+  local nl, lines = string.char(10), {}
+  if pkg.env then lines[#lines + 1] = "os.setenv(" .. string.format("%q", pkg.env) .. ", " .. string.format("%q", target) .. ")" end
+  lines[#lines + 1] = "assert(loadfile(" .. string.format("%q", concat(target, "bin", name .. ".lua")) .. "))(...)"
+  return table.concat(lines, nl) .. nl
+end
+
+function M.autorun_text(pkg, name, target, autorun, concat)
+  local line = concat(target, "bin", name .. ".lua")
+  local extra = type(autorun) == "string" and autorun or pkg.autorun
+  if extra then line = line .. " " .. extra:gsub("{target}", target) end
+  return "os.execute(" .. string.format("%q", line) .. ")\n", line
+end
+
+-- The version a file declares: a line like  M.VERSION = "0.5.16"  or  local VERSION = "1.2".
+function M.find_version(body)
+  return body:match('[%w_.]*VERSION%s*=%s*"([^"\n]+)"')
+end
+
+-- Package names for completion: the display name of each package (REMCS, not remcs), sorted.
+function M.package_names(cfg)
+  local out = {}
+  for key, pkg in pairs(cfg) do out[#out + 1] = pkg.name or key end
+  table.sort(out, function(x, y) return x:lower() < y:lower() end)
+  return out
+end
+
+-- Decides what `opm update -a` / `opm update <package>` should re-pull, given the recorded
+-- installed map (lowercase name -> target path, opm.lua's own job to persist/load) and the
+-- current programs.cfg. A single named package that isn't installed or fell out of the catalog is
+-- a real error (nothing sensible to do, raised via error() same as this module's other functions).
+-- -a instead returns a `skipped` list for anything no longer in the catalog rather than aborting
+-- the whole batch - "update everything installed" shouldn't fail entirely over one stale entry.
+function M.plan_update(installed, cfg, selector)
+  if selector == "-a" then
+    local names = {}
+    for n in pairs(installed) do names[#names + 1] = n end
+    table.sort(names)
+    local plan, skipped = {}, {}
+    for _, n in ipairs(names) do
+      if cfg[n] then
+        plan[#plan + 1] = { name = n, target = installed[n] }
+      else
+        skipped[#skipped + 1] = { name = n, reason = "no longer in programs.cfg" }
+      end
+    end
+    return plan, skipped
+  end
+  local name = selector:lower()
+  local target = installed[name]
+  if not target then
+    error("package '" .. name .. "' is not recorded as installed here - pull it first with  opm pull " .. name .. " <target>", 0)
+  end
+  if not cfg[name] then
+    error("package '" .. name .. "' is no longer in programs.cfg", 0)
+  end
+  return { { name = name, target = target } }, {}
+end
+
+local SUBCOMMANDS = { "bundle", "hook", "list", "pull", "update" }
+
+-- Tab completion for a command line (the text before the cursor): the list of whole completed lines,
+-- or nil when the line is not an opm command line this knows how to complete.
+function M.complete(names, line, suffix)
+  suffix = suffix or ""
+  local function pick(prefix, word, candidates)
+    local out, w = {}, word:lower()
+    for _, c in ipairs(candidates) do
+      if c:lower():sub(1, #w) == w then out[#out + 1] = prefix .. c .. " " .. suffix end
+    end
+    return out
+  end
+  local pre, word = line:match("^(%s*opm%s+)(%S*)$")
+  if pre then return pick(pre, word, SUBCOMMANDS) end
+  local pre2, sub, word2 = line:match("^(%s*opm%s+(%a+)%s+)(%S*)$")
+  if pre2 and (sub == "pull" or sub == "bundle") and not word2:find("^%-") then return pick(pre2, word2, names) end
+  return nil
+end
+
+return M
 
 @@ 2601 /eeprom/kernal.lua
 -- The kernal's own EEPROM image. muxos REPLACES OpenOS on the kernal --

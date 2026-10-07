@@ -101,6 +101,38 @@ local body = ""
 for chunk in internet.request("http://example/x") do body = body .. chunk end
 print("fetched " .. body .. " via " .. require("component").internet.address:sub(1, 8))
 ]==],
+  -- The .mxe spec (test 37): libraries in both search dirs, one needing another.
+  ["/usr/lib/mxe/toplib.lua"] = [==[--[[mxe
+libraries = {"baselib"}
+]]
+return {value = require("baselib").v .. "+top"}]==],
+  ["/lib/mxe/baselib.lua"] = [==[return {v = "base"}]==],
+  ["/bin/spec.mxe"] = [==[--[[mxe
+muxos = "0.1.0"
+name = "spec"
+version = "2.0"
+libraries = {"mux", "http", "toplib"}
+requires = {"internet", "tape_drive"}
+]]
+local mux = require("mux")
+local args, opts = mux.parseArgs(...)
+fs.write("/home/spec/a.txt", "one\ntwo\n")
+local f = fs.open("/home/spec/a.txt", "a") f:write("three\n") f:close()
+local lines = 0 for _ in fs.read("/home/spec/a.txt"):gmatch("\n") do lines = lines + 1 end
+fs.copy("/home/spec/a.txt", "/home/spec/b.txt")
+fs.rename("/home/spec/b.txt", "/home/spec/c.txt")
+local names = table.concat(fs.list("/home/spec"), ",")
+fs.remove("/home/spec/a.txt")
+local body, status = require("http").get("http://gitea/repo/hello.txt")
+print("spec " .. args[1] .. "|" .. tostring(opts.v) .. tostring(opts.x) .. "|" .. opts.name .. "|" .. require("toplib").value
+  .. "|" .. lines .. "|" .. names .. "|" .. tostring(fs.exists("/home/spec/a.txt")) .. "|" .. body .. status
+  .. "|" .. tostring(launch.compatible) .. launch.name .. launch.version
+  .. "|" .. tostring(launch.components.internet) .. tostring(launch.components.tape_drive))
+print("hello " .. tostring(readLine("who? ")))
+]==],
+  -- OPM, as the installer ships it (test 38).
+  ["/bin/opm.mxe"] = readFile(REPO_ROOT .. "/opm/opm.mxe"),
+  ["/lib/mxe/opm_core.lua"] = readFile(REPO_ROOT .. "/opm/opm_core.lua"),
   -- A legacy graphics program (test 34).
   ["/bin/paint.lua"] = [==[local component = require("component")
 local event = require("event")
@@ -196,10 +228,23 @@ assert(kernal.status == "running", "kernal failed to boot: see log")
 
 -- Hardware for the cluster component bus (test 36): an internet card on
 -- the kernal, a redstone card on worker 1.
+-- A tiny web for it (tests 37-38): a Gitea-style package catalog.
+local GITEA = "http://gitea/repo/"
+local webFiles = {
+  [GITEA .. "hello.txt"] = "page",
+  [GITEA .. "programs.cfg"] = [[{
+  ["demo"] = { files = { ["master/demo/demo.lua"] = "/bin", ["master/demo/demolib.lua"] = "/lib" },
+               dependencies = { ["demodep"] = "/" }, name = "Demo", description = "a demo program" },
+  ["demodep"] = { files = { ["master/demodep/extra.lua"] = "/lib" }, name = "demodep", description = "its dependency" },
+}]],
+  [GITEA .. "demo/demo.lua"] = 'local VERSION = "1.2"\nprint("demo says " .. require("demolib").msg .. " " .. require("extra").v)\n',
+  [GITEA .. "demo/demolib.lua"] = 'return {msg = "hi"}',
+  [GITEA .. "demodep/extra.lua"] = 'return {v = "dep"}',
+}
 local function fakeInternet()
   return {
     request = function(url)
-      local chunks = {"hello ", "", "bus"}
+      local chunks = webFiles[url] and {webFiles[url]} or {"hello ", "", "bus"}
       return {
         finishConnect = function() return true end,
         response = function() return 200, "OK", {} end,
@@ -1213,5 +1258,56 @@ emu:advance(4)
 assertScreenContains("fetched hello bus via " .. internetAddr:sub(1, 8), "OpenOS's internet library works over the bus")
 closeWindowAt(1, 50)
 print("  OK -- a legacy program uses OpenOS's internet library with the kernal's internet card")
+
+print("test 37: the .mxe spec -- fs, readLine, parseArgs, versions, library search, http, header fields")
+typeLine("spec pos -vx --name=bob")
+emu:advance(4)
+assertScreenContains("spec pos|truetrue|bob|base+top|3|a.txt,c.txt|false|page200|truespec2.0|truefalse",
+  "fs, parseArgs, /usr/lib/mxe and library dependencies, http.get, compatible, name/version, requires")
+assertScreenContains("who? _", "readLine shows its prompt in the foreground")
+typeLine("ann")
+emu:advance(2)
+assertScreenContains("who? ann", "what's typed is echoed")
+assertScreenContains("hello ann", "readLine returns the line")
+assert(kernalFiles["/home/spec/c.txt"] == "one\ntwo\nthree\n", "fs.write/open(a)/copy/rename reached the kernal's disk")
+typeLine('run return "bg37=" .. tostring(select(2, readLine()))')
+emu:advance(2)
+assertScreenContains("bg37=not in the foreground at the console", "readLine outside the console's foreground fails")
+typeLine('run for _, p in pairs(gmuxapi.get_processes()) do if p.programName == "spec" then return "v37=" .. p.programName .. "@" .. p.programVersion end end return "v37=none"')
+emu:advance(2)
+assertScreenContains("v37=spec@2.0", "the header's name and version show in process listings")
+print("  OK -- every section-7 API works as docs/MXE.md specifies")
+
+print("test 38: opm, ported to .mxe -- list, pull, run, update, bundle, offline install")
+local base = "--base=" .. GITEA
+typeLine("opm " .. base .. " list")
+emu:advance(3)
+assertScreenContains("demo               a demo program", "opm lists the catalog")
+typeLine("opm " .. base .. " pull demo")
+emu:advance(4)
+assertScreenContains("demo/demo.lua -> /usr/bin/demo.lua  ", "files go under /usr")
+assertScreenContains("version 1.2", "versions are reported")
+assertScreenContains("done", "the pull finished")
+assert(kernalFiles["/usr/bin/demo.lua"] and kernalFiles["/usr/lib/demolib.lua"] and kernalFiles["/usr/lib/extra.lua"],
+  "the package and its dependency were installed")
+assert(kernalFiles["/etc/opm.installed"]:find('["demo"]="/usr"', 1, true), "the install is recorded")
+typeLine("demo")
+emu:advance(3)
+assertScreenContains("demo says hi dep", "the installed OpenOS package runs, finding its libraries under /usr/lib")
+closeWindowAt(1, 50)
+typeLine("opm " .. base .. " update demo")
+emu:advance(4)
+assertScreenContains("updating demo -> /usr", "update re-pulls at the recorded target")
+typeLine("opm " .. base .. " bundle demo /home/b")
+emu:advance(4)
+assertScreenContains("bundle ready", "bundle wrote the package for offline use")
+assert(kernalFiles["/home/b/files/programs.cfg"] and kernalFiles["/home/b/files/demo/demo.lua"], "bundle contents")
+typeLine("opm --from=/home/b pull demo /home/x")
+emu:advance(4)
+assert(kernalFiles["/home/x/bin/demo.lua"] == webFiles[GITEA .. "demo/demo.lua"], "an offline install from the bundle")
+typeLine("opm " .. base .. " update")
+emu:advance(3)
+assertScreenContains("no opm-mxe package", "self-update needs the opm-mxe package in the catalog")
+print("  OK -- opm installs, updates and bundles packages on muxos")
 
 print("ALL OK")

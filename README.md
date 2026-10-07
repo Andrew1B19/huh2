@@ -93,6 +93,7 @@ node/runtime.lua       worker's real runtime, served by the kernal (installed as
                        NOT flashed anywhere) -- job execution, remote-component bridge, gpu
                        face, gmuxapi (muxos's own, gmux-API-shaped)
 docs/MXE.md           the .mxe program format: the spec programs written for muxos target
+opm/                  OPM, the package manager, ported to .mxe (ships with muxos)
 docs/PROTOCOL.md      shared wire format: the boot handshake + the main message protocol +
                        the gmux API translation + the bare-metal kernal design
 test/emu/              a 4-node (1 kernal + 3 workers) test environment, emulating this
@@ -485,6 +486,13 @@ kernal. Values a call returns, like an internet request handle, work
 remotely too. OpenComputers gives each computer its own component bus,
 so this is emulated over the network. The display, network cards and
 firmware stay off it. `bus` at the console lists it. Test 36.
+
+**`.mxe` spec and OPM -- BUILT.** docs/MXE.md is the contract for
+programs written for muxos: header fields, version compatibility,
+libraries (`/lib/mxe`, `/usr/lib/mxe`, with dependencies), and the native
+API (`fs`, `readLine`, `gmuxapi`, `component`, the `mux` and `http`
+libraries). OPM is ported to it (`opm/`) and ships with muxos:
+`opm pull <package>`. Tests 37-38.
 
 **Migration and draining -- BUILT.** An `.mxe` that lists the built-in
 `mux` library can opt in with `mux.migratable(save)`; `migrate <id>
