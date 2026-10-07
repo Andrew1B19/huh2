@@ -25,6 +25,19 @@
 -- silently succeeding against the test host's own real standard
 -- library.
 --
+-- Every node boots through the mod's OWN machine.lua (vendored,
+-- unmodified, in test/emu/oc/): the emulator plays the Java host --
+-- raw computer/component/system/unicode APIs underneath, resuming
+-- machine.lua's main loop with signals and honoring what it yields
+-- (a sleep timeout, a shutdown boolean, an indirect component call).
+-- So muxos's EEPROM code runs inside the real sandbox: wrapped
+-- coroutine.yield/resume, the Lua-side computer.pullSignal, no
+-- debug.sethook, no eris, and the real "too long without yielding"
+-- deadline (measured in host CPU time via os.clock; `emu.timeout`
+-- plays system.timeout()). An earlier version ran the boot code
+-- directly against raw Lua primitives instead, which hid three
+-- real-hardware breakages (see docs/PROTOCOL.md's "The real sandbox").
+--
 -- Known, deliberate simplifications (not hidden): no energy/power
 -- model, no call-budget enforcement (`callBudget`/`direct` methods --
 -- see docs/PROTOCOL.md's "Call budget" section -- are not simulated;
@@ -38,11 +51,13 @@
 local Emulator = {}
 Emulator.__index = Emulator
 
-local BASE_GLOBALS = {
-  "assert", "error", "ipairs", "load", "next", "pairs", "pcall", "print",
-  "rawequal", "rawget", "rawlen", "rawset", "select", "setmetatable",
-  "tonumber", "tostring", "type", "xpcall",
-}
+local MACHINE_PATH = (debug.getinfo(1, "S").source:match("^@(.*)emulator%.lua$") or "./") .. "oc/machine.lua"
+local machineSource
+do
+  local f = assert(io.open(MACHINE_PATH, "r"), "missing " .. MACHINE_PATH)
+  machineSource = f:read("a")
+  f:close()
+end
 
 function Emulator.new()
   local self = setmetatable({}, Emulator)
@@ -50,6 +65,7 @@ function Emulator.new()
   self.nodeOrder = {}
   self.now = 0.0
   self._nextAddr = 1
+  self.timeout = 5 -- seconds of host CPU time per slice, like system.timeout()
   self.log = {} -- {t, node, msg} -- every node's own print() output, captured
   return self
 end
@@ -85,6 +101,13 @@ function Emulator:newNode(kind)
   }
   self.nodes[address] = node
   self.nodeOrder[#self.nodeOrder + 1] = address
+  -- The machine's own "computer" component (machine.lua's
+  -- computer.beep etc. invoke it at computer.address()).
+  node.components[address] = {type = "computer", methods = {
+    beep = function(...) self:_logf(node, "BEEP(%s)", table.concat({...}, ", ")) return true end,
+    getDeviceInfo = function() return {} end,
+  }}
+  node.componentOrder[#node.componentOrder + 1] = address
   return node
 end
 
@@ -95,90 +118,127 @@ function Emulator:addComponent(node, ctype, methods)
   return addr
 end
 
-local function makeComponentAPI(node)
+-- --- The host side machine.lua runs on (what the mod's Java code provides) ---
+
+local function hostComponentAPI(node)
   return {
-    list = function(filter)
-      local matches = {}
+    list = function(filter, exact)
+      local result = {}
       for _, addr in ipairs(node.componentOrder) do
-        local c = node.components[addr]
-        if not filter or c.type == filter then
-          matches[#matches + 1] = {addr, c.type}
+        local t = node.components[addr].type
+        if not filter or (exact and t == filter) or (not exact and t:find(filter, 1, true)) then
+          result[addr] = t
         end
       end
-      local i = 0
-      return function()
-        i = i + 1
-        if matches[i] then return matches[i][1], matches[i][2] end
-        return nil
-      end
-    end,
-    invoke = function(address, method, ...)
-      local c = node.components[address]
-      if not c then error("no such component: " .. tostring(address), 0) end
-      local fn = c.methods[method]
-      if not fn then error("no such method '" .. tostring(method) .. "' on a " .. c.type, 0) end
-      return fn(...)
+      return result
     end,
     type = function(address)
       local c = node.components[address]
       if not c then return nil, "no such component" end
       return c.type
     end,
-  }
-end
-
-local function makeComputerAPI(node)
-  return {
-    address = function() return node.address end,
-    uptime = function() return node.emu.now end,
-    beep = function(...) node.emu:_logf(node, "BEEP(%s)", table.concat({...}, ", ")) end,
-    pushSignal = function(...)
-      node.signalQueue[#node.signalQueue + 1] = {...}
+    slot = function(address)
+      if not node.components[address] then return nil, "no such component" end
+      return -1
+    end,
+    methods = function(address)
+      local c = node.components[address]
+      if not c then return nil, "no such component" end
+      local methods = {}
+      for name in pairs(c.methods) do methods[name] = {direct = true, getter = false, setter = false} end
+      return methods
+    end,
+    doc = function() return nil end,
+    -- Host convention machine.lua's processResult expects: (true, ...)
+    -- on success, (false, reason) on failure.
+    invoke = function(address, method, ...)
+      local c = node.components[address]
+      if not c then return false, "no such component" end
+      local fn = c.methods[method]
+      if not fn then return false, "no such method" end
+      local result = table.pack(pcall(fn, ...))
+      if result[1] then return true, table.unpack(result, 2, result.n) end
+      return false, result[2]
     end,
   }
 end
 
--- Deliberately excludes os/io/require/dofile/loadfile -- see this
--- file's own header for why that absence is the point, not an
--- oversight.
-function Emulator:buildEnv(node)
+local function hostComputerAPI(node)
+  return {
+    address = function() return node.address end,
+    uptime = function() return node.emu.now end,
+    realTime = os.clock,
+    pushSignal = function(...)
+      node.signalQueue[#node.signalQueue + 1] = table.pack(...)
+      return true
+    end,
+    freeMemory = function() return 1024 * 1024 end,
+    totalMemory = function() return 2 * 1024 * 1024 end,
+    energy = function() return 10000 end,
+    maxEnergy = function() return 10000 end,
+    users = function() return end,
+    addUser = function() return nil, "not supported" end,
+    removeUser = function() return false end,
+    isRobot = function() return false end,
+    tmpAddress = function() return nil end,
+    getArchitecture = function() return "Lua 5.3" end,
+    getArchitectures = function() return {"Lua 5.3"} end,
+    setArchitecture = function() return false end,
+    getBootAddress = function() return nil end,
+    setBootAddress = function() end,
+  }
+end
+
+local function hostUnicodeAPI()
+  local function chars(s)
+    local t = {}
+    for _, cp in utf8.codes(s) do t[#t + 1] = utf8.char(cp) end
+    return t
+  end
+  return {
+    char = utf8.char,
+    len = function(s) return utf8.len(s) or #s end,
+    sub = function(s, i, j)
+      local t = chars(s)
+      local n = #t
+      i = i or 1; j = j or n
+      if i < 0 then i = n + i + 1 end
+      if j < 0 then j = n + j + 1 end
+      return table.concat(t, "", math.max(i, 1), math.min(j, n))
+    end,
+    lower = string.lower,
+    upper = string.upper,
+    reverse = function(s)
+      local t, r = chars(s), {}
+      for i = #t, 1, -1 do r[#r + 1] = t[i] end
+      return table.concat(r)
+    end,
+    isWide = function() return false end,
+    charWidth = function() return 1 end,
+    wlen = function(s) return utf8.len(s) or #s end,
+    wtrunc = function(s, n) return s:sub(1, n - 1) end,
+  }
+end
+
+function Emulator:_machineEnv(node)
   local env = {}
-  for _, name in ipairs(BASE_GLOBALS) do
+  for _, name in ipairs({"assert", "error", "getmetatable", "ipairs", "load", "next", "pairs", "pcall",
+      "rawequal", "rawget", "rawlen", "rawset", "select", "setmetatable", "tonumber", "tostring", "type",
+      "xpcall", "_VERSION"}) do
     env[name] = _G[name]
   end
-  env.string, env.table, env.math, env.utf8, env.debug, env.coroutine =
-    string, table, math, utf8, debug, coroutine
+  env.string, env.table, env.math, env.coroutine, env.debug, env.utf8 = string, table, math, coroutine, debug, utf8
+  env.os = {time = os.time, date = os.date, clock = os.clock}
+  env.computer = hostComputerAPI(node)
+  env.component = hostComponentAPI(node)
+  env.unicode = hostUnicodeAPI()
+  env.system = {
+    timeout = function() return self.timeout end,
+    allowBytecode = function() return false end,
+    allowGC = function() return false end,
+  }
+  env.userdata = {}
   env._G = env
-  env.component = makeComponentAPI(node)
-  env.computer = makeComputerAPI(node)
-  -- A bare `load(chunk, name)` call with no explicit 4th argument
-  -- defaults to the REAL host _G, not the calling chunk's own _ENV --
-  -- confirmed empirically, not assumed. On real hardware this is
-  -- harmless (there's only one _G per computer, already holding the
-  -- native component/computer globals), which is exactly why
-  -- kernal/bios.lua's own `load(buffer, "=muxos")` call (and
-  -- kernal/muxos.lua's `loadSibling`) never pass an explicit env --
-  -- but this emulator runs all 4 nodes in ONE real Lua state, so
-  -- without this wrapper, any bare load() inside a node's code would
-  -- silently leak the TEST HOST's real globals (real os/io, no
-  -- simulated component/computer) into whatever it loads. Rebinding
-  -- this node's own `load` to default to ITS OWN env reproduces the
-  -- single-shared-_G-per-computer behavior real hardware gets for
-  -- free.
-  env.load = function(chunk, chunkname, mode, loadEnv)
-    return load(chunk, chunkname, mode, loadEnv or env)
-  end
-  -- The real native `print` only logs to the Java server console, never
-  -- the in-game screen (confirmed from SystemAPI.scala's own source
-  -- comment) -- captured here the same way, into the emulator's shared
-  -- log, rather than either reaching a "screen" or polluting the test
-  -- run's own stdout.
-  env.print = function(...)
-    local parts = {}
-    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
-    node.emu:_logf(node, "%s", table.concat(parts, "\t"))
-  end
-  node.env = env
   return env
 end
 
@@ -190,6 +250,17 @@ end
 -- that nothing in this project's production files ever calls
 -- modem.send (unicast); every message type is broadcast, with logical
 -- addressing carried inside the payload's own `to` field instead.
+--
+-- modem_message's first two arguments are the RECEIVING and SENDING
+-- network cards' own component addresses -- not either computer's
+-- computer.address(). Real OC raises the signal from the receiving
+-- card's component (Machine prepends that component's address) with
+-- packet.source, which NetworkCard sets to its own node address. This
+-- emulator used to pass the computers' addresses instead, which hid a
+-- real bug: node/runtime.lua was addressing the kernal by the
+-- boot-handshake sender address (a card address on real hardware)
+-- while the kernal only answered to its computer address, so on real
+-- hardware every worker->kernal request would have been ignored.
 function Emulator:addModem(node)
   local addr = self:addComponent(node, "modem", {
     open = function(port) node.modemOpenPorts[port] = true; return true end,
@@ -197,27 +268,41 @@ function Emulator:addModem(node)
       for _, otherAddr in ipairs(node.emu.nodeOrder) do
         if otherAddr ~= node.address then
           local other = node.emu.nodes[otherAddr]
-          if other.modemOpenPorts[port] then
+          if other.modemAddr and other.modemOpenPorts[port] then
             other.signalQueue[#other.signalQueue + 1] =
-              {"modem_message", otherAddr, node.address, port, 0, ...}
+              {"modem_message", other.modemAddr, node.modemAddr, port, 0, ...}
           end
         end
       end
       return true
     end,
+    -- To one card only, like the real network card's send.
+    send = function(address, port, ...)
+      for _, otherAddr in ipairs(node.emu.nodeOrder) do
+        local other = node.emu.nodes[otherAddr]
+        if otherAddr ~= node.address and other.modemAddr == address and other.modemOpenPorts[port] then
+          other.signalQueue[#other.signalQueue + 1] =
+            {"modem_message", other.modemAddr, node.modemAddr, port, 0, ...}
+        end
+      end
+      return true
+    end,
   })
+  node.modemAddr = addr
   return addr
 end
 
--- EEPROM: only getData/setData are used (the boot-address memory both
--- kernal/bios.lua and kernal/muxos.lua's own re-discovery rely on) --
--- not a real code-storage EEPROM, since this emulator calls each
--- node's real boot chunk directly rather than "flashing" it first.
-function Emulator:addEeprom(node)
-  local data = ""
+-- EEPROM: holds the node's boot code (machine.lua's bootstrap reads it
+-- with `get`) and the small data area kernal/bios.lua uses to remember
+-- its boot filesystem.
+function Emulator:addEeprom(node, code, data)
+  data = data or ""
   return self:addComponent(node, "eeprom", {
+    get = function() return code end,
+    set = function(c) code = c; return true end,
     getData = function() return data end,
     setData = function(d) data = d or ""; return true end,
+    getSize = function() return 4096 end,
   })
 end
 
@@ -227,26 +312,116 @@ end
 function Emulator:addFilesystem(node, files)
   local handles = {}
   local nextHandle = 1
+  local dirs = {["/"] = true}
+  local modified = {}
+  local clock = 0
+  local function norm(path)
+    local parts = {}
+    for part in tostring(path):gmatch("[^/]+") do parts[#parts + 1] = part end
+    return "/" .. table.concat(parts, "/")
+  end
+  local function touch(path)
+    clock = clock + 1
+    modified[path] = clock
+  end
+  local function isDir(path)
+    path = norm(path)
+    if dirs[path] then return true end
+    local prefix = path == "/" and "/" or path .. "/"
+    for f in pairs(files) do
+      if f:sub(1, #prefix) == prefix then return true end
+    end
+    return false
+  end
+  -- Real OC caps one read at 2048 bytes (maxReadBuffer).
+  local READ_CAP = 2048
   return self:addComponent(node, "filesystem", {
     open = function(path, mode)
-      if not files[path] then return nil, "file not found" end
+      path, mode = norm(path), mode or "r"
+      if mode:match("[wa]") then
+        if mode:match("w") or not files[path] then files[path] = "" end
+        touch(path)
+      elseif not files[path] then
+        return nil, path
+      end
       local h = nextHandle
       nextHandle = nextHandle + 1
-      handles[h] = {path = path, pos = 1}
+      handles[h] = {path = path, pos = mode:match("a") and #files[path] + 1 or 1, mode = mode}
       return h
     end,
     read = function(handle, n)
       local h = handles[handle]
-      if not h then return nil, "invalid handle" end
+      if not h then return nil, "bad file descriptor" end
       local content = files[h.path]
       if h.pos > #content then return nil end
-      n = math.min(n or math.huge, #content - h.pos + 1)
+      n = math.min(n or math.huge, #content - h.pos + 1, READ_CAP)
       local chunk = content:sub(h.pos, h.pos + n - 1)
       h.pos = h.pos + #chunk
       return chunk
     end,
+    write = function(handle, data)
+      local h = handles[handle]
+      if not h or not h.mode:match("[wa]") then return nil, "bad file descriptor" end
+      local content = files[h.path]
+      files[h.path] = content:sub(1, h.pos - 1) .. data .. content:sub(h.pos + #data)
+      h.pos = h.pos + #data
+      touch(h.path)
+      return true
+    end,
+    seek = function(handle, whence, offset)
+      local h = handles[handle]
+      if not h then return nil, "bad file descriptor" end
+      local base = whence == "set" and 0 or whence == "end" and #files[h.path] or h.pos - 1
+      h.pos = math.max(0, base + (offset or 0)) + 1
+      return h.pos - 1
+    end,
     close = function(handle) handles[handle] = nil; return true end,
-    exists = function(path) return files[path] ~= nil end,
+    exists = function(path) path = norm(path) return files[path] ~= nil or isDir(path) end,
+    isDirectory = function(path) return isDir(path) end,
+    size = function(path) return #(files[norm(path)] or "") end,
+    lastModified = function(path) return modified[norm(path)] or 0 end,
+    list = function(path)
+      path = norm(path)
+      if not isDir(path) then return nil, "no such file or directory" end
+      local prefix = path == "/" and "/" or path .. "/"
+      local seen, out = {}, {}
+      local function add(name)
+        if not seen[name] then seen[name] = true out[#out + 1] = name end
+      end
+      for f in pairs(files) do
+        if f:sub(1, #prefix) == prefix then
+          local rest = f:sub(#prefix + 1)
+          local first = rest:match("^[^/]+")
+          add(rest:find("/", 1, true) and first .. "/" or first)
+        end
+      end
+      for d in pairs(dirs) do
+        if d ~= path and d:sub(1, #prefix) == prefix and not d:sub(#prefix + 1):find("/", 1, true) then
+          add(d:sub(#prefix + 1) .. "/")
+        end
+      end
+      table.sort(out)
+      out.n = #out
+      return out
+    end,
+    makeDirectory = function(path) dirs[norm(path)] = true return true end,
+    remove = function(path)
+      path = norm(path)
+      if files[path] then files[path] = nil return true end
+      if dirs[path] then dirs[path] = nil return true end
+      return false
+    end,
+    rename = function(from, to)
+      from, to = norm(from), norm(to)
+      if not files[from] then return false end
+      files[to], files[from] = files[from], nil
+      touch(to)
+      return true
+    end,
+    spaceUsed = function() return 0 end,
+    spaceTotal = function() return 1048576 end,
+    isReadOnly = function() return false end,
+    getLabel = function() return "kernal" end,
   })
 end
 
@@ -290,14 +465,21 @@ function Emulator:addGpuScreen(node, screenW, screenH)
     getActiveBuffer = function() return active end,
     setForeground = function(c) local old = fg; fg = c; return old end,
     setBackground = function(c) local old = bg; bg = c; return old end,
+    -- One cell per character, like the real gpu (UTF-8 aware; raw
+    -- bytes for invalid UTF-8). Wide glyphs aren't modelled.
     set = function(x, y, text)
       local buf = buffers[active]
-      for i = 1, #text do
-        local cell = getCell(buf, x + i - 1, y)
-        cell.char, cell.fg, cell.bg = text:sub(i, i), fg, bg
+      local i = 0
+      local chars = utf8.len(text) and text:gmatch(utf8.charpattern) or text:gmatch(".")
+      for ch in chars do
+        local cell = getCell(buf, x + i, y)
+        cell.char, cell.fg, cell.bg = ch, fg, bg
+        i = i + 1
       end
       return true
     end,
+    getDepth = function() return 8 end,
+    maxDepth = function() return 8 end,
     fill = function(x, y, w, h, char)
       local buf = buffers[active]
       for row = y, y + h - 1 do
@@ -363,15 +545,26 @@ end
 -- own NativeLuaArchitecture.runThreaded drives a real computer.
 -- ---------------------------------------------------------------- --
 
-function Emulator:boot(node, chunk, ...)
+-- Boots a node the way the mod does: machine.lua's chunk, run as the
+-- node's coroutine; it reads the EEPROM itself and runs its code in
+-- the sandbox. Its first yield is the memory-baseline one, resumed at
+-- once.
+function Emulator:boot(node)
+  local chunk = assert(load(machineSource, "=machine", "t", self:_machineEnv(node)))
   node.co = coroutine.create(chunk)
   node.status = "running"
-  self:_resume(node, ...)
+  self:_resume(node)
+  self:_resume(node)
 end
 
 function Emulator:_resume(node, ...)
   if node.status ~= "running" then return end
-  local ok, a = coroutine.resume(node.co, ...)
+  local ok, a, b = coroutine.resume(node.co, ...)
+  -- An indirect component call: machine.lua yields a function for the
+  -- host to run on its own thread and resumes with the result.
+  while ok and type(a) == "function" and coroutine.status(node.co) ~= "dead" do
+    ok, a, b = coroutine.resume(node.co, a())
+  end
   if not ok then
     node.status = "dead"
     self:_logf(node, "CRASHED: %s", tostring(a))
@@ -379,7 +572,8 @@ function Emulator:_resume(node, ...)
   end
   if coroutine.status(node.co) == "dead" then
     node.status = "dead"
-    self:_logf(node, "halted (chunk returned: %s)", tostring(a))
+    -- machine.lua returns (false, reason) when the machine crashes.
+    self:_logf(node, "halted (%s, %s)", tostring(a), tostring(b))
     return
   end
   if type(a) == "number" then
@@ -402,7 +596,7 @@ function Emulator:step()
     local node = self.nodes[addr]
     if node.status == "running" and #node.signalQueue > 0 then
       local sig = table.remove(node.signalQueue, 1)
-      self:_resume(node, table.unpack(sig))
+      self:_resume(node, table.unpack(sig, 1, sig.n or #sig))
       return true
     end
   end
@@ -449,7 +643,7 @@ end
 -- scenarios to inject key_down/key_up (the REPL has no other input
 -- source) the same way a real keyboard component's events arrive.
 function Emulator:injectSignal(node, ...)
-  node.signalQueue[#node.signalQueue + 1] = {...}
+  node.signalQueue[#node.signalQueue + 1] = table.pack(...)
 end
 
 return Emulator

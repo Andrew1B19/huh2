@@ -14,13 +14,22 @@ PORT = 4477
 2. **Runtime protocol** -- everything in the Message types table below.
    Spoken by `node/runtime.lua` (what `bios.lua` fetches and runs) and
    `kernal/muxos.lua`. Every message is a Lua table, turned into text
-   with a small serializer (`[key]=value` pairs good enough for
+   with a small serializer (a Lua table constructor: the array part
+   positionally, everything else as `[key]=value`; good enough for
    nil/boolean/number/string/table -- no functions, no userdata) --
    and, since every message over the modem is chunked now, not just
    boot's `CODE`, that serialized string is itself wrapped as one or
    more `MSG <id> <i>/<n> <chunk>` wire frames (`CHUNK_SIZE` = 7000
-   bytes/chunk, same convention as boot's `BOOT_CHUNK_SIZE`) rather than
-   sent as a single `modem.broadcast(PORT, text)` call. Even a message
+   bytes/chunk, same convention as boot's `BOOT_CHUNK_SIZE`). A message
+   with a destination (`to`) is sent to that network card only
+   (`modem.send`); only discovery (`HELLO`, and the kernal's `PING` with
+   no `to`) is broadcast, so a node never receives, reassembles or parses
+   traffic meant for another. Decoding uses `load()`, so a payload must
+   be only data first: outside string literals, nothing but what the
+   serializer writes (letters, digits, whitespace, `{}[]=,.-+/`). A
+   function, a call, a comment or a long string is refused before
+   `load()` sees it, so a stray or hostile packet can't run code on a
+   node. Even a message
    that fits in one chunk still gets this framing (`i=1, n=1`) -- one
    wire shape, always, rather than two depending on size. `<id>` is a
    per-sender counter; reassembly is keyed by `(sender's real network
@@ -62,14 +71,13 @@ nothing about the real wire protocol yet -- it just needs to get
 
 1. Worker broadcasts `BOOT <its own address>`.
 2. Kernal's `serveBoot()` reads `runtime.lua` off its own disk (a sibling
-   file of `muxos.lua`, cached after the first read) and broadcasts it as
+   file of `muxos.lua`, cached after the first read) and sends it to that
+   worker as
    a sequence of `CODE <i>/<n> <chunk>` messages (`BOOT_CHUNK_SIZE` =
    7000 bytes each, comfortably under `maxNetworkPacketSize` even with
    the `CODE <i>/<n> ` prefix -- `runtime.lua` is well past the
-   8192-byte single-message budget, see "EEPROM size" below). Every
-   worker still waiting on its own BOOT picks up these same broadcasts,
-   not just the one that asked -- they all need the identical payload,
-   so one set of broadcasts serves all of them.
+   8192-byte single-message budget, see "EEPROM size" below). Only the
+   worker that asked receives it.
 3. Worker collects chunks by index (`chunks[i] = chunk`, not by arrival
    order -- delivery order isn't assumed), and once all `n` are present,
    `table.concat`s them, `load()`s the result, and calls it.
@@ -111,42 +119,22 @@ plus the stock EEPROM image the mod itself ships,
   bug (would have crashed with "attempt to call a nil value" the first
   time a worker actually booted on real hardware), fixed alongside this
   rewrite, not something introduced by it.
-- **There is no `computer.pullSignal` at all.** The real primitive is
-  yielding the kernel coroutine with `coroutine.yield(timeoutSeconds)`,
-  caught by the mod's own `NativeLuaArchitecture.runThreaded`, which
-  resumes the coroutine with the next signal's name + args once one
-  arrives (or with nothing, if the timeout simply elapses first).
-  `computer.pullSignal` is OpenOS's own thin wrapper over exactly that.
-  Every bare-metal file in this project (`node/bios.lua`,
-  `node/runtime.lua`, `kernal/muxos.lua`) now defines its own tiny
-  `pullSignal(timeout)` local function wrapping `coroutine.yield`
-  directly, rather than assuming OpenOS provided the real one.
-- **Shutdown/reboot works the same way**: yielding a plain boolean
-  (`false` = power off, `true` = reboot) is the real primitive
-  (`ExecutionResult.Shutdown`); falling off the end of the chunk with an
-  ordinary `return` is NOT a clean shutdown -- the mod's own
-  `runThreaded` logs "the kernel stopped unexpectedly" in that case.
-  `kernal/muxos.lua`'s `shutdown(reboot)` wraps the real primitive; the
-  REPL's `quit`/`exit` go through it instead of just returning.
-- **The native `print` never reaches the in-game screen at all** --
-  confirmed from its own source comment: "Until we get to ingame
-  screens we log to Java's stdout." It's a server-console debug stub,
-  not a terminal. `kernal/muxos.lua` shadows it with its own `print`
-  that routes through a small built-in text console (see below) --
-  without this, the REPL would be completely silent on the in-game
-  screen.
-- **`beep` works without OpenOS** (the stock `bios.lua` itself calls
-  `computer.beep(...)`) -- it's dispatched through the computer
-  component's own generic `@Callback` machinery, not one of
-  `ComputerAPI.scala`'s explicitly hand-written functions, but callable
-  all the same.
+- **Corrected later -- see "The real sandbox" below.** This section
+  originally said there is no `computer.pullSignal` and that the real
+  primitive is yielding the kernel coroutine with
+  `coroutine.yield(timeout)`. That was read off the Scala side only and
+  is wrong for EEPROM code: the mod's own `machine.lua` runs the EEPROM
+  inside a sandbox that DOES provide `computer.pullSignal` and
+  `computer.shutdown`, and wraps `coroutine.yield`, so a bare
+  `coroutine.yield(timeout)` loses its timeout there. muxos now uses
+  `computer.pullSignal`/`computer.shutdown`.
 
 ### What muxos.lua builds itself, in place of each OpenOS piece
 
 | OpenOS provided | muxos.lua now builds | 
 |---|---|
-| `computer.pullSignal(timeout)` | `pullSignal(timeout)` -- `coroutine.yield(timeout)` |
-| `computer.shutdown(reboot)` | `shutdown(reboot)` -- `coroutine.yield(reboot)` |
+| `computer.pullSignal(timeout)` | provided by the sandbox -- used directly |
+| `computer.shutdown(reboot)` | provided by the sandbox -- used directly |
 | `component.proxy(addr)` / dot-shorthand | `componentProxy(addr)`/`primaryComponent(ctype)` -- a metatable over `component.invoke`, duplicated (not shared) in `kernal/compositor.lua` too |
 | `event.pull`/`event.listen` | `tick(timeout)` -- one `pullSignal` call per invocation, dispatched inline by signal name; every wait in the program (REPL idle, `waitForReply`, `discover`) calls `tick()` instead of polling |
 | `thread.create` (the old background dispatcher) | nothing -- there is exactly one coroutine; see "Resolved, then resolved differently again" below for why the old two-"thread" design doesn't apply any more |
@@ -163,12 +151,41 @@ in place of `component.isAvailable("gpu")`/`component.gpu`;
 `bitmap.lua` needed no changes at all -- it never touched `component`
 directly, only ever receiving a `gpu`-shaped table as a parameter.
 
-One specific consequence worth calling out: the REPL text console and
-`kernal/compositor.lua` are now the only two places in this project
-allowed to touch the real gpu. The console isn't a window the
-compositor manages -- it IS the display, drawn directly, with the
-compositor's own windows compositing on top of it in Z-order the same
-way they would over any other screen content.
+One specific consequence worth calling out: `kernal/compositor.lua` owns
+the real screen. The REPL console is normally an ordinary compositor
+window; in console mode it's the compositor's exclusive owner and draws
+on the screen directly. See "The console" below.
+
+## The real sandbox
+
+All EEPROM code -- and so all of muxos, since the EEPROM loads it --
+runs inside the mod's own `machine.lua` sandbox, not on raw Lua. Read
+from the mod's source (`assets/opencomputers/lua/machine.lua`) and now
+exercised directly: `test/emu`'s emulator boots every node through that
+very file (vendored unmodified in `test/emu/oc/`, MIT), playing the
+Java host underneath. What it means for muxos:
+
+- **`computer.pullSignal(timeout)` and `computer.shutdown(reboot)` exist**
+  (defined in Lua by `machine.lua`) and are what muxos uses to wait and
+  to power off.
+- **`coroutine.yield` is wrapped**: it yields `(nil, ...)` as a *user*
+  yield, which the sandbox's `coroutine.resume` hands back to the
+  resumer; only `computer.pullSignal` and friends yield to the machine.
+  A bare `coroutine.yield(timeout)` at the top level -- what muxos used
+  to do -- loses its timeout: the wait only ends when some signal
+  arrives, and `coroutine.yield(true)` doesn't shut down.
+- **`debug` has only `getinfo`, `traceback`, `getlocal`, `getupvalue`**
+  -- no `debug.sethook`. Every instruction budget muxos had would have
+  crashed on its first use; the machine's own deadline replaces them
+  (see "JOB code and the non-yielding timeout").
+- **No `eris`** -- see "Transparent migration".
+- **No `print`** -- muxos never relied on the native one.
+
+The emulator used to run boot code directly against raw Lua, which hid
+all of this (the same kind of gap as the modem-address bug). Running
+the old code inside the real sandbox reproduced it: the kernal booted
+but never discovered a worker. `test/hardware/verify.lua` checks each of
+these on real hardware, and passes in the emulated sandbox (test 30).
 
 ## Message types
 
@@ -177,17 +194,54 @@ way they would over any other screen content.
 | `HELLO`   | `from`                                                    | worker  | "I just booted, here's my address"                |
 | `PING`    | `from`                                                    | kernal  | "who's out there"                                  |
 | `PONG`    | `from`, `to`                                              | worker  | reply to `PING`                                    |
-| `JOB`     | `from`, `to`, `id`, `code`, `args`                        | kernal  | run `code` (a Lua chunk) with `args`               |
+| `JOB`     | `from`, `to`, `id`, `code`, `args`, `program`, `restore`  | kernal  | run `code` (a Lua chunk) with `args`; `program` (path, kind, `.mxe` launch response and libraries) when it's a launched program; `restore` is a migrated process's saved state (`mux.restored()`) |
 | `LIST`    | `from`, `to`, `id`                                        | either  | "list the components attached to you"             |
-| `INVOKE`  | `from`, `to`, `id`, `address`, `method`, `args`           | either  | call `component.invoke(address, method, args...)` on the receiver's own component |
-| `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, muxos-shaped) |
+| `INVOKE`  | `from`, `to`, `id`, `address`, `method`, `args`           | either  | call `component.invoke(address, method, args...)` on the receiver's own component (also the bus's relayed call; results that can't cross the wire come back as value references) |
+| `COMPONENTS` | `from`, `to`, `components`                             | worker  | this node's components for the cluster bus (address -> type and methods): at boot, on `GETCOMPONENTS`, and when one is added or removed |
+| `GETCOMPONENTS` | `from`, `to`                                        | kernal  | "report your components" (sent to a node the kernal hasn't seen before) |
+| `BUSLIST` | `from`, `to`, `id`, `caller`                              | worker  | a process listing the cluster bus: address -> {type, node, methods} |
+| `BUSINVOKE` | `from`, `to`, `id`, `address`, `method`, `args`, `caller` | worker | a process calling a component on another node: the kernal calls its own, or relays an `INVOKE` to the owning worker and passes its answer back |
+| `VALUECALL` | `from`, `to`, `id`, `node`, `value`, `method`, `args`, `caller` | either | a method call on a value a component call returned (an internet request handle, ...), which stays on `node`; the kernal relays it there |
+| `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, muxos-shaped) -- summaries: no source, no result |
+| `GETPROCESS` | `from`, `to`, `id`, `jobId`                            | worker  | one job's full record (`gmuxapi.get_process(id)`) |
+| `CONTROL` | `from`, `to`, `id`, `jobId`, `verb`, `caller`                | worker  | pause/resume/kill one of the caller's own descendants (`gmuxapi.pause_process`/`resume_process`/`kill_process`) |
+| `EVENT`   | `from`, `to`, `jobId`, `event`                                | kernal  | an input event for a process on that node, read with `gmuxapi.pull_event` |
+| `OUTPUT`  | `from`, `to`, `jobId`, `text`                                 | worker  | a process's printed output, for the console |
+| `LAUNCH`  | `from`, `to`, `id`, `path`, `args`, `caller`                  | worker  | launch a program as the caller's child (`gmuxapi.launch`) |
+| `FS`      | `from`, `to`, `id`, `op`, `args`, `caller`                    | worker  | a legacy process's filesystem call on the kernal's disk (`op` = a filesystem component method); handles are the kernal's own, per process |
+| `ISFOREGROUND` | `from`, `to`, `id`, `caller`                         | worker  | `readLine`: is the caller the console's foreground program? RESULT true, or ERROR |
+| `GETMODULE` | `from`, `to`, `id`, `name`, `caller`                        | worker  | a legacy process's `require`/`dofile` for a module it wasn't shipped with: a module name or a `/lib`/`/usr/lib` path; replies `{path, source}` |
+| `KILL`/`PAUSE`/`RESUME`/`MIGRATE <id> <node>` | raw, unchunked           | kernal  | process controls, sent to the job's node and applied when its scheduler would next run the job; the node also checks `<node>` is itself, so a job id reused elsewhere (after a migration) isn't hit by a stale control |
+| `MIGRATABLE` | `from`, `to`, `jobId`                                  | worker  | an `.mxe` called `mux.migratable(save)`: the kernal may now move it |
+| `MIGRATED` | `from`, `to`, `jobId`, `state`                           | worker  | answer to `MIGRATE`: the process saved `state` and ended here; the kernal re-sends the same job (same id) to the target as a `JOB` with `restore = state` |
+| `MIGRATEFAILED` | `from`, `to`, `jobId`, `error`                      | worker  | answer to `MIGRATE`: not moved (never opted in, save failed, or state can't be serialized); the process carries on |
 | `SPAWN`   | `from`, `to`, `id`, `code`, `args`, `node`                | worker  | "dispatch a new job" (gmux API's `create_headless_process`/`create_graphics_process`); replies immediately with a handle, doesn't wait for the job to finish |
-| `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`) |
+| `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId`, `resizable`, `decorated` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
 | `GETWINDOWS` | `from`, `to`, `id`                                      | worker  | "list every window you know about" (gmux API's `get_windows()`) |
+| `DRAWWINDOW` | `from`, `to`, `id`, `windowId`, `code`, `args`, `pixels`, `mode`, `width`, `height`, `bg`, `clear`, `caller`, `noReply` | worker | redraw a window the calling process owns (`gmuxapi.draw_window`); with code, `width`/`height` different from the window's resize it first (resizable windows); `noReply` = sent without waiting, nothing comes back |
 | `REQUESTFULLSCREEN` | `from`, `to`, `id`                                | worker  | "let me bypass the compositor and INVOKE the real gpu/screen directly" |
 | `RELEASEFULLSCREEN` | `from`, `to`, `id`                                | worker  | give that grant back |
 | `RESULT`  | `from`, `to`, `id`, `result`                              | either  | success -- `JOB`'s return value, `LIST`'s address→type table, `INVOKE`'s list of return values, `GETPROCESSES`'s job list, `SPAWN`'s `{id, node}` handle, `CREATEWINDOW`'s window record, `GETWINDOWS`'s window list, or `REQUESTFULLSCREEN`/`RELEASEFULLSCREEN`'s `{granted/released = true}` |
 | `ERROR`   | `from`, `to`, `id`, `error`                               | either  | failure -- load error, runtime error, invoke error, a bad `SPAWN`/`CREATEWINDOW` request, a blocked display-component `INVOKE`, or a refused fullscreen request |
+
+**Addresses and sender checks.** Every `from`/`to` is a node's
+**network card** address, not `computer.address()`: `modem_message`
+reports the sending card's address, so that's the only identity a
+receiver can check a payload against. The kernal drops any message
+whose `from` doesn't match the card that actually sent it, only
+records a job's `RESULT`/`ERROR` from the node that job was dispatched
+to, and only stores a reply someone is waiting on (from the node it was
+asked of). A worker drops mismatched `from` the same way, and accepts
+`JOB`/`LIST`/`INVOKE` only from the kernal's card (`kernalAddr`, learned
+once from the boot handshake). Until this was fixed, workers addressed
+the kernal by its card (from the handshake) while the kernal only
+answered to its computer address -- every worker->kernal request would
+have been ignored on real hardware. `test/emu`'s emulator had been
+reporting computer addresses in `modem_message`, which hid it.
+
+`INVOKE` arguments and results are `table.pack`-style lists with an
+explicit `n`, so a `nil` in the middle (a component's `nil, "reason"`
+failure return) stays in place instead of shifting what follows it.
 
 `code` is compiled on the worker as `local args = ...` followed by your
 code, then called as `chunk(args)` inside a `pcall`, so a job can refer to
@@ -311,25 +365,22 @@ blocked" instead of quietly drawing onto the kernal's live screen. Use
 `gmuxapi.create_window()` for ordinary output; reach for
 `request_fullscreen()` only when actually building a fullscreen app.
 
-**Local escape hatch for a stuck grant**: `exclusiveFullscreenOwner` is
-not released automatically if its holder disappears (see the gap flagged
-just above), so `kernal/muxos.lua` also listens for Ctrl+Alt+C at the
-kernal itself and force-releases the grant, whoever holds it, the moment
-all three keys are down -- the "Ctrl+Alt+Del equivalent" for exiting a
-stuck fullscreen app without restarting the kernal. **This is a real,
-acknowledged conflict, not an oversight**: Ctrl+Alt+C is already
-OpenOS's own built-in process-interrupt shortcut. Confirmed from
-OpenOS's own source (`lib/event.lua`): `computer.pullSignal` is
-monkey-patched there to check
-`isControlDown()+isKeyDown('c')+isAltDown()` on *every* signal pull and
-call `process.info().data.signal("interrupted", 0)` when all three are
-held -- the same mechanism as a terminal's own Ctrl+C. This is baked
-into `computer.pullSignal` itself, unconditionally, so no choice of
-listener mechanism on muxos's side avoids it: pressing this combo to
-escape fullscreen also interrupts whatever OpenOS considers the kernal's
-current process at that moment (which could be `muxos.lua`'s own REPL).
-Implemented as specified anyway; if this combo needs to stay reserved
-for OpenOS's native interrupt instead, a different one should be picked.
+**The compositor's exclusive mode.** One owner at a time can have the
+real screen to itself, with compositing stopped entirely: a node holding
+the fullscreen grant, or the kernal's console (console mode, below).
+Leaving the mode redraws the composited picture from the window
+buffers.
+
+**Ctrl+Alt+C.** A **press** exits fullscreen: it force-releases the
+fullscreen grant (whoever holds it -- a crashed holder can't trap the
+screen) and leaves console mode. **Holding** it for a second is the
+kernal-level interrupt that drops into the full-screen kernal console:
+the console becomes the compositor's exclusive owner, focused, drawing
+straight onto the real screen. The `comp` command (or another press)
+returns to normal compositing (test 10). Ctrl+Alt+C was OpenOS's own
+process-interrupt shortcut (`lib/event.lua` checks it on every signal
+pull); muxos has no OpenOS underneath, so there's nothing to conflict
+with any more and the combo is reclaimed for this.
 
 **GPU stays on the kernal -- a current hard requirement, not just the
 usual case**: today, every real `gpu.*` call anywhere in muxos happens
@@ -345,27 +396,22 @@ near-term plan -- for now, "GPU lives on the kernal" is a stated
 requirement of the system, the same way T3 hardware is (see "Hardware
 requirements" below), not an assumption that happens to hold today.
 
-**Closing a window does not end the program it belongs to.** This
-matches gmux's own behavior and is intentional: "close" is a compositor-
-level action (remove the window from the display) separate from
-"terminate" (kill the job). A closed window becomes an icon on the
-toolbar instead of disappearing outright, so the underlying job stays
-alive and reachable. The icon a toolbar entry uses, in priority order:
-the window's own bitmap, if it was a bit window (`options.pixels`); 
-otherwise the program's name, if the window was created via a `run`-
-style dispatch that already has a name to use; otherwise an icon
-supplied explicitly through the API when neither of those applies. None
-of this toolbar/icon compositing is built yet (see "Still not done" in
-the bitmap-windows section above) -- this is the intended semantics to
-build it against, recorded now so it isn't lost or reinvented
-differently later.
+**Closing a window ends its program -- as in gmux (BUILT).** An
+earlier note here said closing a window wouldn't end its program and
+that gmux behaves that way. It doesn't: gmux's `Window:close()` calls
+`process:kill()`. The decorations were then specified as "copy gmux",
+so close kills the owner process (see "Window decorations"), and
+minimize (collapse to the title bar) is how a window gets out of the
+way while its program keeps running. The old plan of a closed window
+becoming a toolbar icon (icon from the window's bitmap, else the
+program's name, else one supplied through the API) is kept here in case
+a toolbar is built for minimized windows later; nothing of it is built.
 
 ## Scheduler
 
-**Direction, not yet built**: round-robin job dispatch across the
-worker nodes, with a "simple multi-core balancer" on top -- preferring
-whichever worker currently has the fewest active jobs rather than
-strictly rotating blind to load. Beyond that assignment policy, job
+**BUILT**: round-robin job dispatch across the live worker nodes, with
+a simple multi-core balancer on top -- the live node with the fewest
+running jobs wins, and round-robin order breaks ties (test 27). Beyond that assignment policy, job
 handling otherwise follows the same shape gmux already uses (a process
 table, `SPAWN`/`JOB` dispatch-and-record as already implemented --
 see "The gmux application API, translated" above) for now; this may get
@@ -389,6 +435,38 @@ provides (per-node dispatch, the compositor, multithreading awareness);
 legacy OpenOS programs get the best-effort compatibility shim, not equal
 footing.
 
+### Running OpenOS programs (decided; libraries and virtual components built)
+
+This isn't a separate translation layer sitting on top of muxos. muxos
+itself understands OpenOS programs and runs them as a native ability of
+the OS -- it just also has a much wider API, for much more direct
+calls, for programs written specifically for muxos. (A loose analogy:
+Windows 95 running DOS programs, except this is the reverse kind of
+implementation -- the new OS natively absorbing the old one's programs.)
+
+What that involves, as decided in the design discussion (recorded late
+-- it was agreed but never written down):
+
+- **A heavily modified OpenOS, not a from-scratch rewrite.** OpenOS's
+  libraries get modified for muxos case by case: some are
+  straightforward, some need real reimplementation, and whatever
+  doesn't need rewriting from scratch isn't. The approach follows how
+  gmux does it where that works.
+- **Libraries move toward the nodes as faces.** The legacy userland
+  that runs alongside a program on a worker mostly ends up as front-end
+  faces: the same OpenOS-shaped API, making the real calls back to the
+  OS -- the same pattern as the worker's `gpu` face today.
+- **Legacy programs see virtual components, gmux-style.** A legacy
+  program is pointed at a virtual GPU/screen (and keyboard, modem,
+  ...) exactly as gmux does it, plus muxos's additions. gmux's own
+  virtual components (`gmux/lib/gmux/backend/virtual_components/`) get
+  forked and built into the OS for this.
+- **The front end comes from gmux.** The window/interaction side
+  (gmux's frontend) is built from gmux for now.
+- **Placement is the scheduler's.** Legacy programs are scheduled like
+  everything else -- the kernal decides where they run (see "Placement
+  authority never moves").
+
 ## `.mxe`: a native-app marker, not a security boundary
 
 muxos programs written to take advantage of its own API (rather than
@@ -406,6 +484,221 @@ in this project that would need one. Permissible on that basis -- it's
 exactly the kind of "which code path do I run this through" decision a
 file extension is good for, as long as nothing security-relevant is ever
 gated on it.
+
+## Program launcher -- BUILT
+
+Works like OpenOS's shell: a name typed at the console that isn't a
+built-in command is looked up on `/bin` then `/usr/bin` (`.mxe` before
+`.lua`), or a path is used as given; the rest of the line is its
+arguments, passed as `...`. An `.mxe` runs in the foreground -- the
+console waits until it ends and feeds it typed input, echoing it like a
+terminal -- unless the line ends with `&`, which runs it in the
+background. A `.lua` program has its own window (its terminal, as in
+gmux), so the console never waits for it. A process can launch a program too, with
+`gmuxapi.launch(nameOrPath, args)`, and becomes its parent. Either way,
+the scheduler places it.
+
+- **`.lua`** runs in the OpenOS environment, gmux-style: its own
+  window is its terminal, so `print`, `io.write`/`io.read`, `io.stderr`
+  (red) and `term` write and read there, wrapping and scrolling, and an
+  uncaught error is written there in red (the title gets ❌). The window
+  exists from the start, as in gmux; it appears at the process's first
+  flush, even if nothing is printed. It also gets:
+  - `io.open`/`io.lines`, `loadfile`/`dofile` and OpenOS's `filesystem`
+    over the kernal's disk (see "Legacy filesystem");
+  - `os` (`sleep`, `clock`, `time`, `date`, `getenv`/`setenv` with
+    `PWD`, `remove`, `rename`, `exit`), `checkArg`, and OpenOS's
+    `require` (see "Legacy libraries" below);
+  - gmux-style virtual components as its `component` (see "Legacy
+    virtual components").
+
+  Nothing muxos-specific (no `gmuxapi`).
+- **`.mxe`** declares what it expects in a header at the top of the file:
+
+  ```lua
+  --[[mxe
+  muxos = "0.1.0"
+  libraries = {"name", ...}
+  ]]
+  ```
+
+  The header is evaluated as data (empty environment, small instruction
+  budget). The program gets the launcher's response as the global
+  `launch`: `muxos` (the actual version), `requested`, `versionMatch`
+  (a mismatch never stops it from running), `libraries` (name ->
+  found or not) and `errors`. Libraries live at `/lib/mxe/<name>.lua` or `/usr/lib/mxe/<name>.lua` on
+  the kernal's disk, are shipped with the program, load into its own
+  environment, and are reached with `require(name)`. Both headers and
+  libraries are specified in docs/MXE.md.
+
+## Legacy libraries -- BUILT
+
+A legacy program's `require` works like OpenOS's, with its own
+`package.loaded`. There are two kinds of module:
+
+- **Faces built into the worker runtime** for the machine-level modules:
+  - `computer`, with `pullSignal`/`pushSignal` over the process's own
+    events;
+  - `event`, with `pull` (OpenOS's filter: name pattern plus equal
+    arguments), `pullFiltered`, `push`, `listen` and `ignore`;
+  - `term` (the program's window), `filesystem`, `unicode` (the
+    machine's), and a minimal
+    `process` and `package` (including OpenOS's `package.delay`);
+  - `buffer`, which doesn't work yet;
+  - `component`: the process's own virtual gpu, screen and keyboard
+    (see "Legacy virtual components"), the OS filesystem, and every
+    other component in the cluster over the bus (see "Cluster component
+    bus"), gmux-style. It has OpenOS's `list`, `proxy`, `invoke`,
+    `type`, `methods`, `isAvailable`, `getPrimary` and
+    `component.<type>`, and OpenOS's "no primary 'x' available" error.
+
+  Input arrives in OpenOS's signal shape (`"key_down", address, char,
+  code, player`). When the program has loaded OpenOS's `keyboard`
+  library, its pressed-key tables are kept current, as OpenOS's boot
+  scripts would.
+- **Files on the kernal's disk**, found on OpenOS's package path:
+  `/lib/?.lua`, `/usr/lib/?.lua`, then `?/init.lua` in each. This is
+  where the vendored OpenOS libraries go (`kernal/lib`: `serialization`,
+  `text`, `sides`, `colors`, `keyboard`, `transforms` and their
+  `core/full_*` halves, unchanged, MIT). Expanding the legacy userland
+  is installing files there, no OS change needed.
+
+The launcher ships every module the program requires by a literal name,
+and the modules those require, up to 32, with the `JOB`
+(`program.modules`). So the usual case costs no extra round trips. Any
+other `require` (a computed name) sends a `GETMODULE` request to the
+kernal (`package.delay` loads a library's lazy half with `dofile`, from
+the disk). The kernal caches module sources and re-reads a file only when its
+`lastModified` changes. Test 33.
+
+## Legacy virtual components -- BUILT, forked from gmux
+
+A legacy program sees what gmux gives one: its own virtual gpu, screen
+and keyboard (`gmux/lib/gmux/backend/virtual_components/`, with the same
+addresses), and nothing else. gmux's virtual gpu draws into real gpu
+buffers on the machine it runs on. A worker has no gpu, so muxos's
+keeps the screen and its buffers as cell grids in the worker's memory,
+behind gmux's API:
+
+- `set` (vertical too), `fill`, `copy`, `get`;
+- colors, palette, depth;
+- `get`/`set`/`maxResolution` and the viewport;
+- `allocateBuffer`/`freeBuffer`/`freeAllBuffers`/`buffers`,
+  `setActiveBuffer`, `bitblt`, and memory.
+
+Its window is on the kernal:
+
+- **Created** on the first draw that's flushed, titled after the
+  program, sized to the resolution and resizable (gmux makes a vgpu
+  window resizable).
+- **Updated** with the rows that changed, as same-color runs, in one
+  `DRAWWINDOW` sent without waiting for a reply. Flushes happen at the
+  process's yield points: always before it blocks (`sleep`, waiting for
+  an event or input, ending), and at most every 0.05s otherwise, so a
+  busy draw loop doesn't flood the network.
+- **Resizing** works both ways. `setResolution` resizes the window and
+  queues `screen_resized`, as a real screen does. The user resizing or
+  maximizing the window is a resolution change for the program,
+  delivered as `screen_resized`, as in gmux.
+
+Touch, drag, drop and scroll on the window arrive in OpenOS's shape
+with the virtual screen's address and window coordinates. Keys reach the
+program when its window is focused. The default resolution fits the
+kernal's screen, up to 80x25, with room for the title bar. The
+program's terminal draws on the same virtual gpu. Test 34.
+
+## Cluster component bus -- BUILT
+
+The original design point: four computers on one component bus, each
+seeing the others' components. OpenComputers gives every computer
+(every rack server too) its own isolated component bus, and the only
+link between computers is network messages (see "Why there's a
+"remote component" layer at all" above). So muxos emulates one bus over the network.
+
+**Registry.** Each worker reports its components to the kernal
+(`COMPONENTS`) at boot, when the kernal first sees it
+(`GETCOMPONENTS`), and whenever one is added or removed. The kernal adds
+its own, refreshed on its `component_added`/`component_removed`. The
+`bus` console command lists the registry.
+
+**Who sees it.**
+- Native processes and `.mxe` programs get `component` over the bus:
+  open visibility.
+- Legacy programs get it too, after their virtual gpu/screen/keyboard
+  and the OS filesystem, as gmux exposes real components behind its
+  virtual ones.
+- `component.<type>` and `getPrimary` prefer the program's virtual
+  devices, then components on its own node, then the rest of the
+  cluster. The listing is cached for 1s.
+
+**Calls.**
+- A component on the caller's own node is called directly, with no
+  network hop.
+- Anything else is a `BUSINVOKE` to the kernal. The kernal calls its own
+  components itself, and relays the call as an `INVOKE` to the worker
+  that owns the component, passing the answer back under the caller's
+  request id. Relays expire after 10s.
+- Workers answer `INVOKE` (and `VALUECALL`, `GETCOMPONENTS` and input
+  events) at their jobs' yield points, so a call doesn't wait for the
+  other node's job to finish. A job that never yields can't answer until
+  it does; that's the same limit as everything else here.
+
+**Values.** A call can return something that can't cross the wire, like
+an internet card's request handle or a socket. That value stays on its
+node: the caller gets a reference, and a proxy whose methods are
+`VALUECALL`s, relayed by the kernal to that node. `close` frees it; past
+64 values per node, the oldest is closed and dropped. So OpenOS's own
+`internet` library, vendored in `kernal/lib`, works unchanged against
+an internet card on any node.
+
+**Not on the bus:**
+- gpu, screen and keyboard: the compositor owns them, and programs get
+  windows and input instead;
+- network cards and tunnels: the cluster's own link (networking for
+  programs is still deferred);
+- EEPROMs and computer components: node firmware and power control;
+- the kernal's boot disk: programs reach it as the OS filesystem (`FS`),
+  with its own handle bookkeeping.
+
+**Not yet:** a remote component's signals (`redstone_changed`, an
+internet card's events, ...) don't reach programs on other nodes yet.
+
+Test 36 covers the registry, a relayed call (worker 2 to worker 1's
+redstone card), a direct call on the owning node, an internet request
+handle used remotely, and a legacy program fetching through OpenOS's
+`internet` library with the kernal's internet card.
+
+## Legacy filesystem -- BUILT, like gmux
+
+A gmux app uses the OS's own filesystem; gmux's virtual filesystem
+component is only for its simulator. Likewise a legacy program uses the
+kernal's disk, the muxos filesystem:
+
+- OpenOS's `filesystem` library: `exists`, `isDirectory`, `size`,
+  `lastModified`, `list`, `makeDirectory`, `remove`, `rename`, `copy`,
+  `open`, and the path helpers.
+- `io.open`, `io.lines`, `loadfile`, `dofile`, `os.remove`/`rename`.
+- A `filesystem` component in `component.list()`, with the disk's real
+  address.
+
+Relative paths resolve against `PWD` for `io`/`dofile`, as OpenOS's
+shell does, and from the root for `filesystem`, as in OpenOS.
+
+Each call is an `FS` request to the kernal (filesystem component method
+plus arguments). Open files get the kernal's own small handle numbers,
+belong to the process that opened them, and are closed when it ends.
+Files are buffered on the worker: reads fetch 16 KB, and the kernal
+loops over the disk's 2 KB per-call limit, so that's one round trip.
+Writes go out past 4 KB or on `flush`/`seek`/`close`. Test 35.
+
+Every `.mxe` process's `print` goes to the kernal console as `OUTPUT`
+messages, buffered per process and sent at its yield points, before it
+reads input, when it ends, or past 1 KB. Test 29 covers all of the
+above.
+
+**Package manager**: OPM (currently an OpenOS package manager) will be
+expanded into muxos's native package manager and track installed
+packages. The kernal only needs to provide a way for OPM to talk to it.
 
 ## Hardware requirements
 
@@ -479,9 +772,11 @@ the full mechanism (z-order, occlusion culling via rectangle
 subtraction, dirty tracking, a persistent frame buffer composited into
 and flipped to the real screen with one `bitblt` per `flush()`, adapted
 from `gmux/lib/gmux/frontend/graphics.lua`'s `Block`/`get_boxes`/
-`subtract_rectangle`). **Still not gmux's full desktop**: no dragging,
-no resizing, no input routing (`gmux/lib/gmux/frontend/windows.lua`, 482
-lines, wasn't touched) -- and still character-cell only, like gmux
+`subtract_rectangle`). Only what changed is repainted: a moved, resized,
+minimized or closed window exposes just its old outline, which the
+windows under it repaint, and the flip copies only the bounding box of
+the changes. Windows carry gmux's decorations and take input (see
+"Window decorations"). Still character-cell only, like gmux
 itself and like the real GPU hardware (`get`/`set`/`copy`/`fill`/
 `bitblt` all operate on an `api.internal.TextBuffer` in
 `GraphicsCard.scala` -- there is no pixel/framebuffer API in OC at all).
@@ -567,8 +862,10 @@ could survive without.
 Stock `eepromSize` (the max bytes of code an EEPROM can hold, confirmed
 from `application.conf`) is **4096**. This is why `node/bios.lua` and
 `node/runtime.lua` are split the way they are: `bios.lua` is the only
-thing actually bound by that limit, and at **2806 bytes** it has plenty
-of room. `runtime.lua` (**14411 bytes** as of the generic chunking
+thing actually bound by that limit, and at **2413 bytes** it has room
+to spare. Comments count toward the limit too -- it once grew past 4096
+through comments alone, so `test/emu/integration_test.lua` (test 19) now
+checks both EEPROM images' sizes. `runtime.lua` (**14411 bytes** as of the generic chunking
 layer) carries everything that used to make the combined file blow past
 4096 -- it's fetched into RAM over the modem instead, so `eepromSize`
 doesn't apply to it.
@@ -767,73 +1064,35 @@ that worker's whole computer, not just erroring the job, and the worker
 would be unable to answer `PING` or anything else for the job's entire
 duration either way.
 
-**The fix that seemed obvious doesn't work**: a `debug.sethook` count
-hook that forces a yield every N instructions, whether the job's code
-yields on its own or not, would in principle let the dispatch loop
-interleave network servicing with an arbitrary non-cooperating job.
-Tested directly against the real `lua5.3` binary (not assumed): yielding
-from inside a debug hook raises `"attempt to yield across a C-call
-boundary"` every single time. This is a genuine Lua 5.3 language
-restriction, not a muxos limitation or an OC sandboxing quirk -- a hook
-callback can never suspend execution, full stop.
+**How it works now** (after "The real sandbox" findings, below):
 
-What a hook CAN do is `error()` -- confirmed that works fine from a
-hook, unwinding the coroutine cleanly and returned as `(false, msg)`
-from `coroutine.resume`, same as any other Lua error. So the actual
-design, in `node/runtime.lua`:
-
-- **`yield()`** -- exposed to job code as a real global (same pattern as
-  `gpu`/`gmuxapi`: JOB code is `load()`ed fresh each time with no
-  visibility into `runtime.lua`'s own locals, so it has to be a global).
-  Calling it is an ORDINARY yield from regular code, not from a hook --
-  confirmed that works fine -- so a job that expects to run long can
-  cooperate voluntarily, and `yieldToStayResponsive()` (pulls, then
-  immediately re-pushes with `computer.pushSignal`, the exact mechanism
-  OpenOS's own boot code uses) runs at each of its yield points, keeping
-  the node responsive for as long as the job keeps cooperating.
-- **`yield()` yields a sentinel (`"__cooperate"`), not a bare
-  `coroutine.yield()`** -- found necessary the hard way, via
-  `test/emu`'s end-to-end integration test (see "Hardening found by
-  actually running the real files together" below): job code can ALSO
-  reach `gmuxapi.*` (e.g. `request_fullscreen()`), which does its OWN
-  nested wait via this same `pullSignal`, expecting the REAL network
-  reply it's waiting for as the resume value. Once job code runs inside
-  `runJobCode`'s wrapped coroutine, both kinds of yield are bare
-  `coroutine.yield(...)` calls somewhere down the call stack with no
-  other way to tell them apart. An earlier version of this fix treated
-  every yield as voluntary cooperation and swallowed the real reply
-  `remoteRequest()` needed, hanging the job forever. The sentinel fixes
-  this: a voluntary `yield()` gets the brief, bounded service pass
-  above; anything else (a bare number, from `pullSignal`'s own timeout
-  argument, or nothing) gets a REAL signal transparently forwarded into
-  it, exactly as if the job coroutine were the node's top-level one.
-- **A hard instruction-budget circuit breaker** -- also `debug.sethook`,
-  but erroring instead of attempting to yield. This can't resume a job
-  that blows the budget; it protects THIS NODE's availability, not that
-  job's progress, by killing a non-cooperating job outright, cleanly,
-  well before it risks the mod killing the whole computer instead.
-- **The hook is re-armed before every resume, not set once.** A count
-  hook's count is a running total of instructions executed by that
-  coroutine -- confirmed empirically it does NOT reset on its own across
-  a yield/resume cycle -- so without re-arming, a job that cooperates by
-  calling `yield()` periodically would still eventually trip the SAME
-  lifetime budget just by running long enough in total, defeating the
-  entire point of cooperating. Re-arming (`armBudgetHook`, called again
-  before each `coroutine.resume`) gives every voluntary yield a FRESH
-  budget for its next slice instead -- confirmed with a mocked test: a
-  job yielding every ~100 loop iterations against a budget that would
-  kill it in one continuous run instead completes normally across many
-  slices.
-
-`PREEMPT_INSTRUCTIONS` (2,000,000) is a judgment call, not measured
-against real hardware: large enough that ordinary job code shouldn't
-trip it by accident, with no empirical basis yet for exactly how that
-maps to OC's real (unverified) wall-clock timeout. Verified via
-`/tmp/test_job_preemption.lua`: a quick job under budget, a cooperating
-job surviving many slices via `yield()`, a signal arriving mid-job
-getting pushed back correctly, a non-cooperating job killed by the
-circuit breaker, and an ordinary error inside job code still reported
-distinctly from a budget-exceeded kill.
+- **The machine's own deadline is the circuit breaker.** OpenComputers
+  ends any coroutine that runs longer than `system.timeout()` (5s by
+  default) without the machine getting a yield -- the sandbox's
+  `coroutine.resume` installs that check on every coroutine. A job runs
+  in its own coroutine, so a job that never yields is ended with "too
+  long without yielding", comes back as an ordinary `ERROR`, and the
+  worker survives because its main loop yields to the machine promptly
+  afterwards (test 6). There is no tighter muxos-side budget: the
+  sandbox has no `debug.sethook`, and a Lua 5.3 hook can't yield anyway,
+  so forced preemption isn't possible.
+- **Workers multitask.** Each process is a coroutine, and the node's
+  scheduler resumes whichever can run, round-robin. A process gives up
+  the node when it waits (`sleep`, `pull_event`, `readLine`, any kernal
+  RPC), yielding a *condition*: a deadline, an RPC reply, an input event.
+  The scheduler checks those conditions itself. Every signal is received
+  in one place (`receive`), which answers PINGs, files RPC replies for
+  whoever awaits them, queues input events and handles kernal requests,
+  so nothing is set aside or lost whichever process is waiting.
+- **`yield()`** -- exposed to job code -- is how a long computation
+  cooperates: the scheduler runs the node's other processes and handles
+  what arrived (a real `computer.pullSignal`, which resets the machine's
+  deadline), then resumes it.
+- **`sleep(seconds)`** is the way for job code to wait on time. A job
+  that waited with a bare `coroutine.yield(timeout)` would be handed --
+  and silently consume -- every signal that arrived meanwhile, including
+  the `JOB` message for a child the kernal had just queued on that same
+  node. `sleep` sets everything aside for the main loop instead.
 
 ## Hardening found by actually running the real files together
 
@@ -892,9 +1151,9 @@ This started as a design decided through discussion, written down
 before implementation so it wouldn't get lost or reinvented
 differently later. Parent/child jobs, orphan policies, and app-identity
 reclaim are now BUILT and verified end to end (`test/emu/integration_test.lua`'s
-test 12) -- marked below as each piece is covered. Semi-live migration
-and the persistent-window-handle API are still forward design, not yet
-implemented -- marked as such where they appear.
+test 12) -- marked below as each piece is covered, as are persistent
+window handles and keyboard delivery. Opt-in `.mxe` migration (through `mux`) and node draining are built too.
+
 
 ### Why this exists
 
@@ -949,57 +1208,93 @@ an already-placed parent and child beyond what the existing protocol
 already does.
 
 A child can become a parent itself -- the relationship is just a field
-on a table entry, nothing stops it from recursing. **Still undecided:**
-whether there's a cap on depth or total fan-out per top-level job. With
-only 3 workers total, an unbounded spawner could starve everything
-else; some cap (e.g. "no more than N live descendants per top-level
-job") seems likely necessary but the exact number, and whether it's a
-hard limit or something the scheduler just weighs against, hasn't been
-decided -- no cap is enforced today.
+on a table entry, nothing stops it from recursing.
 
-**The "what happens when every worker is busy" question turned out to
-already have an answer, implicitly, in the existing design**: a worker
-only ever runs one job at a time (`runJobCode` blocks that worker's own
-main loop until the job finishes, is killed, or hits the instruction
-budget), so round-robin dispatch to an already-busy worker just means
-the new `JOB` message waits in that worker's own signal queue until
-it's free -- not denied, not queued at the kernal, just delayed at the
-target. This is true for a child exactly the same as for a top-level
-job, including the edge case of a child landing (round-robin) on the
-SAME node as its own still-running parent -- which surfaced a real,
-separate bug while building this (see "A real bug this surfaced" below).
-A real load-aware balancer (preferring the least-busy worker) is still
-"not yet built" -- that's a quality-of-placement question, not the
-correctness question this needed answered first.
+### Fan-out/depth cap on recursive spawning -- BUILT
 
-**A real bug this surfaced**: `node/runtime.lua`'s `remoteRequest()`
-(the nested wait `gmuxapi.*` calls use) used to silently discard any
-fully-reassembled message that wasn't the specific reply it was
-waiting for. Harmless as long as nothing but that reply could ever
-arrive mid-wait -- which stopped being true the instant a child could
-be placed on its own parent's node: the kernal's fresh `JOB` message
-for the child would arrive at that node while it was still blocked
-inside `remoteRequest`, waiting for its own unrelated `SPAWN` reply,
-and got dropped on the floor -- the child's own `JOB` message simply
-vanished, and it never started. Fixed by pushing back (via
-`computer.pushSignal`) anything that isn't the awaited reply, so the
-outer dispatch loop still sees it once the wait resolves. Verified via
-`test/emu/integration_test.lua`'s test 12 (confirmed by reverting the
-fix and watching a child land on its own parent's node and never
-start). Known limitation, flagged rather than hidden: this correctly
-replays a single-chunk message (the common case) but not one that
-needed multiple chunks, since `reassemble()` already discarded the
-earlier chunks on the way to completing this one.
+With only 3 workers total, an unbounded spawner could starve everything
+else. The answer landed on: **a job tree (the top-level job plus every
+descendant it spawned, directly or through several levels) may not have
+more than `#nodeOrder` jobs counted as "running" at once** -- "as many
+nodes as there is," per the design decision this was built against.
+Depth and fan-out collapse into one check this way, rather than needing
+two separate limits: a grandchild spawning its own child counts against
+the same tree total as a direct child would.
+
+Mechanically: every job record gets a `rootId` field -- its own id for a
+top-level job, inherited in O(1) from its parent's own `rootId`
+otherwise (never a chain-walk, so this stays cheap no matter how deep a
+tree gets). `countRunningInTree(rootId)` counts every job sharing that
+`rootId` whose `status == "running"`; `handleSpawn` checks this against
+`#nodeOrder` before dispatching a child (never for a top-level job --
+only child spawns, where `msg.parent` is set, are capped) and replies
+with a clear `ERROR` naming the cap and the current count if it's
+already been reached. The parent itself counts toward its own tree's
+total while it's still running (mid-spawn, waiting on its own children),
+so with 3 nodes a parent can have at most 2 live children before the
+3rd spawn attempt is rejected.
+
+**When a worker already has jobs**, a new one just starts alongside
+them: workers multitask (see "JOB code and the non-yielding timeout").
+The balancer still sends new work to the least-busy live node. This is
+true for a child exactly as for a top-level job, including a child
+placed on its own parent's node: the parent waits for its `SPAWN` reply
+as a condition, so the child's `JOB` is received and started meanwhile.
+
+Controls (`KILL`, `PAUSE`, `RESUME`, `MIGRATE`) are recorded per job id
+even before that job's `JOB` arrives, and applied when the scheduler
+would next run it: a killed process is ended, a paused one isn't
+resumed, a migrating one is moved (test 17).
 
 ### Job environment abstraction
 
 Partially answered by what's built: a dispatched job gets the real
-global `jobId` (its own id) and, through `gmuxapi`, a way to ask for a
-child. What's still open is the harder part -- what's exposed to an
-`.mxe` app specifically, as opposed to a plain headless `JOB`, and
-whether that differs from today's shared `gpu`/`gmuxapi`/`yield`
-globals every job already gets regardless of whether it declared a
-name or any orphan policy at all.
+global `jobId` (its own id), `yield`/`sleep`, and, through `gmuxapi`, a
+way to ask for a child.
+
+**Decided, not yet built -- process isolation for every program.** Both
+legacy programs and `.mxe`s run as isolated processes in the sense that
+matters for fault tolerance: a program crashing doesn't take down the
+node or the system, and the kernal can pause or end it.
+
+The difference is what each sees:
+
+- A **legacy** program gets gmux-style virtual components (its own
+  virtual gpu/screen/keyboard/modem -- see "The legacy layer").
+- An **`.mxe`** gets no virtual components. It's a pseudo-emulated
+  environment that makes kernel calls instead (the native OS APIs, plus
+  any libraries it asked for at launch) and has open visibility of the
+  system: it knows there are globals and is exposed to more of them
+  than a legacy program, which only sees its OpenOS/gmux environment.
+  Each process still has its own environment, so one program's globals
+  never leak into another's. (Recorded wrongly at first as "the shared
+  runtime globals every job gets today"; corrected.)
+- **Parent/child processes are `.mxe`-only.** They're a new concept
+  OpenOS programs never call, so legacy programs simply get the
+  OpenOS/gmux environment -- there's nothing to implement for them
+  there.
+
+**BUILT for every job today (which all run as native processes):**
+
+- A crashing job is contained: its error comes back as an `ERROR` and
+  the worker keeps running (tests 6, 15).
+- The kernal can pause, resume, or end any process (`pause`/`resume`/
+  `kill <id>` at the REPL), and a process can do the same to its own
+  descendants (`gmuxapi.pause_process`/`resume_process`/
+  `kill_process`). Controls are raw messages to the process's node,
+  acted on when its scheduler would next run it. A paused process's node
+  keeps answering liveness probes and running its other processes. Ended processes get status `"killed"` with the
+  reason (user, parent, orphan policy, orphan timeout).
+- Each process has its own environment: its globals never leak into
+  another process on the same node. The native API it sees through it
+  is read-only, and it has no `debug` and no raw `component` (test 27).
+
+Not built yet: the legacy environment, which needs the launcher to tell
+legacy from `.mxe`.
+
+A kernal system bus (a dbus-like named-service/signal bus) is a
+possible later addition for `.mxe` programs to talk to kernal services
+and each other.
 
 ### App identity and orphan reclaim -- BUILT
 
@@ -1009,9 +1304,13 @@ job id (those don't survive a relaunch) and not a separately-chosen
 session id. The kernal keeps `appsByName`, a **global map: app name ->
 the job id(s) spawned under it with `orphanPolicy == "orphan"`**. A new
 message type, `GETORPHANS` (`gmuxapi.get_orphans(name)` on the worker
-side), hands back every `{id, node}` handle still registered under
-that name and **removes them from the pool** -- claimed once, not
-re-handed-out to a second caller. When an app with that name launches
+side), hands back the jobs registered under that name **whose parent is
+no longer running** -- a child whose parent is alive stays with that
+parent, so a second instance of the same app can't take it. Each comes
+back as `{id, node, status, result, error}`: an orphan that already
+finished is still returned, with its result, so the relaunched app can
+see what happened while it was gone. Claimed jobs are **removed from the
+pool** -- claimed once, not re-handed-out to a second caller. When an app with that name launches
 again -- even much later, even if every internal id involved has
 changed in between -- calling `get_orphans` with its own name gets its
 old orphans back.
@@ -1025,18 +1324,35 @@ child (default: `"orphan"`). Applied by
 `applyOrphanPolicyForChildrenOf`, called the instant the kernal records
 a job as no longer running, for every child of that job:
 
-- **`orphan`** -- the child keeps running untethered. Nothing happens
-  mechanically; it's already registered in `appsByName` for reclaim
-  (see above), and stays there until reclaimed. There's no timeout or
-  manual-kill cleanup built yet for an orphan nobody ever reclaims --
-  flagged, not hidden.
-- **`kill`** -- the kernal broadcasts a raw, unchunked `"KILL <id>"`
+- **`orphan`** -- the child keeps running untethered, registered in
+  `appsByName` for reclaim (see above), and marks `job.orphanedAt =
+  computer.uptime()` at the moment it's actually orphaned (when its
+  parent finishes) -- not when it was originally spawned, which could
+  have been long before. **Stale-orphan cleanup -- BUILT**:
+  `sweepStaleOrphans()`, called once per tick alongside the existing
+  `sweepStaleChunks()`, kills (same best-effort raw `KILL <id> <node>`
+  as the `kill` policy below, same cooperative-yield-point limitation)
+  any `orphan`-policy job that's sat unreclaimed longer than
+  `orphanTimeoutSeconds()` -- resending at most once per
+  `KILL_RETRY_INTERVAL` (10s) in case the first was lost. **The timeout is dynamic, per the
+  design decision it was built against ("dependent on scheduler
+  stress")**: `orphanTimeoutSeconds() = BASE_ORPHAN_TIMEOUT / (1 +
+  schedulerStress())`, where `BASE_ORPHAN_TIMEOUT = 300` and
+  `schedulerStress() = (count of every job across the whole system
+  with status "running") / #nodeOrder` -- a real backlog measure, not
+  just "is anything happening," since it can exceed 1 when nodes run
+  several jobs each. An idle system gives an unreclaimed
+  orphan the full 300s; as load climbs, that shrinks, freeing a slot
+  sooner precisely when capacity is actually scarce. The exact curve
+  (simple inverse) is a judgment call, not measured against real
+  hardware or workloads.
+- **`kill`** -- the kernal sends the job's node a raw, unchunked `"KILL <id> <node>"`
   (same convention as boot's own `BOOT`/`CODE`, bypassing the generic
   `MSG` framing deliberately -- this needs to be checked cheaply at
   every signal a running job's cooperative loop sees, and a kill
   message is tiny enough to never need chunking anyway). **Best-effort
-  only**: `node/runtime.lua`'s `runJobCode` only checks for a matching
-  `KILL` at the job's own cooperative `yield()` points -- a child that
+  only**: a worker's scheduler acts on it the next time it would resume
+  the job, i.e. at the job's own yield and wait points -- a child that
   never yields can't be killed early this way, no sooner than its own
   instruction-budget circuit breaker would catch it anyway (see "JOB
   code and the non-yielding timeout"). This is the same fundamental
@@ -1066,72 +1382,94 @@ going. This was a deliberate simplification, not an oversight: trying
 to make arbitrary in-flight state survive an actual hardware failure is
 a much bigger problem than this system needs to solve.
 
-Nodes rejoining (or new ones joining) the live pool is mostly already
-free, and needs to *stay* true as the above gets built, not be
-reinvented: `noteNode()` already fires on any `HELLO`/`PONG` at any
-time, so a worker that boots after the kernal's been running a while
-already gets discovered live, with no kernal restart needed.
+**Liveness -- BUILT, with no dedicated heartbeat.** Every verified
+message from a known node refreshes it, and workers answer `PING` at
+their jobs' yield points (`yield()`, `sleep()`, any `gmuxapi` wait), so
+a node busy with a cooperating job still answers. The kernal only
+watches nodes that have running jobs: once one has been silent for 3s
+(counting from the later of its last message and its last dispatch) it
+gets a `PING` probe, and after 10s with no reply it's marked down. Its
+running jobs become `"lost"` (and their children's orphan policies
+apply, as if the parent had finished); it's skipped by round-robin, by
+`runall`, and in the fan-out cap and scheduler-stress counts, and a
+fullscreen grant it held is released. An idle node that died is found
+out the first time a job is sent to it and goes unacknowledged. Any
+later message from it brings it back. Note the kernal does NOT receive
+a node's yields as such -- the yield points are just where the node
+answers probes, which gives the same signal without new traffic.
+`spawn` to an unknown or down node is refused.
 
-**Planned draining is a different, deliberate action** -- taking a
-node out of rotation on purpose (maintenance, say), as opposed to it
-just dying. This is a real, distinct capability worth having, separate
-from crash handling.
+**Job history.** Running jobs are always kept. Only the last 100
+finished jobs are kept, and a finished job keeps a 40-character
+`codePreview` instead of its full source. `get_processes` returns
+summaries (no source, no result); `get_process(id)` returns one job in
+full.
 
-### Semi-live migration
+Nodes rejoining (or new ones joining) the live pool is free:
+`noteNode()` fires on any `HELLO`/`PONG` at any time, so a worker that
+boots after the kernal's been running a while gets discovered live,
+with no kernal restart needed.
 
-For planned draining (or any other reason to move a running job off its
-current node without losing its progress), the design is: **pause,
-serialize, ship, resume** -- and the job itself never knows the
-difference. Concretely:
+**Planned draining -- BUILT** -- a different, deliberate action:
+taking a node out of rotation on purpose (maintenance, say), as opposed
+to it just dying. REPL `drain <node>` marks it draining: the balancer
+and `liveNodeCount()` skip it, every migratable `.mxe` on it is moved to
+another node (see below), and everything else finishes where it is.
+`undrain <node>` puts it back. `nodes` shows `DRAINING`. Test 31.
 
-1. **Pause**: the kernal simply stops resuming that job's coroutine.
-   No special signal needed -- "paused" just means "not scheduled."
-2. **Serialize**: `eris.persist(perms, co)` turns the live, suspended
-   coroutine -- including its call stack and local variables -- into a
-   byte string.
-3. **Ship**: the bytes go over the same wire framing as everything
-   else (`MSG` chunking) to the target node.
-4. **Resume**: `eris.unpersist(uperms, bytes)` on the target
-   reconstitutes it as a live coroutine; resuming it continues exactly
-   where it left off.
+### Migration -- BUILT for `.mxe`, through the `mux` library
 
-**This is confirmed, not speculative.** `eris` is a real native Lua
-global in OC's own sandbox (`LuaStateFactory.scala` opens the `ERIS`
-library in all three of OC's Lua profiles -- 5.2, 5.3, *and* 5.4, so it
-coexists with `kernal/bitmap.lua`'s `utf8.char` dependency on any
-5.3/5.4 build with no conflict). More than that: the actual mechanism
-was run for real, against the genuine upstream `fnuecke/eris` library
-(built from its own source, since it's a modified Lua distribution, not
-a loadable module) -- not OC's exact binding, but the same real
-implementation OC's own `PersistenceAPI.scala` is built on. Confirmed
-directly:
+The built-in `mux` library (granted to any `.mxe` that lists it in its
+header's `libraries`, never fetched from disk):
 
-- A coroutine persisted mid-loop, with real accumulated local state,
-  revives into a brand-new coroutine object that resumes and continues
-  correctly.
-- **The scenario that actually matters for migration**: persisting in
-  ONE process, writing the bytes to a file, and unpersisting in a
-  COMPLETELY SEPARATE process -- the revived job continued its exact
-  progress, and a native function reference marked permanent (the
-  stand-in for `component`/`computer` in a real migration) correctly
-  re-bound to the **receiving** process's own binding, not a stale
-  reference to the sender's.
-- Getting this right requires marking essentially everything reachable
-  from the persisted coroutine's `_ENV` as permanent in `eris`'s
-  `perms` table -- not just the one native function you think to mark
-  (found the hard way: an empty `perms` table fails the instant the
-  coroutine's closure reaches `coroutine.yield` itself via its
-  environment). The fix mirrors exactly what OC's own
-  `PersistenceAPI.scala` does: walk all of `_G` recursively.
+- `mux.migratable(save)` -- opt in. `save` is called at a yield point
+  when the kernal wants to move the process and returns a plain table
+  (anything the serializer can send). Tells the kernal via `MIGRATABLE`.
+- `mux.restored()` -- the table `save` returned, after a move; `nil` on
+  a fresh start. The program is restarted from the top with it, so it
+  picks up where it left off.
 
-See `test/hardware/verify.lua` (checks 6-9) and its own README for the
-full account, including what still ISN'T confirmed: OC's own
-jnlua-bound `eris` integration specifically, and real OC
-`component`/`computer` behavior under an actual migration (as opposed
-to a stand-in native function) -- that's what running the suite on
-real hardware still needs to close.
+Flow: REPL `migrate <id> [node]` (or `drain`) sends the job's node
+`MIGRATE <id> <node>`. At its next yield point the worker calls `save`;
+on success it ends the process and sends `MIGRATED` with the state, and
+the kernal re-dispatches the same job id (code, args, program) to the
+target with `restore`. On failure (never opted in, `save` errored,
+state not serializable) it sends `MIGRATEFAILED` and the process keeps
+running. A job still queued (never started) moves with no state. If the
+chosen target went down meanwhile, the kernal picks another live node;
+with none, the job is `lost`. Legacy programs are never migrated. Test 31.
+
+The original design below is why it's opt-in rather than transparent.
+
+### Transparent migration -- BLOCKED: no `eris` in the sandbox
+
+The design was: **pause, serialize, ship, resume** -- pause the job,
+`eris.persist` its suspended coroutine (call stack and locals) to bytes,
+ship them to the target node, `eris.unpersist` and resume there, with
+the job never knowing. The mechanism itself works (confirmed against
+the real upstream `eris` library earlier, including a cross-process
+round trip).
+
+**Decided instead**: no migration for legacy programs. For an `.mxe`
+it's an optional feature, through a `mux` library: an app that wants
+to be movable hands over a state table and is restarted from it on the
+new node; one that doesn't simply isn't migrated.
+
+**Why not the original design: sandboxed code can't reach `eris`.** The mod opens the ERIS
+library in the Lua state for its own use (saving machines when a world
+saves), but `machine.lua`'s sandbox -- which EEPROM code, and so all of
+muxos, runs in -- doesn't expose it. Confirmed by reading the mod's
+`machine.lua` and by `test/hardware/verify.lua`, which reports it absent
+in the emulated sandbox. So this can't be built as designed; the opt-in `mux` version
+above replaces it.
 
 ### Compositor access for `.mxe`
+
+An `.mxe` makes draw calls to the compositor directly -- no virtual GPU
+-- and doesn't have to run on the kernal's node to do it. The
+compositor's interface for this is built on a similar model to gmux's
+virtual GPU, but with far less overhead, and without a gmux-style
+virtual frame buffer per app.
 
 An `.mxe` app gets a **window handle** from the compositor, not
 compositor authority -- the same kind of restriction in kind as the
@@ -1140,33 +1478,135 @@ its own handle, but it doesn't get to touch anyone else's window or any
 of the compositor's own bookkeeping (z-order, occlusion, dirty
 tracking, flush timing all stay the compositor's).
 
-This is a real shift from how `createWindow` works today, though:
-right now it's one-shot (`options.code` runs once against a freshly
-allocated buffer, and "updating" a window means calling `createWindow`
-again). The handle model implies a **persistent, redrawable** window --
-an app holds its handle for its whole lifetime and pushes new content
-into it whenever it wants, not once. The exact API for this (what a
-repeated draw call looks like, how dirty-tracking interacts with a
-handle that's drawn into intermittently rather than once) hasn't been
-designed yet.
+**Persistent window handles -- BUILT.** A window belongs to the process
+it was created for (`create_graphics_process`'s child) or, otherwise, to
+the process that created it. That process -- or an ancestor of it --
+redraws it whenever it wants with `gmuxapi.draw_window(id, options)`
+(`DRAWWINDOW`): `code` (with `args`, visible to the code as `args`)
+and/or a `pixels` bitmap, blanking the buffer first unless
+`clear = false`. Redraw code runs in the same sandbox as creation (no
+kernal globals, drawing-only `gpu`, no `pcall`, its own coroutine
+under the machine's deadline).
+Compiled draw code is cached per window keyed by its source, so an app
+that redraws with the same code and new `args` doesn't recompile each
+time. Any other process is refused (test 28).
+
+### Window focus and keyboard delivery -- BUILT
+
+**Focus**: `kernal/compositor.lua` keeps one focused window. A newly
+created window takes focus, the same convention as it taking the top
+z-order slot. Touching a window focuses and raises it (touching the
+console gives keys back to the REPL); the `focus <window id>` REPL
+command does it from the keyboard, and Ctrl+Alt+C focuses the console. `windows` shows the focused window and each
+window's owning process (test 14).
+
+**Delivery**: keyboard (`key_down`/`key_up`) and mouse-wheel input go to
+the process that owns the focused window, as `EVENT` messages to its
+node; the process reads them with `gmuxapi.pull_event(timeout)`, which
+returns `{name, ...}` lists like `{"key_down", char, code}`. Events for
+a process still queued on its node wait for it (up to 64). The console
+gets the input instead in console mode, when it's focused, or when the
+focused window's process has ended or its node is down; Ctrl+Alt+C
+always reaches the kernal (test 28). This is the `.mxe` model -- the
+kernal hands the process its input directly, no virtual keyboard
+component.
+
+**Still open**: a keyboard gesture for moving focus between windows
+(today touch, `focus` at the console, and Ctrl+Alt+C).
+
+### Window decorations -- BUILT, copied from gmux
+
+`kernal/compositor.lua` draws gmux's decorations
+(`gmux/lib/gmux/frontend/windows.lua`): same colors (monochrome on a
+1-bit screen), glyphs and button columns. A decorated window's `x,y` is
+its title bar; its body (`width` x `height`, what the owner draws into)
+is on the rows below. The title bar is painted straight into the frame
+buffer, so it costs no video memory.
+
+- **Title**: gmux's process prefix -- the window stays up after its
+  process ends, marked ⏹ (done or killed) or ❌ (error, lost) -- then
+  the title, cut short of the buttons.
+- **Minimize** (w-5): collapses to the title bar and back.
+- **Maximize** (w-3, `resizable` windows only): fills the screen and
+  back.
+- **Close** (w-1): removes the window and kills its process, as in gmux.
+- **Title drag** moves the window; dragging a resizable window's
+  bottom-right body cell resizes it.
+
+Each button also answers on the cell to its right (the glyphs can be
+double-width). Touch, drag and drop anywhere else in a body go to the
+owner process as `{"touch"|"drag"|"drop", x, y, button}` in body
+coordinates. A resize (maximize, restore, corner drag) sends
+`{"window_resized", id, width, height}`. The buffer is reallocated
+keeping what fits, and the owner redraws.
+
+`create_window`/`create_graphics_process` take gmux's `resizable` and
+`title_bar` (`false` = undecorated) options. The console is an
+undecorated window. Windows are clipped to the screen, so one dragged
+partly off-screen is fine. Nothing reacts to touch while one owner has
+the whole screen (console mode, fullscreen). Test 32.
+
+### The console -- BUILT
+
+The console's text lives in regular memory; it never has a video
+buffer of its own. It has two sizes:
+
+- **Normally** it's a compositor *text window* on the bottom layer. A
+  text window holds rows of text instead of a gpu buffer, and the
+  compositor paints the visible part of those rows straight into the
+  frame buffer. Its size isn't fixed: it starts as the bottom half of the
+  screen, and `console <width> <height> [x y]` resizes or moves it at
+  any time (cheap -- there's no buffer to reallocate; output re-wraps to
+  the new width).
+- **In console mode** (hold Ctrl+Alt+C; `comp` or a press leaves it) it's the compositor's
+  exclusive owner -- the same mode a fullscreen node uses -- and draws
+  straight onto the real screen at full resolution.
+
+So the frame buffer is the only full-screen buffer muxos allocates, and
+the console allocates none (test 20 checks both). Output is kept as
+logical lines -- the last 500 lines of output -- and wrapped only when
+rendered, at whichever width the console
+currently has, at most once per tick, which gives:
+
+- **Scrollback**: PgUp/PgDn scroll a page; the mouse wheel scrolls 3
+  rows. A `[scrolled N -- PgDn]` tag shows while scrolled back, a
+  scrolled-back view stays put as new output arrives, and typing snaps
+  back to the bottom.
+- **Backspace across a wrapped input line**, since the line being typed
+  is one logical line.
+- **Input buffering**: keys typed while a command is still running are
+  queued and replayed once it returns, instead of running a second
+  command nested inside the first one's wait. (A different approach may
+  replace this later.) Ctrl+Alt+C and scrolling are never queued.
+
+The console gets keyboard input whenever no live process owns the
+focused window (see "Window focus and keyboard delivery" above).
 
 ### Still open
 
 Collected in one place:
 
-- Depth/fan-out caps on recursive parent/child spawning (or whether
-  there's a cap at all) -- no cap is enforced today.
 - The exact shape of the "job environment abstraction" -- what's
   actually exposed to a dispatched `.mxe` app vs. a plain `JOB`, beyond
   the `jobId` global and `gmuxapi` every job already gets today.
-- The persistent-window-handle API's exact shape (semi-live migration
-  and the compositor handle model are both still forward design, not
-  implemented -- see their own sections above).
-- No timeout or manual-kill cleanup for an "orphan"-policy job that's
-  never reclaimed -- it just runs forever, registered in `appsByName`,
-  until something asks for it by name.
 - "promote"'s self-dependence requirement isn't enforced -- the kernal
   takes the declared policy at face value.
+- **OPM's interface to the kernal** -- undecided (what OPM needs from
+  the kernal beyond reading/writing the disk).
+- The general `.mxe`-vs-legacy hardware access model: `.mxe` apps make
+  direct kernel calls for every subsystem (the `gmuxapi` pattern
+  already built for windows/gpu, generalized) and never see
+  virtualized/emulated hardware components; legacy OpenOS/gmux-compat
+  apps DO get emulated hardware for compatibility (e.g. a virtual
+  modem component). Concrete examples given, not yet built: networking
+  should give `.mxe` a lightweight kernal modem kernel module
+  implementation plus eventual GERTi access, while legacy sees an
+  emulated modem; keyboard input should be delivered directly to
+  whichever `.mxe` job currently has focus, instead of via a virtual
+  keyboard component. Window-focus tracking itself is now scaffolded
+  (see "Window-focus tracking" above) -- what's still open is the
+  networking side entirely (the modem kernel module, GERTi access) and
+  the actual keyboard-delivery wiring on top of that scaffolding.
 
 **Resolved while building the rest of this section**: "what the kernal
 does when every worker is already busy" turned out to already have an

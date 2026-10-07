@@ -9,14 +9,13 @@ the kernal is the scheduler/front-end.
   (mirroring the mod's own stock bios.lua, adapted to load `/muxos.lua`
   instead of OpenOS's `/init.lua`), and `kernal/muxos.lua` is its
   "init" -- not a program running under OpenOS, a REPLACEMENT for it.
-  There is no OpenOS anywhere on the kernal: no `require`, no `io`/`os`
-  libraries, no `event`/`thread`/`keyboard` libraries, no
-  `component.proxy()`/dot-shorthand component access. All of those are
-  confirmed ABSENT from the mod's own native Lua sandbox (verified
-  directly against its Scala source -- see docs/PROTOCOL.md), so
-  `muxos.lua` builds every one of those itself from the real primitives
-  (`component.list`/`component.invoke`, `coroutine.yield`) instead of
-  assuming OpenOS is there to provide them -- the same bare-metal
+  There is no OpenOS anywhere on the kernal: no `require`, no `io`,
+  no `event`/`thread`/`keyboard` libraries. It runs in the mod's own
+  `machine.lua` sandbox (see docs/PROTOCOL.md's "The real sandbox"),
+  which provides `component`, `computer` (including
+  `computer.pullSignal`) and the standard libraries, so `muxos.lua`
+  builds the rest itself instead of assuming OpenOS is there to
+  provide it -- the same bare-metal
   discipline `node/bios.lua`/`node/runtime.lua` always had to follow,
   just applied on the kernal too now, including its own minimal
   built-in text console (there is no `io`/`print`-to-screen without
@@ -75,7 +74,7 @@ kernal/bios.lua       the kernal's own EEPROM image: mirrors the mod's stock bio
                        OpenOS on the kernal, there's no OpenOS /init.lua in this picture.
 kernal/muxos.lua      kernal "init": boot-serving + discovery + round-robin job dispatch +
                        job registry (jobs) + a minimal built-in REPL/text console, all built
-                       on raw component.list/invoke + coroutine.yield, no OpenOS libraries.
+                       on the sandbox's component/computer APIs, no OpenOS libraries.
 kernal/compositor.lua  the only file that touches the real gpu for window content: window
                        registry, Z-order, occlusion culling, dirty tracking, a persistent
                        frame buffer, draw-code execution, blit-to-screen. Read off the boot
@@ -83,20 +82,27 @@ kernal/compositor.lua  the only file that touches the real gpu for window conten
 kernal/bitmap.lua      half-block/braille pixel-grid encoder for "bit windows" -- OC's gpu
                        hardware has no pixel API, so this is sub-cell encoding on top of the
                        same character grid. Loaded by compositor.lua via loadSibling().
+installer/install.lua  the installer (runs on OpenOS): installs the kernal, flashes EEPROMs.
+tools/build.lua        builds it, with everything it installs, into dist/ (see "Installing").
+dist/muxos-installer.lua  the built single-file installer.
+test/emu/install_test.lua runs that installer on emulated hardware and boots the result.
+kernal/lib/            OpenOS libraries for legacy programs (vendored unchanged, MIT),
+                       installed as /lib on the kernal's disk; see kernal/lib/README.md.
 node/bios.lua         worker EEPROM image: tiny network-boot stub, fetches node/runtime.lua
 node/runtime.lua       worker's real runtime, served by the kernal (installed as its sibling,
                        NOT flashed anywhere) -- job execution, remote-component bridge, gpu
                        face, gmuxapi (muxos's own, gmux-API-shaped)
+docs/MXE.md           the .mxe program format: the spec programs written for muxos target
+opm/                  OPM, the package manager, ported to .mxe (ships with muxos)
 docs/PROTOCOL.md      shared wire format: the boot handshake + the main message protocol +
                        the gmux API translation + the bare-metal kernal design
 test/emu/              a 4-node (1 kernal + 3 workers) test environment, emulating this
                        project's own verified native primitives -- not the community OCEmu
                        (needs LÖVE2D, not installable headless here). Boots the REAL,
                        unmodified repo files and drives the kernal's REPL like a human would.
-test/hardware/         verify.lua -- a bare-metal suite for REAL OpenComputers hardware,
-                       covering what test/emu's sandbox can't: real eris coroutine
-                       persistence (the proposed job-migration mechanism), the real Lua
-                       library profile, real GPU buffer operations.
+test/hardware/         verify.lua (+ its bios.lua loader) -- a suite for REAL OpenComputers
+                       hardware confirming the sandbox behavior muxos depends on; it
+                       also passes inside test/emu's emulated sandbox (test 30).
 smux/                 reference only (see above): a real, standalone OpenOS multiplexer,
                        forked from gmux's backend. Not run on any node in this project.
 gmux/                 reference only (see above): the real graphical multiplexer, vendored
@@ -123,39 +129,105 @@ resolve. `smux/test/test_gertinet.lua` fails on `require` as a result;
 everything else (33 of smux's own tests: framing, session, job_console,
 serve, the installer) passes standalone.
 
-## Flashing a worker
+## Installing
 
-From an OpenOS shell that has an EEPROM component available (either the
-worker's own, before you've wiped its default BIOS, or via an EEPROM
-programmer):
+### Hardware
 
-```
-eeprom node/bios.lua
-```
+- **Kernal:** one computer with a tier 3 GPU, a screen, a keyboard, a
+  network card and a hard disk. It runs no OpenOS once installed.
+- **Workers:** three computers, each with a network card and an EEPROM.
+  No disk is needed.
+- **Network:** all four computers on the same network (cables or
+  wireless) so their network cards can reach each other.
 
-Then boot that node with no filesystem attached -- it never looks for
-one. It will sit broadcasting `BOOT` every 5 seconds until the kernal
-answers; that's expected, not a hang.
-
-## Running the kernal
-
-`kernal/bios.lua` is the kernal's EEPROM image -- flash it the same way
-as a worker's:
+### Build the installer (on your PC)
 
 ```
-eeprom kernal/bios.lua
+lua5.3 tools/build.lua                    # dist/muxos-installer.lua
+lua5.3 tools/build.lua --floppy <dir>     # also a floppy layout: install.lua + files/
 ```
 
-Then copy `kernal/muxos.lua`, `kernal/compositor.lua`,
-`kernal/bitmap.lua`, **and** `node/runtime.lua` onto the ROOT of the
-kernal's filesystem (as `/muxos.lua`, `/compositor.lua`, `/bitmap.lua`,
-`/runtime.lua` -- fixed paths, see "Layout" above) and boot the kernal
-with that filesystem attached. There is no OpenOS shell to run
-`muxos.lua` from any more -- `kernal/bios.lua` loads and runs it
-directly as the kernal's entire resident environment. Workers fetch
-`runtime.lua`'s source from the kernal's disk at boot -- it is never
-installed on a worker itself; `compositor.lua`/`bitmap.lua` likewise
-never leave the kernal.
+The build checks everything compiles, that both BIOS images fit an EEPROM
+(4096 bytes), and that the kernal and worker versions match.
+`dist/muxos-installer.lua` is committed, so you can skip building.
+`lua5.3 test/emu/install_test.lua` runs that exact installer against
+emulated hardware and boots the result.
+
+### Get it into the game
+
+Either way, the installer runs on an OpenOS computer:
+
+- **One file, with an internet card:**
+  `wget https://raw.githubusercontent.com/<owner>/<repo>/<branch>/dist/muxos-installer.lua`.
+  On a private repository, download it from GitHub yourself and use one
+  of the options below.
+- **With opm, from the LewisHost.Net catalog:** copy this repository
+  into oc-programs as `muxos/` and merge `dist/programs.cfg`'s entries
+  into the catalog. Then, on an OpenOS computer,
+  `opm pull muxos-installer <floppy>` puts the installer on that floppy
+  with a `muxos` launcher: run `/mnt/<floppy>/muxos worker`, then
+  `/mnt/<floppy>/muxos kernal`.
+- **Copy it onto a disk:** put `muxos-installer.lua` (or the floppy
+  layout's contents) into the disk's folder in your world save,
+  `saves/<world>/opencomputers/<disk address>/`, while the disk is in a
+  computer.
+
+The single file is about 260 KB. OpenOS reads a program whole before
+running it, so the computer running it needs plenty of memory (two tier
+3 sticks are comfortable). The floppy layout copies file by file and
+needs far less.
+
+### 1. Flash the workers
+
+On any OpenOS computer:
+
+```
+muxos-installer.lua worker
+```
+
+It flashes the worker BIOS onto the EEPROM in that computer, then asks
+you to swap in the next one: take the EEPROM out, put the next one in,
+and press Enter. Type `q` when done. Put each flashed EEPROM in a worker,
+and put this computer's own EEPROM back. `--count=3` stops after three.
+
+### 2. Install the kernal
+
+On the kernal computer, booted into OpenOS (from a floppy, or OpenOS on
+its hard disk):
+
+```
+muxos-installer.lua kernal
+```
+
+It:
+
+- lists the writable disks and asks which one to use (the installer's
+  own disk isn't offered);
+- checks the space and warns about missing hardware (tier 3 GPU, screen,
+  network card);
+- writes muxos and the OpenOS libraries for legacy programs. Each file
+  goes in as `<name>.new` and they're all swapped in at the end, so a
+  disk that fills up mid-install changes nothing;
+- flashes this computer's EEPROM with the kernal BIOS, pointed at that
+  disk.
+
+Running it again upgrades in place and keeps your own files. Take the
+OpenOS floppy out, reboot, and muxos starts. Workers boot from the
+network as soon as they're powered on, in any order.
+
+Options: `--disk=<address prefix or label>`, `--yes` (no questions),
+`--reboot`.
+
+### Installing by hand
+
+- Flash `node/bios.lua` onto each worker's EEPROM and `kernal/bios.lua`
+  onto the kernal's (`flash -q <file>` in OpenOS).
+- Copy `kernal/muxos.lua`, `kernal/compositor.lua`, `kernal/bitmap.lua`
+  and `node/runtime.lua` to the root of the kernal's disk, and
+  `kernal/lib` to `/lib`.
+
+The kernal BIOS boots the first disk with `/muxos.lua` on it. Workers
+never need a disk: they fetch `runtime.lua` from the kernal at boot.
 
 It discovers workers automatically, then drops into a prompt:
 
@@ -170,6 +242,11 @@ muxos> processes
 muxos> spawn 1 return 42
 muxos> window hello 5 5 20 5 gpu.set(1,1,"hi from the kernal")
 muxos> windows
+muxos> comp
+muxos> console 80 20
+muxos> hello world            (runs /bin/hello.mxe or /bin/hello.lua)
+muxos> hello world &          (in the background)
+muxos> pause 12 / resume 12 / kill 12
 muxos> bitdemo halfblock 5 5
 muxos> bitdemo braille 30 5
 muxos> components 1
@@ -285,10 +362,12 @@ answer any of them from its own state alone:
   through, for a fullscreen app that wants to bypass the compositor's
   buffer/blit indirection on purpose.
 
-See docs/PROTOCOL.md for exactly what's NOT translated: this is not
-gmux's real desktop (no layering, dragging, resizing, or input routing
--- `gmux/lib/gmux/frontend/windows.lua`/`graphics.lua` weren't ported),
-and `get_backend`/`get_graphics`/`get_process`/`show_error` don't exist
+Windows carry gmux's decorations (copied from
+`gmux/lib/gmux/frontend/windows.lua`): a title bar with the process
+status prefix, minimize, maximize (resizable windows) and close (which
+kills the process, as in gmux), title-drag to move, and corner-drag to
+resize. Touch focuses and raises a window, and pointer input reaches its
+owner process. See docs/PROTOCOL.md for what's NOT translated: `get_backend`/`get_graphics`/`get_process`/`show_error` don't exist
 here at all.
 
 ## Status
@@ -301,12 +380,13 @@ fire-and-forget `SPAWN` path, completion recorded generically either
 way) + a symmetric remote-component bridge (kernal<->worker, used by
 workers to reach kernal hardware they don't have locally, e.g. `gpu`),
 gated so direct gpu/screen access requires an exclusive fullscreen grant
-(with a Ctrl+Alt+C local escape hatch to force-release a grant whose
-holder disappeared) + a compositor module (`kernal/compositor.lua`)
+(Ctrl+Alt+C: a press exits fullscreen, force-releasing a grant whose
+holder disappeared; holding it drops into the full-screen kernal
+console until `comp`) + a compositor module (`kernal/compositor.lua`)
 that's the sole real gpu-touching code in the project for window
 content, with Z-order, occlusion culling, dirty tracking, and a
 persistent frame buffer flipped to the real screen with one `bitblt`
-per flush, adapted from gmux's real `graphics.lua` + a single-coroutine
+per flush (of just the changed area), adapted from gmux's real `graphics.lua` + a single-coroutine
 event loop (`tick()`) that every wait in the program funnels through,
 replacing OpenOS's thread library entirely now that the kernal is
 bare-metal + every message over the modem generically chunked (not
@@ -322,30 +402,26 @@ itself now fully bare-metal (`kernal/bios.lua` + a `muxos.lua` built
 entirely on native primitives, with its own minimal text console and
 keyboard-modifier tracking replacing OpenOS's io/keyboard libraries) +
 protection against OC's real non-yielding timeout for dispatched `JOB`
-code (a voluntary `yield()` a job can call to cooperate, plus a hard
-instruction-budget circuit breaker that kills a non-cooperating job
-before it risks the mod killing the whole worker -- see
-docs/PROTOCOL.md for why the obvious "force a yield from a debug hook"
-fix doesn't actually work in Lua 5.3) + a 4-node test environment
-(`test/emu/`) that boots the real, unmodified files end to end and
+code (a voluntary `yield()` a job can call to cooperate, `sleep(seconds)`
+to wait without swallowing other traffic, and each job in its own
+coroutine so the machine's own "too long without yielding" deadline ends
+a runaway job without taking the worker down) + a 4-node test
+environment (`test/emu/`) that boots every node through the mod's own
+`machine.lua` sandbox (vendored in `test/emu/oc/`) and runs the real,
+unmodified files end to end, and
 drives the kernal's REPL like a human would, which caught two genuine
 bugs no isolated unit mock could have (a compositor `flush()` that
 wiped the console's own output, and a job-preemption design that could
 hang a job calling `gmuxapi.*` forever -- see docs/PROTOCOL.md's
 "Hardening found by actually running the real files together").
 Not yet built: a real scheduler (load balancing beyond round-robin, async
-futures/callbacks for `submit()` itself, not just `SPAWN`), node
-health/failure handling, the fullscreen grant's no-automatic-release-on-
-crash gap, broader OpenOS-compatibility-shim coverage for legacy
-programs beyond `gpu` (see docs/PROTOCOL.md's OpenOS-compatibility
-section for the intended shape), dragging/resizing/input routing (still
-not gmux's full desktop), per-job isolated drawing surfaces (so
+futures/callbacks for `submit()` itself, not just `SPAWN`), more of the OpenOS userland for legacy
+programs, e.g. `buffer` and `shell` (see docs/PROTOCOL.md's OpenOS-compatibility
+section for the intended shape), per-job isolated drawing surfaces (so
 `create_graphics_process`'s job and its window are actually wired
 together -- true for bit windows too now), an actual toolbar/icons/
 wallpaper built with the bit-window encoder (the encoder works, nothing
-composites a desktop with it yet, and closing a window to a toolbar
-icon isn't built either -- see docs/PROTOCOL.md for the intended
-semantics), the REPL's own line editor (append/backspace only -- no
+composites a desktop with it yet), the REPL's own line editor (append/backspace only -- no
 history, no cursor movement within a line), multi-monitor support
 (explicitly deferred until the single-GPU case works end to end), and
 anything workload-specific.
@@ -358,22 +434,93 @@ the real global `jobId`, the kernal's single global job table carries
 stays exactly where it was -- round-robin, unchanged), and
 `orphan`/`kill`/`promote` are all applied for real the moment a
 parent's job finishes (`kill` is best-effort, only reachable at a
-child's own cooperative yield points -- same fundamental limit as the
-JOB timeout circuit breaker). App identity and orphan reclaim are real
+child's own cooperative yield points). App identity and orphan reclaim are real
 too: `gmuxapi.get_orphans(name)` hands back a relaunched app's old
 orphans, claimed once. Building this surfaced and fixed a real bug in
 `remoteRequest()` that silently dropped a child's own `JOB` dispatch
 when it landed on its own parent's node -- see docs/PROTOCOL.md.
 Verified end to end in `test/emu/integration_test.lua` (test 12).
 
-**Still forward design, not yet built**: planned node draining as
-distinct from an unrecoverable node death, and "semi-live" job
-migration via `eris` coroutine persistence (the mechanism itself is
-confirmed for real against the genuine upstream `eris` library,
-including a full cross-process round trip -- see
-`test/hardware/verify.lua` -- but nothing in `kernal/muxos.lua`/
-`node/runtime.lua` uses it yet). See docs/PROTOCOL.md's "The `.mxe`
-process model" section for the full design and what's still genuinely
-undecided (fan-out caps, the exact job-environment and
-persistent-window-handle APIs, no cleanup timeout for an unreclaimed
-orphan).
+A fan-out/depth cap is real too: a job tree (a top-level job plus every
+descendant it spawned, at any depth) can't have more than `#nodeOrder`
+jobs "running" at once -- as many as there are worker nodes. And an
+`orphan`-policy job that's never reclaimed doesn't just run forever
+unbounded any more: its cleanup timeout shrinks dynamically as
+scheduler load rises (`BASE_ORPHAN_TIMEOUT / (1 + schedulerStress())`),
+freeing its slot sooner precisely when capacity is actually scarce.
+Both verified end to end in `test/emu/integration_test.lua` (test 13
+for the fan-out cap; the dynamic-timeout formula itself is also
+cross-checked in isolation, since its 300s base timeout makes a true
+end-to-end test of the sweep impractical).
+
+Window-focus tracking is scaffolded now too: `CREATEWINDOW` carries an
+optional `ownerJobId` (`create_graphics_process` sets it to the
+spawned child's own id), and `kernal/compositor.lua` tracks which
+window is focused (a new window takes focus automatically, same as it
+taking the top z-order slot) with `M.getFocus()`/`M.setFocus(id)` and a
+manual `focus <window id>` REPL command; touching a window focuses it
+too. Keys, wheel and touch input go to the focused window's process
+(see docs/PROTOCOL.md's "Window focus and keyboard delivery" and
+"Window decorations"). Verified in `test/emu/integration_test.lua`
+(tests 14, 28, 32).
+
+The console keeps its text in regular memory (500 lines of scrollback)
+and has no video buffer: it's a resizable text window (`console <w> <h>`,
+bottom half of the screen by default) painted into the frame buffer, or,
+in console mode, drawn straight onto the screen. It has scrollback
+(PgUp/PgDn, mouse wheel) and queues input while a command runs. Nodes are tracked
+for liveness without a heartbeat (probes answered at job yield points;
+a silent node's jobs become `lost`), finished-job history is capped at
+100 without source, and `get_orphans` only hands out real orphans (with
+their result if they finished). Verified in `test/emu/integration_test.lua`
+(tests 20-26).
+
+**Legacy (OpenOS) programs -- BUILT so far.** A `.lua` program gets
+OpenOS's `require`: the common OpenOS libraries (vendored in
+`kernal/lib`, installed as `/lib`; add more by installing files there)
+plus runtime faces for `component`, `computer`, `event`, `term`,
+`filesystem` and `unicode`. It behaves like a gmux app: it has its own
+decorated, resizable window that is its terminal (`print`/`io.read`)
+and its virtual gpu/screen/keyboard, and it uses the OS filesystem
+(the kernal's disk) through `io`/`filesystem`. Tests 29, 33-35.
+
+**Cluster component bus -- BUILT.** Every node's components are visible
+to programs anywhere in the cluster. Each node reports its components to
+the kernal, and programs use them through the normal `component` API:
+calls to their own node's components are direct, others go through the
+kernal. Values a call returns, like an internet request handle, work
+remotely too. OpenComputers gives each computer its own component bus,
+so this is emulated over the network. The display, network cards and
+firmware stay off it. `bus` at the console lists it. Test 36.
+
+**`.mxe` spec and OPM -- BUILT.** docs/MXE.md is the contract for
+programs written for muxos: header fields, version compatibility,
+libraries (`/lib/mxe`, `/usr/lib/mxe`, with dependencies), and the native
+API (`fs`, `readLine`, `gmuxapi`, `component`, the `mux` and `http`
+libraries). OPM is ported to it (`opm/`) and ships with muxos:
+`opm pull <package>`. Tests 37-38.
+
+**Migration and draining -- BUILT.** An `.mxe` that lists the built-in
+`mux` library can opt in with `mux.migratable(save)`; `migrate <id>
+[node]` moves it at its next yield point and it restarts on the target
+with `mux.restored()` returning its saved state. `drain <node>` takes a
+node out of rotation and moves its migratable processes off; `undrain`
+reverses it. Legacy programs aren't migrated. (Transparent migration
+isn't possible: the sandbox has no `eris`.) Test 31.
+
+**Still forward design, not yet built**: the
+rest of the general `.mxe`-vs-legacy hardware access model: the
+networking side entirely (a lightweight kernal modem kernel module for
+`.mxe`, eventual GERTi access, vs. an emulated modem for legacy). See
+docs/PROTOCOL.md's "The `.mxe` process model" section for the full
+design and what's still genuinely undecided.
+
+Processes are isolated (own environment, crash-contained) and the
+kernal can pause, resume, or end any of them; windows are persistent
+handles their process can redraw (`gmuxapi.draw_window`), and keyboard
+input goes to the process owning the focused window
+(`gmuxapi.pull_event`). Programs launch OpenOS-shell style by name
+from the console (foreground, or background with `&`) or via
+`gmuxapi.launch`: `.mxe` headers declare the muxos version and
+libraries they want and get a response; `.lua` programs get an
+OpenOS environment with console I/O. Verified in tests 27-29.

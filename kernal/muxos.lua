@@ -5,23 +5,15 @@
 -- this file directly off the boot filesystem; there is no OpenOS
 -- /init.lua anywhere in this picture.
 --
--- Everything OpenOS would normally provide at this point --
--- computer.pullSignal, event.pull/listen, thread.create, the keyboard
--- library, io/print-to-screen, component.proxy/dot-shorthand access --
--- is confirmed ABSENT from the mod's own native Lua sandbox surface,
--- verified directly against its Scala source
--- (li.cil.oc.server.machine.luac.{ComponentAPI,ComputerAPI,SystemAPI}):
--- component's real surface is only list/type/slot/methods/invoke/doc;
--- computer has no pullSignal at all (the real primitive is yielding the
--- kernel coroutine, caught by NativeLuaArchitecture.runThreaded); and
--- the native `print` only logs to the Java server console per its own
--- source comment ("Until we get to ingame screens we log to Java's
--- stdout"), never the in-game screen. So this file builds every one of
--- those itself from the real primitives (component.list/component.invoke,
--- coroutine.yield) instead of assuming OpenOS is there to provide them
--- -- the same bare-metal discipline node/bios.lua and node/runtime.lua
--- already had to follow, just applied here too now instead of resting
--- on a normal OpenOS boot underneath.
+-- This runs inside the mod's own sandbox (its machine.lua), not on raw
+-- Lua: what's there is component (list/type/slot/methods/invoke/doc/
+-- proxy), computer (including computer.pullSignal, pushSignal,
+-- shutdown, uptime), the standard libraries with a wrapped
+-- coroutine.yield/resume, and a debug table with only getinfo/
+-- traceback/getlocal/getupvalue. What OpenOS would add on top --
+-- event.pull/listen, thread.create, the keyboard library,
+-- io/print-to-screen -- isn't there, so this file builds what it needs
+-- itself (the sandbox has no `print` at all).
 --
 -- Install: kernal/bios.lua (flashed to the EEPROM), this file,
 -- kernal/compositor.lua, kernal/bitmap.lua, and node/runtime.lua all
@@ -40,26 +32,22 @@
 -- actually load.
 
 local PORT = 4477
+local MUXOS_VERSION = "0.1.1"
 local TIMEOUT = 5 -- seconds to wait for a worker reply before giving up
 
--- The real primitive behind every blocking wait in this file. Yielding
--- the kernel coroutine with a timeout (in seconds) IS computer.pullSignal's
--- actual underlying mechanism -- confirmed from NativeLuaArchitecture's
--- runThreaded, which resumes a yielded coroutine with the next signal's
--- name + args once one arrives (or with nothing, if the timeout simply
--- elapses first).
+-- Every blocking wait goes through the sandbox's computer.pullSignal,
+-- which yields to the machine. (A bare coroutine.yield(timeout) does
+-- NOT: the sandbox wraps coroutine.yield to yield (nil, ...) as a user
+-- yield, so the timeout is lost and the wait only ends on a signal.)
 local function pullSignal(timeout)
-  return coroutine.yield(timeout)
+  return computer.pullSignal(timeout)
 end
 
--- Yielding a plain boolean is the real shutdown/reboot primitive
--- (false = power off, true = reboot) -- OpenOS's own computer.shutdown()
--- is just a wrapper over this. Falling off the end of this file instead
--- (a normal Lua `return`) is NOT a clean shutdown -- the mod's own
--- runThreaded treats that as "the kernel stopped unexpectedly" and logs
--- a warning, so "quit"/"exit" at the REPL go through this instead.
+-- Falling off the end of this file is NOT a clean shutdown -- the
+-- machine treats that as the kernel stopping unexpectedly -- so
+-- "quit"/"exit" go through this.
 local function shutdown(reboot)
-  coroutine.yield(reboot and true or false)
+  computer.shutdown(reboot)
 end
 
 -- Our OWN tiny component-proxy helper -- NOT OpenOS's
@@ -84,32 +72,89 @@ local function primaryComponent(ctype)
   return componentProxy(address), address
 end
 
+-- tostring() would round floats to 14 significant digits and turn
+-- inf/nan into bare identifiers that deserialize as nil.
+local function serializeNumber(v)
+  if v ~= v then return "0/0" end
+  if v == math.huge then return "1/0" end
+  if v == -math.huge then return "-1/0" end
+  if math.type(v) == "integer" then return tostring(v) end
+  local s = string.format("%.17g", v)
+  if not s:find("[%.eE]") then s = s .. ".0" end
+  return s
+end
+
 local function serialize(v, seen)
   seen = seen or {}
   local t = type(v)
-  if t == "nil" or t == "boolean" or t == "number" then
+  if t == "nil" or t == "boolean" then
     return tostring(v)
+  elseif t == "number" then
+    return serializeNumber(v)
   elseif t == "string" then
     return string.format("%q", v)
   elseif t == "table" then
     if seen[v] then error("cannot serialize a cyclic table") end
     seen[v] = true
+    -- The array part goes positionally (no "[i]=" per element, which
+    -- would roughly double list-heavy messages), the rest as [k]=v.
     local parts = {}
+    local n = #v
+    for i = 1, n do parts[i] = serialize(v[i], seen) end
     for k, val in pairs(v) do
-      parts[#parts + 1] = "[" .. serialize(k, seen) .. "]=" .. serialize(val, seen)
+      if not (math.type(k) == "integer" and k >= 1 and k <= n) then
+        parts[#parts + 1] = "[" .. serialize(k, seen) .. "]=" .. serialize(val, seen)
+      end
     end
+    -- Only tables on the current path count as cycles; the same table
+    -- referenced twice elsewhere is fine.
+    seen[v] = nil
     return "{" .. table.concat(parts, ",") .. "}"
   else
     error("cannot serialize a value of type " .. t)
   end
 end
 
-local function deserialize(s)
-  local chunk = load("return " .. s, "=msg", "t", {})
-  if not chunk then return nil end
-  local ok, v = pcall(chunk)
-  if not ok then return nil end
-  return v
+local deserialize
+do
+  -- Messages are decoded with load(), so a message must be only data
+  -- first. Outside string literals our serializer writes nothing but
+  -- letters, digits, whitespace and { } [ ] = , . - + / -- so anything else
+  -- (a function, a call, a method call like ("x"):rep(1e9), a comment, a
+  -- long string that could hide a quote) is refused before load() sees it.
+  -- That leaves table constructors of literals, which can't run code.
+  local function isData(s)
+    local i, n = 1, #s
+    while i <= n do
+      local q = s:find('"', i, true)
+      local outside = s:sub(i, (q or n + 1) - 1)
+      if outside:find("[^%w%s{}%[%]=,%.%-%+/]") or outside:find("%[[%[=]") or outside:find("%-%-") then
+        return false
+      end
+      if not q then return true end
+      i = q + 1
+      while true do -- to the end of the string literal
+        local c = s:find('[\\"]', i)
+        if not c then return false end
+        if s:byte(c) == 92 then
+          i = c + 2
+        else
+          i = c + 1
+          break
+        end
+      end
+    end
+    return true
+  end
+
+  deserialize = function(s)
+    if not isData(s) then return nil end
+    local chunk = load("return " .. s, "=msg", "t", {})
+    if not chunk then return nil end
+    local ok, v = pcall(chunk)
+    if not ok then return nil end
+    return v
+  end
 end
 
 local modem, modemAddr = primaryComponent("modem")
@@ -163,8 +208,20 @@ local function loadSibling(name)
   return chunk
 end
 
-local selfAddr = computer.address()
+-- Every node's wire identity is its network card's address, not
+-- computer.address(): modem_message reports the SENDING CARD's address,
+-- so this is the only identity a receiver can check a payload's `from`
+-- against, and it's what node/bios.lua learns as kernalAddr from the
+-- boot handshake.
+local selfAddr = modemAddr
 local nodes = {}      -- address -> {lastSeen = computer.uptime()}
+-- The cluster component bus (see "Cluster component bus" below).
+local bus = {
+  components = {}, -- address -> {type, node, methods}
+  relays = {},     -- our request id -> {to, id, node, expires}
+}
+-- The program running in the foreground at the console (runForeground).
+local foregroundJob = nil
 local nodeOrder = {}  -- address list, stable iteration/round-robin order
 local nextJobId = 1
 local nextNode = 1
@@ -187,70 +244,178 @@ local exclusiveFullscreenOwner = nil
 -- load bitmap.lua the same way this file loaded it.
 local compositor = loadSibling("compositor.lua")(loadSibling)
 
--- The kernal's own gpu/screen, cached once -- used for isDisplayComponent
--- (below) AND for the REPL's own minimal text console (see "Minimal
--- built-in terminal" below): there is no OpenOS io/term to print through
--- any more, so the REPL draws onto the SAME real screen the compositor
--- owns, directly, the one other place in this project allowed to touch
--- the real gpu (the compositor's own windows still composite on top of
--- whatever the console drew, in z-order, same as any other screen content).
+-- The kernal's own gpu/screen, cached once -- used for
+-- isDisplayComponent (below) and to size the console window.
 local gpu, gpuAddr = primaryComponent("gpu")
 local _, screenAddr = primaryComponent("screen")
 if gpu and screenAddr then
   tryInvoke(gpuAddr, "bind", screenAddr)
 end
 
--- --- Minimal built-in terminal, replacing OpenOS's io/term entirely ---
+-- --- The console, replacing OpenOS's io/term ---
+--
+-- The console's text lives in regular memory (consoleLines) and never
+-- has a video buffer of its own. Normally it's a compositor text
+-- window on the bottom layer, painted from its rows straight into the
+-- frame buffer. Its size isn't fixed: it starts as the bottom half of
+-- the screen and the `console <width> <height> [x y]` command changes
+-- it at any time (cheap, since there's no buffer to reallocate). In
+-- console mode (hold Ctrl+Alt+C) it's the compositor's
+-- exclusive owner instead and draws straight onto the real screen at
+-- full resolution.
+--
+-- Output is kept as logical (unwrapped) lines and wrapped only when
+-- rendered, at whatever width the console currently has -- which is
+-- what makes scrollback, switching between the two sizes, and
+-- backspacing across a wrapped input line simple. Rendering happens at
+-- most once per tick (renderConsole, from tick()).
 
 local termW, termH = 1, 1
 if gpu then
   termW, termH = gpu.getResolution()
 end
-local cursorX, cursorY = 1, 1
 
-local function scrollUp()
-  gpu.copy(1, 2, termW, termH - 1, 0, -1)
-  gpu.fill(1, termH, termW, 1, " ")
+local CONSOLE_LAYER = -1000
+local CONSOLE_MIN_W, CONSOLE_MIN_H = 10, 3
+-- Scrollback, in lines of output (oldest dropped first).
+local SCROLLBACK_LINES = 500
+local consoleLines = {}      -- committed logical lines, oldest first
+local consoleDirty = true
+local scrollOffset = 0       -- wrapped rows scrolled back from the bottom
+local inputBuffer = ""       -- the REPL's line being typed
+local consolePartial = ""    -- program output not yet ended by a newline
+local commandBusy = false    -- a command is running; see handleKeyDown
+
+local consoleW, consoleH = termW, math.max(CONSOLE_MIN_H, math.floor(termH / 2))
+local consoleWin = gpu and compositor.createWindow({title = "console", x = 1, y = termH - consoleH + 1,
+  width = consoleW, height = consoleH, layer = CONSOLE_LAYER, text = true, decorated = false}) or nil
+
+local function consoleOwnsScreen()
+  return compositor.exclusiveOwner() == "console"
 end
 
-local function newline()
-  cursorX = 1
-  cursorY = cursorY + 1
-  if cursorY > termH then
-    scrollUp()
-    cursorY = termH
+-- The console's current size: the whole screen in console mode, its
+-- window otherwise.
+local function viewSize()
+  if consoleOwnsScreen() then return termW, termH end
+  return consoleW, consoleH
+end
+
+-- Splits one logical line into rows of at most `width` characters
+-- (UTF-8 aware; falls back to bytes for invalid UTF-8).
+local function wrapLine(line, width)
+  local len = utf8.len(line)
+  if not len then
+    local rows = {}
+    for i = 1, math.max(#line, 1), width do rows[#rows + 1] = line:sub(i, i + width - 1) end
+    return rows
+  end
+  if len <= width then return {line} end
+  local rows = {}
+  local startChar = 1
+  while startChar <= len do
+    local from = utf8.offset(line, startChar)
+    local to = utf8.offset(line, startChar + width)
+    rows[#rows + 1] = to and line:sub(from, to - 1) or line:sub(from)
+    startChar = startChar + width
+  end
+  return rows
+end
+
+local function liveLine()
+  if commandBusy then
+    -- A foreground program is running: show its unfinished output line
+    -- (e.g. a prompt it wrote with io.write, plus the echo of what's
+    -- being typed into it).
+    if consolePartial ~= "" then return consolePartial .. "_" end
+    return nil
+  end
+  return "muxos> " .. inputBuffer .. "_"
+end
+
+local function totalRows(width)
+  local n = 0
+  for _, line in ipairs(consoleLines) do n = n + #wrapLine(line, width) end
+  local live = liveLine()
+  if live then n = n + #wrapLine(live, width) end
+  return n
+end
+
+local function setScroll(rows)
+  local w, h = viewSize()
+  scrollOffset = math.max(0, math.min(rows, totalRows(w) - h))
+  consoleDirty = true
+end
+
+-- The h rows currently in view, top to bottom. Content shorter than the
+-- view starts at the top, like a fresh terminal.
+local function visibleRows(w, h)
+  local needed = h + scrollOffset
+  local rows = {}            -- collected bottom-up
+  local exhausted = true
+  local function addLine(line)
+    local wrapped = wrapLine(line, w)
+    for i = #wrapped, 1, -1 do
+      rows[#rows + 1] = wrapped[i]
+      if #rows >= needed then return true end
+    end
+  end
+  local live = liveLine()
+  if live and addLine(live) then exhausted = false end
+  if exhausted then
+    for i = #consoleLines, 1, -1 do
+      if addLine(consoleLines[i]) then exhausted = false break end
+    end
+  end
+  local out = {}
+  if exhausted and #rows < h then
+    for i = 1, #rows do out[i] = rows[#rows - i + 1] end
+  else
+    for r = 1, h do out[h - r + 1] = rows[scrollOffset + r] end
+  end
+  return out
+end
+
+local function renderConsole()
+  if not consoleDirty or not consoleWin then return end
+  -- Another owner (a fullscreen node) has the screen: leave it alone.
+  local owner = compositor.exclusiveOwner()
+  if owner and owner ~= "console" then return end
+  consoleDirty = false
+  local w, h = viewSize()
+  local rows = visibleRows(w, h)
+  if scrollOffset > 0 then
+    local tag = "[scrolled " .. scrollOffset .. " -- PgDn]"
+    local first = rows[1] or ""
+    local keep = math.max(0, w - #tag)
+    local len = utf8.len(first) or #first
+    if len < keep then
+      first = first .. (" "):rep(keep - len)
+    else
+      first = first:sub(1, (utf8.offset(first, keep + 1) or (keep + 1)) - 1)
+    end
+    rows[1] = first .. tag
+  end
+  if owner == "console" then
+    compositor.drawDirect(function(g)
+      g.setForeground(0xFFFFFF)
+      g.setBackground(0x000000)
+      g.fill(1, 1, w, h, " ")
+      for y = 1, h do
+        if rows[y] and rows[y] ~= "" then g.set(1, y, rows[y]) end
+      end
+    end)
+  else
+    compositor.setText(consoleWin.id, rows)
   end
 end
 
--- No word-wrap, no scrollback, no resize handling -- a flat fixed-width
--- console that scrolls one row at a time. A real gap against a proper
--- terminal, flagged rather than hidden, same honesty-over-coverage
--- standard as everything else in this project; good enough for a REPL
--- whose output is mostly short status lines.
-local function termWrite(text)
-  if not gpu then return end
-  local pos = 1
-  local len = #text
-  while pos <= len do
-    local nl = text:find("\n", pos, true)
-    local lineEnd = (nl or len + 1) - 1
-    while pos <= lineEnd do
-      local available = termW - cursorX + 1
-      local take = math.min(available, lineEnd - pos + 1)
-      if take > 0 then
-        gpu.set(cursorX, cursorY, text:sub(pos, pos + take - 1))
-        cursorX = cursorX + take
-        pos = pos + take
-      end
-      if cursorX > termW then
-        newline()
-      end
-    end
-    if nl then
-      newline()
-      pos = nl + 1
-    end
-  end
+local function consoleAppend(line)
+  consoleLines[#consoleLines + 1] = line
+  if #consoleLines > SCROLLBACK_LINES then table.remove(consoleLines, 1) end
+  -- Keep a scrolled-back view still while new output arrives below it.
+  if scrollOffset > 0 then scrollOffset = scrollOffset + #wrapLine(line, (viewSize())) end
+  consoleDirty = true
 end
 
 -- Shadows the native `print` (which only logs to the Java server
@@ -260,7 +425,29 @@ local function print(...)
   local n = select("#", ...)
   local parts = {}
   for i = 1, n do parts[i] = tostring((select(i, ...))) end
-  termWrite(table.concat(parts, "\t") .. "\n")
+  local text = table.concat(parts, "\t")
+  if consolePartial ~= "" then
+    consoleAppend(consolePartial)
+    consolePartial = ""
+  end
+  for line in (text .. "\n"):gmatch("(.-)\n") do consoleAppend(line) end
+end
+
+-- Program output (OUTPUT messages): may end mid-line, so the unfinished
+-- part is held in consolePartial until its newline arrives.
+local function consoleWrite(text)
+  local start = 1
+  while true do
+    local nl = text:find("\n", start, true)
+    if not nl then
+      consolePartial = consolePartial .. text:sub(start)
+      break
+    end
+    consoleAppend(consolePartial .. text:sub(start, nl - 1))
+    consolePartial = ""
+    start = nl + 1
+  end
+  consoleDirty = true
 end
 
 -- --- Minimal keyboard modifier tracking, replacing OpenOS's keyboard library ---
@@ -294,7 +481,9 @@ local function send(msg)
   local total = math.ceil(#payload / CHUNK_SIZE)
   for i = 1, total do
     local chunk = payload:sub((i - 1) * CHUNK_SIZE + 1, i * CHUNK_SIZE)
-    modem.broadcast(PORT, "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk)
+    local frame = "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk
+    -- Addressed messages go to that card only; only discovery broadcasts.
+    if msg.to then modem.send(msg.to, PORT, frame) else modem.broadcast(PORT, frame) end
   end
 end
 
@@ -337,12 +526,56 @@ local function sweepStaleChunks()
   end
 end
 
+-- Any verified message from a node counts as a sign of life -- there's
+-- no dedicated heartbeat. See checkLiveness() for how a quiet node is
+-- probed and eventually marked down.
 local function noteNode(addr)
   if not nodes[addr] then
     nodes[addr] = {}
     nodeOrder[#nodeOrder + 1] = addr
+    -- Its components join the cluster bus (it also reports them itself
+    -- when it boots; this covers one that was running before us).
+    send({type = "GETCOMPONENTS", from = selfAddr, to = addr})
   end
-  nodes[addr].lastSeen = computer.uptime()
+  local node = nodes[addr]
+  node.lastSeen = computer.uptime()
+  node.probedAt = nil
+  if node.down then
+    node.down = nil
+    print("node " .. addr .. " is responding again")
+  end
+end
+
+-- Nodes that can take new work: up, and not being drained.
+local function liveNodeCount()
+  local n = 0
+  for _, addr in ipairs(nodeOrder) do
+    if not nodes[addr].down and not nodes[addr].draining then n = n + 1 end
+  end
+  return n
+end
+
+-- Round-robin with a simple multi-core balancer on top: the live node
+-- with the fewest running jobs wins, and round-robin order breaks ties
+-- (so an idle rack still rotates instead of piling onto node 1).
+local function nextLiveNode(avoid)
+  local best, bestLoad
+  for _ = 1, #nodeOrder do
+    local addr = nodeOrder[nextNode]
+    nextNode = (nextNode % #nodeOrder) + 1
+    local node = nodes[addr]
+    if not node.down and not node.draining and addr ~= avoid then
+      local load = node.running or 0
+      if not best or load < bestLoad then best, bestLoad = addr, load end
+      if load == 0 then break end
+    end
+  end
+  if best then
+    for i, addr in ipairs(nodeOrder) do
+      if addr == best then nextNode = (i % #nodeOrder) + 1 break end
+    end
+  end
+  return best
 end
 
 local function nextId()
@@ -358,7 +591,35 @@ end
 -- parent) -- see docs/PROTOCOL.md's ".mxe process model" section for
 -- the full design these implement.
 local jobs = {}
-local jobOrder = {}
+
+-- Finished jobs are kept for `processes`/get_processes, but only the
+-- most recent MAX_FINISHED_JOBS of them, and without their full source
+-- (a short `codePreview` stays). Running jobs are always kept.
+local MAX_FINISHED_JOBS = 100
+local finishedOrder = {}
+local CODE_PREVIEW_CHARS = 40
+
+local function codePreview(code)
+  if type(code) ~= "string" then return nil end
+  local len = utf8.len(code)
+  if not len then return code:sub(1, CODE_PREVIEW_CHARS) end
+  if len <= CODE_PREVIEW_CHARS then return code end
+  return code:sub(1, utf8.offset(code, CODE_PREVIEW_CHARS + 1) - 1) .. "..."
+end
+
+local function orderedJobIds()
+  local ids = {}
+  for id in pairs(jobs) do ids[#ids + 1] = id end
+  table.sort(ids)
+  return ids
+end
+
+-- Indexes kept alongside `jobs` so the per-tick and per-completion work
+-- (scheduler stress, fan-out counts, orphan sweeps, orphan policy) is
+-- proportional to what's live, not to every job ever dispatched.
+local runningJobs = {}   -- id -> true while status == "running"
+local runningCount = 0
+local childrenOf = {}    -- parent id -> {child id, ...}
 
 -- appName -> {jobId, jobId, ...}. Only ever holds jobs whose
 -- orphanPolicy is "orphan" -- the pool a relaunched app's
@@ -388,7 +649,12 @@ end
 
 -- id -> the RESULT/ERROR/PONG message that answered it. Filled in by
 -- handleModemMessage (see below), read and cleared by waitForReply.
+-- Only replies someone is actually waiting on (`awaiting`: id -> the
+-- address expected to answer) are stored -- otherwise every
+-- fire-and-forget spawned job's RESULT, and every reply that arrived
+-- after its waiter timed out, would sit here forever.
 local replyBox = {}
+local awaiting = {}
 
 -- Record a job's dispatch and actually send it, WITHOUT waiting for the
 -- result -- shared by submit() (which then blocks on awaitReply itself)
@@ -400,35 +666,304 @@ local replyBox = {}
 -- SPAWN carrying an explicit `parent` (its own job id, which
 -- node/runtime.lua now exposes to running job code as the global
 -- `jobId`) sets these.
-local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy)
-  if not targetAddr then
-    if #nodeOrder == 0 then
-      return nil, "no worker nodes discovered yet -- try 'discover'"
+local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy, program)
+  if targetAddr then
+    if not nodes[targetAddr] then return nil, "unknown node: " .. tostring(targetAddr) end
+    if nodes[targetAddr].down then return nil, "node is down: " .. targetAddr end
+  else
+    if liveNodeCount() == 0 then
+      return nil, "no live worker nodes -- try 'discover'"
     end
-    -- Round-robin, unconditionally -- this project's answer to "what
-    -- happens when every worker is already busy" is implicit, not an
-    -- admission-control gate: a worker only ever runs one job at a
-    -- time (runJobCode blocks that worker's own main loop until the
-    -- job finishes or is killed), so dispatching to an already-busy
-    -- worker just means the new JOB message waits in that worker's
-    -- own signal queue until it's free -- not denied, not queued at
-    -- the kernal, just delayed at the target. A real load-aware
-    -- balancer (preferring the least-busy worker) is still "not yet
-    -- built" -- see README.md's Status section -- but that's a
-    -- quality-of-placement question, not a correctness gate this
-    -- needed to answer first.
-    targetAddr = nodeOrder[nextNode]
-    nextNode = (nextNode % #nodeOrder) + 1
+    -- Least-busy live node (see nextLiveNode). A worker runs one job at
+    -- a time, so a job sent to a busy worker just waits in that
+    -- worker's own queue -- not denied, not queued at the kernal.
+    targetAddr = nextLiveNode()
   end
+  nodes[targetAddr].lastDispatch = computer.uptime()
   local id = nextId()
-  jobs[id] = {id = id, node = targetAddr, status = "running", code = code, startedAt = computer.uptime(),
-    parent = parent, appName = appName, orphanPolicy = parent and (orphanPolicy or "orphan") or nil}
-  jobOrder[#jobOrder + 1] = id
+  -- rootId is the ultimate ancestor of this job's tree -- itself, for
+  -- a top-level job; inherited in O(1) from the parent's own rootId
+  -- otherwise (never a chain-walk). This is what the fan-out cap below
+  -- counts against: "how many jobs in THIS tree are running right
+  -- now," not a global count, so one tree hitting its cap doesn't
+  -- block unrelated top-level work.
+  local rootId = parent and jobs[parent] and jobs[parent].rootId or id
+  jobs[id] = {id = id, node = targetAddr, status = "running", code = code, codePreview = codePreview(code),
+    startedAt = computer.uptime(),
+    parent = parent, appName = appName, orphanPolicy = parent and (orphanPolicy or "orphan") or nil,
+    rootId = rootId, path = program and program.path, kind = program and program.kind,
+    program = program, args = args}
+  runningJobs[id] = true
+  runningCount = runningCount + 1
+  nodes[targetAddr].running = (nodes[targetAddr].running or 0) + 1
+  if parent then
+    childrenOf[parent] = childrenOf[parent] or {}
+    local siblings = childrenOf[parent]
+    siblings[#siblings + 1] = id
+  end
   if parent and jobs[id].orphanPolicy == "orphan" then
     registerOrphanCandidate(appName, id)
   end
-  send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args})
+  send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args, program = program})
   return id, targetAddr
+end
+
+-- --- Program launcher ---
+--
+-- Works like OpenOS's: a name typed at the console is looked up on
+-- PROGRAM_PATH (.mxe before .lua), or a path is used as given. A .lua
+-- program runs in the OpenOS environment; an .mxe declares, in a
+-- header at the top of the file, the muxos version it targets and any
+-- libraries it wants beyond the native API:
+--
+--   --[[mxe
+--   muxos = "0.1.0"
+--   libraries = {"name", ...}
+--   ]]
+--
+-- and gets a response (the global `launch` in its environment): the
+-- actual version, whether it matches (a mismatch never stops it from
+-- running), and which libraries were found. Libraries live at
+-- <dir>/<name>.lua (MXE_LIBRARY_DIRS) on the kernal's disk and are shipped with
+-- the program. Either way, the scheduler places it.
+local PROGRAM_PATH = {"/bin", "/usr/bin"}
+-- Libraries built into the worker runtime rather than shipped from disk.
+local BUILTIN_MXE_LIBRARIES = {mux = true, http = true}
+-- Searched in order (docs/MXE.md section 5).
+local MXE_LIBRARY_DIRS = {"/lib/mxe/", "/usr/lib/mxe/"}
+
+local function fileExists(path)
+  return tryInvoke(fsAddr, "exists", path) == true
+end
+
+local function resolveProgram(name)
+  local candidates = {}
+  local function add(base)
+    if base:match("%.mxe$") or base:match("%.lua$") then
+      candidates[#candidates + 1] = base
+    else
+      candidates[#candidates + 1] = base .. ".mxe"
+      candidates[#candidates + 1] = base .. ".lua"
+    end
+  end
+  if name:find("/", 1, true) then
+    add(name)
+  else
+    for _, dir in ipairs(PROGRAM_PATH) do add(dir .. "/" .. name) end
+  end
+  for _, path in ipairs(candidates) do
+    if fileExists(path) then return path end
+  end
+end
+
+-- The header is evaluated as Lua assignments in an empty environment --
+-- it's data, not a place to run code. It runs in its own coroutine, so
+-- one that never finishes is ended by the machine's own "too long
+-- without yielding" deadline without taking the kernal down.
+local function readManifest(source)
+  local body = source:match("^%s*%-%-%[%[mxe(.-)%]%]")
+  if not body then return {} end
+  local env = {}
+  local chunk, err = load(body, "=mxe header", "t", env)
+  if not chunk then return nil, "bad .mxe header: " .. tostring(err) end
+  local co = coroutine.create(chunk)
+  local ok, runErr = coroutine.resume(co)
+  if not ok then return nil, "bad .mxe header: " .. tostring(runErr) end
+  return {muxos = env.muxos, libraries = env.libraries, requires = env.requires, name = env.name,
+    version = env.version, description = env.description, author = env.author}
+end
+
+local function versionParts(v)
+  local parts = {}
+  for n in tostring(v):gmatch("%d+") do parts[#parts + 1] = tonumber(n) end
+  return parts
+end
+
+local function sameVersion(a, b)
+  local x, y = versionParts(a), versionParts(b)
+  for i = 1, math.max(#x, #y, 1) do
+    if (x[i] or 0) ~= (y[i] or 0) then return false end
+  end
+  return true
+end
+
+-- --- Legacy (OpenOS) libraries ---
+--
+-- A legacy program's `require` finds modules the OpenOS way, on
+-- LEGACY_PACKAGE_PATH on the kernal's disk -- the vendored OpenOS
+-- libraries in kernal/lib, plus whatever else is installed there.
+-- Expanding the legacy userland is dropping files into /lib. The
+-- modules a program requires by a literal name (and theirs, in turn)
+-- are shipped with it, so the common case costs no round trips; any
+-- other require (a computed name, package.delay's lazy halves) is a
+-- GETMODULE request. Machine-level modules are faces built into the
+-- worker runtime and never looked up here.
+local LEGACY_PACKAGE_PATH = {"/lib/?.lua", "/usr/lib/?.lua", "/lib/?/init.lua", "/usr/lib/?/init.lua"}
+local LEGACY_FACES = {component = true, computer = true, event = true, term = true, unicode = true,
+  process = true, buffer = true, package = true, filesystem = true}
+local MAX_PREFETCH = 32
+local moduleCache = {} -- path -> {source, modified}
+
+-- Re-reads a module only when the file changed.
+local function readModuleFile(path)
+  local modified = tryInvoke(fsAddr, "lastModified", path)
+  local cached = moduleCache[path]
+  if cached and modified and cached.modified == modified then return cached.source end
+  local source = readFile(path)
+  if source then moduleCache[path] = {source = source, modified = modified} end
+  return source
+end
+
+-- A module name (dots for directories), or an absolute path under
+-- /lib or /usr/lib (package.delay and dofile use paths), to its file.
+local function resolveModule(name)
+  if type(name) ~= "string" or name == "" or name:find("..", 1, true) then return nil end
+  if name:sub(1, 1) == "/" then
+    if (name:sub(1, 5) == "/lib/" or name:sub(1, 9) == "/usr/lib/") and fileExists(name) then return name end
+    return nil
+  end
+  if not name:match("^[%w_%.%-]+$") then return nil end
+  local rel = name:gsub("%.", "/")
+  for _, pattern in ipairs(LEGACY_PACKAGE_PATH) do
+    local path = pattern:gsub("%?", rel)
+    if fileExists(path) then return path end
+  end
+end
+
+local function literalRequires(source, into)
+  for name in source:gmatch("require%s*%(?%s*[\"']([^\"']+)[\"']") do into[#into + 1] = name end
+end
+
+-- name -> source for every module `source` requires by a literal name,
+-- transitively (at most MAX_PREFETCH of them).
+local function prefetchModules(source)
+  local modules, seen, queue = {}, {}, {}
+  literalRequires(source, queue)
+  local i, count = 1, 0
+  while i <= #queue and count < MAX_PREFETCH do
+    local name = queue[i]
+    i = i + 1
+    if not LEGACY_FACES[name] and not seen[name] then
+      seen[name] = true
+      local path = resolveModule(name)
+      local moduleSource = path and readModuleFile(path)
+      if moduleSource then
+        modules[name] = moduleSource
+        count = count + 1
+        literalRequires(moduleSource, queue)
+      end
+    end
+  end
+  return modules
+end
+
+local launchProgram
+do
+  -- docs/MXE.md section 3: same major, and the running version at least
+  -- the requested one within it; before 1.0 the minor counts as the major.
+  local function compatibleVersion(requested, running)
+    if requested == nil then return true end
+    local r, h = versionParts(requested), versionParts(running)
+    local function at(t, i) return t[i] or 0 end
+    if at(r, 1) ~= at(h, 1) then return false end
+    if at(h, 1) == 0 then
+      return at(r, 2) == at(h, 2) and at(h, 3) >= at(r, 3)
+    end
+    return at(h, 2) > at(r, 2) or (at(h, 2) == at(r, 2) and at(h, 3) >= at(r, 3))
+  end
+
+  -- The libraries an .mxe asked for, and theirs in turn (a library may
+  -- have its own header): name -> source (or true for a built-in), and
+  -- the order to load them in, dependencies first.
+  local function resolveMxeLibraries(names, response)
+    local libs, order, visiting = {}, {}, {}
+    local function visit(name)
+      if type(name) ~= "string" or not name:match("^[%w_%.%-]+$") or libs[name] ~= nil or visiting[name] then return end
+      visiting[name] = true
+      if BUILTIN_MXE_LIBRARIES[name] then
+        libs[name] = true
+      else
+        local source
+        for _, dir in ipairs(MXE_LIBRARY_DIRS) do
+          source = readFile(dir .. name .. ".lua")
+          if source then break end
+        end
+        if source then
+          local manifest = readManifest(source)
+          for _, dep in ipairs(manifest and type(manifest.libraries) == "table" and manifest.libraries or {}) do
+            visit(dep)
+          end
+        end
+        libs[name] = source or false
+      end
+      response.libraries[name] = libs[name] ~= false
+      if libs[name] then order[#order + 1] = name end
+    end
+    for _, name in ipairs(names) do visit(name) end
+    for name, v in pairs(libs) do
+      if v == false then libs[name] = nil end
+    end
+    return libs, order
+  end
+
+  -- Is a component of this type anywhere on the bus (a node that's up)?
+  function bus.has(ctype)
+    for _, c in pairs(bus.components) do
+      if c.type == ctype and (c.node == selfAddr or (nodes[c.node] and not nodes[c.node].down)) then return true end
+    end
+    return false
+  end
+
+  launchProgram = function(path, args, parent)
+    local source, err = readFile(path)
+    if not source then return nil, "can't read " .. path .. ": " .. tostring(err) end
+    local program = {path = path, kind = path:match("%.mxe$") and "mxe" or "legacy"}
+    if program.kind == "mxe" then
+      local manifest, manifestErr = readManifest(source)
+      if not manifest then return nil, manifestErr end
+      local response = {muxos = MUXOS_VERSION, requested = manifest.muxos, libraries = {},
+        versionMatch = manifest.muxos == nil or sameVersion(manifest.muxos, MUXOS_VERSION),
+        compatible = compatibleVersion(manifest.muxos, MUXOS_VERSION), components = {}}
+      for _, field in ipairs({"name", "version", "description", "author"}) do
+        if type(manifest[field]) == "string" then response[field] = manifest[field] end
+      end
+      for _, ctype in ipairs(type(manifest.requires) == "table" and manifest.requires or {}) do
+        if type(ctype) == "string" then response.components[ctype] = bus.has(ctype) end
+      end
+      program.launch = response
+      program.libs, program.libOrder = resolveMxeLibraries(
+        type(manifest.libraries) == "table" and manifest.libraries or {}, response)
+    else
+      program.modules = prefetchModules(source)
+      -- Sizes the default resolution of its virtual gpu.
+      program.screen = {termW, termH}
+      program.fsAddress = fsAddr
+    end
+    local appName = path:match("([^/]+)%.%w+$")
+    local id, addrOrErr = dispatchJob(source, args, nil, parent, appName, nil, program)
+    if id and program.launch then
+      jobs[id].programName, jobs[id].programVersion = program.launch.name, program.launch.version
+    end
+    return id, addrOrErr
+  end
+end
+
+-- Fan-out/depth cap on recursive spawning: "for as many nodes as
+-- there is" -- a job tree (the top-level job plus every descendant it
+-- spawned, directly or through several levels) may not have more jobs
+-- "running" at once than there are live worker nodes. Counts the WHOLE
+-- tree via each job's own rootId, not just direct children, so a
+-- grandchild spawning its own child is covered the same as a direct
+-- child -- "depth" and "fan-out" collapse into the same single check
+-- this way, rather than needing two separate limits.
+local function countRunningInTree(rootId)
+  local count = 0
+  for id in pairs(runningJobs) do
+    if jobs[id].rootId == rootId then
+      count = count + 1
+    end
+  end
+  return count
 end
 
 -- Applies a job's declared orphan policy once its PARENT is no longer
@@ -441,28 +976,290 @@ end
 -- - "promote": it's now a top-level job in every sense -- clear
 --   `parent` and stop tracking it as reclaimable (nobody declared by
 --   this name will ever "come back" for it; it's independent now).
--- - "kill": best-effort only -- broadcasts a raw, unchunked "KILL
---   <id>" (same convention as boot's BOOT/CODE, bypassing the generic
---   MSG framing since this needs to be checked cheaply and can't wait
---   on reassembly) that node/runtime.lua's runJobCode checks for at
---   the job's own cooperative yield points. A job that never yields
+-- - "kill": best-effort only -- sends the job's node a raw, unchunked
+--   "KILL <id> <node>" (same convention as boot's BOOT/CODE, bypassing
+--   the generic MSG framing since this needs to be checked cheaply and
+--   can't wait on reassembly), which the node's scheduler acts on the
+--   next time the job would run. A job that never yields
 --   can't be killed early this way -- same fundamental limit as the
 --   instruction-budget circuit breaker (see "JOB code and the
 --   non-yielding timeout"), not a gap specific to this feature.
 local function applyOrphanPolicyForChildrenOf(parentId)
-  for _, id in ipairs(jobOrder) do
+  for _, id in ipairs(childrenOf[parentId] or {}) do
     local job = jobs[id]
-    if job.parent == parentId then
-      if job.orphanPolicy == "promote" then
-        unregisterOrphanCandidate(job.appName, id)
-        job.parent = nil
-      elseif job.orphanPolicy == "kill" then
-        modem.broadcast(PORT, "KILL " .. id)
-        job.parent = nil
+    if not job then
+      -- already dropped from history
+    elseif job.orphanPolicy == "promote" then
+      unregisterOrphanCandidate(job.appName, id)
+      job.parent = nil
+    elseif job.orphanPolicy == "kill" then
+      if job.status == "running" then
+        job.killReason = "killed (orphan policy, parent no longer running)"
+        modem.send(job.node, PORT, "KILL " .. id .. " " .. job.node)
       end
-      -- "orphan" (or unset): nothing to do here.
+      job.parent = nil
+    elseif job.orphanPolicy == "orphan" then
+      -- Marks WHEN this job actually became orphaned -- the clock
+      -- sweepStaleOrphans() (below) measures against, not when it
+      -- was originally spawned (which could have been long before
+      -- its parent actually finished).
+      job.orphanedAt = computer.uptime()
     end
   end
+  childrenOf[parentId] = nil
+end
+
+-- How loaded the scheduler is right now: running jobs per worker node.
+-- Can exceed 1 -- "running" counts every job the kernal has dispatched
+-- and not yet seen finish (a worker runs all of its jobs side by side),
+-- so this is a real load measure, not just "is anything happening."
+local function schedulerStress()
+  local live = liveNodeCount()
+  if live == 0 then return 0 end
+  return runningCount / live
+end
+
+-- "Timeout is dependent on scheduler stress": an orphan nobody's
+-- reclaimed sits for up to BASE_ORPHAN_TIMEOUT seconds while the
+-- system is idle, shrinking as load climbs -- freeing capacity sooner
+-- precisely when capacity is actually scarce, rather than holding an
+-- unreclaimed job's slot regardless of whether anything else needs it.
+-- The exact curve (simple inverse, BASE/(1+stress)) is a judgment
+-- call, not measured against real hardware or real workloads.
+local BASE_ORPHAN_TIMEOUT = 300
+
+local function orphanTimeoutSeconds()
+  return BASE_ORPHAN_TIMEOUT / (1 + schedulerStress())
+end
+
+-- Called every tick (see the main loop below) but only does work about
+-- once a second -- the timeout is minutes, so per-tick precision buys
+-- nothing. Finds every
+-- "orphan"-policy job that's actually been orphaned (orphanedAt set)
+-- and still running, and kills it (same best-effort raw KILL broadcast
+-- as the "kill" policy, same cooperative-yield-point limitation) once
+-- it's been unclaimed longer than the current dynamic timeout.
+-- Re-broadcasts periodically (not just once) in case the first KILL
+-- never reached a job that wasn't yielding yet when it was sent.
+local KILL_RETRY_INTERVAL = 10
+local ORPHAN_SWEEP_INTERVAL = 1
+local lastOrphanSweep = -math.huge
+
+local function sweepStaleOrphans()
+  local now = computer.uptime()
+  if now - lastOrphanSweep < ORPHAN_SWEEP_INTERVAL then return end
+  lastOrphanSweep = now
+  local timeout = orphanTimeoutSeconds()
+  for id in pairs(runningJobs) do
+    local job = jobs[id]
+    if job.orphanPolicy == "orphan" and job.orphanedAt
+        and now - job.orphanedAt > timeout then
+      if not job.lastKillSentAt or now - job.lastKillSentAt > KILL_RETRY_INTERVAL then
+        job.killReason = "killed (unclaimed orphan timed out)"
+        modem.send(job.node, PORT, "KILL " .. id .. " " .. job.node)
+        job.lastKillSentAt = now
+        unregisterOrphanCandidate(job.appName, id)
+      end
+    end
+  end
+end
+
+-- Records a job as no longer running ("done", "error", or "lost"),
+-- applies its children's orphan policies, and trims history.
+-- Defined with the FS handler below.
+local closeJobFiles
+
+local function finishJob(id, status, result, err)
+  local job = jobs[id]
+  closeJobFiles(id)
+  runningJobs[id] = nil
+  runningCount = runningCount - 1
+  local node = nodes[job.node]
+  if node and node.running then node.running = node.running - 1 end
+  job.paused = nil
+  job.status, job.result, job.error = status, result, err
+  job.finishedAt = computer.uptime()
+  job.code, job.program, job.args, job.migrating = nil, nil, nil, nil
+  finishedOrder[#finishedOrder + 1] = id
+  while #finishedOrder > MAX_FINISHED_JOBS do
+    local old = table.remove(finishedOrder, 1)
+    local oldJob = jobs[old]
+    if oldJob then
+      unregisterOrphanCandidate(oldJob.appName, old)
+      jobs[old] = nil
+      childrenOf[old] = nil
+    end
+  end
+  -- Its windows stay up, marked like gmux's: ended (done or killed) or
+  -- failed (error, lost).
+  local windowStatus = (status == "done" or status == "killed") and "dead" or "error"
+  for _, winId in ipairs(compositor.windowsOwnedBy(id)) do
+    compositor.setStatus(winId, windowStatus)
+  end
+  -- This job is no longer running -- apply whatever orphan policy ITS
+  -- OWN children declared at spawn time.
+  applyOrphanPolicyForChildrenOf(id)
+end
+
+-- Liveness without a dedicated heartbeat: every message a node sends
+-- refreshes it (noteNode), and workers answer PING at their jobs' yield
+-- points, so a node running a job only needs probing when it has gone
+-- quiet. Only nodes with running jobs are watched -- an idle node that
+-- died is found out the first time a job is sent its way and goes
+-- unacknowledged.
+local PROBE_AFTER = 3
+local DOWN_AFTER = 10
+local lastLivenessCheck = -math.huge
+
+local function markNodeDown(addr)
+  nodes[addr].down = true
+  print("node " .. addr .. " stopped responding -- marking it down")
+  if exclusiveFullscreenOwner == addr then
+    exclusiveFullscreenOwner = nil
+    compositor.setExclusive(nil)
+    consoleDirty = true
+  end
+  local lost = {}
+  for id in pairs(runningJobs) do
+    if jobs[id].node == addr then lost[#lost + 1] = id end
+  end
+  table.sort(lost)
+  for _, id in ipairs(lost) do
+    finishJob(id, "lost", nil, "node stopped responding")
+  end
+end
+
+local function checkLiveness()
+  local now = computer.uptime()
+  if now - lastLivenessCheck < 1 then return end
+  lastLivenessCheck = now
+  local watched = {}
+  for id in pairs(runningJobs) do watched[jobs[id].node] = true end
+  for addr in pairs(watched) do
+    local node = nodes[addr]
+    if node and not node.down then
+      local silent = now - math.max(node.lastSeen or 0, node.lastDispatch or 0)
+      if silent > DOWN_AFTER then
+        markNodeDown(addr)
+      elseif silent > PROBE_AFTER and (not node.probedAt or now - node.probedAt > PROBE_AFTER) then
+        node.probedAt = now
+        send({type = "PING", from = selfAddr, to = addr})
+      end
+    end
+  end
+end
+
+-- Pause, resume, or end a running process. Raw broadcasts like KILL
+-- (see node/runtime.lua's noteControl); the worker acts on them at the
+-- process's yield points, so a pause/kill takes effect at its next
+-- yield, and a process still queued on its node is held/refused
+-- before it starts.
+local function controlJob(id, verb, reason)
+  local job = jobs[id]
+  if not job or job.status ~= "running" then
+    return false, "no running job " .. tostring(id)
+  end
+  if verb == "PAUSE" then
+    job.paused = true
+  elseif verb == "RESUME" then
+    job.paused = nil
+  elseif verb == "KILL" then
+    job.killReason = reason or "killed"
+  else
+    return false, "unknown control " .. tostring(verb)
+  end
+  modem.send(job.node, PORT, verb .. " " .. id .. " " .. job.node)
+  return true
+end
+
+local function isDescendantOf(id, ancestorId)
+  local job = jobs[id]
+  local seen = 0
+  while job and job.parent and seen < 1000 do
+    if job.parent == ancestorId then return true end
+    job = jobs[job.parent]
+    seen = seen + 1
+  end
+  return false
+end
+
+-- --- .mxe migration (optional, through the `mux` library) ---
+--
+-- An .mxe that called mux.migratable(save) is marked `migratable`. To
+-- move it, the kernal broadcasts a raw "MIGRATE <id>"; at the process's
+-- next yield point its worker calls `save`, sends the state back
+-- (MIGRATED) and ends it there, and the kernal starts it again on the
+-- target node under the SAME job id -- so its parent, children,
+-- windows and app identity are untouched -- where mux.restored()
+-- returns that state. A process that never opted in isn't moved; legacy
+-- programs never are.
+local function migrateJob(id, target)
+  local job = jobs[id]
+  if not job or job.status ~= "running" then return false, "no running job " .. tostring(id) end
+  if not job.migratable then return false, "job " .. id .. " isn't migratable (it never called mux.migratable)" end
+  if job.migrating then return false, "job " .. id .. " is already being migrated" end
+  if target then
+    if not nodes[target] or nodes[target].down then return false, "node isn't up: " .. tostring(target) end
+    if target == job.node then return false, "job " .. id .. " is already on " .. target end
+  else
+    target = nextLiveNode(job.node)
+    if not target then return false, "no other live node to move job " .. id .. " to" end
+  end
+  job.migrating = target
+  modem.send(job.node, PORT, "MIGRATE " .. id .. " " .. job.node)
+  return true, target
+end
+
+local function handleMigrated(msg)
+  local job = jobs[msg.jobId]
+  if not job or job.status ~= "running" or job.node ~= msg.from or not job.migrating then return end
+  local from, target = job.node, job.migrating
+  if not nodes[target] or nodes[target].down then
+    target = nextLiveNode(from)
+  end
+  job.migrating = nil
+  if not target then
+    finishJob(job.id, "lost", nil, "migration had no live node to restart on")
+    return
+  end
+  if nodes[from].running then nodes[from].running = nodes[from].running - 1 end
+  job.node = target
+  nodes[target].running = (nodes[target].running or 0) + 1
+  nodes[target].lastDispatch = computer.uptime()
+  job.migrations = (job.migrations or 0) + 1
+  send({type = "JOB", from = selfAddr, to = target, id = job.id, code = job.code, args = job.args,
+    program = job.program, restore = msg.state})
+  print("job [" .. job.id .. "] migrated from " .. from .. " to " .. target)
+end
+
+local function handleMigrateFailed(msg)
+  local job = jobs[msg.jobId]
+  if not job or job.node ~= msg.from or not job.migrating then return end
+  job.migrating = nil
+  print("job [" .. job.id .. "] couldn't migrate: " .. tostring(msg.error))
+end
+
+local function handleMigratable(msg)
+  local job = jobs[msg.jobId]
+  if job and job.status == "running" and job.node == msg.from and job.kind == "mxe" then
+    job.migratable = true
+  end
+end
+
+-- Take a node out of rotation: no new work goes to it, and every
+-- migratable process on it is moved off. Others finish where they are.
+local function drainNode(addr)
+  local node = nodes[addr]
+  if not node then return false, "unknown node: " .. tostring(addr) end
+  node.draining = true
+  local moved, staying = 0, 0
+  for id in pairs(runningJobs) do
+    local job = jobs[id]
+    if job.node == addr then
+      if job.migratable and migrateJob(id) then moved = moved + 1 else staying = staying + 1 end
+    end
+  end
+  return true, moved, staying
 end
 
 local runtimeSource = nil -- loaded lazily and cached, see loadRuntime()
@@ -476,9 +1273,8 @@ local function loadRuntime()
 end
 
 -- Answer a worker's BOOT request (node/bios.lua's network-boot stub) with
--- its real runtime, broadcast once -- any OTHER worker still waiting on
--- its own BOOT picks up the same reply for free, since they all need the
--- identical payload. Not wrapped in the serialized-table protocol: BOOT
+-- its real runtime, sent to that worker only. Not wrapped in the
+-- serialized-table protocol: BOOT
 -- happens before a worker has that runtime loaded at all, so it uses its
 -- own plain "WORD <payload>" convention (see node/bios.lua).
 local BOOT_CHUNK_SIZE = 7000
@@ -492,7 +1288,7 @@ local function serveBoot(workerAddr)
   local total = math.ceil(#source / BOOT_CHUNK_SIZE)
   for i = 1, total do
     local chunk = source:sub((i - 1) * BOOT_CHUNK_SIZE + 1, i * BOOT_CHUNK_SIZE)
-    modem.broadcast(PORT, "CODE " .. i .. "/" .. total .. " " .. chunk)
+    modem.send(workerAddr, PORT, "CODE " .. i .. "/" .. total .. " " .. chunk)
   end
 end
 
@@ -500,6 +1296,147 @@ end
 -- components. This is the reverse direction of the "remote component"
 -- bridge in node/bios.lua: a worker with no screen/disk of its own asks
 -- the kernal to act on its behalf, same wire shape either direction.
+-- --- Cluster component bus ---
+--
+-- Every node's components, visible to processes anywhere in the cluster
+-- (the original design: one component bus across the rack). OpenComputers
+-- gives each computer its own component bus, so this is the cluster's
+-- emulation of one, over the network: each worker reports its components
+-- (COMPONENTS), the kernal keeps the registry with its own, and a process
+-- lists it (BUSLIST) and calls into it (BUSINVOKE). A component on the
+-- caller's own node it calls directly; one on the kernal the kernal calls;
+-- one on another worker the kernal relays to that worker. Values a call
+-- returns that can't cross the wire stay on their node and are used
+-- through VALUECALL. Not on the bus: the display and keyboard (the
+-- compositor's), network cards, EEPROMs and computer components -- and
+-- the kernal's boot disk, which processes reach as the OS filesystem.
+do
+  local EXCLUDED = {gpu = true, screen = true, keyboard = true, modem = true, tunnel = true,
+    eeprom = true, computer = true}
+  local RELAY_TIMEOUT = 10
+  local components, relays = bus.components, bus.relays
+
+  function bus.setNodeComponents(node, list)
+    for addr, c in pairs(components) do
+      if c.node == node then components[addr] = nil end
+    end
+    for addr, c in pairs(type(list) == "table" and list or {}) do
+      if type(addr) == "string" and type(c) == "table" and type(c.type) == "string" and not EXCLUDED[c.type] then
+        components[addr] = {type = c.type, node = node, methods = type(c.methods) == "table" and c.methods or {}}
+      end
+    end
+  end
+
+  function bus.refreshOwn()
+    local list = {}
+    for addr, ctype in component.list() do
+      if addr ~= fsAddr then
+        local ok, methods = pcall(component.methods, addr)
+        list[addr] = {type = ctype, methods = ok and methods or {}}
+      end
+    end
+    bus.setNodeComponents(selfAddr, list)
+  end
+
+  -- Values from the kernal's own components that can't cross the wire
+  -- (same scheme as node/runtime.lua's).
+  local values, valueCount, nextValue = {}, 0, 1
+  local MAX_VALUES = 64
+
+  local function isPlain(v, depth)
+    local t = type(v)
+    if t == "nil" or t == "boolean" or t == "number" or t == "string" then return true end
+    if t ~= "table" or depth > 8 then return false end
+    for k, x in pairs(v) do
+      if not isPlain(k, depth + 1) or not isPlain(x, depth + 1) then return false end
+    end
+    return true
+  end
+
+  local function exportValue(v)
+    if isPlain(v, 0) then return v end
+    if valueCount >= MAX_VALUES then
+      local oldest = math.huge
+      for k in pairs(values) do if k < oldest then oldest = k end end
+      local old = values[oldest]
+      values[oldest], valueCount = nil, valueCount - 1
+      pcall(function() old.close() end)
+    end
+    local n = nextValue
+    nextValue, valueCount = n + 1, valueCount + 1
+    values[n] = v
+    return {__busValue = n, node = selfAddr}
+  end
+
+  local function reply(msg, packed)
+    if packed[1] then
+      local returns = {n = packed.n - 1}
+      for i = 2, packed.n do returns[i - 1] = exportValue(packed[i]) end
+      if pcall(send, {type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = returns}) then return end
+      packed = {false, "the result can't be sent"}
+    end
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = tostring(packed[2])})
+  end
+
+  function bus.fail(msg, err)
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
+  end
+
+  -- Passes a request on to the worker that owns the component (or
+  -- value); its answer goes back to the caller under the caller's id.
+  local function relay(node, msg, fields)
+    local id = nextId()
+    relays[id] = {to = msg.from, id = msg.id, node = node, expires = computer.uptime() + RELAY_TIMEOUT}
+    fields.from, fields.to, fields.id = selfAddr, node, id
+    send(fields)
+  end
+
+  function bus.sweep()
+    local now = computer.uptime()
+    for id, r in pairs(relays) do
+      if now > r.expires then relays[id] = nil end
+    end
+  end
+
+  local function nodeUp(node)
+    return node == selfAddr or (nodes[node] and not nodes[node].down)
+  end
+
+  function bus.list(msg)
+    local list = {}
+    for addr, c in pairs(components) do
+      if nodeUp(c.node) then list[addr] = {type = c.type, node = c.node, methods = c.methods} end
+    end
+    send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
+  end
+
+  function bus.invoke(msg)
+    local c = components[msg.address]
+    if not c or not nodeUp(c.node) then return bus.fail(msg, "no such component") end
+    local args = type(msg.args) == "table" and msg.args or {n = 0}
+    if c.node == selfAddr then
+      reply(msg, table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(args, 1, args.n or #args))))
+    else
+      relay(c.node, msg, {type = "INVOKE", address = msg.address, method = msg.method, args = args})
+    end
+  end
+
+  function bus.valueCall(msg)
+    local args = type(msg.args) == "table" and msg.args or {n = 0}
+    if msg.node == selfAddr then
+      local v = values[msg.value]
+      if v == nil then return bus.fail(msg, "that value is gone (closed, or its node restarted)") end
+      reply(msg, table.pack(pcall(function() return v[msg.method](table.unpack(args, 1, args.n or #args)) end)))
+      if msg.method == "close" then values[msg.value], valueCount = nil, valueCount - 1 end
+    elseif msg.node ~= nil and nodeUp(msg.node) then
+      relay(msg.node, msg, {type = "VALUECALL", value = msg.value, method = msg.method, args = args})
+    else
+      bus.fail(msg, "that value's node is gone")
+    end
+  end
+end
+bus.refreshOwn()
+
 local function handleList(msg)
   local list = {}
   for addr, ctype in component.list() do
@@ -522,10 +1459,14 @@ local function handleInvoke(msg)
       error = "direct gpu/screen access is blocked -- use create_window, or gmuxapi.request_fullscreen() for exclusive access"})
     return
   end
-  local packed = table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(msg.args or {})))
+  local args = msg.args or {}
+  local packed = table.pack(pcall(component.invoke, msg.address, msg.method, table.unpack(args, 1, args.n or #args)))
   if packed[1] then
-    local returns = {}
-    for i = 2, packed.n do returns[#returns + 1] = packed[i] end
+    -- Indexed with an explicit `n`, not appended: appending skipped
+    -- nils, so a method's `nil, "reason"` came back as `"reason"` alone,
+    -- a truthy first value that reads as success.
+    local returns = {n = packed.n - 1}
+    for i = 2, packed.n do returns[i - 1] = packed[i] end
     send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = returns})
   else
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = tostring(packed[2])})
@@ -543,6 +1484,7 @@ local function handleRequestFullscreen(msg)
     return
   end
   exclusiveFullscreenOwner = msg.from
+  compositor.setExclusive(msg.from)
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {granted = true}})
 end
 
@@ -553,6 +1495,8 @@ local function handleReleaseFullscreen(msg)
     return
   end
   exclusiveFullscreenOwner = nil
+  compositor.setExclusive(nil)
+  consoleDirty = true
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {released = true}})
 end
 
@@ -577,6 +1521,17 @@ local function handleSpawn(msg)
       error = "orphanPolicy must be one of orphan/kill/promote, got " .. tostring(msg.orphanPolicy)})
     return
   end
+  if msg.parent and jobs[msg.parent] then
+    local rootId = jobs[msg.parent].rootId or msg.parent
+    local running = countRunningInTree(rootId)
+    local live = liveNodeCount()
+    if running >= live then
+      send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+        error = "fan-out cap reached: this job tree already has " .. running ..
+          " running job(s), as many as there are live worker nodes (" .. live .. ")"})
+      return
+    end
+  end
   local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node, msg.parent, msg.appName, msg.orphanPolicy)
   if not jobId then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = targetAddr})
@@ -591,18 +1546,164 @@ end
 -- the mechanism a relaunched app uses to pick up where its last
 -- instance's orphaned children left off (see docs/PROTOCOL.md's "App
 -- identity and orphan reclaim").
-local function handleGetOrphans(msg)
-  local list = {}
-  local ids = appsByName[msg.appName]
-  if ids then
-    for _, id in ipairs(ids) do
-      local job = jobs[id]
-      if job then
-        list[#list + 1] = {id = job.id, node = job.node}
-      end
-    end
-    appsByName[msg.appName] = nil
+--
+-- Only jobs that are actually orphaned (their parent is no longer
+-- running) can be claimed -- a child whose parent is alive stays with
+-- that parent, so a second instance of the same app can't take it.
+-- Orphans that already finished are returned too, with their status and
+-- result, so a relaunched app can see what happened while it was gone.
+-- A process may pause/resume/kill only its own descendants.
+local function handleControl(msg)
+  local caller = jobs[msg.caller]
+  if not caller or caller.status ~= "running" or caller.node ~= msg.from then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "not called from a running process"})
+    return
   end
+  if not isDescendantOf(msg.jobId, msg.caller) then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+      error = "job " .. tostring(msg.jobId) .. " is not a descendant of job " .. tostring(msg.caller)})
+    return
+  end
+  local ok, err = controlJob(msg.jobId, msg.verb, "killed by parent job " .. tostring(msg.caller))
+  if not ok then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
+    return
+  end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
+end
+
+-- The process making a request, if it's really running on the node
+-- that sent it.
+local function callerJob(msg)
+  local job = jobs[msg.caller]
+  if job and job.status == "running" and job.node == msg.from then return job end
+end
+
+local function handleOutput(msg)
+  local job = jobs[msg.jobId]
+  if job and job.node == msg.from and type(msg.text) == "string" then
+    consoleWrite(msg.text)
+  end
+end
+
+-- gmuxapi.launch: a process launching a program becomes its parent.
+local function handleLaunch(msg)
+  local caller = callerJob(msg)
+  local path = type(msg.path) == "string" and resolveProgram(msg.path)
+  local reply
+  if not caller then
+    reply = "not called from a running process"
+  elseif not path then
+    reply = "program not found: " .. tostring(msg.path)
+  else
+    local id, addrOrErr = launchProgram(path, type(msg.args) == "table" and msg.args or {}, caller.id)
+    if id then
+      send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {id = id, node = addrOrErr, path = path}})
+      return
+    end
+    reply = addrOrErr
+  end
+  send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = reply})
+end
+
+-- A legacy process's require/dofile asking for a module it wasn't
+-- shipped with.
+local function handleGetModule(msg)
+  if not callerJob(msg) then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "not called from a running process"})
+    return
+  end
+  local path = resolveModule(msg.name)
+  local source = path and readModuleFile(path)
+  if source then
+    send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {path = path, source = source}})
+  else
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+      error = "module '" .. tostring(msg.name) .. "' not found"})
+  end
+end
+
+-- A legacy process's filesystem access: the kernal's disk, like the
+-- OS's own filesystem is for a gmux app. `op` is a filesystem component
+-- method; `args` its arguments. Open handles get small numbers of our
+-- own (the real ones may not cross the wire) and belong to the process
+-- that opened them, closed when it ends. A read returns up to `count`
+-- bytes (capped), looping over the disk's per-call limit here so the
+-- process pays one round trip, not one per 2 KB.
+local FS_OPS = {exists = true, isDirectory = true, size = true, lastModified = true, list = true,
+  makeDirectory = true, remove = true, rename = true, spaceUsed = true, spaceTotal = true,
+  isReadOnly = true, getLabel = true, open = true, read = true, write = true, seek = true, close = true}
+local FS_READ_MAX = 65536
+local fsHandles = {} -- our handle -> {real = handle, job = id}
+local nextFsHandle = 1
+
+closeJobFiles = function(jobId)
+  for n, h in pairs(fsHandles) do
+    if h.job == jobId then
+      tryInvoke(fsAddr, "close", h.real)
+      fsHandles[n] = nil
+    end
+  end
+end
+
+local function handleFs(msg)
+  local caller = callerJob(msg)
+  local function fail(err)
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = tostring(err)})
+  end
+  if not caller then return fail("not called from a running process") end
+  local op, args = msg.op, type(msg.args) == "table" and msg.args or {n = 0}
+  if not FS_OPS[op] then return fail("no such method: " .. tostring(op)) end
+  local h
+  if op == "read" or op == "write" or op == "seek" or op == "close" then
+    h = fsHandles[args[1]]
+    if not h or h.job ~= caller.id then return fail("bad file descriptor") end
+  end
+  local result
+  if op == "read" then
+    local want = math.min(tonumber(args[2]) or FS_READ_MAX, FS_READ_MAX)
+    local parts, got = {}, 0
+    while got < want do
+      local ok, data, err = pcall(component.invoke, fsAddr, "read", h.real, want - got)
+      if not ok then return fail(data) end
+      if data == nil then
+        if err then return fail(err) end
+        break
+      end
+      parts[#parts + 1] = data
+      got = got + #data
+    end
+    result = {n = 1, got > 0 and table.concat(parts) or nil}
+  else
+    local callArgs = {table.unpack(args, 1, args.n or #args)}
+    if h then callArgs[1] = h.real end
+    result = table.pack(pcall(component.invoke, fsAddr, op, table.unpack(callArgs, 1, args.n or #args)))
+    if not result[1] then return fail(result[2]) end
+    table.remove(result, 1)
+    result.n = result.n - 1
+    if op == "open" and result[1] ~= nil then
+      fsHandles[nextFsHandle] = {real = result[1], job = caller.id}
+      result[1] = nextFsHandle
+      nextFsHandle = nextFsHandle + 1
+    elseif op == "close" then
+      fsHandles[args[1]] = nil
+    end
+  end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = result})
+end
+
+local function handleGetOrphans(msg)
+  local list, keep = {}, {}
+  for _, id in ipairs(appsByName[msg.appName] or {}) do
+    local job = jobs[id]
+    if job and job.orphanedAt then
+      list[#list + 1] = {id = job.id, node = job.node, status = job.status,
+        result = job.result, error = job.error}
+    elseif job then
+      keep[#keep + 1] = id
+    end
+  end
+  appsByName[msg.appName] = #keep > 0 and keep or nil
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
 end
 
@@ -611,12 +1712,51 @@ end
 -- content. muxos.lua's job here is only wire plumbing: unwrap the
 -- request, call in, wrap the reply.
 local function handleCreateWindow(msg)
+  msg.text = nil -- text windows are the kernal's own (the console)
+  -- A window belongs to the process it was made for (create_graphics_
+  -- process names its child), otherwise to the process that made it.
+  if not msg.ownerJobId then
+    local caller = callerJob(msg)
+    msg.ownerJobId = caller and caller.id
+  end
   local win, err = compositor.createWindow(msg)
   if not win then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
     return
   end
-  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = win})
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = compositor.describe(win)})
+end
+
+-- Redraw an existing window. Only its owner process (or an ancestor of
+-- it) may draw into it. `width`/`height`, when they differ from the
+-- window's, resize it first (a legacy program's setResolution);
+-- `noReply` is for draws sent without waiting (a legacy virtual gpu's
+-- flushes).
+local function handleDrawWindow(msg)
+  local caller = callerJob(msg)
+  local win = compositor.getWindow(msg.windowId)
+  local reply
+  if not caller then
+    reply = "not called from a running process"
+  elseif not win then
+    reply = "no such window: " .. tostring(msg.windowId)
+  elseif win.ownerJobId ~= caller.id and not (win.ownerJobId and isDescendantOf(win.ownerJobId, caller.id)) then
+    reply = "window " .. tostring(msg.windowId) .. " belongs to another process"
+  end
+  if not reply and type(msg.width) == "number" and type(msg.height) == "number"
+      and (msg.width ~= win.width or msg.height ~= win.height) then
+    local ok, err = compositor.setGeometry(win.id, win.x, win.y, msg.width, msg.height)
+    if not ok then reply = err end
+  end
+  if not reply then
+    local ok, err = compositor.redrawWindow(msg.windowId, msg)
+    if ok then
+      if not msg.noReply then send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true}) end
+      return
+    end
+    reply = err
+  end
+  if not msg.noReply then send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = reply}) end
 end
 
 local function handleGetWindows(msg)
@@ -628,12 +1768,31 @@ end
 -- to be a request, since the jobs it's asking about run on other
 -- physical nodes. Returns the same job records `jobs` holds -- a plain
 -- list, serializable as-is since each entry is only strings/numbers.
+--
+-- Summaries only (no source, no result); gmuxapi.get_process(id) (the
+-- GETPROCESS message) returns one job in full.
+local SUMMARY_FIELDS = {"id", "node", "status", "startedAt", "finishedAt", "parent", "appName",
+  "orphanPolicy", "rootId", "codePreview", "error", "paused", "kind", "path", "migratable", "migrations",
+  "programName", "programVersion"}
+
 local function handleGetProcesses(msg)
   local list = {}
-  for _, id in ipairs(jobOrder) do
-    list[#list + 1] = jobs[id]
+  for _, id in ipairs(orderedJobIds()) do
+    local job, summary = jobs[id], {}
+    for _, field in ipairs(SUMMARY_FIELDS) do summary[field] = job[field] end
+    list[#list + 1] = summary
   end
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = list})
+end
+
+local function handleGetProcess(msg)
+  local job = jobs[msg.jobId]
+  if not job then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+      error = "no such job (or it has been dropped from history): " .. tostring(msg.jobId)})
+    return
+  end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = job})
 end
 
 -- Fully handle one already-reassembled, deserialized message -- a
@@ -656,11 +1815,18 @@ local function handleModemMessage(from, port, data)
   end
 
   local msg = deserialize(payload)
-  if type(msg) ~= "table" or not msg.from or msg.from == selfAddr then
+  -- `from` (the transport-reported sending card) is the only sender
+  -- identity that can't be forged from inside a payload. Without this,
+  -- any node could claim to be the fullscreen holder (bypassing
+  -- handleInvoke's gate) or answer for another node's job.
+  if type(msg) ~= "table" or msg.from ~= from or from == selfAddr then
     return
   end
 
-  if msg.type == "HELLO" or msg.type == "PONG" then
+  -- HELLO/PONG introduce a node; anything else from a known node just
+  -- refreshes it (an unknown sender isn't enrolled as a worker by, say,
+  -- a stray RESULT).
+  if msg.type == "HELLO" or msg.type == "PONG" or nodes[msg.from] then
     noteNode(msg.from)
   end
   if msg.to ~= selfAddr then
@@ -671,40 +1837,87 @@ local function handleModemMessage(from, port, data)
     handleList(msg)
   elseif msg.type == "INVOKE" then
     handleInvoke(msg)
+  elseif msg.type == "ISFOREGROUND" then
+    -- readLine (docs/MXE.md): only the console's foreground program reads typed lines.
+    local caller = callerJob(msg)
+    if caller and foregroundJob == caller.id then
+      send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
+    else
+      send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+        error = "not in the foreground at the console"})
+    end
+  elseif msg.type == "COMPONENTS" then
+    bus.setNodeComponents(msg.from, msg.components)
+  elseif msg.type == "BUSLIST" or msg.type == "BUSINVOKE" or msg.type == "VALUECALL" then
+    if not callerJob(msg) then
+      bus.fail(msg, "not called from a running process")
+    elseif msg.type == "BUSLIST" then
+      bus.list(msg)
+    elseif msg.type == "BUSINVOKE" then
+      bus.invoke(msg)
+    else
+      bus.valueCall(msg)
+    end
   elseif msg.type == "GETPROCESSES" then
     handleGetProcesses(msg)
+  elseif msg.type == "GETPROCESS" then
+    handleGetProcess(msg)
   elseif msg.type == "SPAWN" then
     handleSpawn(msg)
   elseif msg.type == "GETORPHANS" then
     handleGetOrphans(msg)
+  elseif msg.type == "CONTROL" then
+    handleControl(msg)
+  elseif msg.type == "OUTPUT" then
+    handleOutput(msg)
+  elseif msg.type == "MIGRATED" then
+    handleMigrated(msg)
+  elseif msg.type == "MIGRATEFAILED" then
+    handleMigrateFailed(msg)
+  elseif msg.type == "MIGRATABLE" then
+    handleMigratable(msg)
+  elseif msg.type == "FS" then
+    handleFs(msg)
+  elseif msg.type == "GETMODULE" then
+    handleGetModule(msg)
+  elseif msg.type == "LAUNCH" then
+    handleLaunch(msg)
   elseif msg.type == "CREATEWINDOW" then
     handleCreateWindow(msg)
   elseif msg.type == "GETWINDOWS" then
     handleGetWindows(msg)
+  elseif msg.type == "DRAWWINDOW" then
+    handleDrawWindow(msg)
   elseif msg.type == "REQUESTFULLSCREEN" then
     handleRequestFullscreen(msg)
   elseif msg.type == "RELEASEFULLSCREEN" then
     handleReleaseFullscreen(msg)
   elseif msg.type == "PONG" or msg.type == "RESULT" or msg.type == "ERROR" then
+    local relay = msg.id and bus.relays[msg.id]
+    if relay and relay.node == msg.from and msg.type ~= "PONG" then
+      bus.relays[msg.id] = nil
+      send({type = msg.type, from = selfAddr, to = relay.to, id = relay.id, result = msg.result, error = msg.error})
+      return
+    end
     if msg.id then
-      replyBox[msg.id] = msg
+      if awaiting[msg.id] == msg.from then
+        replyBox[msg.id] = msg
+      end
       -- Generic job-completion recording: covers BOTH a submit()-dispatched
       -- job (something is actively waitForReply()-ing on it, which still
       -- picks up this same msg from replyBox) AND a handleSpawn()-dispatched
       -- one (fire-and-forget -- nothing is waiting locally, so this is the
       -- ONLY place its completion is ever recorded).
-      if (msg.type == "RESULT" or msg.type == "ERROR") and jobs[msg.id] and jobs[msg.id].status == "running" then
+      if (msg.type == "RESULT" or msg.type == "ERROR") and jobs[msg.id] and jobs[msg.id].status == "running"
+          and jobs[msg.id].node == msg.from then
         local job = jobs[msg.id]
-        job.finishedAt = computer.uptime()
         if msg.type == "RESULT" then
-          job.status, job.result = "done", msg.result
+          finishJob(msg.id, "done", msg.result, nil)
+        elseif job.killReason and msg.error == "killed" then
+          finishJob(msg.id, "killed", nil, job.killReason)
         else
-          job.status, job.error = "error", msg.error
+          finishJob(msg.id, "error", nil, msg.error)
         end
-        -- This job is no longer running -- apply whatever orphan
-        -- policy ITS OWN children declared at spawn time (see
-        -- dispatchJob/applyOrphanPolicyForChildrenOf above).
-        applyOrphanPolicyForChildrenOf(job.id)
       end
     end
   end
@@ -714,65 +1927,247 @@ end
 -- Forward-declared; assigned once everything it calls exists.
 local runCommand
 
--- The REPL's current input line, built up one key_down signal at a time
--- (see "Minimal built-in terminal" and handleKeyDown below) since there
--- is no io.read() to block on any more.
-local inputBuffer = ""
+local KEY_PAGEUP, KEY_PAGEDOWN = 0xC9, 0xD1
 
-local function promptLine()
-  termWrite("muxos> ")
+-- Keys typed while a command is still running. Handling them inline
+-- used to run a second command NESTED inside the first one's wait;
+-- now they're replayed, in order, once the running command returns.
+local queuedKeys = {}
+
+-- The kernal-level interrupt: bring the console up and show it alone,
+-- whatever else is going on (a stuck fullscreen app, a window covering
+-- everything). `comp` returns to normal compositing.
+-- Ctrl+Alt+C, pressed: exit whatever is fullscreen -- a node's
+-- fullscreen grant (force-released, so a crashed holder can't trap the
+-- screen), or console mode.
+local function exitFullscreen()
+  if exclusiveFullscreenOwner then
+    print("Ctrl+Alt+C: force-releasing fullscreen grant held by " .. exclusiveFullscreenOwner)
+    exclusiveFullscreenOwner = nil
+  end
+  compositor.setExclusive(nil)
+  consoleDirty = true
 end
 
-local function handleKeyDown(char, code)
-  heldKeys[code] = true
-  -- Local escape hatch: Ctrl+Alt+C at the kernal force-releases the
-  -- fullscreen grant regardless of who holds it, so a crashed/
-  -- disconnected holder doesn't require restarting the kernal.
-  --
-  -- REAL CONFLICT, not hidden: Ctrl+Alt+C is OpenOS's OWN built-in
-  -- process-interrupt shortcut (see docs/PROTOCOL.md for the full
-  -- finding). That conflict no longer applies quite the same way now
-  -- that muxos doesn't run under OpenOS at all -- there is no OpenOS
-  -- process-interrupt mechanism here to collide with any more -- but
-  -- the combo is kept as specified rather than reclaimed for something
-  -- else, since it's still a reasonable "exit fullscreen" mnemonic on
-  -- its own.
-  if code == KEY_C and isControlDown() and isAltDown() then
-    if exclusiveFullscreenOwner then
-      print("Ctrl+Alt+C: force-releasing fullscreen grant held by " .. exclusiveFullscreenOwner)
-      exclusiveFullscreenOwner = nil
-    end
-    return
-  end
+-- Ctrl+Alt+C, held for CONSOLE_HOLD_SECONDS: the kernal-level
+-- interrupt that drops into the full-screen kernal console.
+local CONSOLE_HOLD_SECONDS = 1
+local comboPressedAt, comboHoldFired = nil, false
+
+local function consoleInterrupt()
+  exitFullscreen()
+  compositor.setExclusive("console")
+  if consoleWin then compositor.setFocus(consoleWin.id) end
+  scrollOffset = 0
+  consoleDirty = true
+  print("console only -- type 'comp' to show windows again")
+end
+
+local function scrollConsole(rows)
+  setScroll(scrollOffset + rows)
+end
+
+-- The process that gets keyboard/scroll input right now: the owner of
+-- the focused window, if it's a live process. Otherwise (console mode,
+-- the console focused, or a window whose process has ended) the console
+-- gets it. Ctrl+Alt+C always reaches the kernal.
+local function focusedProcess()
+  if consoleOwnsScreen() then return nil end
+  local win = compositor.getFocus()
+  if not win or (consoleWin and win.id == consoleWin.id) or not win.ownerJobId then return nil end
+  local job = jobs[win.ownerJobId]
+  if job and job.status == "running" and nodes[job.node] and not nodes[job.node].down then return job end
+end
+
+local function deliverEvent(job, event)
+  send({type = "EVENT", from = selfAddr, to = job.node, jobId = job.id, event = event})
+end
+
+-- The program running in the foreground from the console (see
+-- runForeground), which gets the console's typed input. The kernal
+-- echoes it like a terminal: printable characters, backspace (only over
+-- what was typed since the last Enter), and Enter.
+local foregroundTyped = ""
+
+local function feedForeground(char, code)
+  local job = jobs[foregroundJob]
+  if not job or job.status ~= "running" then return false end
+  deliverEvent(job, {"key_down", char, code})
   if code == KEY_ENTER then
-    termWrite("\n")
-    local line = inputBuffer
-    inputBuffer = ""
-    runCommand(line)
-    promptLine()
+    consoleAppend(consolePartial)
+    consolePartial, foregroundTyped = "", ""
   elseif code == KEY_BACK then
-    if #inputBuffer > 0 then
-      inputBuffer = inputBuffer:sub(1, -2)
-      if cursorX > 1 then
-        cursorX = cursorX - 1
-        gpu.set(cursorX, cursorY, " ")
-      end
+    local len = utf8.len(foregroundTyped)
+    if len and len > 0 then
+      local cut = utf8.offset(foregroundTyped, -1)
+      local removed = #foregroundTyped - cut + 1
+      foregroundTyped = foregroundTyped:sub(1, cut - 1)
+      consolePartial = consolePartial:sub(1, #consolePartial - removed)
     end
   elseif char and char >= 32 then
     local ok, ch = pcall(utf8.char, char)
     if ok then
+      foregroundTyped = foregroundTyped .. ch
+      consolePartial = consolePartial .. ch
+    end
+  end
+  consoleDirty = true
+  return true
+end
+
+local function handleKeyDown(char, code)
+  heldKeys[code] = true
+  -- Ctrl+Alt+C was OpenOS's own interrupt shortcut; muxos has no OpenOS
+  -- underneath, so it's reclaimed as the kernal's console interrupt.
+  if code == KEY_C and isControlDown() and isAltDown() then
+    -- Key repeat sends more key_downs while it's held; only the first
+    -- one is a press.
+    if not comboPressedAt then
+      comboPressedAt, comboHoldFired = computer.uptime(), false
+      exitFullscreen()
+    end
+    return
+  end
+  local target = focusedProcess()
+  if target then
+    deliverEvent(target, {"key_down", char, code})
+    return
+  end
+  -- Scrolling never waits behind a running command.
+  if code == KEY_PAGEUP then scrollConsole(select(2, viewSize()) - 1) return end
+  if code == KEY_PAGEDOWN then scrollConsole(-(select(2, viewSize()) - 1)) return end
+  if commandBusy and foregroundJob and feedForeground(char, code) then return end
+  if commandBusy then
+    queuedKeys[#queuedKeys + 1] = {char, code}
+    return
+  end
+  if code == KEY_ENTER then
+    local line = inputBuffer
+    inputBuffer = ""
+    consoleAppend("muxos> " .. line)
+    scrollOffset = 0
+    commandBusy = true
+    consoleDirty = true
+    local ok, err = pcall(runCommand, line)
+    commandBusy = false
+    consoleDirty = true
+    if not ok then print("command error: " .. tostring(err)) end
+    while #queuedKeys > 0 and not commandBusy do
+      local key = table.remove(queuedKeys, 1)
+      handleKeyDown(key[1], key[2])
+    end
+  elseif code == KEY_BACK then
+    local len = utf8.len(inputBuffer)
+    if len and len > 0 then
+      inputBuffer = inputBuffer:sub(1, utf8.offset(inputBuffer, -1) - 1)
+    elseif #inputBuffer > 0 then
+      inputBuffer = inputBuffer:sub(1, -2)
+    end
+    consoleDirty = true
+  elseif char and char >= 32 then
+    local ok, ch = pcall(utf8.char, char)
+    if ok then
       inputBuffer = inputBuffer .. ch
-      termWrite(ch)
+      scrollOffset = 0
+      consoleDirty = true
     end
   end
   -- No arrow-key history, no cursor movement within the line, no paste
-  -- handling -- a flat append/backspace-only line editor. A real gap
-  -- against a proper shell, flagged rather than hidden, same standard
-  -- as the rest of this project.
+  -- handling -- a flat append/backspace-only line editor.
 end
 
-local function handleKeyUp(code)
+local function handleKeyUp(char, code)
   heldKeys[code] = nil
+  if code == KEY_C or not (isControlDown() and isAltDown()) then
+    comboPressedAt = nil
+  end
+  local target = focusedProcess()
+  if target then deliverEvent(target, {"key_up", char, code}) end
+end
+
+local function handleScroll(x, y, direction)
+  local target = focusedProcess()
+  if target then
+    deliverEvent(target, {"scroll", x, y, direction})
+  else
+    -- Mouse wheel over the screen: positive direction is up.
+    scrollConsole((direction or 0) > 0 and 3 or -3)
+  end
+end
+
+-- --- Touch: window decorations and pointer input (gmux's touch_event) ---
+--
+-- A touch focuses and raises the window under it. On the title bar it
+-- hits a button (minimize, maximize, close -- close also kills the
+-- owner process, as in gmux) or starts a move that following drags
+-- carry out; on a resizable window's bottom-right body cell it starts a
+-- resize. Anything else reaches the window's owner process as
+-- {"touch"/"drag"/"drop", x, y, button} in the body's own coordinates.
+-- A resized window's owner gets {"window_resized", id, width, height}.
+-- Nothing here while one owner has the whole screen.
+local currentGrab = nil
+local MIN_WINDOW_WIDTH = 8 -- room for the title bar's buttons
+
+local function windowProcess(win)
+  local job = win.ownerJobId and jobs[win.ownerJobId]
+  if job and job.status == "running" and nodes[job.node] and not nodes[job.node].down then return job end
+end
+
+local function notifyResized(win)
+  local job = windowProcess(win)
+  if job then deliverEvent(job, {"window_resized", win.id, win.width, win.height}) end
+end
+
+local function closeWindow(win)
+  local job = windowProcess(win)
+  compositor.close(win.id)
+  if job then controlJob(job.id, "KILL", "killed (window closed)") end
+end
+
+local function handleTouch(name, x, y, button)
+  if compositor.exclusiveOwner() then currentGrab = nil return end
+  if currentGrab then
+    local grab = currentGrab
+    local win = compositor.getWindow(grab.id)
+    if name == "drop" or not win then currentGrab = nil return end
+    if name == "drag" then
+      if grab.kind == "move" then
+        compositor.move(win.id, x - grab.dx, y)
+      else
+        local w = math.max(MIN_WINDOW_WIDTH, x - win.x + 1)
+        local h = math.max(1, y - compositor.bodyTop(win) + 1)
+        if (w ~= win.width or h ~= win.height) and compositor.resize(win.id, w, h) then notifyResized(win) end
+      end
+      return
+    end
+    currentGrab = nil -- a fresh touch ends the grab and is handled below
+  end
+  local win, part, lx, ly = compositor.hitTest(x, y)
+  if not win then return end
+  if name == "touch" then
+    compositor.setFocus(win.id)
+    compositor.raise(win.id)
+  end
+  if part == "title" then
+    if name ~= "touch" then return end
+    local w = win.width
+    if lx == w - 5 or lx == w - 4 then
+      compositor.minimize(win.id)
+    elseif (lx == w - 3 or lx == w - 2) and win.resizable then
+      if compositor.maximize(win.id) then notifyResized(win) end
+    elseif lx == w - 1 or lx == w then
+      closeWindow(win)
+    else
+      currentGrab = {id = win.id, kind = "move", dx = lx - 1}
+    end
+    return
+  end
+  if name == "touch" and win.resizable and win.decorated and lx == win.width and ly == win.height then
+    currentGrab = {id = win.id, kind = "resize"}
+    return
+  end
+  local job = windowProcess(win)
+  if job then deliverEvent(job, {name, lx, ly, button}) end
 end
 
 -- Pulls and fully handles exactly one signal, or times out -- the ONE
@@ -799,11 +2194,26 @@ local function tick(timeout)
     if name == "key_down" then
       handleKeyDown(a3, a4)
     elseif name == "key_up" then
-      handleKeyUp(a4)
+      handleKeyUp(a3, a4)
+    elseif name == "scroll" then
+      handleScroll(a3, a4, a5)
+    elseif name == "touch" or name == "drag" or name == "drop" then
+      handleTouch(name, a3, a4, a5)
+    elseif name == "component_added" or name == "component_removed" then
+      bus.refreshOwn()
     elseif name == "modem_message" then
       handleModemMessage(a3, a4, a6)
     end
+    if comboPressedAt and not comboHoldFired and heldKeys[KEY_C] and isControlDown() and isAltDown()
+        and computer.uptime() - comboPressedAt >= CONSOLE_HOLD_SECONDS then
+      comboHoldFired = true
+      consoleInterrupt()
+    end
     sweepStaleChunks()
+    bus.sweep()
+    sweepStaleOrphans()
+    checkLiveness()
+    renderConsole()
     compositor.flush()
   end)
   if not ok then
@@ -831,14 +2241,17 @@ end
 -- pingOnce().
 local function waitForReply(id, addr, timeout)
   local deadline = computer.uptime() + (timeout or TIMEOUT)
+  awaiting[id] = addr
   while computer.uptime() < deadline do
     local msg = replyBox[id]
     if msg then
       replyBox[id] = nil
+      awaiting[id] = nil
       return msg
     end
     tick(deadline - computer.uptime())
   end
+  awaiting[id] = nil
   return nil, "timed out waiting for " .. tostring(addr)
 end
 
@@ -852,6 +2265,25 @@ end
 -- Submit `code` (compiled as a chunk and called with `args` as its only
 -- argument) to one worker node and block for the result. Picks the next
 -- node round-robin unless targetAddr is given.
+-- Runs a launched program in the foreground: the console waits until it
+-- ends (any way: done, error, killed, lost), feeding it typed input
+-- meanwhile, like an OpenOS shell.
+local function runForeground(id)
+  foregroundJob, foregroundTyped = id, ""
+  while jobs[id] and jobs[id].status == "running" do
+    tick(0.5)
+  end
+  foregroundJob = nil
+  if consolePartial ~= "" then
+    consoleAppend(consolePartial)
+    consolePartial = ""
+  end
+  local job = jobs[id]
+  if job and job.status ~= "done" then
+    print(job.status .. ": " .. tostring(job.error))
+  end
+end
+
 local function submit(code, args, targetAddr)
   local id, addrOrErr = dispatchJob(code, args, targetAddr)
   if not id then
@@ -928,7 +2360,8 @@ local function listNodes()
     return
   end
   for i, addr in ipairs(nodeOrder) do
-    print(string.format("[%d] %s  (last seen %.1fs ago)", i, addr, computer.uptime() - nodes[addr].lastSeen))
+    print(string.format("[%d] %s  (last seen %.1fs ago)%s", i, addr, computer.uptime() - nodes[addr].lastSeen,
+      nodes[addr].down and " DOWN" or (nodes[addr].draining and " DRAINING" or "")))
   end
 end
 
@@ -947,18 +2380,19 @@ end
 -- a worker (handleGetProcesses) -- the REPL runs in the same process as
 -- `jobs` itself.
 local function printProcesses()
-  if #jobOrder == 0 then
+  local ids = orderedJobIds()
+  if #ids == 0 then
     print("no jobs dispatched yet")
     return
   end
-  for _, id in ipairs(jobOrder) do
+  for _, id in ipairs(ids) do
     local job = jobs[id]
     local parentInfo = ""
     if job.appName or job.orphanPolicy then
       parentInfo = string.format(" (parent=%s app=%s policy=%s)",
         job.parent and tostring(job.parent) or "none", tostring(job.appName), tostring(job.orphanPolicy))
     end
-    print(string.format("[%d] %s on %s%s%s", job.id, job.status, job.node,
+    print(string.format("[%d] %s on %s%s%s", job.id, job.paused and "paused" or job.status, job.node,
       job.error and (" -- " .. job.error) or "", parentInfo))
   end
 end
@@ -992,8 +2426,15 @@ local function printWindows()
     print("no windows created yet")
     return
   end
+  local focus = compositor.getFocus()
   for _, win in ipairs(list) do
-    print(string.format("[%d] %q  %dx%d at (%d,%d)", win.id, win.title, win.width, win.height, win.x, win.y))
+    local tags = ""
+    if focus and win.id == focus.id then tags = tags .. " (focused)" end
+    if win.ownerJobId then tags = tags .. " (owner job " .. win.ownerJobId .. ")" end
+    if win.minimized then tags = tags .. " (minimized)" end
+    if win.maximized then tags = tags .. " (maximized)" end
+    if win.status then tags = tags .. " (process " .. win.status .. ")" end
+    print(string.format("[%d] %q  %dx%d at (%d,%d)%s", win.id, win.title, win.width, win.height, win.x, win.y, tags))
   end
 end
 
@@ -1020,9 +2461,11 @@ runCommand = function(line)
   elseif line:match("^runall%s") then
     local code = line:sub(8)
     for _, addr in ipairs(nodeOrder) do
+      if nodes[addr].down then goto continue end
       local result, err = submit(code, nil, addr)
       if err then print(addr .. ": error: " .. err)
       else print(addr .. ": " .. tostring(result)) end
+      ::continue::
     end
   elseif line:match("^spawn%s") then
     local node, code = line:match("^spawn%s+(%S+)%s+(.*)$")
@@ -1043,6 +2486,78 @@ runCommand = function(line)
     end
   elseif line == "windows" then
     printWindows()
+  elseif line:match("^console%s") then
+    local w, h, x, y = line:match("^console%s+(%d+)%s+(%d+)%s*(%d*)%s*(%d*)$")
+    w, h, x, y = tonumber(w), tonumber(h), tonumber(x), tonumber(y)
+    if not w then
+      print("usage: console <width> <height> [x y]  (default: docked bottom-left)")
+    elseif w < CONSOLE_MIN_W or h < CONSOLE_MIN_H or w > termW or h > termH then
+      print(string.format("console size must be between %dx%d and %dx%d", CONSOLE_MIN_W, CONSOLE_MIN_H, termW, termH))
+    else
+      x, y = x or 1, y or (termH - h + 1)
+      if x + w - 1 > termW or y + h - 1 > termH then
+        print("that doesn't fit on the screen")
+      else
+        compositor.setGeometry(consoleWin.id, x, y, w, h)
+        consoleW, consoleH = w, h
+        setScroll(scrollOffset)
+        consoleDirty = true
+        print(string.format("console is now %dx%d at (%d,%d)", w, h, x, y))
+      end
+    end
+  elseif line:match("^pause%s") or line:match("^resume%s") or line:match("^kill%s") then
+    local verb, idStr = line:match("^(%a+)%s+(%d+)$")
+    if not verb then
+      print("usage: pause|resume|kill <job id>")
+    else
+      local ok, err = controlJob(tonumber(idStr), verb:upper(), "killed by user")
+      if ok then print(verb .. " sent to job [" .. idStr .. "]") else print("error: " .. err) end
+    end
+  elseif line:match("^migrate%s") then
+    local idStr, target = line:match("^migrate%s+(%d+)%s*(%S*)$")
+    if not idStr then
+      print("usage: migrate <job id> [node]")
+    else
+      local ok, result = migrateJob(tonumber(idStr), target ~= "" and resolveNode(target) or nil)
+      if ok then print("migrating job [" .. idStr .. "] to " .. result) else print("error: " .. result) end
+    end
+  elseif line:match("^drain%s") or line:match("^undrain%s") then
+    local verb, target = line:match("^(%a+)%s+(%S+)$")
+    local addr = target and resolveNode(target)
+    if not addr then
+      print("usage: drain|undrain <node>")
+    elseif verb == "undrain" then
+      if nodes[addr] then nodes[addr].draining = nil print(addr .. " takes new work again") else print("unknown node: " .. addr) end
+    else
+      local ok, moved, staying = drainNode(addr)
+      if ok then
+        print(string.format("draining %s: moving %d migratable job(s), %d will finish there", addr, moved, staying))
+      else
+        print("error: " .. moved)
+      end
+    end
+  elseif line == "comp" then
+    -- Back to normal compositing from console mode.
+    -- Only takes the screen back from the console, never from a node
+    -- holding the fullscreen grant.
+    if consoleOwnsScreen() then compositor.setExclusive(nil) end
+    scrollOffset = 0
+    consoleDirty = true
+    print("compositor restored -- all windows shown")
+  elseif line:match("^focus%s") then
+    -- Manual stand-in for the gesture that will eventually move focus
+    -- for real (there's no mouse/click component anywhere in this
+    -- project) -- see kernal/compositor.lua's M.setFocus. Moving focus
+    -- doesn't yet DO anything beyond being observable via `windows`
+    -- (handleKeyDown below still only ever feeds the kernal's own REPL
+    -- input buffer) -- that's the next piece, not this one.
+    local idStr = line:match("^focus%s+(%d+)$")
+    if not idStr then
+      print("usage: focus <window id>")
+    else
+      local ok, err = compositor.setFocus(tonumber(idStr))
+      if ok then print("window [" .. idStr .. "] focused") else print("error: " .. err) end
+    end
   elseif line:match("^bitdemo%s") then
     local mode, x, y = line:match("^bitdemo%s+(%S+)%s+(%d+)%s+(%d+)$")
     if not mode or (mode ~= "halfblock" and mode ~= "braille") then
@@ -1051,6 +2566,21 @@ runCommand = function(line)
       local win, err = compositor.createWindow({title = "bitdemo", x = tonumber(x), y = tonumber(y),
         pixels = demoPixels(16), width = 16, height = 16, mode = mode, bg = 0x000000})
       if err then print("error: " .. err) else print("created bit window [" .. win.id .. "] (" .. win.width .. "x" .. win.height .. " cells)") end
+    end
+  elseif line == "bus" then
+    local addrs = {}
+    for addr in pairs(bus.components) do addrs[#addrs + 1] = addr end
+    table.sort(addrs, function(a, b)
+      local x, y = bus.components[a], bus.components[b]
+      if x.type ~= y.type then return x.type < y.type end
+      return a < b
+    end)
+    if #addrs == 0 then print("no components on the bus") end
+    for _, addr in ipairs(addrs) do
+      local c = bus.components[addr]
+      local where = c.node == selfAddr and "kernal" or c.node
+      if c.node ~= selfAddr and nodes[c.node] and nodes[c.node].down then where = where .. " (DOWN)" end
+      print(string.format("%-14s %s  on %s", c.type, addr, where))
     end
   elseif line:match("^components%s") then
     printComponents(resolveNode(line:match("^components%s+(%S+)")))
@@ -1073,22 +2603,45 @@ runCommand = function(line)
       end
     end
   elseif line ~= "" then
-    print("unknown command")
+    -- Not a built-in: run it as a program, OpenOS-shell style. A
+    -- trailing "&" runs it in the background.
+    local words = {}
+    for word in line:gmatch("%S+") do words[#words + 1] = word end
+    local background = words[#words] == "&"
+    if background then table.remove(words) end
+    local path = words[1] and resolveProgram(words[1])
+    if not path then
+      print("unknown command")
+      return
+    end
+    local id, addrOrErr = launchProgram(path, {table.unpack(words, 2)})
+    if not id then
+      print("error: " .. addrOrErr)
+    elseif background or path:match("%.lua$") then
+      -- A legacy program has its own window (its terminal), as in
+      -- gmux, so the console doesn't wait for it.
+      print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
+    else
+      runForeground(id)
+    end
   end
 end
 
 print("muxos kernal -- " .. selfAddr)
 print("commands:")
 print("  discover | nodes | ping <node> [count] | quit")
-print("  run <lua code> | runall <lua code> | processes")
+print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job id>")
+print("  migrate <job id> [node] | drain|undrain <node>")
 print("  spawn <node> <lua code>")
 print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
+print("  console <width> <height> [x y] -- resize/move the console window")
+print("  comp -- leave console mode (hold Ctrl+Alt+C to enter it; a press exits fullscreen); PgUp/PgDn or the wheel scroll")
+print("  focus <window id> -- moves keyboard focus (manual stand-in -- no mouse/click gesture exists yet)")
 print("  bitdemo <halfblock|braille> <x> <y> -- draws a test pattern as a bit window")
-print("  components <node> | call <node> <component addr> <method> [args table]")
+print("  bus (every component in the cluster) | components <node> | call <node> <component addr> <method> [args table]")
 print("(<node> is either a [n] index from 'nodes' or a full node address)")
 discover(1)
 listNodes()
-promptLine()
 
 while true do
   tick(0.05) -- ~1 tick between idle maintenance passes (sweepStaleChunks/compositor.flush)

@@ -31,19 +31,156 @@ local runtimeSrc = readFile(REPO_ROOT .. "/node/runtime.lua")
 local workerBiosSrc = readFile(REPO_ROOT .. "/node/bios.lua")
 
 local emu = Emulator.new()
+-- system.timeout() for every node: 1s of host CPU per slice keeps the
+-- "too long without yielding" scenarios fast.
+emu.timeout = 1
 
 -- --- Build the kernal ---
 local kernal = emu:newNode("kernal")
-local kernalEnv = emu:buildEnv(kernal)
 emu:addModem(kernal)
-emu:addEeprom(kernal)
+emu:addEeprom(kernal, kernalBiosSrc)
 local gpuAddr, screenAddr, screenBuffers = emu:addGpuScreen(kernal, 50, 30)
-emu:addFilesystem(kernal, {
+local kernalFiles = {
   ["/muxos.lua"] = muxosSrc,
   ["/compositor.lua"] = compositorSrc,
   ["/bitmap.lua"] = bitmapSrc,
   ["/runtime.lua"] = runtimeSrc,
-})
+  -- Sample programs for the launcher (test 29).
+  ["/bin/hello.mxe"] = [==[--[[mxe
+muxos = "0.1.1"
+libraries = {"greeting", "nosuchlib"}
+]]
+local greeting = require("greeting")
+print(greeting.say("mxe") .. " v=" .. tostring(launch.versionMatch) .. " g=" .. tostring(launch.libraries.greeting)
+  .. " n=" .. tostring(launch.libraries.nosuchlib) .. " a=" .. tostring((...)))
+]==],
+  ["/lib/mxe/greeting.lua"] = [==[return {say = function(name) return "hello " .. name end}]==],
+  ["/bin/old.mxe"] = [==[--[[mxe
+muxos = "9.9"
+]]
+print("old-runs v=" .. tostring(launch.versionMatch) .. " want=" .. tostring(launch.requested) .. " have=" .. launch.muxos)
+]==],
+  ["/bin/counter.mxe"] = [==[--[[mxe
+muxos = "0.1.0"
+libraries = {"mux"}
+]]
+local mux = require("mux")
+local state = mux.restored() or {n = 0, starts = 0, target = tonumber((...)) or 20}
+state.starts = state.starts + 1
+mux.migratable(function() return state end)
+while state.n < state.target do
+  state.n = state.n + 1
+  sleep(0.25)
+end
+print("counter done n=" .. state.n .. " starts=" .. state.starts)
+]==],
+  ["/bin/ask.lua"] = [==[io.write("name? ")
+local name = io.read()
+print("hi " .. name .. " gmuxapi=" .. tostring(gmuxapi) .. " os.time=" .. type(os.time))
+]==],
+  -- Legacy libraries (test 33): the vendored OpenOS ones are added below.
+  ["/usr/lib/extralib.lua"] = [==[return {v = "ok"}]==],
+  -- A legacy program using files (test 35).
+  ["/bin/files.lua"] = [==[local fs = require("filesystem")
+local f = io.open("/home/notes.txt", "w")
+f:write("line one\n", "line two\n", string.rep("x", 5000), "\n")
+f:close()
+local r = io.open("/home/notes.txt")
+local l1, l2, rest = r:read("l"), r:read("L"), r:read("a")
+r:close()
+fs.makeDirectory("/home/sub")
+fs.copy("/home/notes.txt", "/home/sub/copy.txt")
+local names = {} for n in fs.list("/home") do names[#names + 1] = n end
+os.setenv("PWD", "/home")
+local count = 0 for _ in io.lines("sub/copy.txt") do count = count + 1 end
+local ok = pcall(dofile, "/lib/sides.lua") print("fs " .. l1 .. "|" .. l2:gsub("\n", "N") .. "|" .. #rest .. "|" .. table.concat(names, ",") .. "|" .. count .. "|" .. fs.size("/home/sub/copy.txt") .. "|" .. tostring(fs.exists("/home/nope")) .. "|" .. tostring(ok) .. "|" .. tostring(fs.isDirectory("/home/sub"))) error("boom")
+]==],
+  -- A legacy program using an internet card elsewhere in the cluster (test 36).
+  ["/bin/fetch.lua"] = [==[local internet = require("internet")
+local body = ""
+for chunk in internet.request("http://example/x") do body = body .. chunk end
+print("fetched " .. body .. " via " .. require("component").internet.address:sub(1, 8))
+]==],
+  -- The .mxe spec (test 37): libraries in both search dirs, one needing another.
+  ["/usr/lib/mxe/toplib.lua"] = [==[--[[mxe
+libraries = {"baselib"}
+]]
+return {value = require("baselib").v .. "+top"}]==],
+  ["/lib/mxe/baselib.lua"] = [==[return {v = "base"}]==],
+  ["/bin/spec.mxe"] = [==[--[[mxe
+muxos = "0.1.0"
+name = "spec"
+version = "2.0"
+libraries = {"mux", "http", "toplib"}
+requires = {"internet", "tape_drive"}
+]]
+local mux = require("mux")
+local args, opts = mux.parseArgs(...)
+fs.write("/home/spec/a.txt", "one\ntwo\n")
+local f = fs.open("/home/spec/a.txt", "a") f:write("three\n") f:close()
+local lines = 0 for _ in fs.read("/home/spec/a.txt"):gmatch("\n") do lines = lines + 1 end
+fs.copy("/home/spec/a.txt", "/home/spec/b.txt")
+fs.rename("/home/spec/b.txt", "/home/spec/c.txt")
+local names = table.concat(fs.list("/home/spec"), ",")
+fs.remove("/home/spec/a.txt")
+local body, status = require("http").get("http://gitea/repo/hello.txt")
+print("spec " .. args[1] .. "|" .. tostring(opts.v) .. tostring(opts.x) .. "|" .. opts.name .. "|" .. require("toplib").value
+  .. "|" .. lines .. "|" .. names .. "|" .. tostring(fs.exists("/home/spec/a.txt")) .. "|" .. body .. status
+  .. "|" .. tostring(launch.compatible) .. launch.name .. launch.version
+  .. "|" .. tostring(launch.components.internet) .. tostring(launch.components.tape_drive))
+print("hello " .. tostring(readLine("who? ")))
+]==],
+  -- OPM, as the installer ships it (test 38).
+  ["/bin/opm.mxe"] = readFile(REPO_ROOT .. "/opm/opm.mxe"),
+  ["/lib/mxe/opm_core.lua"] = readFile(REPO_ROOT .. "/opm/opm_core.lua"),
+  -- A legacy graphics program (test 34).
+  ["/bin/paint.lua"] = [==[local component = require("component")
+local event = require("event")
+local gpu = component.gpu
+local w0, h0 = gpu.getResolution()
+gpu.setResolution(20, 4)
+gpu.setBackground(0x0000FF)
+gpu.fill(1, 1, 20, 4, " ")
+gpu.set(2, 2, "legacy gfx")
+gpu.copy(2, 2, 10, 1, 0, 1)
+local buf = gpu.allocateBuffer(5, 1)
+gpu.setActiveBuffer(buf)
+gpu.set(1, 1, "BUF!!")
+gpu.setActiveBuffer(0)
+gpu.bitblt(0, 2, 4, 5, 1, buf, 1, 1)
+gpu.set(2, 1, "d=" .. w0 .. "x" .. h0 .. " s=" .. tostring(component.isAvailable("screen")))
+local _, addr, x, y = event.pull("touch")
+gpu.set(2, 1, "touch " .. x .. "," .. y .. " " .. tostring(addr == gpu.getScreen()))
+local _, _, nw, nh = event.pull("screen_resized")
+gpu.set(2, 1, "size " .. nw .. "x" .. nh .. " res=" .. table.concat({gpu.getResolution()}, "x"))
+os.sleep(0.5)
+]==],
+  ["/bin/libs.lua"] = [==[local serialization = require("serialization")
+local text = require("text")
+local sides = require("sides")
+local colors = require("colors")
+local keyboard = require("keyboard")
+local event = require("event")
+local component = require("component")
+local t = serialization.unserialize(serialization.serialize({a = 1, b = "x"}))
+local extra = require("extra" .. "lib")
+local gpuOk = pcall(function() return component.gpu end)
+print("libs t=" .. t.a .. t.b .. " pad=" .. text.padRight("ab", 4) .. "| top=" .. sides.top .. " red=" .. colors.red
+  .. " f1=" .. keyboard.keys.f1 .. " extra=" .. extra.v .. " gpu=" .. tostring(gpuOk)
+  .. " avail=" .. tostring(component.isAvailable("gpu")) .. " same=" .. tostring(require("text") == text))
+io.write("press: ")
+local name, _, char = event.pull("key_down")
+print("got " .. name .. " " .. string.char(char) .. " held=" .. tostring(keyboard.isKeyDown(string.char(char))))
+local ok, err = pcall(require, "nosuchmodule")
+print("missing=" .. tostring(ok) .. " " .. (tostring(err):match("module 'nosuchmodule' not found") and "nf" or tostring(err)))
+]==],
+}
+-- The vendored OpenOS libraries, installed as /lib on the kernal's disk.
+for _, rel in ipairs({"serialization", "text", "sides", "colors", "keyboard", "transforms", "internet",
+    "core/full_keyboard", "core/full_text", "core/full_transforms"}) do
+  kernalFiles["/lib/" .. rel .. ".lua"] = readFile(REPO_ROOT .. "/kernal/lib/" .. rel .. ".lua")
+end
+emu:addFilesystem(kernal, kernalFiles)
 
 local function renderScreen()
   local buf = screenBuffers[0]
@@ -59,6 +196,23 @@ local function renderScreen()
   return table.concat(lines, "\n")
 end
 
+-- The text in screen cells [x, x+n-1] of row y.
+local function cellText(x, y, n)
+  local row = screenBuffers[0].cells[y] or {}
+  local out = {}
+  for i = 0, n - 1 do out[#out + 1] = (row[x + i] and row[x + i].char) or " " end
+  return table.concat(out)
+end
+local function touch(name, x, y)
+  emu:injectSignal(kernal, name, screenAddr, x, y, 0, "tester")
+  emu:advance(0.5)
+end
+-- Closes the window whose title bar starts at (x, 1) and is `w` wide.
+local function closeWindowAt(x, w)
+  touch("touch", x + w - 2, 1)
+  emu:advance(0.5)
+end
+
 local function dumpScreenOnFailure(label)
   io.stderr:write("\n=== screen at failure (" .. label .. ") ===\n" .. renderScreen() .. "\n=== end ===\n")
   io.stderr:write("\n=== emulator log (last 40) ===\n")
@@ -69,18 +223,57 @@ local function dumpScreenOnFailure(label)
   end
 end
 
-local biosChunk = assert(kernalEnv.load(kernalBiosSrc, "=bios", "t", kernalEnv))
-emu:boot(kernal, biosChunk)
+emu:boot(kernal)
 assert(kernal.status == "running", "kernal failed to boot: see log")
 
+-- Hardware for the cluster component bus (test 36): an internet card on
+-- the kernal, a redstone card on worker 1.
+-- A tiny web for it (tests 37-38): a Gitea-style package catalog.
+local GITEA = "http://gitea/repo/"
+local webFiles = {
+  [GITEA .. "hello.txt"] = "page",
+  [GITEA .. "programs.cfg"] = [[{
+  ["demo"] = { files = { ["master/demo/demo.lua"] = "/bin", ["master/demo/demolib.lua"] = "/lib" },
+               dependencies = { ["demodep"] = "/" }, name = "Demo", description = "a demo program" },
+  ["demodep"] = { files = { ["master/demodep/extra.lua"] = "/lib" }, name = "demodep", description = "its dependency" },
+}]],
+  [GITEA .. "demo/demo.lua"] = 'local VERSION = "1.2"\nprint("demo says " .. require("demolib").msg .. " " .. require("extra").v)\n',
+  [GITEA .. "demo/demolib.lua"] = 'return {msg = "hi"}',
+  [GITEA .. "demodep/extra.lua"] = 'return {v = "dep"}',
+}
+local function fakeInternet()
+  return {
+    request = function(url)
+      local chunks = webFiles[url] and {webFiles[url]} or {"hello ", "", "bus"}
+      return {
+        finishConnect = function() return true end,
+        response = function() return 200, "OK", {} end,
+        read = function() return table.remove(chunks, 1) end,
+        close = function() chunks = {} return true end,
+      }
+    end,
+    isHttpEnabled = function() return true end,
+  }
+end
+local internetAddr = emu:addComponent(kernal, "internet", fakeInternet())
+-- Added after the kernal booted: it hears about it, as on real hardware.
+emu:injectSignal(kernal, "component_added", internetAddr, "internet")
+
 -- --- Build 3 workers ---
-local workers = {}
+local workers, workerModems, redstoneAddr = {}, {}, nil
 for i = 1, 3 do
   local w = emu:newNode("worker")
-  local wenv = emu:buildEnv(w)
-  emu:addModem(w)
-  local chunk = assert(wenv.load(workerBiosSrc, "=bios", "t", wenv))
-  emu:boot(w, chunk)
+  workerModems[i] = emu:addModem(w)
+  if i == 1 then
+    local outputs = {}
+    redstoneAddr = emu:addComponent(w, "redstone", {
+      getInput = function(side) return side * 10 end,
+      setOutput = function(side, v) local old = outputs[side] or 0 outputs[side] = v return old end,
+      getOutput = function(side) return outputs[side] or 0 end,
+    })
+  end
+  emu:addEeprom(w, workerBiosSrc)
+  emu:boot(w)
   assert(w.status == "running", "worker " .. i .. " failed to boot: see log")
   workers[i] = w
 end
@@ -126,13 +319,15 @@ assertScreenContains("muxos>", "prompt visible")
 -- fixed-height scrolling console, see kernal/muxos.lua's termWrite),
 -- not something to assert on. All 3 workers should still be visible in
 -- the post-boot discover(1) + listNodes() output, though.
+-- Nodes are identified by their network card's address (see
+-- kernal/muxos.lua's selfAddr), so check for each worker's own card.
 do
   local screen = renderScreen()
-  local count = 0
-  for _ in screen:gmatch("worker%-%x+") do count = count + 1 end
-  if count < 3 then
-    dumpScreenOnFailure("worker discovery")
-    error("expected all 3 workers listed after boot, found " .. count)
+  for i, w in ipairs(workers) do
+    if not screen:find(w.modemAddr, 1, true) then
+      dumpScreenOnFailure("worker discovery")
+      error("worker " .. i .. " (card " .. w.modemAddr .. ") not listed after boot")
+    end
   end
 end
 print("  OK -- 3 workers visible on screen after boot")
@@ -172,11 +367,11 @@ emu:advance(3)
 assertScreenContains("reply from", "ping after long job")
 print("  OK -- worker still answers PING immediately after a long cooperating job")
 
-print("test 6: a NON-cooperating long JOB gets killed by the instruction-budget circuit breaker, not the worker")
-typeLine("run local x = 0 for i = 1, 100000000 do x = x + 1 end return x")
+print("test 6: a NON-cooperating long JOB is ended by the machine's deadline, not the worker")
+typeLine("run local x = 0 while true do x = x + 1 end")
 emu:advance(4)
 assertScreenContains("error", "non-cooperating job error")
-assertScreenContains("instruction budget", "circuit breaker message")
+assertScreenContains("too long without yielding", "the machine's own deadline ended the job")
 print("  OK -- non-cooperating job was killed with the expected error, worker itself survived")
 
 -- Confirm the worker that ran it is STILL alive and answering, not
@@ -216,37 +411,48 @@ assertScreenContains("true|nil|", "fullscreen round trip result")
 assertScreenContains("blocked", "blocked again after release")
 print("  OK -- gpu.set succeeded while the grant was held, and was blocked again after releasing it")
 
-print("test 10: Ctrl+Alt+C force-releases a stuck fullscreen grant at the kernal console")
+print("test 10: Ctrl+Alt+C -- a press exits fullscreen (releasing a stuck grant), holding it enters console mode")
 -- worker 1 grabs the grant and deliberately never releases it (fire-and-forget spawn).
 typeLine('spawn 1 gmuxapi.request_fullscreen()')
 emu:advance(2)
--- worker 2 trying to grab it now must be denied -- confirms the grant is actually held.
+-- worker 2 trying to grab it now must be denied. The console is a
+-- compositor window, and compositing is suspended while a node owns the
+-- screen, so this denial only becomes visible once fullscreen is exited.
 typeLine('run local g, gerr = gmuxapi.request_fullscreen() return tostring(g) .. "|" .. tostring(gerr)')
 emu:advance(2)
-assertScreenContains("already held by", "grant correctly held by worker 1")
-print("  OK -- grant confirmed held (second requester denied)")
 
--- Inject the real Ctrl+Alt+C combo as three separate key_down signals,
--- exactly as a human holding all three keys would generate -- matching
--- the exact keycodes OpenOS's own lib/keyboard.lua uses (verified
--- against its source, see docs/PROTOCOL.md).
+-- Ctrl+Alt+C as real key_down/key_up signals (OpenOS's keycodes),
+-- held for `holdFor` seconds before the keys are released.
 local KEY_LCONTROL, KEY_LMENU, KEY_C = 0x1D, 0x38, 0x2E
-emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_LCONTROL, "tester")
-emu:step()
-emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_LMENU, "tester")
-emu:step()
-emu:injectSignal(kernal, "key_down", screenAddr, string.byte("c"), KEY_C, "tester")
-emu:step()
-emu:advance(1)
-assertScreenContains("force-releasing fullscreen grant", "Ctrl+Alt+C release message")
-print("  OK -- Ctrl+Alt+C printed the force-release message")
+local function pressCombo(holdFor)
+  emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_LCONTROL, "tester"); emu:step()
+  emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_LMENU, "tester"); emu:step()
+  emu:injectSignal(kernal, "key_down", screenAddr, string.byte("c"), KEY_C, "tester"); emu:step()
+  emu:advance(holdFor or 0.2)
+  emu:injectSignal(kernal, "key_up", screenAddr, string.byte("c"), KEY_C, "tester"); emu:step()
+  emu:injectSignal(kernal, "key_up", screenAddr, 0, KEY_LMENU, "tester"); emu:step()
+  emu:injectSignal(kernal, "key_up", screenAddr, 0, KEY_LCONTROL, "tester"); emu:step()
+  emu:advance(0.5)
+end
 
--- Confirm the grant is ACTUALLY free now, not just that the message
--- printed: a fresh request should succeed immediately.
-typeLine('run local g, gerr = gmuxapi.request_fullscreen() return tostring(g) .. "|" .. tostring(gerr)')
+pressCombo()
+assertScreenContains("already held by", "second requester was denied while the grant was held")
+assertScreenContains("force-releasing fullscreen grant", "a press force-released the stuck grant")
+if renderScreen():gsub("\n", ""):find("console only", 1, true) then
+  dumpScreenOnFailure("press vs hold")
+  error("a short press entered console mode; only holding should")
+end
+print("  OK -- a press exited fullscreen, releasing the stuck grant, without entering console mode")
+pressCombo(1.5)
+assertScreenContains("console only", "holding Ctrl+Alt+C entered console mode")
+print("  OK -- holding Ctrl+Alt+C dropped into the full-screen kernal console")
+
+-- Confirm the grant is ACTUALLY free now: a fresh request succeeds (and
+-- is released again in the same job, so the console stays visible).
+typeLine('run local g = gmuxapi.request_fullscreen() local r = gmuxapi.release_fullscreen() return tostring(g ~= nil) .. "|" .. tostring(r ~= nil)')
 emu:advance(2)
-assertScreenContains("true|nil", "grant actually available again after Ctrl+Alt+C")
-print("  OK -- fullscreen grant was genuinely free after the escape hatch, not just the message")
+assertScreenContains("true|true", "grant actually available again after Ctrl+Alt+C")
+print("  OK -- fullscreen grant was genuinely free after the interrupt, not just the message")
 
 print("test 11: node/runtime.lua never reassigns kernalAddr after boot (structural regression check)")
 -- An end-to-end "spoof a peer message and see if kernalAddr breaks"
@@ -300,7 +506,7 @@ print("test 12: parent/child jobs -- orphan/promote/kill policies, applied for r
 -- applyOrphanPolicyForChildrenOf fires for real -- this is the actual
 -- mechanism from docs/PROTOCOL.md's ".mxe process model", not a mock
 -- of it.
-typeLine('run local a=gmuxapi.create_headless_process({code="local t=0 for i=1,2000 do t=t+1 if i%50==0 then yield() end end return t", name="testapp", orphan_policy="orphan"}); local b=gmuxapi.create_headless_process({code="return 123", name="testapp", orphan_policy="promote"}); local c=gmuxapi.create_headless_process({code="local t=0 for i=1,2000 do t=t+1 if i%50==0 then yield() end end return t", name="testapp", orphan_policy="kill"}); return tostring(a.process.id) .. "," .. tostring(b.process.id) .. "," .. tostring(c.process.id)')
+typeLine('run local a=gmuxapi.create_headless_process({code="local t=0 for i=1,2000 do t=t+1 if i%50==0 then yield() end end return t", name="testapp", orphan_policy="orphan"}); local b=gmuxapi.create_headless_process({code="return 123", name="testapp", orphan_policy="promote"}); local c=gmuxapi.create_headless_process({code="for i=1,400 do sleep(0.05) end return 1", name="testapp", orphan_policy="kill"}); return tostring(a.process.id) .. "," .. tostring(b.process.id) .. "," .. tostring(c.process.id)')
 emu:advance(3)
 
 local childIds
@@ -330,7 +536,7 @@ emu:advance(2)
 
 typeLine("processes")
 emu:advance(2)
-assertScreenContains("[" .. childIds.kill .. "] error", "kill-policy child shows as errored")
+assertScreenContains("[" .. childIds.kill .. "] killed", "kill-policy child shows as killed")
 assertScreenContains("killed (orphan policy", "kill-policy child's error names the real reason")
 print("  OK -- the kill-policy child was actually killed once its parent finished, not just bookkept")
 
@@ -343,5 +549,775 @@ typeLine('run local list = gmuxapi.get_orphans("testapp") local n = 0 for _ in p
 emu:advance(3)
 assertScreenContains("count=0", "orphans are claimed once -- a second get_orphans call for the same name returns nothing")
 print("  OK -- orphan was claimed once; a second get_orphans call returns none")
+
+print("test 13: fan-out cap -- a job tree can't have more running jobs than there are worker nodes (3)")
+-- The parent job itself counts as "running" in its own tree while it's
+-- spawning children (it hasn't returned yet), so with 3 worker nodes
+-- the cap (#nodeOrder == 3) allows the parent plus only 2 children
+-- before a 3rd spawn attempt is rejected. Each child needs to still be
+-- "running" (not finished) through all three back-to-back spawn round
+-- trips below for that cap to actually bind.
+--
+-- The child sleeps with sleep(): a CPU-bound loop (even with yield())
+-- finishes in zero simulated time, because the emulator only advances
+-- its clock for a real timed wait, so a busy-loop child would already
+-- be done -- and out of the tree's count -- before the 3rd spawn.
+typeLine('run local childCode="sleep(5) return 1" local ok1,e1=gmuxapi.create_headless_process({code=childCode,name="fanout"}) local ok2,e2=gmuxapi.create_headless_process({code=childCode,name="fanout"}) local ok3,e3=gmuxapi.create_headless_process({code=childCode,name="fanout"}) return "r1="..tostring(ok1~=nil).." r2="..tostring(ok2~=nil).." r3="..tostring(ok3~=nil).." e3="..tostring(e3)')
+emu:advance(3)
+assertScreenContains("r1=true r2=true r3=false", "first two children succeed, third is rejected")
+assertScreenContains("fan-out cap reached", "rejection names the real reason")
+print("  OK -- 1st and 2nd child spawns succeeded, 3rd was rejected once the tree hit the 3-node cap")
+
+-- Test 13's own two surviving children are still mid-sleep (5
+-- simulated seconds from when each started, and only 3 of those have
+-- passed) -- drain that before
+-- test 14 starts anything new, so every worker node is actually free
+-- rather than queued up behind a sleeper that has nothing to do with
+-- this next test.
+emu:advance(3)
+
+print("test 14: window focus -- ownership + default/explicit focus")
+-- create_graphics_process spawns a job AND a window FOR it, in one
+-- call -- the window's ownerJobId should be that job's own id, not
+-- whichever node happened to make the CREATEWINDOW request (this
+-- `run` job's own node, not the spawned child's). The child just
+-- sleeps so there's no race with the checks below.
+typeLine('run local r=gmuxapi.create_graphics_process({code="sleep(5) return 1", name="focustest", width=10, height=5}) return tostring(r.process.id) .. "," .. tostring(r.window.id) .. "," .. tostring(r.window.ownerJobId)')
+emu:advance(2)
+
+local focusProcId, focusWinId
+do
+  local screen = renderScreen():gsub("\n", "")
+  local p, w, owner = screen:match("(%d+),(%d+),(%d+)")
+  if not p then
+    dumpScreenOnFailure("create_graphics_process ids")
+    error("could not find process/window/owner ids on screen")
+  end
+  assert(p == owner, "the new window's ownerJobId must be the SPAWNED child's own id -- got process=" .. p .. " owner=" .. owner)
+  focusProcId, focusWinId = p, w
+end
+print("  OK -- create_graphics_process's window is owned by the job it was created for (job " .. focusProcId .. ", window " .. focusWinId .. ")")
+
+-- While that window is focused and its process is alive, keystrokes go
+-- to the process (test 28), so let it finish (it sleeps 5s) before
+-- typing more commands -- with its owner gone, input falls back to the
+-- console even though the window keeps focus.
+emu:advance(5)
+
+typeLine("windows")
+emu:advance(2)
+assertScreenContains("[" .. focusWinId .. "]", "graphics-process window listed")
+assertScreenContains("(focused)", "the newest window takes focus by default")
+assertScreenContains("(owner job " .. focusProcId .. ")", "the listing shows the real owning job, not just that one exists")
+print("  OK -- the new window took focus by default and shows its real owning job")
+
+-- A second, plain window (REPL `window` command, no owning job at
+-- all) should steal focus the same way -- "new window = new focus" is
+-- unconditional, not special-cased to only graphics-process windows.
+typeLine("window plain 1 1 5 3 gpu.set(1,1,\"x\")")
+emu:advance(2)
+local plainWinId = renderScreen():gsub("\n", ""):match("created window %[(%d+)%]")
+assert(plainWinId, "expected the plain window's own id to be echoed")
+typeLine("windows")
+emu:advance(2)
+assertScreenContains("[" .. plainWinId .. "]", "plain window listed")
+assertScreenContains("[" .. plainWinId .. "] \"plain\"  5x3 at (1,1) (focused)", "the plain window has no owner tag and now holds focus, having been created more recently")
+print("  OK -- a plain, ownerless window still takes focus on creation, same as an owned one")
+
+-- Explicit `focus <id>` (the manual stand-in for a gesture that
+-- doesn't exist yet -- no mouse/click anywhere in this project) moves
+-- focus back, and is reflected the same way in `windows`.
+typeLine("focus " .. focusWinId)
+emu:advance(2)
+assertScreenContains("window [" .. focusWinId .. "] focused", "focus command confirms the change")
+typeLine("windows")
+emu:advance(2)
+assertScreenContains("[" .. focusWinId .. "]", "graphics-process window still listed")
+assertScreenContains("(owner job " .. focusProcId .. ")", "owner tag still present after refocusing")
+print("  OK -- `focus <id>` moves focus back explicitly, observable via `windows`")
+
+typeLine("focus 99999")
+emu:advance(2)
+assertScreenContains("error: no such window", "focusing a nonexistent window id is rejected, not silently accepted")
+print("  OK -- focusing a nonexistent window id fails with a clear error, leaving focus unchanged")
+
+-- Returns everything after the LAST occurrence of `marker` on the
+-- (row-joined) screen, so an assertion can't be satisfied by output
+-- left over from an earlier test.
+local function screenAfter(marker)
+  local flat = renderScreen():gsub("\n", "")
+  local last
+  local from = 1
+  while true do
+    local s = flat:find(marker, from, true)
+    if not s then break end
+    last, from = s, s + 1
+  end
+  if not last then
+    dumpScreenOnFailure("marker " .. marker)
+    error("marker " .. marker .. " not on screen")
+  end
+  return flat:sub(last)
+end
+
+print("test 15: a job returning an unserializable value gets an ERROR back, and the worker survives")
+-- send() used to raise straight out of the worker's main loop when the
+-- RESULT couldn't be serialized, killing that worker's runtime outright.
+emu:advance(5)
+typeLine("runall return function() end")
+emu:advance(4)
+typeLine('runall return "alive" .. 15')
+emu:advance(4)
+do
+  local after = screenAfter("runall return function")
+  local errors = 0
+  for _ in after:gmatch("could not send job result") do errors = errors + 1 end
+  local alive = 0
+  for _ in after:gmatch("alive15") do alive = alive + 1 end
+  if errors ~= 3 or alive ~= 3 then
+    dumpScreenOnFailure("unserializable result")
+    error("expected 3 result-send errors and 3 live workers, got " .. errors .. " and " .. alive)
+  end
+end
+print("  OK -- each worker reported the bad result as an error and still answered the next job")
+
+print("test 16: a forged `from` can't release someone else's fullscreen grant")
+pressCombo() -- leave console mode
+typeLine("spawn 1 gmuxapi.request_fullscreen()")
+emu:advance(2)
+local holder = screenAfter("spawn 1 gmuxapi"):match("spawned job %[%d+%] on (modem%-%x+)")
+assert(holder, "could not find the fullscreen holder's address")
+local forger
+for _, w in ipairs(workers) do
+  if w.modemAddr ~= holder then forger = w.modemAddr break end
+end
+-- Sent by `forger`'s card, but claiming to be the holder.
+local forged = string.format('MSG 990001 1/1 {["type"]="RELEASEFULLSCREEN",["from"]=%q,["to"]=%q,["id"]=990001}',
+  holder, kernal.modemAddr)
+emu:injectSignal(kernal, "modem_message", kernal.modemAddr, forger, 4477, 0, forged)
+emu:advance(1)
+typeLine('run return "MARK16"')
+emu:advance(2)
+pressCombo()
+if not screenAfter("MARK16"):find("force-releasing fullscreen grant held by " .. holder, 1, true) then
+  dumpScreenOnFailure("forged release")
+  error("the forged RELEASEFULLSCREEN released the real holder's grant")
+end
+print("  OK -- the grant was still held by " .. holder .. " after a forged release from " .. forger)
+
+print("test 17: a kill-policy child still QUEUED behind another job is killed, not run")
+-- nodeOrder[2] gets a 5-second sleeper; the parent on nodeOrder[1] then
+-- pins a kill-policy child onto that busy node and returns at once. The
+-- KILL arrives while the sleeper is running -- before the child has
+-- started -- and used to be swallowed by the sleeper's own wait.
+emu:advance(5)
+typeLine('spawn 2 sleep(5) return 1')
+emu:advance(1)
+local busyNode = screenAfter("spawn 2 sleep(5)"):match("spawned job %[%d+%] on (modem%-%x+)")
+assert(busyNode, "could not find the busy node's address")
+typeLine('spawn 1 gmuxapi.create_headless_process({code="return 17", orphan_policy="kill", node="' .. busyNode .. '"})')
+emu:advance(8)
+-- The full `processes` listing is longer than the screen by now, so
+-- ask for the newest kill-policy job's status directly.
+typeLine('run local last for _, p in ipairs(gmuxapi.get_processes()) do if p.orphanPolicy == "kill" then last = p end end return "K17=" .. tostring(last.status) .. "/" .. tostring(last.error)')
+emu:advance(3)
+if not screenAfter("K17="):find("K17=killed/killed (orphan policy", 1, true) then
+  dumpScreenOnFailure("queued kill-policy child")
+  error("the queued kill-policy child was not killed")
+end
+print("  OK -- the queued child was killed when it reached the front of the queue")
+
+print("test 18: window draw code runs sandboxed on the kernal")
+-- CREATEWINDOW code comes from any worker and runs ON the kernal, so it
+-- must not see the kernal's globals or the raw gpu, and must not be able
+-- to hang the kernal.
+typeLine("window sb 1 1 5 1 component.list()")
+emu:advance(1)
+if not screenAfter("window sb 1 1 5 1"):find("window draw code failed", 1, true) then
+  dumpScreenOnFailure("window sandbox")
+  error("window draw code could reach the kernal's `component` global")
+end
+typeLine("window gs 1 1 5 1 gpu.setActiveBuffer(0)")
+emu:advance(1)
+if not screenAfter("window gs 1 1 5 1"):find("isn't available to window draw code", 1, true) then
+  dumpScreenOnFailure("window gpu whitelist")
+  error("window draw code could switch the gpu off its own buffer")
+end
+print("  OK -- no kernal globals, and only drawing calls on its own buffer")
+typeLine("window spin 1 1 5 1 while true do end")
+emu:advance(1)
+if not screenAfter("window spin 1 1 5 1"):find("too long without yielding", 1, true) then
+  dumpScreenOnFailure("window budget")
+  error("a non-terminating window draw was not stopped")
+end
+typeLine('run return "kernal" .. "-ok"')
+emu:advance(2)
+assertScreenContains("kernal-ok", "kernal still dispatching after a runaway window draw")
+print("  OK -- a non-terminating window draw is cut off and the kernal keeps running")
+
+print("test 19: both EEPROM images fit the 4096-byte EEPROM")
+-- Comments count toward the limit; node/bios.lua once grew to 4404
+-- bytes through comments alone without anything noticing.
+for _, path in ipairs({"/node/bios.lua", "/kernal/bios.lua"}) do
+  local size = #readFile(REPO_ROOT .. path)
+  assert(size <= 4096, path .. " is " .. size .. " bytes, over the 4096-byte EEPROM limit")
+  print("  OK -- " .. path:sub(2) .. " is " .. size .. " bytes")
+end
+
+print("test 20: Ctrl+Alt+C shows the console alone; `comp` restores the windows")
+-- Hold Ctrl+Alt+C for console mode: a window created now is drawn into
+-- its buffer but not shown until `comp`.
+pressCombo(1.5)
+typeLine('window solo 30 2 6 1 gpu.set(1,1,"SO".."LOX")')
+emu:advance(1)
+if renderScreen():gsub("\n", ""):find("SOLOX", 1, true) then
+  dumpScreenOnFailure("solo mode")
+  error("a window was shown while the console was in solo mode")
+end
+typeLine("comp")
+emu:advance(1)
+assertScreenContains("SOLOX", "window shown again after comp")
+print("  OK -- windows hidden in solo mode and shown again after `comp`")
+
+-- Video memory: the console has no buffer at all -- its text is in
+-- regular memory, painted into the frame buffer (or straight onto the
+-- screen in console mode). The frame buffer is the only full-screen
+-- buffer.
+do
+  local full = 0
+  for idx, b in pairs(screenBuffers) do
+    if idx ~= 0 and b.w == 50 and b.h == 30 then full = full + 1 end
+  end
+  assert(full == 1, "expected exactly one full-screen buffer (the frame), found " .. full)
+  for idx, b in pairs(screenBuffers) do
+    assert(not (b.w == 50 and b.h == 15), "the console has a video buffer (buffer " .. idx .. ")")
+  end
+end
+typeLine("windows")
+emu:advance(1)
+assertScreenContains('"console"  50x15 at (1,16)', "the console starts as the bottom half of the screen")
+print("  OK -- only the frame buffer is full-screen; the 50x15 console has no video buffer at all")
+
+print("test 21: console scrollback with PgUp/PgDn and the mouse wheel")
+local KEY_PAGEUP, KEY_PAGEDOWN = 0xC9, 0xD1
+typeLine('run local t = {} for i = 1, 40 do t[#t + 1] = string.format("L%02d", i) end return table.concat(t, "\\n")')
+emu:advance(2)
+local function screenHas(text) return renderScreen():gsub("\n", ""):find(text, 1, true) ~= nil end
+assert(screenHas("L40") and not screenHas("L01"), "expected only the tail of the 40-line output on screen")
+-- The console is a 15-row window again after `comp`, so a page is 14
+-- rows; line 1 of 40 sits 41 rows up (under the prompt row), so two
+-- pages (offset 28, rows 29-43 in view) bring it into view.
+for _ = 1, 2 do
+  emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_PAGEUP, "tester"); emu:step()
+end
+emu:advance(0.2)
+if not (screenHas("L01") and screenHas("[scrolled")) then
+  dumpScreenOnFailure("PgUp")
+  error("PgUp did not scroll the console back")
+end
+for _ = 1, 2 do
+  emu:injectSignal(kernal, "key_down", screenAddr, 0, KEY_PAGEDOWN, "tester"); emu:step()
+end
+emu:advance(0.2)
+assert(screenHas("L40") and not screenHas("L01") and not screenHas("[scrolled"), "PgDn did not return to the bottom")
+emu:injectSignal(kernal, "scroll", screenAddr, 10, 10, 1, "tester"); emu:step()
+emu:advance(0.2)
+assert(screenHas("[scrolled 3"), "mouse wheel up did not scroll the console")
+emu:injectSignal(kernal, "scroll", screenAddr, 10, 10, -1, "tester"); emu:step()
+emu:advance(0.2)
+assert(not screenHas("[scrolled"), "mouse wheel down did not scroll back")
+print("  OK -- PgUp/PgDn and the wheel scroll through earlier output and back")
+
+-- The console's size isn't fixed: `console` resizes it, and output
+-- re-wraps to the new width.
+typeLine("console 30 8")
+emu:advance(0.5)
+typeLine('run return string.rep("w", 35)')
+emu:advance(2)
+if not screenHas(("w"):rep(30)) or screenHas(("w"):rep(31)) then
+  dumpScreenOnFailure("console rewrap")
+  error("output did not re-wrap to the 30-column console")
+end
+typeLine("windows")
+emu:advance(1)
+assertScreenContains('"console"  30x8 at (1,23)', "console resized and docked bottom-left")
+typeLine("console 5 2")
+emu:advance(0.5)
+assertScreenContains("console size must be between", "too-small size refused")
+typeLine("console 50 15")
+emu:advance(0.5)
+print("  OK -- `console` resizes the console window, output re-wraps, bad sizes are refused")
+
+print("test 22: backspace works across a wrapped input line")
+local KEY_BACK_CODE = 0x0E
+for _ = 1, 60 do
+  emu:injectSignal(kernal, "key_down", screenAddr, string.byte("x"), 0, "tester"); emu:step()
+end
+for _ = 1, 15 do
+  emu:injectSignal(kernal, "key_down", screenAddr, 8, KEY_BACK_CODE, "tester"); emu:step()
+end
+emu:advance(0.2)
+if not screenHas("muxos> " .. ("x"):rep(45) .. "_") or screenHas(("x"):rep(46)) then
+  dumpScreenOnFailure("wrapped backspace")
+  error("the wrapped input line did not shrink to 45 characters")
+end
+emu:injectSignal(kernal, "key_down", screenAddr, 13, 0x1C, "tester"); emu:step()
+emu:advance(0.5)
+print("  OK -- 60 typed, 15 erased across the wrap, 45 left on screen")
+
+print("test 23: keys typed while a command runs are queued, not run nested")
+typeLine('run sleep(2) return "slow" .. 23')
+typeLine('run return "queued" .. 23')
+emu:advance(5)
+do
+  local flat = renderScreen():gsub("\n", "")
+  local slow, queued = flat:find("slow23", 1, true), flat:find("queued23", 1, true)
+  if not slow or not queued or queued < slow then
+    dumpScreenOnFailure("input buffering")
+    error("the second command did not wait for the first")
+  end
+end
+print("  OK -- the second command ran after the first finished")
+
+print("test 24: only real orphans can be claimed, finished ones with their result")
+-- P sleeps 6s with its child A registered under "orph24"; while P is
+-- alive, A isn't claimable. After P finishes, A is -- including after
+-- A itself has finished.
+typeLine('spawn 1 gmuxapi.create_headless_process({code=[[sleep(4) return "A24"]], name="orph24"}) sleep(6)')
+emu:advance(1)
+typeLine('run return "n24=" .. #gmuxapi.get_orphans("orph24")')
+emu:advance(2)
+assertScreenContains("n24=0", "a child of a still-running parent is not claimable")
+emu:advance(12)
+typeLine('run local l = gmuxapi.get_orphans("orph24") return "c24=" .. #l .. "/" .. tostring(l[1] and l[1].status) .. "/" .. tostring(l[1] and l[1].result)')
+emu:advance(2)
+assertScreenContains("c24=1/done/A24", "the finished orphan is claimable with its status and result")
+print("  OK -- unclaimable while its parent ran; claimed afterward with status and result")
+
+print("test 25: finished jobs are kept only up to the history cap, without their source")
+for i = 1, 105 do
+  typeLine("run return " .. i)
+  emu:advance(0.3)
+end
+typeLine('run local ok, err = gmuxapi.get_process(1) return "r25=" .. tostring(ok) .. "/" .. tostring(err)')
+emu:advance(2)
+assertScreenContains("r25=nil/no such job", "the oldest job was dropped from history")
+typeLine('run local p = gmuxapi.get_processes() local last = p[#p - 1] local full = gmuxapi.get_process(last.id) return "k25=" .. tostring(last.code) .. "/" .. tostring(last.codePreview) .. "/" .. tostring(full.code)')
+emu:advance(2)
+-- p[#p] is this probe itself; p[#p - 1] is the finished r25 probe above.
+assertScreenContains("k25=nil/local ok, err = gmuxapi.get_process(1) r.../nil",
+  "summaries carry a 40-char preview, not source, and a finished job's full record has dropped its source")
+print("  OK -- oldest finished job dropped; summaries and finished records carry only a preview")
+
+print("test 26: liveness -- a busy node stays up, a dead one is marked down and its job lost")
+typeLine("spawn 2 sleep(13) return 26")
+emu:advance(1)
+local sleeperId = screenAfter("spawn 2 sleep(13)"):match("spawned job %[(%d+)%]")
+emu:advance(15)
+typeLine('run return "s26=" .. gmuxapi.get_process(' .. sleeperId .. ').status')
+emu:advance(2)
+assertScreenContains("s26=done", "a node busy sleeping 13s answered probes and was not marked down")
+-- Now actually kill a worker and give it a job.
+local victim = workers[3]
+victim.status = "dead"
+typeLine("spawn " .. victim.modemAddr .. " return 1")
+emu:advance(1)
+local lostId = screenAfter("spawn " .. victim.modemAddr):match("spawned job %[(%d+)%]")
+emu:advance(14)
+assertScreenContains("stopped responding", "the dead node was marked down")
+typeLine('run return "l26=" .. gmuxapi.get_process(' .. lostId .. ').status')
+emu:advance(2)
+assertScreenContains("l26=lost", "the dead node's job is marked lost")
+typeLine('runall return "up" .. 26')
+emu:advance(4)
+do
+  local after, n = screenAfter("runall return"), 0
+  for _ in after:gmatch("up26") do n = n + 1 end
+  if n ~= 2 then
+    dumpScreenOnFailure("runall after node down")
+    error("expected runall to reach only the 2 live workers, got " .. n)
+  end
+end
+print("  OK -- a long sleeper stayed up; the dead node was marked down, its job lost, and skipped")
+
+print("test 27: process isolation, pause/resume/kill, and the balancer")
+-- (Worker 3 is down after test 26, so 2 live nodes from here.)
+typeLine('runall leak27 = "leaked" return "set"')
+emu:advance(3)
+typeLine('runall return "g27=" .. tostring(leak27)')
+emu:advance(3)
+do
+  local after, n = screenAfter("runall return \"g27="), 0
+  for _ in after:gmatch("g27=nil") do n = n + 1 end
+  assert(n == 2 and not after:find("g27=leaked", 1, true), "a process's globals leaked into a later process")
+end
+typeLine('run local ok = pcall(function() string.x27 = 1 end) return "e27=" .. tostring(debug) .. "/" .. tostring(component) .. "/" .. tostring(ok)')
+-- (component is now the cluster bus face; test 36 covers it)
+emu:advance(2)
+assertScreenContains("e27=nil/table: ", "no debug; `component` is the cluster bus, not the raw one")
+assertScreenContains("/false", "read-only libraries")
+print("  OK -- per-process globals; no debug or raw component; libraries are read-only")
+
+typeLine("spawn 1 for i = 1, 6 do sleep(0.5) end return \"slept27\"")
+emu:advance(0.5)
+local pid = screenAfter("spawn 1 for i = 1, 6"):match("spawned job %[(%d+)%]")
+typeLine("pause " .. pid)
+emu:advance(5)
+typeLine('run return "p27=" .. tostring(gmuxapi.get_process(' .. pid .. ').status) .. "/" .. tostring(gmuxapi.get_process(' .. pid .. ').paused)')
+emu:advance(2)
+assertScreenContains("p27=running/true", "the job is held while paused, well past when it would have finished")
+typeLine("resume " .. pid)
+emu:advance(5)
+typeLine('run return "r27=" .. gmuxapi.get_process(' .. pid .. ').status')
+emu:advance(2)
+assertScreenContains("r27=done", "the job finished after being resumed")
+print("  OK -- pause holds a process, resume lets it finish")
+
+typeLine("spawn 1 sleep(30) return 1")
+emu:advance(0.5)
+local kid = screenAfter("spawn 1 sleep(30)"):match("spawned job %[(%d+)%]")
+typeLine("kill " .. kid)
+emu:advance(2)
+typeLine('run local p = gmuxapi.get_process(' .. kid .. ') return "k27=" .. p.status .. "/" .. p.error')
+emu:advance(2)
+assertScreenContains("k27=killed/killed by user", "the user can end a process")
+print("  OK -- kill ends a process, recorded as killed by user")
+
+typeLine('run local c = gmuxapi.create_headless_process({code = "sleep(30) return 1"}) local ok, err = gmuxapi.kill_process(c.process.id) local ok2, err2 = gmuxapi.kill_process(' .. pid .. ') return "c27=" .. tostring(ok) .. "/" .. tostring(err2)')
+emu:advance(3)
+assertScreenContains("c27=true/job " .. pid .. " is not a descendant", "a process can end its own child but not an unrelated job")
+print("  OK -- a process can control its own descendants only")
+
+typeLine("spawn 1 sleep(6) return 0")
+emu:advance(0.5)
+local busyAddr = screenAfter("spawn 1 sleep(6)"):match("spawned job %[%d+%] on (modem%-%x+)")
+typeLine('run return "b27=" .. gmuxapi.get_process(jobId).node')
+emu:advance(2)
+local landed = screenAfter('b27="'):match("b27=(modem%-%x+)")
+assert(landed and landed ~= busyAddr, "the balancer sent new work to the busy node")
+print("  OK -- new work goes to the least-busy node")
+
+print("test 28: keyboard input goes to the focused window's process, which redraws its window")
+typeLine('run local r = gmuxapi.create_graphics_process({name = "kbd28", width = 12, height = 1, code = [[' ..
+  'local win while not win do for _, w in ipairs(gmuxapi.get_windows()) do if w.ownerJobId == jobId then win = w.id end end if not win then sleep(0.2) end end ' ..
+  'local s = "" while true do local e = gmuxapi.pull_event(20) if not e then break end ' ..
+  'if e[1] == "key_down" then if e[3] == 28 then break end s = s .. utf8.char(e[2]) ' ..
+  'gmuxapi.draw_window(win, {code = "gpu.set(1, 1, args.t)", args = {t = s}}) end end return s]]}) return "w28=" .. r.process.id')
+emu:advance(2)
+local kbdId = screenAfter("w28="):match("w28=(%d+)")
+assert(kbdId, "graphics process id not shown")
+typeLine("hi28")
+emu:advance(2)
+do
+  -- Row 1 is its title bar (gmux decorations: Enter ended the process,
+  -- so it's marked ended, and the title is cut short of the buttons),
+  -- row 2 its body.
+  local titleRow, bodyRow = renderScreen():match("^([^\n]*)\n([^\n]*)")
+  if titleRow:sub(1, #"\u{23F9} - kb") ~= "\u{23F9} - kb" or not titleRow:find("\u{2716}", 1, true) or bodyRow:sub(1, 4) ~= "hi28" or screenHas("muxos> hi28") then
+    dumpScreenOnFailure("keyboard delivery")
+    error("typed keys didn't reach the focused process and its window")
+  end
+end
+typeLine('run return "R28=" .. tostring(gmuxapi.get_process(' .. kbdId .. ').result)')
+emu:advance(2)
+assertScreenContains("R28=hi28", "the process received the keys and returned them")
+print("  OK -- keys went to the focused window's process (not the console), which redrew its window")
+
+typeLine([[run local ok, err = gmuxapi.draw_window(1, {code = "gpu.set(1,1,'x')"}) return "d28=" .. tostring(err)]])
+emu:advance(2)
+assertScreenContains("d28=window 1 belongs to another process", "a process can't draw into a window it doesn't own")
+print("  OK -- drawing into another process's window is refused")
+
+print("test 29: the program launcher -- .mxe headers and libraries, legacy .lua programs, foreground/background")
+typeLine("hello world")
+emu:advance(3)
+assertScreenContains("hello mxe v=true g=true n=false a=world", ".mxe got its header response, its library, and its args")
+typeLine("old")
+emu:advance(3)
+assertScreenContains("old-runs v=false want=9.9 have=0.1.1", "a version mismatch is reported but the program still runs")
+print("  OK -- .mxe launched by name: version response, granted/missing libraries, require, args")
+
+typeLine("ask")
+emu:advance(2)
+assertScreenContains("/bin/ask.lua started on", "a legacy program has its own window, so the console doesn't wait")
+assert(cellText(1, 1, 7) == "ask.lua" and cellText(1, 2, 7) == "name? _", "its prompt is in its own window, got " .. cellText(1, 2, 7))
+typeLine("bob")
+emu:advance(3)
+assert(cellText(1, 2, 9) == "name? bob", "typed input was echoed in its window")
+assert(cellText(1, 3, 35) == "hi bob gmuxapi=nil os.time=function",
+  "it read the input, and sees the OpenOS environment, not gmuxapi; got " .. cellText(1, 3, 35))
+closeWindowAt(1, 50)
+print("  OK -- a legacy .lua program writes and reads in its own window (its terminal), like gmux")
+
+typeLine("hello bg &")
+emu:advance(3)
+assertScreenContains("/bin/hello.mxe started on", "a trailing & runs it in the background")
+assertScreenContains("a=bg", "the background program's output still reaches the console")
+typeLine('run local h = gmuxapi.launch("hello", {"kid"}) sleep(1) return "L29=" .. tostring(gmuxapi.get_process(h.id).parent == jobId)')
+emu:advance(4)
+assertScreenContains("a=kid", "a program launched by a process ran")
+assertScreenContains("L29=true", "the launching process is its parent")
+typeLine("nosuchprogram")
+emu:advance(1)
+assertScreenContains("unknown command", "an unknown name is still an unknown command")
+print("  OK -- background launch, gmuxapi.launch (as parent), unknown names")
+
+print("test 30: the hardware verification suite passes inside the emulated sandbox")
+-- test/hardware/verify.lua is what you run on real hardware; it runs
+-- here through the same machine.lua sandbox, booted by its own loader.
+do
+  local hw = Emulator.new()
+  hw.timeout = 1
+  local node = hw:newNode("hw")
+  hw:addEeprom(node, readFile(REPO_ROOT .. "/test/hardware/bios.lua"))
+  hw:addFilesystem(node, {["/verify.lua"] = readFile(REPO_ROOT .. "/test/hardware/verify.lua")})
+  local _, _, bufs = hw:addGpuScreen(node, 100, 30)
+  hw:boot(node)
+  hw:advance(30)
+  local rows = {}
+  for y = 1, bufs[0].h do
+    local row, chars = bufs[0].cells[y] or {}, {}
+    for x = 1, bufs[0].w do chars[x] = (row[x] and row[x].char) or " " end
+    rows[#rows + 1] = table.concat(chars)
+  end
+  local screen = table.concat(rows, "\n")
+  if not screen:find("checks, 0 failed", 1, true) then
+    io.stderr:write(screen .. "\n")
+    error("the hardware verification suite failed in the emulated sandbox")
+  end
+end
+print("  OK -- every check in test/hardware/verify.lua passes")
+
+print("test 31: .mxe migration through the mux library, and draining a node")
+typeLine("counter 20 &")
+emu:advance(1)
+local cid = screenAfter("counter 20 &"):match("%[(%d+)%] /bin/counter.mxe started on")
+assert(cid, "counter didn't start")
+emu:advance(1)
+typeLine("migrate " .. cid)
+emu:advance(1)
+assertScreenContains("job [" .. cid .. "] migrated from", "the kernal moved the process")
+emu:advance(8)
+assertScreenContains("counter done n=20 starts=2", "it finished on the new node, continuing from its saved state")
+print("  OK -- a migratable .mxe moved mid-run and carried on from its saved state")
+
+typeLine("spawn 1 sleep(5) return 1")
+emu:advance(0.5)
+local plain = screenAfter("spawn 1 sleep(5)"):match("spawned job %[(%d+)%]")
+typeLine("migrate " .. plain)
+emu:advance(1)
+assertScreenContains("isn't migratable", "a process that never opted in isn't moved")
+print("  OK -- a process that never opted in is refused")
+
+emu:advance(5)
+typeLine("counter 40 &")
+emu:advance(1)
+local did, dnode = screenAfter("counter 40 &"):match("%[(%d+)%] /bin/counter.mxe started on (modem%-%x+)")
+assert(did, "second counter didn't start")
+emu:advance(1)
+typeLine("drain " .. dnode)
+emu:advance(2)
+assertScreenContains("draining " .. dnode .. ": moving 1 migratable job(s)", "drain moved the migratable process")
+assertScreenContains("job [" .. did .. "] migrated from " .. dnode, "it actually moved")
+-- Only one other node is up at this point (an earlier test took one
+-- down) and it's busy with the moved counter, so spawn rather than
+-- `run`: the job queues there instead of the REPL blocking on it.
+typeLine("spawn 1 return 1")
+emu:advance(0.5)
+local landed31 = screenAfter("spawn 1 return 1"):match("spawned job %[%d+%] on (modem%-%x+)")
+assert(landed31 and landed31 ~= dnode, "new work went to the draining node")
+typeLine("undrain " .. dnode)
+emu:advance(12)
+assertScreenContains("counter done n=40 starts=2", "the drained process finished elsewhere")
+print("  OK -- drain moved the migratable process off and kept new work away")
+
+print("test 32: gmux window decorations -- touch, move, minimize, maximize, resize, close")
+typeLine('run local r = gmuxapi.create_graphics_process({name = "deco32", x = 20, y = 3, width = 14, height = 3, resizable = true, code = [[' ..
+  'local win while not win do for _, w in ipairs(gmuxapi.get_windows()) do if w.ownerJobId == jobId then win = w.id end end if not win then sleep(0.2) end end ' ..
+  'while true do local e = gmuxapi.pull_event(60) if not e then break end local t ' ..
+  'if e[1] == "touch" then t = "T" .. e[2] .. "," .. e[3] elseif e[1] == "window_resized" then t = "R" .. e[3] .. "x" .. e[4] end ' ..
+  'if t then gmuxapi.draw_window(win, {code = "gpu.set(1, 1, args.t)", args = {t = t}}) end end]]}) return "w32=" .. r.process.id')
+emu:advance(2)
+local decoId = screenAfter("w32="):match("w32=(%d+)")
+assert(decoId, "graphics process didn't start")
+assert(cellText(20, 3, 6) == "deco32" and cellText(32, 3, 1) == "\u{2716}", "title bar with the close button at w-1")
+
+touch("touch", 22, 5)
+emu:advance(1)
+assert(cellText(20, 4, 4) == "T3,2", "a body touch reaches the process in the body's own coordinates, got " .. cellText(20, 4, 4))
+print("  OK -- title bar drawn; a body touch reaches the owner in window coordinates")
+
+touch("touch", 25, 3)
+touch("drag", 35, 6)
+touch("drop", 35, 6)
+assert(cellText(30, 6, 6) == "deco32" and cellText(30, 7, 4) == "T3,2", "dragging the title bar moved the window")
+assert(cellText(20, 4, 4) ~= "T3,2", "what was behind the old position shows again")
+print("  OK -- dragging the title bar moves the window")
+
+touch("touch", 38, 6)
+assert(cellText(30, 6, 6) == "deco32" and cellText(30, 7, 4) ~= "T3,2", "minimize collapses to the title bar")
+touch("touch", 38, 6)
+assert(cellText(30, 7, 4) == "T3,2", "minimize again restores the body")
+print("  OK -- minimize collapses the window to its title bar and back")
+
+touch("touch", 40, 6)
+emu:advance(1)
+assert(cellText(1, 1, 6) == "deco32" and cellText(1, 2, 6) == "R50x29", "maximize fills the screen and tells the owner, got " .. cellText(1, 2, 6))
+touch("touch", 47, 1)
+emu:advance(1)
+assert(cellText(30, 6, 6) == "deco32" and cellText(30, 7, 5) == "R14x3", "maximize again restores the old geometry, got " .. cellText(30, 7, 5))
+print("  OK -- maximize fills the screen and restores, the owner is told each time")
+
+touch("touch", 43, 9)
+touch("drag", 47, 10)
+touch("drop", 47, 10)
+emu:advance(1)
+assert(cellText(30, 7, 5) == "R18x4" and cellText(46, 6, 1) == "\u{2716}", "dragging the corner resizes, got " .. cellText(30, 7, 5))
+print("  OK -- dragging the bottom-right corner resizes the window")
+
+touch("touch", 46, 6)
+emu:advance(1)
+assert(cellText(30, 6, 6) ~= "deco32", "close removes the window")
+touch("touch", 5, 25) -- the console: keys go back to the REPL
+typeLine('run return "s32=" .. gmuxapi.get_process(' .. decoId .. ').status')
+emu:advance(2)
+assertScreenContains("s32=killed", "closing the window killed its process, as in gmux")
+print("  OK -- close removes the window and kills its process; touching the console refocuses it")
+
+print("test 33: legacy require -- vendored OpenOS libraries, lazy halves, dynamic names, faces")
+typeLine("libs")
+emu:advance(3)
+assert(cellText(1, 1, 8) == "libs.lua", "its output is in its own window")
+assertScreenContains('libs t=1x pad=ab  | top=1 red=14 f1=59 extra=ok gpu=true avail=true same=true',
+  "shipped, lazily loaded, and fetched-on-demand modules all work; component has the virtual gpu")
+typeLine("q")
+emu:advance(2)
+
+assertScreenContains("got key_down q held=true", "event.pull filters by name; keyboard tracks held keys")
+assertScreenContains("missing=false nf", "a module that doesn't exist fails like OpenOS's require")
+closeWindowAt(1, 50)
+print("  OK -- OpenOS libraries load through require, package.delay, and GETMODULE")
+
+print("test 34: legacy graphics -- a gmux-style virtual gpu drawn into the program's own window")
+typeLine("paint")
+emu:advance(2)
+assert(cellText(2, 2, 14) == "d=50x25 s=true", "a legacy program gets a virtual gpu and screen, sized to fit, got " .. cellText(2, 2, 14))
+assert(cellText(1, 1, 8) == "paint.lu", "its window was created on the first draw, titled after it, got " .. cellText(1, 1, 8))
+assert(cellText(2, 3, 10) == "legacy gfx" and cellText(2, 4, 10) == "legacy gfx", "set and copy reached the window")
+assert(cellText(2, 5, 5) == "BUF!!", "bitblt from a virtual buffer reached the window")
+assert(cellText(1, 1, 20):find("\u{2BC5}", 1, true), "its window is resizable (maximize button shown)")
+print("  OK -- set/fill/copy/buffers/bitblt draw into a window sized by setResolution")
+emu:injectSignal(kernal, "touch", screenAddr, 5, 3, 0, "tester")
+emu:advance(1)
+assert(cellText(2, 2, 14) == "touch 5,2 true", "touch arrives in OpenOS's shape, window coordinates, got " .. cellText(2, 2, 14))
+emu:injectSignal(kernal, "touch", screenAddr, 17, 1, 0, "tester")
+emu:advance(1)
+assert(cellText(2, 2, 20) == "size 50x29 res=50x29", "maximizing is a resolution change for the program, got " .. cellText(2, 2, 20))
+print("  OK -- touch and window resizes reach it as OpenOS signals (screen_resized), as in gmux")
+emu:advance(2)
+closeWindowAt(1, 50)
+
+print("test 35: legacy filesystem -- the kernal's disk, like the OS filesystem for a gmux app")
+typeLine("files")
+emu:advance(4)
+assertScreenContains("fs line one|line twoN|5001|notes.txt,sub/|3|5019|false|true|true",
+  "io.open/read/write, filesystem.list/copy/size/exists/isDirectory/makeDirectory, PWD, io.lines, dofile")
+assertScreenContains("/bin/files.lua:13: boom", "an error is written into the program's own window")
+assert(cellText(1, 1, 1) == "\u{274C}", "and its title is marked as failed")
+closeWindowAt(1, 50)
+print("  OK -- files on the kernal's disk; a legacy error shows in its window")
+
+print("test 36: the cluster component bus -- every node's components, from any process")
+local w1, w2 = workerModems[1], workerModems[2]
+typeLine("bus")
+emu:advance(1)
+assertScreenContains(string.format("%-14s %s  on kernal", "internet", internetAddr), "the kernal's internet card is on the bus")
+assertScreenContains(string.format("%-14s %s  on %s", "redstone", redstoneAddr, w1), "worker 1's redstone card is on the bus")
+do
+  local after = screenAfter("muxos> bus")
+  assert(not after:find("gpu ", 1, true) and not after:find("modem ", 1, true) and not after:find("eeprom ", 1, true),
+    "the display, network cards and firmware stay off the bus")
+end
+print("  OK -- the kernal keeps a registry of every node's components")
+
+typeLine("spawn " .. w2 .. " print('rs2=' .. component.redstone.getInput(2) .. '/' .. tostring(component.isAvailable('gpu')) .. '/' .. tostring(component.redstone.setOutput(3, 9)))")
+emu:advance(2)
+assertScreenContains("rs2=20/false/0", "worker 2 calls worker 1's redstone card through the kernal")
+typeLine("spawn " .. w1 .. " print('rs1=' .. component.redstone.getOutput(3) .. '/' .. component.type('" .. redstoneAddr .. "'))")
+emu:advance(2)
+assertScreenContains("rs1=9/redstone", "on worker 1 the same card is called directly, and sees worker 2's write")
+print("  OK -- a component on another worker is relayed; one on the caller's own node is called directly")
+
+typeLine("spawn " .. w2 .. " local h = component.internet.request('http://x') h.finishConnect() local b = '' for i = 1, 5 do local d = h.read() if not d then break end b = b .. d end h.close() print('net=' .. b .. '/' .. tostring(select(2, pcall(h.read))))")
+emu:advance(3)
+assertScreenContains("net=hello bus/that value is gone", "a request handle stays on the kernal and is used through VALUECALL; closing frees it")
+print("  OK -- values a call returns (an internet request handle) are used remotely, and freed on close")
+
+typeLine("fetch")
+emu:advance(4)
+assertScreenContains("fetched hello bus via " .. internetAddr:sub(1, 8), "OpenOS's internet library works over the bus")
+closeWindowAt(1, 50)
+print("  OK -- a legacy program uses OpenOS's internet library with the kernal's internet card")
+
+print("test 37: the .mxe spec -- fs, readLine, parseArgs, versions, library search, http, header fields")
+typeLine("spec pos -vx --name=bob")
+emu:advance(4)
+assertScreenContains("spec pos|truetrue|bob|base+top|3|a.txt,c.txt|false|page200|truespec2.0|truefalse",
+  "fs, parseArgs, /usr/lib/mxe and library dependencies, http.get, compatible, name/version, requires")
+assertScreenContains("who? _", "readLine shows its prompt in the foreground")
+typeLine("ann")
+emu:advance(2)
+assertScreenContains("who? ann", "what's typed is echoed")
+assertScreenContains("hello ann", "readLine returns the line")
+assert(kernalFiles["/home/spec/c.txt"] == "one\ntwo\nthree\n", "fs.write/open(a)/copy/rename reached the kernal's disk")
+typeLine('run return "bg37=" .. tostring(select(2, readLine()))')
+emu:advance(2)
+assertScreenContains("bg37=not in the foreground at the console", "readLine outside the console's foreground fails")
+typeLine('run for _, p in pairs(gmuxapi.get_processes()) do if p.programName == "spec" then return "v37=" .. p.programName .. "@" .. p.programVersion end end return "v37=none"')
+emu:advance(2)
+assertScreenContains("v37=spec@2.0", "the header's name and version show in process listings")
+print("  OK -- every section-7 API works as docs/MXE.md specifies")
+
+print("test 38: opm, ported to .mxe -- list, pull, run, update, bundle, offline install")
+local base = "--base=" .. GITEA
+typeLine("opm " .. base .. " list")
+emu:advance(3)
+assertScreenContains("demo               a demo program", "opm lists the catalog")
+typeLine("opm " .. base .. " pull demo")
+emu:advance(4)
+assertScreenContains("demo/demo.lua -> /usr/bin/demo.lua  ", "files go under /usr")
+assertScreenContains("version 1.2", "versions are reported")
+assertScreenContains("done", "the pull finished")
+assert(kernalFiles["/usr/bin/demo.lua"] and kernalFiles["/usr/lib/demolib.lua"] and kernalFiles["/usr/lib/extra.lua"],
+  "the package and its dependency were installed")
+assert(kernalFiles["/etc/opm.installed"]:find('["demo"]="/usr"', 1, true), "the install is recorded")
+typeLine("demo")
+emu:advance(3)
+assertScreenContains("demo says hi dep", "the installed OpenOS package runs, finding its libraries under /usr/lib")
+closeWindowAt(1, 50)
+typeLine("opm " .. base .. " update demo")
+emu:advance(4)
+assertScreenContains("updating demo -> /usr", "update re-pulls at the recorded target")
+typeLine("opm " .. base .. " bundle demo /home/b")
+emu:advance(4)
+assertScreenContains("bundle ready", "bundle wrote the package for offline use")
+assert(kernalFiles["/home/b/files/programs.cfg"] and kernalFiles["/home/b/files/demo/demo.lua"], "bundle contents")
+typeLine("opm --from=/home/b pull demo /home/x")
+emu:advance(4)
+assert(kernalFiles["/home/x/bin/demo.lua"] == webFiles[GITEA .. "demo/demo.lua"], "an offline install from the bundle")
+typeLine("opm " .. base .. " update")
+emu:advance(3)
+assertScreenContains("no opm-mxe package", "self-update needs the opm-mxe package in the catalog")
+print("  OK -- opm installs, updates and bundles packages on muxos")
+
+print("test 39: a worker runs its processes side by side")
+for i = 1, 3 do
+  typeLine("spawn " .. workerModems[1] .. " sleep(2) print('mt39-" .. i .. "') return " .. i)
+end
+emu:advance(3)
+for i = 1, 3 do
+  assertScreenContains("mt39-" .. i, "three 2s sleepers on one node all finish within 3s (they'd take 6s queued)")
+end
+print("  OK -- processes on one node wait concurrently instead of queueing")
 
 print("ALL OK")
