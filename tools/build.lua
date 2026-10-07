@@ -14,11 +14,13 @@
 local ROOT = (arg[0]:match("^(.*)/tools/build%.lua$")) or "."
 local EEPROM_SIZE = 4096
 
+-- Line endings are normalized to LF: a checkout converted to CRLF (git's
+-- core.autocrlf on Windows) builds the same installer, byte for byte.
 local function readFile(path)
   local f = assert(io.open(ROOT .. "/" .. path, "rb"), "missing " .. path)
   local data = f:read("a")
   f:close()
-  return data
+  return (data:gsub("\r\n", "\n"))
 end
 
 local function writeFile(path, data)
