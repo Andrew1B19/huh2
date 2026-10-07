@@ -261,5 +261,27 @@ do
 end
 print("  OK")
 
+print("install 8: a CRLF checkout (git core.autocrlf) builds the same installer; a converted installer says so")
+do
+  local copy = TMP .. "/crlf"
+  assert(os.execute('mkdir -p "' .. copy .. '" && cd "' .. REPO_ROOT .. '" && tar cf - kernal node installer tools opm | tar xf - -C "' .. copy .. '"'))
+  -- Every text file to CRLF, as a converting checkout would.
+  -- (Only "\n" becomes "\r\n", like git; a last line without one stays as is.)
+  assert(os.execute('find "' .. copy .. '" -type f -exec perl -pi -e "s/\\n/\\r\\n/" {} +'))
+  local out = TMP .. "/crlf-installer.lua"
+  assert(os.execute('lua5.3 "' .. copy .. '/tools/build.lua" --out "' .. out .. '" >/dev/null'), "the build fails on a CRLF checkout")
+  assert(readFile(out) == readFile(BUNDLE), "a CRLF checkout builds a different installer")
+
+  local converted = TMP .. "/converted-installer.lua"
+  local f = assert(io.open(converted, "wb"))
+  f:write((readFile(BUNDLE):gsub("\n", "\r\n")))
+  f:close()
+  local node = emu:newNode("crlf")
+  local code, outText = runInstaller(converted, openosFor(node, nil), nil, "kernal", "--yes")
+  assert(code == 1 and outText:find("line endings were converted to CRLF", 1, true),
+    "a CRLF-converted installer explains itself:\n" .. outText)
+end
+print("  OK")
+
 os.execute('rm -rf "' .. TMP .. '"')
 print("ALL OK")

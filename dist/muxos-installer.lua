@@ -78,7 +78,14 @@ local function bundledPayload(path)
   while true do
     local line = f:read("l")
     if not line then f:close() return nil end
-    if line:match("^%-%-%[=*%[MUXOS%-PAYLOAD") then break end
+    if line:match("^%-%-%[=*%[MUXOS%-PAYLOAD") then
+      if line:sub(-1) == "\r" then
+        f:close()
+        return nil, "this installer's line endings were converted to CRLF, which breaks it -- "
+          .. "download it again as-is (raw, not through a converting checkout)"
+      end
+      break
+    end
   end
   local count = tonumber((f:read("l") or ""):match("^@@MANIFEST (%d+)$"))
   if not count then f:close() return nil, "damaged payload (no manifest)" end
