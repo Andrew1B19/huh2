@@ -414,7 +414,7 @@ return main()
 --[=[MUXOS-PAYLOAD 0.1.0
 @@MANIFEST 19
 105436 /muxos.lua
-35776 /compositor.lua
+37750 /compositor.lua
 6492 /bitmap.lua
 90428 /runtime.lua
 2033 /lib/OPENOS_LICENSE
@@ -3083,7 +3083,7 @@ while true do
   tick(0.05) -- ~1 tick between idle maintenance passes (sweepStaleChunks/compositor.flush)
 end
 
-@@ 35776 /compositor.lua
+@@ 37750 /compositor.lua
 -- muxos compositor. This is, BY CONSTRUCTION, the only file in this
 -- entire project that ever makes a real gpu.* call. "Only the display
 -- node actually needs to make those budgeted calls for real" (see
@@ -3183,7 +3183,9 @@ local exclusiveOwner = nil
 -- before any real screen write. Allocated lazily (first window/flush),
 -- sized to the screen's own resolution.
 local frameBuffer = nil
-local frameDirty = false
+-- The part of the frame buffer that changed since the last flip, as one
+-- rectangle: a flush copies only that to the screen.
+local frameDamage = nil
 
 local function nextId()
   local id = nextWindowId
@@ -3208,7 +3210,7 @@ local screenRect = nil
 local function ensureFrameBuffer(gpu)
   if frameBuffer then return frameBuffer end
   local w, h = gpu.getResolution()
-  frameBuffer, _ = gpu.allocateBuffer(w, h)
+  frameBuffer = gpu.allocateBuffer(w, h)
   screenRect = {x = 1, y = 1, w = w, h = h}
   return frameBuffer
 end
@@ -3222,6 +3224,20 @@ local function clipToScreen(r)
 end
 
 -- --- pure geometry, no gpu calls -- adapted from gmux's graphics.lua ---
+
+local function unionRect(a, b)
+  if not a then return b end
+  local x1, y1 = math.min(a.x, b.x), math.min(a.y, b.y)
+  local x2, y2 = math.max(a.x + a.w, b.x + b.w), math.max(a.y + a.h, b.y + b.h)
+  return {x = x1, y = y1, w = x2 - x1, h = y2 - y1}
+end
+
+local function intersectRect(a, b)
+  local x1, y1 = math.max(a.x, b.x), math.max(a.y, b.y)
+  local x2, y2 = math.min(a.x + a.w, b.x + b.w), math.min(a.y + a.h, b.y + b.h)
+  if x2 <= x1 or y2 <= y1 then return nil end
+  return {x = x1, y = y1, w = x2 - x1, h = y2 - y1}
+end
 
 local function rectanglesOverlap(a, b)
   return not (a.x >= b.x + b.w or a.x + a.w <= b.x or a.y >= b.y + b.h or a.y + a.h <= b.y)
@@ -3392,12 +3408,25 @@ end
 -- Does nothing if the window isn't dirty -- this is the actual dirty-
 -- tracking half of the gmux technique: don't spend a real GPU call
 -- recompositing a window that hasn't changed.
+-- A window that's only been uncovered in places (win.damage, from
+-- exposeRect) repaints just those places, not its whole visible area.
 local function compositeWindow(gpu, order, index)
   local win = windows[order[index]]
-  if not win.dirty then return end
+  if not win.dirty and not win.damage then return end
   local top = bodyTop(win)
+  local boxes = visibleBoxes(order, index)
+  if not win.dirty then
+    local clipped = {}
+    for _, box in ipairs(boxes) do
+      for _, d in ipairs(win.damage) do
+        clipped[#clipped + 1] = intersectRect(box, d)
+      end
+    end
+    boxes = clipped
+  end
   gpu.setActiveBuffer(frameBuffer)
-  for _, box in ipairs(visibleBoxes(order, index)) do
+  for _, box in ipairs(boxes) do
+    frameDamage = unionRect(frameDamage, box)
     local body = box
     if win.decorated and box.y == win.y then
       paintTitle(gpu, win, box)
@@ -3412,8 +3441,29 @@ local function compositeWindow(gpu, order, index)
     end
   end
   gpu.setActiveBuffer(0)
-  win.dirty = false
-  frameDirty = true
+  win.dirty, win.damage = false, nil
+end
+
+-- Uncovers a screen area (a window moved, shrank, closed or minimized):
+-- blanks it in the frame buffer and has every window under it repaint
+-- just that area at the next flush.
+local function exposeRect(r)
+  r = clipToScreen(r)
+  if r.w <= 0 or r.h <= 0 then return end
+  local gpu = kernalGpu()
+  if gpu and frameBuffer then
+    gpu.setActiveBuffer(frameBuffer)
+    gpu.setBackground(0x000000)
+    gpu.fill(r.x, r.y, r.w, r.h, " ")
+    gpu.setActiveBuffer(0)
+  end
+  for _, win in pairs(windows) do
+    if intersectRect(outerRect(win), r) then
+      win.damage = win.damage or {}
+      win.damage[#win.damage + 1] = r
+    end
+  end
+  frameDamage = unionRect(frameDamage, r)
 end
 
 -- Runs `code` (compiled fresh, same convention as JOB/a job's `gpu`
@@ -3757,7 +3807,7 @@ function M.close(id)
   local gpu = kernalGpu()
   if win.buffer and gpu then gpu.freeBuffer(win.buffer) end
   if focusedId == id then moveFocus(windowOrder[1]) end
-  M.invalidateAll()
+  exposeRect(outerRect(win))
   return win
 end
 
@@ -3765,8 +3815,10 @@ function M.move(id, x, y)
   local win = windows[id]
   if not win then return false, "no such window: " .. tostring(id) end
   if win.x == x and win.y == y then return true end
+  local old = outerRect(win)
   win.x, win.y = x, y
-  M.invalidateAll()
+  exposeRect(old)
+  win.dirty = true
   return true
 end
 
@@ -3777,8 +3829,10 @@ function M.minimize(id, minimized)
   if not win or not win.decorated then return false, "window can't be minimized" end
   if win.maximized then M.maximize(id, false) end
   if minimized == nil then minimized = not win.minimized end
+  local old = outerRect(win)
   win.minimized = minimized or nil
-  M.invalidateAll()
+  exposeRect(old)
+  win.dirty = true
   return true
 end
 
@@ -3794,7 +3848,8 @@ function M.invalidateAll()
     gpu.fill(1, 1, w, h, " ")
     gpu.setActiveBuffer(0)
   end
-  for _, win in pairs(windows) do win.dirty = true end
+  for _, win in pairs(windows) do win.dirty, win.damage = true, nil end
+  if screenRect then frameDamage = {x = 1, y = 1, w = screenRect.w, h = screenRect.h} end
 end
 
 function M.setExclusive(owner)
@@ -3816,10 +3871,8 @@ function M.drawDirect(fn)
   fn(gpu)
 end
 
--- Moves/resizes a text window. Only text windows: a buffered window's
--- content was drawn once into a buffer of its original size and can't
--- be regenerated at another size.
--- A buffered window can only be resized if it was created
+-- Moves/resizes a window. A text window always can be; a buffered
+-- window only if it was created
 -- `resizable` (its owner is told, and redraws at the new size): its
 -- buffer is reallocated, keeping whatever of the old content fits.
 function M.setGeometry(id, x, y, width, height)
@@ -3836,9 +3889,11 @@ function M.setGeometry(id, x, y, width, height)
     gpu.freeBuffer(win.buffer)
     win.buffer = buffer
   end
+  local old = outerRect(win)
   win.x, win.y, win.width, win.height = x, y, width, height
   -- What was behind its old outline has to show again.
-  M.invalidateAll()
+  exposeRect(old)
+  win.dirty = true
   return true
 end
 
@@ -3870,7 +3925,7 @@ function M.maximize(id, maximized)
     local ok, err = M.setGeometry(id, g[1], g[2], g[3], g[4])
     if not ok then return false, err end
   end
-  M.invalidateAll()
+  win.dirty = true -- its maximize button changes
   return true
 end
 
@@ -3933,9 +3988,9 @@ function M.setText(id, rows)
   win.dirty = true
 end
 
--- Composites every dirty window into the frame buffer, then flips it
--- onto the real screen with ONE bitblt -- only if something changed, so
--- a quiet tick costs zero real GPU calls. Nothing else draws on the
+-- Composites every dirty window into the frame buffer, then flips the
+-- changed area onto the real screen with ONE bitblt -- only if
+-- something changed, so a quiet tick costs zero real GPU calls. Nothing else draws on the
 -- real screen while compositing is active, so the frame buffer never
 -- needs syncing back FROM the screen; whoever draws directly (the
 -- console in console mode, a fullscreen node) does so only as the
@@ -3946,10 +4001,10 @@ function M.flush()
   for i = 1, #windowOrder do
     compositeWindow(gpu, windowOrder, i)
   end
-  if frameDirty then
-    local w, h = gpu.getBufferSize(frameBuffer)
-    gpu.bitblt(0, 1, 1, w, h, frameBuffer, 1, 1)
-    frameDirty = false
+  if frameDamage then
+    local d = clipToScreen(frameDamage)
+    frameDamage = nil
+    if d.w > 0 and d.h > 0 then gpu.bitblt(0, d.x, d.y, d.w, d.h, frameBuffer, d.x, d.y) end
   end
 end
 
