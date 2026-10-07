@@ -14,7 +14,7 @@
 -- hand.
 
 local PORT = 4477
-local MUXOS_VERSION = "0.1.1"
+local MUXOS_VERSION = "0.1.2"
 
 -- node/bios.lua passes this in: the address of whoever's CODE chunks
 -- actually completed the boot handshake -- the ONE place a worker ever
