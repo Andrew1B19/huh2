@@ -124,7 +124,11 @@ When nothing boots, it doesn't just crash: it writes on the screen
 every disk the computer can see, with its label and which muxos files
 are on it, and why any file that was there wouldn't load. Then it stops
 with the same text as its error, for the Analyzer. If the installer
-itself fails, its error and traceback go on the screen too. So a floppy
+itself fails, its error and traceback go on the screen too. Either way
+it writes `/muxos-boot-dump.txt` -- the error, memory and energy, every
+component, and each disk's label, size and root listing -- to the
+installer floppy, or else the first writable disk, for debugging. The
+floppy's `/init.lua` does the same under the stock BIOS. So a floppy
 the computer can't see (no drive, or a rack drive that isn't connected
 to this server) is visible at a glance (install 10).
 

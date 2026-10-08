@@ -276,6 +276,14 @@ every 5 seconds.
 | Kernal: **two beeps, flashing red**, and the screen says "muxos: nothing to boot" | The muxos kernal BIOS found nothing to boot. Under that line it lists every disk the computer can see, its label, and which muxos files are on it. If the floppy isn't listed, the computer can't see it: a case needs a floppy slot (tier 3) or a Disk Drive block next to it; a rack server needs the rack's disk drive connected to it. If it's listed without `muxos-installer.lua`, the files aren't on it. |
 | Kernal: two beeps, flashing red, and the screen says "muxos installer stopped: ..." | The installer started but crashed; the screen shows the error and where. |
 
+Whenever booting fails like this -- under the muxos kernal BIOS or the
+floppy's `init.lua` -- a dump is written to `/muxos-boot-dump.txt` on the
+installer floppy (or, failing that, any writable disk): the error with
+its traceback, memory, energy, every component the computer sees, and
+each disk's label, size and root listing. Read it on an OpenOS computer
+(`cat /mnt/<floppy>/muxos-boot-dump.txt`) or from the floppy's folder in
+the world save, and include it when reporting a problem.
+
 Errors the Analyzer can show:
 
 - **"no bios found; install a configured EEPROM"**: that computer's
