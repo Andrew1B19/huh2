@@ -189,6 +189,18 @@ do
   emu:addFilesystem(other, {["/muxos-installer.dat"] = readFile(DATA)})
   code, out = runInstaller(alone .. "/muxos-installer.lua", openosFor(other, nil), {""}, "check")
   assert(code == 0 and out:find("blank", 1, true), "the data file on another disk was found:\n" .. out)
+  -- An empty or cut-short one (a copy onto a full floppy) says how big it
+  -- is, how big it should be, and how full the disk is.
+  local data = readFile(DATA)
+  for _, broken in ipairs({"", data:sub(1, 4096)}) do
+    local cut = emu:newNode("alone")
+    emu:addFilesystem(cut, {["/muxos-installer.dat"] = broken})
+    code, out = runInstaller(alone .. "/muxos-installer.lua", openosFor(cut, nil), nil, "worker")
+    assert(code == 1 and out:find("it's " .. #broken .. " bytes, should be " .. #data, 1, true)
+      and out:find("free of", 1, true) and out:find("the copy didn't finish", 1, true),
+      "a cut-short data file is explained:\n" .. out)
+    assert(broken ~= "" or out:find("it's there, but empty", 1, true), "an empty data file is called empty:\n" .. out)
+  end
 end
 print("  OK")
 

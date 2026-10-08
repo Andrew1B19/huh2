@@ -128,6 +128,12 @@ if not b then
   os.exit(1)
 end
 local data = payload(b)
+local sized
+b.installer, sized = b.installer:gsub("local DAT_SIZE = nil", "local DAT_SIZE = " .. #data, 1)
+if sized ~= 1 then
+  io.stderr:write("build failed:\ninstaller/install.lua has no DAT_SIZE line to fill in\n")
+  os.exit(1)
+end
 os.execute('mkdir -p "' .. (out:match("^(.*)/[^/]*$") or ".") .. '"')
 writeFile(out, b.installer)
 writeFile(dat, data)

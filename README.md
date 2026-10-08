@@ -169,6 +169,11 @@ The installer is two files, and both go at the root of the floppy:
 - `muxos-installer.lua`, the program (about 22 KB);
 - `muxos-installer.dat`, everything it installs (about 290 KB).
 
+Together they need about 320 KB of the floppy's 512 KB, so start from an
+empty floppy: an older copy of the installer left on it (the old
+single-file one was 314 KB) leaves no room, and the data file is cut
+short.
+
 Ways to get them there:
 
 - **With opm (LewisHost.Net catalog):** copy this repository into
@@ -258,7 +263,11 @@ Errors the Analyzer can show:
   from the installer): the installer looks next to itself, then at the
   root of every disk, and lists each place with why it didn't do: "not
   there", a file that isn't a muxos data file, or one from another
-  version. Put both files from the same build at the floppy's root.
+  version, or one that's cut short (with its size, the size it should
+  be, and the disk's free space). Put both files from the same build at
+  the root of a floppy with room for them. A copy that runs out of space
+  can still look like it worked, so check with `ls -l /mnt/<floppy>` and
+  `df /mnt/<floppy>`.
 - **"failed loading bios: ..."**: the EEPROM holds code that doesn't
   compile; re-flash it.
 - **"not enough memory"**: add RAM (two tier 3 sticks is comfortable for
