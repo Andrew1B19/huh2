@@ -796,7 +796,7 @@ do
 end
 typeLine("windows")
 emu:advance(1)
-assertScreenContains('"console"  50x15 at (1,15)', "the console starts as the bottom half of the screen (title bar on row 15)")
+assertScreenContains('"console"  50x15 at (1,14)', "the console starts as the bottom half of the screen, above the taskbar (title bar on row 14)")
 print("  OK -- only the frame buffer is full-screen; the 50x15 console has no video buffer at all")
 
 print("test 21: console scrollback with PgUp/PgDn and the mouse wheel")
@@ -841,7 +841,7 @@ if not screenHas(("w"):rep(30)) or screenHas(("w"):rep(31)) then
 end
 typeLine("windows")
 emu:advance(1)
-assertScreenContains('"console"  30x8 at (1,22)', "console resized and docked bottom-left (title bar on row 22)")
+assertScreenContains('"console"  30x8 at (1,21)', "console resized and docked bottom-left, above the taskbar (title bar on row 21)")
 typeLine("console 5 2")
 emu:advance(0.5)
 assertScreenContains("console size must be between", "too-small size refused")
@@ -1363,7 +1363,7 @@ do
   assert(iconOf("console"), "the console is a desktop icon:\n" .. text())
   -- The console is a window with a title bar: minimize it, then the
   -- icons it covered show.
-  dtouch(80 - 5, 13)
+  dtouch(80 - 5, 12)
   local hx, hy = iconOf("greeter")
   assert(iconOf("opm") and hx, "/bin's opm and /usr/bin's greeter are icons once the console is out of the way:\n" .. text())
   dtouch(hx, hy)
@@ -1377,7 +1377,7 @@ do
   dtouch(cx, cy)
   assert(text():find("muxos:/home> _", 1, true), "the console icon brings the console back:\n" .. text())
   -- Its close button minimizes it rather than losing it.
-  dtouch(80 - 1, 13)
+  dtouch(80 - 1, 12)
   assert(not text():find("muxos:/home> _", 1, true) and text():find("console", 1, true), "closing the console minimizes it:\n" .. text())
 end
 print("  OK -- icons for the console and every program; touching one starts it; the console minimizes")
@@ -1431,5 +1431,173 @@ do
   assert(not file("/home/t41/where.txt"), "rm -r cleaned up")
 end
 print("  OK -- the core utilities, pipes, redirection, variables, globs, &&/||, /mnt, and muxos commands mixed in")
+
+print("test 42: threads in an .mxe -- concurrent, joinable, killable; errors reported")
+kernalFiles["/bin/threads.mxe"] = [==[--[[mxe
+libraries = {"thread"}
+]]
+local thread = require("thread")
+local t0 = computer.uptime()
+local a = thread.create(function(x) sleep(1) return x * 2 end, 21)
+local b = thread.create(function() sleep(1) return "b" end)
+local okA, ra = a:join()
+local okB, rb = b:join()
+print(string.format("T42 a=%s %s b=%s %s took=%.1f", tostring(okA), tostring(ra), tostring(okB), tostring(rb),
+  computer.uptime() - t0))
+local slow = thread.create(function() sleep(30) end)
+print("T42 timeout=" .. tostring(select(2, slow:join(0.5))) .. " status=" .. slow:status())
+slow:kill()
+slow:join(2)
+print("T42 killed=" .. slow:status())
+thread.create(function() error("boom") end)
+sleep(0.5)
+return "threads done"
+]==]
+typeLine("threads")
+emu:advance(5)
+assertScreenContains("T42 a=true 42 b=true b took=1.", "two threads sleeping 1s each finish together, joined with their results")
+assertScreenContains("T42 timeout=timeout status=running", "join with a timeout")
+assertScreenContains("T42 killed=dead", "kill ends a thread")
+assertScreenContains("thread error: ", "an unjoined thread's error reaches the console")
+assertScreenContains("boom", "...with its message")
+print("  OK -- threads run concurrently, join/kill/timeout work, errors are reported")
+
+-- A fresh cluster: a kernal (with the given extra files on its disk) and
+-- `workers` workers, booted; returns helpers to drive and read it.
+local function newCluster(width, height, extra, workers)
+  local c = {emu = Emulator.new()}
+  c.kernal = c.emu:newNode("kernal")
+  c.emu:addModem(c.kernal)
+  local _, scr, bufs = c.emu:addGpuScreen(c.kernal, width, height)
+  c.files = {}
+  for name, data in pairs(kernalFiles) do c.files[name] = data end
+  for name, data in pairs(extra or {}) do c.files[name] = data end
+  c.emu:addEeprom(c.kernal, readFile(REPO_ROOT .. "/kernal/bios.lua"), c.emu:addFilesystem(c.kernal, c.files))
+  local ws = {}
+  for i = 1, workers or 1 do
+    ws[i] = c.emu:newNode("worker")
+    c.emu:addModem(ws[i])
+    c.emu:addEeprom(ws[i], readFile(REPO_ROOT .. "/node/bios.lua"))
+  end
+  c.emu:boot(c.kernal)
+  for _, w in ipairs(ws) do c.emu:boot(w) end
+  c.emu:advance(4)
+  function c.cell(x, y) return (bufs[0].cells[y] or {})[x] end
+  function c.cells(x, y, n)
+    local out = {}
+    for i = 0, n - 1 do local cell = c.cell(x + i, y) out[#out + 1] = cell and cell.char or " " end
+    return table.concat(out)
+  end
+  function c.text()
+    local rows = {}
+    for y = 1, height do rows[y] = c.cells(1, y, width) end
+    return table.concat(rows, "\n")
+  end
+  function c.touch(x, y)
+    c.emu:injectSignal(c.kernal, "touch", scr, x, y, 0, "tester")
+    c.emu:advance(1)
+  end
+  function c.key(char, code)
+    c.emu:injectSignal(c.kernal, "key_down", scr, char, code or 0, "tester")
+    c.emu:step()
+  end
+  function c.typeLine(line)
+    for i = 1, #line do c.key(line:byte(i)) end
+    c.key(13, 0x1C)
+    c.emu:advance(0.5)
+  end
+  -- Where a string starts on screen (first match), or nil.
+  function c.find(str)
+    for y = 1, height do
+      local x = c.cells(1, y, width):find(str, 1, true)
+      if x then return utf8.len(c.cells(1, y, width):sub(1, x - 1)) + 1, y end
+    end
+  end
+  return c
+end
+
+print("test 43: custom desktop icons, the taskbar, and the start menu")
+do
+  local c = newCluster(80, 25, {
+    ["/usr/bin/fancy.mxe"] = '--[[mxe\nicon = {" .---. ", "( o.o )", " > ^ < ", ""}\nicon_color = 0xFFFF44\n]]\nreturn 1',
+    ["/usr/bin/sidecar.lua"] = 'print("sidecar")',
+    ["/usr/bin/sidecar.icon"] = "#44FF44\n[=====]\n[ sc  ]\n[=====]\n",
+  }, 1)
+  -- The taskbar: the bottom row, a start button, the console's button.
+  local bar = c.cells(1, 25, 80)
+  assert(bar:find("muxos", 1, true) and bar:find("console", 1, true), "the taskbar:\n" .. bar)
+  local bx = bar:find(" console ", 1, true)
+  -- Minimize the console from its taskbar button (it's focused and on
+  -- top), uncovering the icons; then bring it back the same way.
+  c.touch(bx + 2, 25)
+  assert(not c.text():find("muxos:/home> _", 1, true), "the console's button minimized it:\n" .. c.text())
+  local fx, fy = c.find("( o.o )")
+  assert(fx, "an .mxe header's icon is drawn:\n" .. c.text())
+  assert(c.cell(fx, fy).fg == 0xFFFF44, "...in its icon_color")
+  local sx, sy = c.find("[ sc  ]")
+  assert(sx and c.cell(sx, sy).fg == 0x44FF44, "a .icon file's art and color:\n" .. c.text())
+  local dx, dy = c.find("/-------\\")
+  assert(dx and c.cell(dx, dy).fg == 0xFF8844, "programs without one get gmux's icon, in gmux's colors")
+  c.touch(bx + 2, 25)
+  assert(c.text():find("muxos:/home> _", 1, true), "...and the button restored it:\n" .. c.text())
+  -- The start menu lists the apps; touching one starts it.
+  c.touch(3, 25)
+  local mx, my = c.find("sidecar")
+  assert(mx and my > 15, "the start menu lists the apps:\n" .. c.text())
+  c.touch(mx, my)
+  for _ = 1, 10 do
+    if c.text():find("sidecar.lua", 1, true) then break end
+    c.emu:advance(0.5)
+  end
+  assert(c.text():find("sidecar.lua", 1, true), "an app started from the start menu, with a taskbar button:\n" .. c.text())
+  assert(c.cells(1, 25, 80):find("sidecar.lua", 1, true), "its window has a taskbar button")
+end
+print("  OK -- custom icons from .mxe headers and .icon files, taskbar buttons, start menu")
+
+print("test 44: the demo -- threads, child processes on the workers, color and braille windows")
+do
+  local c = newCluster(100, 32, {["/bin/demo.mxe"] = readFile(REPO_ROOT .. "/apps/demo.mxe")}, 3)
+  c.typeLine("demo")
+  for _ = 1, 30 do
+    if c.text():find("cycling colors", 1, true) then break end
+    c.emu:advance(0.5)
+  end
+  local text = c.text()
+  assert(text:find("image computed by 4 child processes on", 1, true), "the strips were computed by child processes:\n" .. text)
+  assert(text:find("cycling colors", 1, true), "the status thread reports the image thread's phase:\n" .. text)
+  -- The half-block window: many colors, half-block characters.
+  local colors, halves = {}, 0
+  for y = 3, 14 do
+    for x = 2, 49 do
+      local cell = c.cell(x, y)
+      if cell then
+        colors[(cell.fg or 0) .. "/" .. (cell.bg or 0)] = true
+        if cell.char == "\u{2580}" or cell.char == "\u{2584}" then halves = halves + 1 end
+      end
+    end
+  end
+  local n = 0
+  for _ in pairs(colors) do n = n + 1 end
+  assert(n > 20 and halves > 50, "the color window shows a half-block image (" .. n .. " colors, " .. halves .. " half blocks)")
+  local braille = 0
+  for y = 3, 8 do
+    for x = 52, 72 do
+      local cell = c.cell(x, y)
+      local code = cell and utf8.codepoint(cell.char)
+      if code and code > 0x2800 and code <= 0x28FF then braille = braille + 1 end
+    end
+  end
+  assert(braille > 20, "the braille window shows graphics (" .. braille .. " braille cells)")
+  -- q in a demo window ends it, its threads joined.
+  local tx, ty = c.find("demo: threads")
+  c.touch(tx + 3, ty + 2)
+  c.key(string.byte("q"), 0x10)
+  for _ = 1, 20 do
+    if c.text():find("demo: done", 1, true) then break end
+    c.emu:advance(0.5)
+  end
+  assert(c.text():find("demo: done", 1, true), "q ended the demo:\n" .. c.text())
+end
+print("  OK -- four threads, strips on the workers, a half-block image and braille graphics, q to quit")
 
 print("ALL OK")

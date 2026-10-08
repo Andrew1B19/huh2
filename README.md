@@ -611,6 +611,28 @@ reasonable degree of `sh`. The prompt shows the working directory
 
 Tested in `test/emu/integration_test.lua`, test 41.
 
+### The desktop, the taskbar and the demo
+
+- **Icons:** a program can have its own icon: an `.mxe` sets `icon` (4
+  rows of 9 columns) and `icon_color` in its header, and any program can
+  have a `<name>.icon` file next to it (art, optionally after a
+  `#RRGGBB` line). See docs/MXE.md.
+- **Taskbar:** the bottom row, above every window. It has a start button
+  (**≡ muxos**), whose menu lists every app, which is handy when windows
+  cover the icons. It has a button per window: touching one restores and
+  raises it, or minimizes it if it's already the focused window on top.
+  The clock is on the right.
+- **`demo`** (`/bin/demo.mxe`, with its own icon): muxos's test program.
+  - Four threads run at once: an image thread, a braille-graphics thread,
+    a status thread, and the main thread waiting for `q`.
+  - It computes a Mandelbrot image in strips, each in a child process
+    that the scheduler places on the workers. It queues strips beyond
+    what the fan-out cap allows.
+  - It draws the image as colour half-block graphics, then cycles its
+    colours; it animates braille graphics; and a text window shows which
+    worker computed each strip.
+  - `demo [strips]`; press `q` in one of its windows to end (test 44).
+
 muxos starts on a desktop, as gmux does: a background with a column of
 app icons at the top left -- the console, and every program in `/bin`
 and `/usr/bin`. Touching an icon starts that program (a legacy `.lua`

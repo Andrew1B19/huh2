@@ -303,14 +303,34 @@ end
 -- A text window has no gpu buffer at all: its rows live in regular
 -- memory (win.textRows) and are drawn straight into the frame buffer
 -- here, clipped to whatever part of it is visible.
+--
+-- A row is a string (the window's colors), or a list of colored spans
+-- {{text, fg, bg}, ...} laid end to end (fg/bg nil: the window's), for
+-- the desktop's icons and the taskbar.
 local function paintTextBox(gpu, win, box, top)
   gpu.setForeground(win.fg)
   gpu.setBackground(win.bg)
   gpu.fill(box.x, box.y, box.w, box.h, " ")
+  local first = box.x - win.x + 1 -- the row's first visible column
   for y = box.y, box.y + box.h - 1 do
     local row = win.textRows[y - top + 1]
-    if row and row ~= "" then
-      local piece = textSlice(tostring(row), box.x - win.x + 1, box.w)
+    if type(row) == "table" then
+      local col = 1
+      for _, span in ipairs(row) do
+        local text = tostring(span[1] or "")
+        local len = utf8.len(text) or #text
+        local from, to = math.max(col, first), math.min(col + len - 1, first + box.w - 1)
+        if from <= to then
+          gpu.setForeground(span[2] or win.fg)
+          gpu.setBackground(span[3] or win.bg)
+          gpu.set(box.x + from - first, y, textSlice(text, from - col + 1, to - from + 1))
+        end
+        col = col + len
+      end
+      gpu.setForeground(win.fg)
+      gpu.setBackground(win.bg)
+    elseif row and row ~= "" then
+      local piece = textSlice(tostring(row), first, box.w)
       if piece ~= "" then gpu.set(box.x, y, piece) end
     end
   end
@@ -893,8 +913,8 @@ function M.redrawWindow(id, options)
   return true
 end
 
--- Replaces a text window's rows (strings, top to bottom) and marks it
--- dirty.
+-- Replaces a text window's rows (top to bottom: strings, or lists of
+-- colored spans -- see paintTextBox) and marks it dirty.
 function M.setText(id, rows)
   local win = windows[id]
   if not win or not win.textRows then return end

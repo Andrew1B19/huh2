@@ -329,7 +329,7 @@ print("  OK")
 print("install 8: a CRLF checkout (git core.autocrlf) builds the same installer; a converted installer says so")
 do
   local copy = TMP .. "/crlf"
-  assert(os.execute('mkdir -p "' .. copy .. '" && cd "' .. REPO_ROOT .. '" && tar cf - kernal node installer tools opm | tar xf - -C "' .. copy .. '"'))
+  assert(os.execute('mkdir -p "' .. copy .. '" && cd "' .. REPO_ROOT .. '" && tar cf - kernal node installer tools opm apps | tar xf - -C "' .. copy .. '"'))
   -- Every text file to CRLF, as a converting checkout would.
   -- (Only "\n" becomes "\r\n", like git; a last line without one stays as is.)
   assert(os.execute('find "' .. copy .. '" -type f -exec perl -pi -e "s/\\n/\\r\\n/" {} +'))
