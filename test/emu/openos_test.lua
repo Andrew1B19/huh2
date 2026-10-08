@@ -203,7 +203,7 @@ do
   answer("y")
   emu:boot(bare)
   emu:advance(3)
-  if not text():find("muxos> _", 1, true) then error("muxos didn't boot from the disk:\n" .. text(), 0) end
+  if not text():find("muxos:/home> _", 1, true) then error("muxos didn't boot from the disk:\n" .. text(), 0) end
 end
 print("  OK")
 

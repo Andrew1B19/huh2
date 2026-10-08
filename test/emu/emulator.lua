@@ -411,7 +411,15 @@ function Emulator:addFilesystem(node, files, prefix, capacity)
       out.n = #out
       return out
     end,
-    makeDirectory = function(path) dirs[norm(path)] = true return true end,
+    -- Parents too, as OpenComputers' makeDirectory does.
+    makeDirectory = function(path)
+      local cur = ""
+      for part in norm(path):gmatch("[^/]+") do
+        cur = cur .. "/" .. part
+        dirs[cur] = true
+      end
+      return true
+    end,
     remove = function(path)
       path = norm(path)
       if files[path] then files[path] = nil return true end

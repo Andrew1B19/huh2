@@ -43,6 +43,7 @@ local gpuAddr, screenAddr, screenBuffers = emu:addGpuScreen(kernal, 50, 30)
 local kernalFiles = {
   ["/muxos.lua"] = muxosSrc,
   ["/compositor.lua"] = compositorSrc,
+  ["/shell.lua"] = readFile(REPO_ROOT .. "/kernal/shell.lua"),
   ["/bitmap.lua"] = bitmapSrc,
   ["/runtime.lua"] = runtimeSrc,
   -- Sample programs for the launcher (test 29).
@@ -313,7 +314,7 @@ local function typeLine(text)
 end
 
 print("test 1: kernal booted and discovered all 3 workers")
-assertScreenContains("muxos>", "prompt visible")
+assertScreenContains("muxos:/home>", "prompt visible")
 -- The startup banner itself may have already scrolled off a short
 -- console by now -- that's correct behavior (confirmed: this is a real
 -- fixed-height scrolling console, see kernal/muxos.lua's termWrite),
@@ -857,7 +858,7 @@ for _ = 1, 15 do
   emu:injectSignal(kernal, "key_down", screenAddr, 8, KEY_BACK_CODE, "tester"); emu:step()
 end
 emu:advance(0.2)
-if not screenHas("muxos> " .. ("x"):rep(45) .. "_") or screenHas(("x"):rep(46)) then
+if not screenHas("muxos:/home> " .. ("x"):rep(45) .. "_") or screenHas(("x"):rep(46)) then
   dumpScreenOnFailure("wrapped backspace")
   error("the wrapped input line did not shrink to 45 characters")
 end
@@ -1013,7 +1014,7 @@ do
   -- so it's marked ended, and the title is cut short of the buttons),
   -- row 2 its body.
   local titleRow, bodyRow = renderScreen():match("^([^\n]*)\n([^\n]*)")
-  if titleRow:sub(1, #"\u{23F9} - kb") ~= "\u{23F9} - kb" or not titleRow:find("\u{2716}", 1, true) or bodyRow:sub(1, 4) ~= "hi28" or screenHas("muxos> hi28") then
+  if titleRow:sub(1, #"\u{23F9} - kb") ~= "\u{23F9} - kb" or not titleRow:find("\u{2716}", 1, true) or bodyRow:sub(1, 4) ~= "hi28" or screenHas("muxos:/home> hi28") then
     dumpScreenOnFailure("keyboard delivery")
     error("typed keys didn't reach the focused process and its window")
   end
@@ -1059,7 +1060,7 @@ assertScreenContains("a=kid", "a program launched by a process ran")
 assertScreenContains("L29=true", "the launching process is its parent")
 typeLine("nosuchprogram")
 emu:advance(1)
-assertScreenContains("unknown command", "an unknown name is still an unknown command")
+assertScreenContains("command not found", "an unknown name is still an unknown command")
 print("  OK -- background launch, gmuxapi.launch (as parent), unknown names")
 
 print("test 30: the hardware verification suite passes inside the emulated sandbox")
@@ -1234,7 +1235,7 @@ emu:advance(1)
 assertScreenContains(string.format("%-14s %s  on kernal", "internet", internetAddr), "the kernal's internet card is on the bus")
 assertScreenContains(string.format("%-14s %s  on %s", "redstone", redstoneAddr, w1), "worker 1's redstone card is on the bus")
 do
-  local after = screenAfter("muxos> bus")
+  local after = screenAfter("muxos:/home> bus")
   assert(not after:find("gpu ", 1, true) and not after:find("modem ", 1, true) and not after:find("eeprom ", 1, true),
     "the display, network cards and firmware stay off the bus")
 end
@@ -1374,11 +1375,61 @@ do
   dtouch(80 - 1, 1) -- close the program's window
   local cx, cy = iconOf("console")
   dtouch(cx, cy)
-  assert(text():find("muxos> _", 1, true), "the console icon brings the console back:\n" .. text())
+  assert(text():find("muxos:/home> _", 1, true), "the console icon brings the console back:\n" .. text())
   -- Its close button minimizes it rather than losing it.
   dtouch(80 - 1, 13)
-  assert(not text():find("muxos> _", 1, true) and text():find("console", 1, true), "closing the console minimizes it:\n" .. text())
+  assert(not text():find("muxos:/home> _", 1, true) and text():find("console", 1, true), "closing the console minimizes it:\n" .. text())
 end
 print("  OK -- icons for the console and every program; touching one starts it; the console minimizes")
+
+print("test 41: the POSIX-style shell -- utilities, pipes, redirection, variables, globs, /mnt")
+do
+  -- A floppy, as the installer's would be: under /mnt by its address.
+  local floppyFiles = {["/readme.txt"] = "alpha\nbeta\ngamma\n"}
+  emu:addFilesystem(kernal, floppyFiles, "flop", 512 * 1024)
+  local function sh(line)
+    typeLine(line)
+    emu:advance(0.5)
+  end
+  local function file(path) return kernalFiles[path] end
+  sh("cd /home && mkdir -p t41/sub && cd t41")
+  sh("pwd > where.txt")
+  assert(file("/home/t41/where.txt") == "/home/t41\n", "cd, mkdir -p, && and pwd: " .. tostring(file("/home/t41/where.txt")))
+  assertScreenContains("muxos:/home/t41> ", "the prompt shows the working directory")
+  sh("echo one > a.txt; echo two >> a.txt; echo 'three  spaced' >> a.txt")
+  assert(file("/home/t41/a.txt") == "one\ntwo\nthree  spaced\n", "> and >> and quoting: " .. tostring(file("/home/t41/a.txt")))
+  sh("cat a.txt | grep t | sort -r | tee sorted.txt | wc -l > count.txt")
+  assert(file("/home/t41/sorted.txt") == "two\nthree  spaced\n" and file("/home/t41/count.txt") == "2\n",
+    "a pipeline through grep, sort, tee and wc")
+  sh('X=world; export GREETING="hello $X"; echo "$GREETING" ${X} \\$X > v.txt')
+  assert(file("/home/t41/v.txt") == "hello world world $X\n", "variables, export, escapes: " .. tostring(file("/home/t41/v.txt")))
+  sh("false || echo recovered > or.txt; true && echo ran >> or.txt; false && echo never >> or.txt")
+  assert(file("/home/t41/or.txt") == "recovered\nran\n", "&& and ||: " .. tostring(file("/home/t41/or.txt")))
+  sh("grep nothing a.txt; echo $? > status.txt; nosuchcommand 2>/dev/null; echo $? >> status.txt")
+  assert(file("/home/t41/status.txt") == "1\n127\n", "$? after grep with no match, and command not found: " .. tostring(file("/home/t41/status.txt")))
+  sh("cp /mnt/flo/readme.txt . && head -n 2 readme.txt > h.txt && tail -n 1 readme.txt > t.txt")
+  assert(file("/home/t41/h.txt") == "alpha\nbeta\n" and file("/home/t41/t.txt") == "gamma\n", "the floppy under /mnt, head and tail")
+  sh("echo copied > /mnt/flo/out.txt")
+  assert(floppyFiles["/out.txt"] == "copied\n", "writing to the floppy")
+  sh("echo a b c | tr a-c x-z | cut -d ' ' -f 2,3 > tr.txt; seq 3 | sort -rn | uniq > seq.txt")
+  assert(file("/home/t41/tr.txt") == "y z\n" and file("/home/t41/seq.txt") == "3\n2\n1\n", "tr, cut, seq, sort -n, uniq")
+  sh("cp -r sub copy && mv a.txt sub/ && rm -r copy && touch sub/b.txt")
+  assert(file("/home/t41/sub/a.txt") and not file("/home/t41/a.txt") and file("/home/t41/sub/b.txt") == "", "cp -r, mv into a directory, rm -r, touch")
+  sh("echo *.txt > glob.txt")
+  assert(file("/home/t41/glob.txt") == "count.txt h.txt or.txt readme.txt seq.txt sorted.txt status.txt t.txt tr.txt v.txt where.txt\n",
+    "globbing: " .. tostring(file("/home/t41/glob.txt")))
+  sh('[ -d sub ] && test -f sub/a.txt && [ "$X" = world ] && echo yes > test.txt')
+  assert(file("/home/t41/test.txt") == "yes\n", "test and [")
+  sh("which ls cat > which.txt; type opm >> which.txt")
+  assert(file("/home/t41/which.txt") == "ls: built in\ncat: built in\nopm is /bin/opm.mxe\n", "which and type: " .. tostring(file("/home/t41/which.txt")))
+  sh("clear")
+  sh("ls /mnt/flo")
+  assertScreenContains("out.txt     readme.txt", "ls in aligned columns")
+  sh("nodes; echo after-nodes")
+  assertScreenContains("after-nodes", "a muxos command inside a shell line")
+  sh("cd ~ && rm -r t41")
+  assert(not file("/home/t41/where.txt"), "rm -r cleaned up")
+end
+print("  OK -- the core utilities, pipes, redirection, variables, globs, &&/||, /mnt, and muxos commands mixed in")
 
 print("ALL OK")
