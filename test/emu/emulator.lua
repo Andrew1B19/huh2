@@ -315,7 +315,8 @@ end
 -- Filesystem: in-memory, pre-populated from `files` (path -> content).
 -- `read`'s handle convention (a plain number, not an io.open()-style
 -- object) matches the real component filesystem API this wraps.
-function Emulator:addFilesystem(node, files, prefix)
+-- `capacity`: bytes (default 1 MB); a floppy is 512 KB.
+function Emulator:addFilesystem(node, files, prefix, capacity)
   local handles = {}
   local nextHandle = 1
   local dirs = {["/"] = true}
@@ -424,8 +425,12 @@ function Emulator:addFilesystem(node, files, prefix)
       touch(to)
       return true
     end,
-    spaceUsed = function() return 0 end,
-    spaceTotal = function() return 1048576 end,
+    spaceUsed = function()
+      local used = 0
+      for _, data in pairs(files) do used = used + #data end
+      return used
+    end,
+    spaceTotal = function() return capacity or 1048576 end,
     isReadOnly = function() return false end,
     getLabel = function() return "kernal" end,
   }, prefix)

@@ -180,12 +180,27 @@ empty floppy: an older copy of the installer left on it (the old
 single-file one was 314 KB) leaves no room, and the data file is cut
 short.
 
-Ways to get them there:
+The sure way, on an OpenOS computer with a floppy in one of its drives:
 
-- **With opm (LewisHost.Net catalog):** copy this repository into
-  oc-programs as `muxos/` and merge `dist/programs.cfg`'s entries into
-  the catalog. On an OpenOS computer, `opm pull muxos-installer <floppy>`
-  puts all three at the floppy's root.
+```
+opm pull muxos-installer /home/muxos
+/home/muxos/muxos-installer.lua floppy
+```
+
+`floppy` mode lists every disk with its `/mnt` path, label and size,
+marks the floppies, and never offers the computer's own OpenOS disk.
+Pick the floppy and it writes all three files there and reads them
+back. (On OpenOS every disk has a `/mnt/xxx` name, the computer's own
+hard disk included, so pulling straight to `/mnt/xxx` can land on the
+wrong disk; the installer warns when it finds itself on the computer's
+own disk.)
+
+Other ways, if you'd rather put the files there yourself:
+
+- **With opm:** `opm pull muxos-installer <floppy>`, when you're sure
+  which `/mnt` name is the floppy (`df` shows each disk's size; a floppy
+  is 512 KB). The catalog entries are in `dist/programs.cfg`: copy this
+  repository into oc-programs as `muxos/` and merge them in.
 - **With an internet card:** `wget` `dist/floppy/init.lua`,
   `dist/muxos-installer.lua` and `dist/muxos-installer.dat` from the
   repository's raw URLs onto a floppy's root.

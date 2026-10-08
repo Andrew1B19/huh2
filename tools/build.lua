@@ -134,10 +134,15 @@ if not b then
   os.exit(1)
 end
 local data = payload(b)
-local sized
+local sized, embedded
 b.installer, sized = b.installer:gsub("local DAT_SIZE = nil", "local DAT_SIZE = " .. #data, 1)
-if sized ~= 1 then
-  io.stderr:write("build failed:\ninstaller/install.lua has no DAT_SIZE line to fill in\n")
+-- The floppy's /init.lua goes inside the program too, so `floppy` mode
+-- can write a bootable floppy from wherever the installer was copied.
+b.installer, embedded = b.installer:gsub("local INIT_LUA = nil", function()
+  return "local INIT_LUA = " .. string.format("%q", b.init)
+end, 1)
+if sized ~= 1 or embedded ~= 1 then
+  io.stderr:write("build failed:\ninstaller/install.lua has no DAT_SIZE or INIT_LUA line to fill in\n")
   os.exit(1)
 end
 os.execute('mkdir -p "' .. (out:match("^(.*)/[^/]*$") or ".") .. '/floppy"')
