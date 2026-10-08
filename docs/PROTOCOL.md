@@ -114,6 +114,20 @@ at the disk it installs to. So an empty computer needs nothing but the
 kernal BIOS and the floppy, and an installed system always wins over a
 forgotten floppy (`test/emu/install_test.lua`, install 9).
 
+The kernal BIOS follows the mod's own stock `bios.lua`: the boot disk's
+address lives in the EEPROM's data, it binds the GPU to the screen, and
+it reads files through the filesystem component. It runs in the mod's
+sandbox (machine.lua), so what OpenOS would add (event, io, ...) isn't
+there; kernal/muxos.lua builds what it needs itself.
+
+When nothing boots, it doesn't just crash: it writes on the screen
+every disk the computer can see, with its label and which muxos files
+are on it, and why any file that was there wouldn't load. Then it stops
+with the same text as its error, for the Analyzer. If the installer
+itself fails, its error and traceback go on the screen too. So a floppy
+the computer can't see (no drive, or a rack drive that isn't connected
+to this server) is visible at a glance (install 10).
+
 This matters because a surprising amount of what looks like "the Lua
 sandbox" in OpenComputers is actually OpenOS, not the mod. Verified
 directly against the mod's own Scala source
