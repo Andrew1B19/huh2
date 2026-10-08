@@ -48,10 +48,11 @@ local function stop(text, floppy)
   error(table.concat(lines, "\n"), 0)
 end
 
+-- Opened directly, like the stock BIOS: "not found" is just absence,
+-- anything else is reported.
 local function loadFrom(a, path)
-  if not call(a, "exists", path) then return nil end
   local h, why = call(a, "open", path)
-  if not h then return nil, why end
+  if not h then return nil, why ~= path and why ~= "file not found" and why or nil end
   local parts = {}
   repeat
     local data, why = call(a, "read", h, math.maxinteger or math.huge)
@@ -98,14 +99,11 @@ for a in list("filesystem") do
   end
 end
 
-say("muxos: nothing to boot. Disks this computer can see:")
+say("muxos: nothing to boot. Disks this computer can see, and their files:")
 for a in list("filesystem") do
-  local has = {}
-  for _, name in ipairs({"muxos.lua", "muxos-installer.lua", "muxos-installer.dat", "init.lua"}) do
-    if call(a, "exists", "/" .. name) then has[#has + 1] = name end
-  end
+  local names, why = call(a, "list", "/")
   say("  " .. a:sub(1, 8) .. (a == tmp and " (tmpfs)" or "") .. " \"" .. tostring(call(a, "getLabel") or "")
-    .. "\": " .. (#has > 0 and table.concat(has, " ") or "-"))
+    .. "\": " .. (names and table.concat(names, " ") or "can't list: " .. tostring(why)))
 end
 for _, p in ipairs(problems) do say("  " .. p) end
 stop("Put the installer floppy in a drive connected to this computer.")

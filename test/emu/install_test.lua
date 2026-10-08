@@ -425,7 +425,8 @@ do
   end
   local why, screen = crash(nil)
   assert(why:find("muxos: nothing to boot", 1, true) and why:find("Put the installer floppy", 1, true), why)
-  assert(screen:find("muxos: nothing to boot. Disks this computer can see:", 1, true), "shown on the screen:\n" .. screen)
+  assert(screen:find("muxos: nothing to boot. Disks this computer can see, and their files:", 1, true),
+    "shown on the screen:\n" .. screen)
   local files = {["/muxos-installer.lua"] = "this is not lua (", ["/notes.txt"] = "hi"}
   why, screen = crash(files)
   -- A dump for debugging, on the disk: the error, the machine, every
@@ -435,14 +436,29 @@ do
     and dump:find("memory %d+/%d+") and dump:find(" eeprom") and dump:find(" gpu")
     and dump:find("filesystem \"[^\n]*: muxos%-installer%.lua notes%.txt"), "the dump:\n" .. dump)
   assert(screen:find("Dump: filesyst/muxos-boot-dump.txt", 1, true), "the dump is named on the screen:\n" .. screen)
-  assert(why:find('": muxos-installer.lua\n', 1, true)
-    and why:find("filesyst/muxos-installer.lua: ", 1, true), why)
+  assert(screen:find('": muxos-installer.lua notes.txt', 1, true), "each disk's files are on the screen:\n" .. screen)
+  assert(why:find("filesyst/muxos-installer.lua: ", 1, true), why)
   assert(screen:find("filesyst/muxos-installer.lua: ", 1, true), "the load error is on the screen:\n" .. screen)
   files = {["/muxos-installer.lua"] = "error('broken on purpose')"}
   why, screen = crash(files)
   assert((files["/muxos-boot-dump.txt"] or ""):find("stack traceback", 1, true), "the installer's traceback is dumped")
   assert(why:find("muxos installer stopped: /muxos-installer.lua:1: broken on purpose", 1, true), why)
   assert(screen:find("muxos installer stopped: /muxos-installer.lua:1: broken on purpose", 1, true), "shown on the screen:\n" .. screen)
+end
+print("  OK")
+
+print("install 11: the kernal BIOS boots the floppy even where `exists` says no (it opens, like the stock BIOS)")
+do
+  local node = emu:newNode("bare")
+  local _, _, bufs = emu:addGpuScreen(node, 80, 25)
+  local floppy = emu:addFilesystem(node, {["/muxos-installer.lua"] = readFile(BUNDLE), ["/muxos-installer.dat"] = readFile(DATA)})
+  node.components[floppy].methods.exists = function() return false end
+  emu:addEeprom(node, readFile(REPO_ROOT .. "/kernal/bios.lua"))
+  emu:boot(node)
+  emu:advance(2)
+  local row, chars = bufs[0].cells[1] or {}, {}
+  for x = 1, 80 do chars[x] = (row[x] and row[x].char) or " " end
+  assert(table.concat(chars):find("muxos 0.1.2 installer (booted from", 1, true), "it booted the installer: " .. table.concat(chars))
 end
 print("  OK")
 

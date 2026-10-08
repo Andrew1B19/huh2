@@ -54,9 +54,11 @@ local function fail(text, disk)
   end
   error(text, 0)
 end
+-- Opened directly, like the stock BIOS does, rather than asking `exists`.
 local function has(address)
-  local ok, found = pcall(invoke, address, "exists", path)
-  return ok and found
+  local handle = call(address, "open", path)
+  if handle then call(address, "close", handle) end
+  return handle ~= nil
 end
 local address = computer.getBootAddress and computer.getBootAddress()
 if not (address and has(address)) then
