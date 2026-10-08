@@ -699,8 +699,14 @@ an internet card on any node.
 - the kernal's boot disk: programs reach it as the OS filesystem (`FS`),
   with its own handle bookkeeping.
 
-**Not yet:** a remote component's signals (`redstone_changed`, an
-internet card's events, ...) don't reach programs on other nodes yet.
+**Signals (BUILT):** a signal from a bus component (`redstone_changed`,
+an internet card's events, ...) reaches every running program in the
+cluster, as every program on one OpenOS machine would see it. The
+worker it happens on relays it to the kernal (`SIGNAL`), and the kernal
+hands it to each running process as an event: `.mxe` programs get it
+from `pull_event`, legacy ones from `event.pull`. The kernal's own bus
+components' signals go the same way. A worker can only relay signals
+from its own components (test 46).
 
 Test 36 covers the registry, a relayed call (worker 2 to worker 1's
 redstone card), a direct call on the owning node, an internet request

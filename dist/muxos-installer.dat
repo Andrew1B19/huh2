@@ -2,11 +2,11 @@
 @@MANIFEST 20
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-131105 /muxos.lua
+132213 /muxos.lua
 38633 /compositor.lua
 42021 /shell.lua
 6492 /bitmap.lua
-96706 /runtime.lua
+97238 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 460 /lib/colors.lua
 4881 /lib/core/full_keyboard.lua
@@ -214,7 +214,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 131105 /muxos.lua
+@@ 132213 /muxos.lua
 -- muxos kernal "init" for huh2. This REPLACES OpenOS on the kernal --
 -- it is the entire resident environment, not a program that runs under
 -- one. kernal/bios.lua (this node's own tiny EEPROM image, mirroring
@@ -1644,6 +1644,24 @@ do
     end
   end
 
+  -- A signal from a bus component (`sig`, the whole signal, packed)
+  -- that reached `node` -- the kernal's own hardware, or relayed by the
+  -- worker it's on (SIGNAL): every running program gets it, as every
+  -- program on one OpenOS machine would (redstone_changed, an internet
+  -- card's events, ...). Only from the node that component is on.
+  function bus.forwardSignal(node, sig)
+    if type(sig) ~= "table" or type(sig[1]) ~= "string" or type(sig[2]) ~= "string" then return end
+    if sig[1] == "component_added" or sig[1] == "component_removed" then return end
+    local c = components[sig[2]]
+    if not c or c.node ~= node then return end
+    local event = {}
+    for i = 1, math.min(tonumber(sig.n) or #sig, 32) do event[i] = sig[i] end
+    for id in pairs(runningJobs) do
+      local job = jobs[id]
+      if job then send({type = "EVENT", from = selfAddr, to = job.node, jobId = id, event = event}) end
+    end
+  end
+
   function bus.refreshOwn()
     local list = {}
     for addr, ctype in component.list() do
@@ -2208,6 +2226,8 @@ local function handleModemMessage(from, port, data)
     handleGetWindows(msg)
   elseif msg.type == "DRAWWINDOW" then
     handleDrawWindow(msg)
+  elseif msg.type == "SIGNAL" then
+    bus.forwardSignal(msg.from, msg.signal)
   elseif msg.type == "NET" then
     local job = callerJob(msg)
     local result, err
@@ -2835,6 +2855,7 @@ local function tick(timeout)
   local name, a2, a3, a4, a5, a6 = table.unpack(sig, 1, 6)
   local ok, err = pcall(function()
     if name == "modem_message" and a4 ~= PORT then net.deliver(sig) end
+    if type(a2) == "string" and bus.components[a2] then bus.forwardSignal(selfAddr, sig) end
     if name == "key_down" then
       handleKeyDown(a3, a4)
     elseif name == "key_up" then
@@ -5793,7 +5814,7 @@ end
 
 return M
 
-@@ 96706 /runtime.lua
+@@ 97238 /runtime.lua
 -- Worker runtime for huh2. NOT flashed anywhere -- this lives on the
 -- KERNAL's filesystem (as a sibling file of kernal/muxos.lua) and gets
 -- served, as plain source text, to each worker over the modem at boot
@@ -6143,9 +6164,23 @@ end
 -- kernal knows a busy node is alive, with no heartbeat); a reply to an
 -- RPC is kept for the process awaiting it; everything else from the
 -- kernal is handled at once (handleMessage).
-receive = function(name, _, from, port, _, data)
+receive = function(name, ...)
   if name == "component_added" or name == "component_removed" then reportComponents() return end
-  if name ~= "modem_message" or noteControl(port, data) then return end
+  if name ~= "modem_message" then
+    -- A signal from one of this node's bus components (redstone_changed,
+    -- an internet card's events, ...): to the kernal, which hands it to
+    -- every running program in the cluster.
+    local addr = ...
+    if kernalAddr and type(addr) == "string" then
+      local ok, ctype = pcall(component.type, addr)
+      if ok and ctype and not BUS_EXCLUDED[ctype] then
+        send({type = "SIGNAL", from = nodeId, to = kernalAddr, signal = table.pack(name, ...)})
+      end
+    end
+    return
+  end
+  local _, from, port, _, data = ...
+  if noteControl(port, data) then return end
   if port ~= PORT or type(data) ~= "string" then return end
   local payload = reassemble(from, data)
   local msg = payload and deserialize(payload)
@@ -8300,9 +8335,9 @@ while true do
     if deadline then timeout = math.min(timeout, math.max(0, deadline - computer.uptime())) end
   end
   for n = 1, MAX_SIGNALS_PER_ROUND do
-    local name, a, b, c, d, e = computer.pullSignal(n == 1 and timeout or 0)
-    if not name then break end
-    receive(name, a, b, c, d, e)
+    local sig = table.pack(computer.pullSignal(n == 1 and timeout or 0))
+    if not sig[1] then break end
+    receive(table.unpack(sig, 1, sig.n))
   end
   if computer.uptime() - lastSweep >= SWEEP_EVERY then
     sweepStaleChunks()

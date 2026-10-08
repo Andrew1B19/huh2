@@ -1427,6 +1427,24 @@ do
     end
   end
 
+  -- A signal from a bus component (`sig`, the whole signal, packed)
+  -- that reached `node` -- the kernal's own hardware, or relayed by the
+  -- worker it's on (SIGNAL): every running program gets it, as every
+  -- program on one OpenOS machine would (redstone_changed, an internet
+  -- card's events, ...). Only from the node that component is on.
+  function bus.forwardSignal(node, sig)
+    if type(sig) ~= "table" or type(sig[1]) ~= "string" or type(sig[2]) ~= "string" then return end
+    if sig[1] == "component_added" or sig[1] == "component_removed" then return end
+    local c = components[sig[2]]
+    if not c or c.node ~= node then return end
+    local event = {}
+    for i = 1, math.min(tonumber(sig.n) or #sig, 32) do event[i] = sig[i] end
+    for id in pairs(runningJobs) do
+      local job = jobs[id]
+      if job then send({type = "EVENT", from = selfAddr, to = job.node, jobId = id, event = event}) end
+    end
+  end
+
   function bus.refreshOwn()
     local list = {}
     for addr, ctype in component.list() do
@@ -1991,6 +2009,8 @@ local function handleModemMessage(from, port, data)
     handleGetWindows(msg)
   elseif msg.type == "DRAWWINDOW" then
     handleDrawWindow(msg)
+  elseif msg.type == "SIGNAL" then
+    bus.forwardSignal(msg.from, msg.signal)
   elseif msg.type == "NET" then
     local job = callerJob(msg)
     local result, err
@@ -2618,6 +2638,7 @@ local function tick(timeout)
   local name, a2, a3, a4, a5, a6 = table.unpack(sig, 1, 6)
   local ok, err = pcall(function()
     if name == "modem_message" and a4 ~= PORT then net.deliver(sig) end
+    if type(a2) == "string" and bus.components[a2] then bus.forwardSignal(selfAddr, sig) end
     if name == "key_down" then
       handleKeyDown(a3, a4)
     elseif name == "key_up" then

@@ -1655,4 +1655,44 @@ print("LNET45 " .. tostring(port) .. " " .. tostring(a) .. " " .. tostring(b) ..
 end
 print("  OK -- programs open ports, send, broadcast and receive through the kernal's card; ports close at exit")
 
+print("test 46: signals from any node's components reach programs anywhere in the cluster")
+do
+  kernalFiles["/bin/sig46.mxe"] = [==[
+local got = 0
+local deadline = computer.uptime() + 6
+while got < 2 and computer.uptime() < deadline do
+  local e = gmuxapi.pull_event(0.5)
+  if e and e[1] == "redstone_changed" then
+    got = got + 1
+    print("SIG46 " .. e[2] .. " side=" .. tostring(e[3]) .. " new=" .. tostring(e[5]))
+  end
+end
+]==]
+  kernalFiles["/usr/bin/sig46legacy.lua"] = [==[
+local event = require("event")
+local _, addr, side, old, new = event.pull(6, "redstone_changed")
+print("LSIG46 " .. tostring(addr) .. " " .. tostring(side) .. " " .. tostring(new))
+]==]
+  -- A redstone component on the kernal itself too, plugged in now.
+  local kernalRedstone = emu:addComponent(kernal, "redstone", {getInput = function() return 0 end})
+  emu:injectSignal(kernal, "component_added", kernalRedstone, "redstone")
+  emu:advance(0.5)
+  typeLine("sig46legacy")
+  typeLine("sig46 &")
+  emu:advance(2)
+  local worker1
+  for _, w in ipairs(workers) do
+    if w.components[redstoneAddr] then worker1 = w end
+  end
+  emu:injectSignal(worker1, "redstone_changed", redstoneAddr, 2, 0, 15)
+  emu:advance(1)
+  emu:injectSignal(kernal, "redstone_changed", kernalRedstone, 4, 3, 7)
+  emu:advance(2)
+  assertScreenContains("SIG46 " .. redstoneAddr .. " side=2 new=15", "a worker's redstone card's signal reached an .mxe")
+  assertScreenContains("SIG46 " .. kernalRedstone .. " side=4 new=7", "...and one on the kernal's own")
+  assertScreenContains("LSIG46 " .. redstoneAddr .. " 2 15", "a legacy program got it through event.pull")
+  closeWindowAt(1, 50)
+end
+print("  OK -- redstone_changed from a worker's card and the kernal's own reach .mxe and legacy programs")
+
 print("ALL OK")

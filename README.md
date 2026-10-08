@@ -533,9 +533,6 @@ against the code (not just this document):
 
 - **GERTi** networking for programs (the raw modem API is built: the
   `modem` library and legacy programs' `modem` component).
-- **Remote component signals.** Calling another node's components works
-  (the bus), but their signals (`redstone_changed`, an internet card's
-  events, ...) don't reach programs on other nodes.
 - **OpenOS libraries for legacy programs:** `shell` (`shell.parse`,
   `shell.resolve`, working directory, ...), `buffer` (a stub that
   errors), the full `process` library, OpenOS's `thread`, `uuid`,

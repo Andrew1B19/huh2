@@ -347,9 +347,23 @@ end
 -- kernal knows a busy node is alive, with no heartbeat); a reply to an
 -- RPC is kept for the process awaiting it; everything else from the
 -- kernal is handled at once (handleMessage).
-receive = function(name, _, from, port, _, data)
+receive = function(name, ...)
   if name == "component_added" or name == "component_removed" then reportComponents() return end
-  if name ~= "modem_message" or noteControl(port, data) then return end
+  if name ~= "modem_message" then
+    -- A signal from one of this node's bus components (redstone_changed,
+    -- an internet card's events, ...): to the kernal, which hands it to
+    -- every running program in the cluster.
+    local addr = ...
+    if kernalAddr and type(addr) == "string" then
+      local ok, ctype = pcall(component.type, addr)
+      if ok and ctype and not BUS_EXCLUDED[ctype] then
+        send({type = "SIGNAL", from = nodeId, to = kernalAddr, signal = table.pack(name, ...)})
+      end
+    end
+    return
+  end
+  local _, from, port, _, data = ...
+  if noteControl(port, data) then return end
   if port ~= PORT or type(data) ~= "string" then return end
   local payload = reassemble(from, data)
   local msg = payload and deserialize(payload)
@@ -2504,9 +2518,9 @@ while true do
     if deadline then timeout = math.min(timeout, math.max(0, deadline - computer.uptime())) end
   end
   for n = 1, MAX_SIGNALS_PER_ROUND do
-    local name, a, b, c, d, e = computer.pullSignal(n == 1 and timeout or 0)
-    if not name then break end
-    receive(name, a, b, c, d, e)
+    local sig = table.pack(computer.pullSignal(n == 1 and timeout or 0))
+    if not sig[1] then break end
+    receive(table.unpack(sig, 1, sig.n))
   end
   if computer.uptime() - lastSweep >= SWEEP_EVERY then
     sweepStaleChunks()
