@@ -71,6 +71,7 @@ local floppy = emu:addFilesystem(node, {
   ["/muxos-installer.lua"] = readFile(REPO_ROOT .. "/dist/muxos-installer.lua"),
   ["/muxos-installer.dat"] = readFile(REPO_ROOT .. "/dist/muxos-installer.dat"),
 }, "floppy") -- so OpenOS mounts it at /mnt/flo
+local blank = emu:addFilesystem(node, {["/notes.txt"] = "mine"}, "blank", 512 * 1024) -- at /mnt/bla
 local eeprom = emu:addEeprom(node, readFile(assets .. "/lua/bios.lua"), hdd)
 
 local function screen()
@@ -203,6 +204,66 @@ do
   emu:boot(bare)
   emu:advance(3)
   if not text():find("muxos> _", 1, true) then error("muxos didn't boot from the disk:\n" .. text(), 0) end
+end
+print("  OK")
+
+-- Making the floppy from OpenOS: `floppy` mode lists the disks (never
+-- this computer's own OpenOS disk), writes the three files to the one
+-- picked, and that floppy then boots an empty computer.
+print("openos 7: floppy mode writes a bootable installer floppy, and never offers the OpenOS disk")
+do
+  typeLine("clear")
+  emu:advance(0.5)
+  typeLine("/mnt/flo/muxos-installer.lua floppy")
+  if not waitFor("Write the installer floppy to which disk?") then fail("no disk prompt") end
+  local listing = screen()
+  if listing:find(hdd:sub(1, 8), 1, true) then fail("it offered this computer's own OpenOS disk") end
+  local line = listing:match("(%d+)%) " .. blank:sub(1, 8):gsub("%-", "%%-") .. "[^\n]*<%- floppy")
+  if not line then fail("the blank floppy isn't listed as a floppy") end
+  typeLine(line)
+  if not waitFor("now boots into the muxos installer", 30) then fail("it didn't write the floppy") end
+  if not waitFor("/home #") then fail("floppy mode didn't finish") end
+  local fsm = node.components[blank].methods
+  local h = fsm.open("/notes.txt")
+  if fsm.read(h, 100) ~= "mine" then fail("it lost a file already on the floppy") end
+  fsm.close(h)
+  -- Copy the floppy's files to a fresh empty computer and boot it with the stock BIOS.
+  local function grab(path)
+    local hh, parts = fsm.open(path), {}
+    while true do local d = fsm.read(hh, 4096) if not d then break end parts[#parts + 1] = d end
+    fsm.close(hh)
+    return table.concat(parts)
+  end
+  local bare = emu:newNode("bare")
+  local _, _, bareBufs = emu:addGpuScreen(bare, 80, 25)
+  emu:addFilesystem(bare, {}) -- its hard disk
+  emu:addFilesystem(bare, {
+    ["/init.lua"] = grab("/init.lua"),
+    ["/muxos-installer.lua"] = grab("/muxos-installer.lua"),
+    ["/muxos-installer.dat"] = grab("/muxos-installer.dat"),
+  })
+  emu:addEeprom(bare, readFile(assets .. "/lua/bios.lua"))
+  emu:boot(bare)
+  emu:advance(3)
+  local row, chars = bareBufs[0].cells[1] or {}, {}
+  for x = 1, 80 do chars[x] = (row[x] and row[x].char) or " " end
+  if not table.concat(chars):find("muxos 0.1.2 installer (booted from", 1, true) then
+    error("the floppy floppy-mode wrote doesn't boot: " .. table.concat(chars), 0)
+  end
+end
+print("  OK")
+
+print("openos 8: an installer on this computer's own OpenOS disk says so")
+do
+  typeLine("clear")
+  emu:advance(0.5)
+  typeLine("cp /mnt/flo/muxos-installer.lua /mnt/flo/muxos-installer.dat /home/")
+  if not waitFor("/home #") then fail("cp didn't finish") end
+  emu:advance(2)
+  typeLine("/home/muxos-installer.lua check")
+  if not waitFor("Note: this installer is on this computer's own disk, not a floppy") then fail("no note") end
+  typeLine("q")
+  if not waitFor("/home #") then fail("check didn't finish") end
 end
 print("  OK")
 

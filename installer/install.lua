@@ -13,6 +13,8 @@
 --                                               computers that will boot this
 --                                               installer from a floppy
 --       muxos-installer.lua check               say which BIOS an EEPROM holds
+--       muxos-installer.lua floppy [--disk=..]  write the installer onto a
+--                                               floppy that boots into it
 --     Options: --disk=<address prefix or label> (kernal target), --yes
 --     (don't ask; take the only disk), --count=<n> (worker: flash n
 --     EEPROMs), --reboot (kernal: reboot when done).
@@ -29,6 +31,7 @@
 
 local VERSION = "dev" -- set by tools/build.lua
 local DAT_SIZE = nil -- the data file's exact size, set by tools/build.lua
+local INIT_LUA = nil -- the floppy's /init.lua (installer/init.lua), set by tools/build.lua
 local CHUNK = 8192
 
 -- --- Platform: OpenOS, or bare from the kernal BIOS ---
@@ -282,7 +285,7 @@ local function bundledPayload(fs, path)
   if okSize and tonumber(size) and size > 0 and size ~= expected then
     return nil, "it's damaged: " .. (size < expected and "cut short" or "longer than its contents")
   end
-  local payload = {files = files}
+  local payload = {files = files, fs = fs, path = path}
   function payload.each(fn)
     local g = assert(openReader(fs, path))
     repeat local line = g.line() until not line or line:match("^@@MANIFEST")
@@ -645,6 +648,133 @@ end
 
 -- --- Main ---
 
+-- --- Making the installer floppy ---
+
+-- Writes the installer -- this program, its data file and the floppy's
+-- /init.lua -- onto a disk you pick, so that disk boots into the
+-- installer. Every disk is shown with its OpenOS mount path, label and
+-- size, floppies marked; this computer's own OpenOS disk is never offered
+-- (an /init.lua there would replace OpenOS's). Each file is read back.
+local FLOPPY_SIZE = 512 * 1024
+
+local function mountsOf(address)
+  if not osfs or not osfs.mounts then return "" end
+  local paths = {}
+  for proxy, path in osfs.mounts() do
+    if proxy.address == address and path ~= "/" then paths[#paths + 1] = path end
+  end
+  table.sort(paths)
+  return table.concat(paths, " ")
+end
+
+local function rootAddress()
+  if not osfs then return nil end
+  local fs = osfs.get("/")
+  return fs and fs.address
+end
+
+local function makeFloppy(payload)
+  if not INIT_LUA then return nil, "this installer wasn't built with the floppy's init.lua (run tools/build.lua)" end
+  local program = medium and readText(medium.fs, medium.path)
+  if not program then return nil, "can't read this installer's own file to copy it" end
+  local root = rootAddress()
+  local disks = {}
+  for _, d in ipairs(diskList(medium and medium.address)) do
+    if d.address ~= root then
+      d.total = d.fs.spaceTotal()
+      d.floppy = d.total <= FLOPPY_SIZE + 4096
+      d.where = mountsOf(d.address)
+      disks[#disks + 1] = d
+    end
+  end
+  table.sort(disks, function(a, b)
+    if a.floppy ~= b.floppy then return a.floppy end
+    return a.address < b.address
+  end)
+  local disk
+  if options.disk then
+    disk = chooseDisk(disks)
+  elseif #disks == 0 then
+    return nil, "no disk to write it to: put a floppy in a drive this computer can see"
+  else
+    say("Disks (not this computer's own" .. (root and " OpenOS disk" or "") .. "):")
+    for i, d in ipairs(disks) do
+      say(string.format("  %d) %s  %s%s  %s, %s free%s", i, d.address:sub(1, 8),
+        d.label ~= "" and d.label or "(no label)", d.where ~= "" and "  " .. d.where or "",
+        human(d.total), human(d.free), d.floppy and "  <- floppy" or ""))
+    end
+    local only = #disks == 1 and disks[1].floppy
+    local pick = only and assumeYes and 1 or tonumber(ask("Write the installer floppy to which disk? "))
+    disk = pick and disks[pick]
+  end
+  if not disk then return nil, "no disk chosen" end
+  if not disk.floppy then
+    say("Disk " .. disk.address:sub(1, 8) .. " is " .. human(disk.total) .. " -- bigger than a floppy.")
+    if not confirm("Write the installer there anyway (it gets an /init.lua and boots into the installer)?") then
+      return nil, "nothing written"
+    end
+  end
+  local target = disk.fs
+  local files = {
+    {"/init.lua", #INIT_LUA},
+    {"/muxos-installer.lua", #program},
+    {"/muxos-installer.dat", DAT_SIZE or payload.fs.size(payload.path)},
+  }
+  local needed, freed = 0, 0
+  for _, f in ipairs(files) do
+    needed = needed + f[2]
+    if target.exists(f[1]) then freed = freed + target.size(f[1]) end
+  end
+  if disk.free + freed < needed then
+    return nil, "the disk has " .. human(disk.free + freed) .. " free (counting the installer files already on it) "
+      .. "and the installer needs " .. human(needed) .. ": delete something from it first"
+  end
+  for _, f in ipairs(files) do target.remove(f[1]) end
+  say("Writing the installer to " .. disk.address:sub(1, 8) .. "...")
+  writeText(target, "/init.lua", INIT_LUA)
+  writeText(target, "/muxos-installer.lua", program)
+  local from = assert(payload.fs.open(payload.path, "r"))
+  local to = assert(target.open("/muxos-installer.dat", "w"))
+  while true do
+    local data = payload.fs.read(from, CHUNK)
+    if not data then break end
+    local ok, err = target.write(to, data)
+    if not ok then
+      payload.fs.close(from)
+      target.close(to)
+      return nil, "writing muxos-installer.dat failed: " .. tostring(err)
+    end
+    breathe()
+  end
+  payload.fs.close(from)
+  target.close(to)
+  if readText(target, "/init.lua") ~= INIT_LUA or readText(target, "/muxos-installer.lua") ~= program then
+    return nil, "the files didn't read back the same (is the disk full or read-only?)"
+  end
+  local check, err = bundledPayload(target, "/muxos-installer.dat")
+  if not check then return nil, "muxos-installer.dat didn't read back right: " .. tostring(err) end
+  say("Done: " .. disk.address:sub(1, 8) .. (disk.where ~= "" and " (" .. disk.where .. ")" or "")
+    .. " now boots into the muxos installer, under the stock Lua BIOS or the muxos kernal BIOS.")
+  return true
+end
+
+-- On OpenOS: a warning when these installer files sit on this computer's
+-- own OpenOS disk rather than a floppy, and when that disk's /init.lua
+-- has been replaced by the floppy's (it would boot the installer, not
+-- OpenOS).
+local function placementWarnings()
+  if bare or not medium or medium.address ~= rootAddress() then return end
+  say("Note: this installer is on this computer's own disk, not a floppy. To make the")
+  say("installer floppy, put a floppy in and choose 'make an installer floppy' (or run")
+  say("muxos-installer.lua floppy).")
+  local ok, init = pcall(readText, medium.fs, "/init.lua")
+  if INIT_LUA and ok and init == INIT_LUA then
+    say("Warning: this disk's /init.lua is the installer floppy's, so this computer will")
+    say("boot into the muxos installer instead of OpenOS. Reinstall OpenOS onto it (boot")
+    say("the OpenOS floppy and run `install`) or delete /init.lua and copy OpenOS's back.")
+  end
+end
+
 local function main()
   say("muxos " .. VERSION .. " installer" .. (bare and " (booted from " .. tostring(medium and medium.address or "?"):sub(1, 8) .. ")" or ""))
   local payload, err = findPayload()
@@ -652,15 +782,17 @@ local function main()
     say("error: " .. tostring(err))
     return 1
   end
+  placementWarnings()
   local mode = positional[1]
   if not mode then
     say("  1) install the kernal on this computer")
     say("  2) flash worker EEPROMs")
     say("  3) flash kernal BIOS EEPROMs (for computers that will boot this installer)")
     say("  4) check which BIOS an EEPROM holds")
-    say("  5) quit")
+    say("  5) make an installer floppy")
+    say("  6) quit")
     local pick = ask("> ")
-    mode = ({["1"] = "kernal", ["2"] = "worker", ["3"] = "bios", ["4"] = "check"})[pick or ""]
+    mode = ({["1"] = "kernal", ["2"] = "worker", ["3"] = "bios", ["4"] = "check", ["5"] = "floppy"})[pick or ""]
     if not mode then return 0 end
   end
   local ok, failure
@@ -675,10 +807,12 @@ local function main()
     ok, failure = flashEeproms(payload, BIOSES.worker)
   elseif mode == "bios" then
     ok, failure = flashEeproms(payload, BIOSES.kernal)
+  elseif mode == "floppy" then
+    ok, failure = makeFloppy(payload)
   elseif mode == "check" then
     ok, failure = checkEeproms(payload)
   else
-    say("usage: muxos-installer.lua [kernal|worker|bios|check] [--disk=<address|label>] [--yes] [--count=<n>] [--reboot]")
+    say("usage: muxos-installer.lua [kernal|worker|bios|check|floppy] [--disk=<address|label>] [--yes] [--count=<n>] [--reboot]")
     return 1
   end
   if not ok then
