@@ -206,4 +206,30 @@ do
 end
 print("  OK")
 
+-- The muxos kernal BIOS runs the installer itself, on a computer that
+-- also has an OpenOS disk, a tmpfs, and an EEPROM still pointing at that
+-- disk -- with or without the floppy's /init.lua.
+print("openos 6: the muxos kernal BIOS boots the installer floppy next to an OpenOS disk")
+for _, withInit in ipairs({true, false}) do
+  local k = emu:newNode("kern")
+  local _, _, kbufs = emu:addGpuScreen(k, 80, 25)
+  local osHdd = emu:addFilesystem(k, tree(assets .. "/loot/openos"))
+  k.tmpAddress = emu:addFilesystem(k, {})
+  local files = {
+    ["/muxos-installer.lua"] = readFile(REPO_ROOT .. "/dist/muxos-installer.lua"),
+    ["/muxos-installer.dat"] = readFile(REPO_ROOT .. "/dist/muxos-installer.dat"),
+  }
+  if withInit then files["/init.lua"] = readFile(REPO_ROOT .. "/dist/floppy/init.lua") end
+  emu:addFilesystem(k, files, "floppy")
+  emu:addEeprom(k, readFile(REPO_ROOT .. "/kernal/bios.lua"), osHdd)
+  emu:boot(k)
+  emu:advance(3)
+  local row, chars = kbufs[0].cells[1] or {}, {}
+  for x = 1, 80 do chars[x] = (row[x] and row[x].char) or " " end
+  if not table.concat(chars):find("muxos 0.1.2 installer (booted from floppy", 1, true) or k.status ~= "running" then
+    error("the kernal BIOS didn't start the installer (" .. (withInit and "with" or "without") .. " /init.lua)", 0)
+  end
+end
+print("  OK")
+
 print("ALL OK")
