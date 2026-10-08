@@ -1003,11 +1003,19 @@ practical -- it generates a small filled-diamond test pattern (red
 center, blue ring, transparent corners) so there's a way to see the
 pipeline work without needing a real deployment yet.
 
-Still not done: no actual demonstrated use for a toolbar/icons/
-wallpaper (the encoder works, but nothing composites a desktop
-background or icon row yet -- wallpaper is planned to be just another,
-lowest-layer bit window through this same mechanism, no separate
-subsystem), and per-job isolated bit-window surfaces have the same gap
+**The desktop (BUILT, gmux's):** a full-screen text window on the
+lowest layer (-2000, under the console's -1000 and every window): a
+0x444444 background (black on a 1-bit screen) and gmux's column of 9x5
+app icons from (2,2), column by column. The icons are the console and
+every program in /bin and /usr/bin, deduplicated by name with `.mxe`
+before `.lua`, exactly as typing the name resolves it. A touch on an
+icon starts the program as `name &` would (a legacy program gets its own
+terminal window); the console icon un-minimizes and raises the console.
+It's a text window, so it needs no video buffer; the icon list is
+rebuilt at boot and on `comp` (test 40). Icons are text art for now: a
+bitmap wallpaper or icons would still go through bit windows, as below.
+
+Still not done: per-job isolated bit-window surfaces have the same gap
 `create_graphics_process` already has for character windows (see
 above) -- a job can ask the kernal to create a bit window, but its own
 `gpu` face still isn't wired to draw into it.
