@@ -27,6 +27,7 @@
 -- untouched.
 
 local VERSION = "0.1.2" -- set by tools/build.lua
+local DAT_SIZE = 293838 -- the data file's exact size, set by tools/build.lua
 local CHUNK = 8192
 
 -- --- Platform: OpenOS, or bare from the kernal BIOS ---
@@ -233,12 +234,14 @@ end
 local function bundledPayload(fs, path)
   local f = openReader(fs, path)
   if not f then return nil, "not there" end
-  local first
+  local first, consumed = nil, 0 -- bytes read up to the end of the manifest
   while true do
     local line = f.line()
     first = first or line
+    consumed = consumed + #(line or "") + 1
     if not line then
       f.close()
+      if not first then return nil, "it's there, but empty" end
       return nil, "it's there, but isn't a muxos data file (it starts: "
         .. string.format("%q", (first or ""):sub(1, 40)) .. ")"
     end
@@ -257,15 +260,27 @@ local function bundledPayload(fs, path)
       break
     end
   end
-  local count = tonumber((f.line() or ""):match("^@@MANIFEST (%d+)$"))
+  local manifest = f.line() or ""
+  consumed = consumed + #manifest + 1
+  local count = tonumber(manifest:match("^@@MANIFEST (%d+)$"))
   if not count then f.close() return nil, "damaged payload (no manifest)" end
-  local files = {}
+  local files, expected = {}, 0
   for i = 1, count do
-    local size, name = (f.line() or ""):match("^(%d+) (.+)$")
+    local line = f.line() or ""
+    consumed = consumed + #line + 1
+    local size, name = line:match("^(%d+) (.+)$")
     if not size then f.close() return nil, "damaged payload (manifest)" end
     files[i] = {path = name, size = tonumber(size)}
+    expected = expected + #("@@ " .. size .. " " .. name .. "\n") + files[i].size + 1
   end
   f.close()
+  -- The manifest gives the file's exact length: a copy cut short (onto a
+  -- full disk) is caught here, not halfway through installing.
+  expected = consumed + expected + #"@@END\n"
+  local okSize, size = pcall(fs.size, path)
+  if okSize and tonumber(size) and size > 0 and size ~= expected then
+    return nil, "it's damaged: " .. (size < expected and "cut short" or "longer than its contents")
+  end
   local payload = {files = files}
   function payload.each(fn)
     local g = assert(openReader(fs, path))
@@ -301,6 +316,7 @@ local DAT_NAME = "muxos-installer.dat"
 -- OpenOS's own files, for reading the data file by its OpenOS path: the
 -- same calls as a filesystem component, so openReader works on it.
 local osFiles = {
+  size = function(path) return osfs and osfs.size(path) or 0 end,
   open = function(path) return io.open(path, "rb") end,
   read = function(handle, n) return handle:read(n) end,
   close = function(handle) handle:close() end,
@@ -318,6 +334,23 @@ local function findPayload()
     end
     local payload, err = bundledPayload(fs, path)
     if payload then return payload end
+    -- A file that's there but wrong: say how big it is against how big it
+    -- should be, and how full its disk is. A copy that ran out of space
+    -- leaves a short or empty file behind.
+    if err ~= "not there" and fs.size then
+      local ok, size = pcall(fs.size, path)
+      if ok and size then
+        err = err .. "; it's " .. size .. " bytes" .. (DAT_SIZE and ", should be " .. DAT_SIZE or "")
+        local okT, total = pcall(function() return fs.spaceTotal() end)
+        local okU, used = pcall(function() return fs.spaceUsed() end)
+        if okT and okU and tonumber(total) and tonumber(used) and total < math.huge then
+          err = err .. "; its disk has " .. human(total - used) .. " free of " .. human(total)
+        end
+        if DAT_SIZE and size < DAT_SIZE then
+          err = err .. " -- the copy didn't finish (a full disk?): free up space and copy it again"
+        end
+      end
+    end
     tried[#tried + 1] = "  " .. where .. ": " .. tostring(err)
   end
   local payload
@@ -326,7 +359,7 @@ local function findPayload()
     local where = medium.osPath and medium.osPath:gsub("[^/]*$", "") .. DAT_NAME
       or "disk " .. tostring(medium.address):sub(1, 8) .. " " .. dat
     payload = try(medium.fs, dat, where, tostring(medium.address) .. dat)
-    if not payload and medium.osPath then
+    if not payload and medium.osPath and tried[#tried]:sub(-9) == "not there" then
       payload = try(osFiles, (medium.osPath:gsub("[^/]*$", "") .. DAT_NAME), where .. " (through OpenOS)")
     end
   else
