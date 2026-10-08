@@ -587,7 +587,7 @@ function Emulator:_resume(node, ...)
     self:_logf(node, "halted (%s, %s)", tostring(a), tostring(b))
     return
   end
-  if type(a) == "number" then
+  if type(a) == "number" and a < math.huge then
     node.wakeAt = self.now + a
   elseif type(a) == "boolean" then
     node.status = "dead"
