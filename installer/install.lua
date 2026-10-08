@@ -822,10 +822,43 @@ local function main()
   return 0
 end
 
+-- A crash, booted bare: the error and traceback on the console, and a
+-- dump -- the error, the machine, every component and every disk's root
+-- listing -- written to /muxos-boot-dump.txt on the installer's disk
+-- (else any writable disk), for debugging.
+local function crashDump(err)
+  local function try(f, ...) local ok, a, b = pcall(f, ...) if ok then return a, b end end
+  local d = {"muxos installer crash dump (" .. VERSION .. ")", err, "",
+    "uptime " .. computer.uptime() .. "  memory " .. computer.freeMemory() .. "/" .. computer.totalMemory()
+    .. "  energy " .. computer.energy() .. "/" .. computer.maxEnergy()}
+  local tmp, disk = computer.tmpAddress and computer.tmpAddress()
+  if medium and not try(medium.fs.isReadOnly) then disk = medium.fs end
+  for address, kind in component.list() do
+    local line = address .. " " .. kind
+    if kind == "filesystem" then
+      local fs = component.proxy(address)
+      line = line .. ' "' .. tostring(try(fs.getLabel)) .. '" ro=' .. tostring(try(fs.isReadOnly)) .. " "
+        .. tostring(try(fs.spaceUsed)) .. "/" .. tostring(try(fs.spaceTotal)) .. ": "
+        .. table.concat(try(fs.list, "/") or {}, " ")
+      if not disk and address ~= tmp and try(fs.isReadOnly) == false then disk = fs end
+    end
+    d[#d + 1] = line
+  end
+  local handle = disk and try(disk.open, "/muxos-boot-dump.txt", "w")
+  if not handle then return nil end
+  try(disk.write, handle, table.concat(d, "\n") .. "\n")
+  try(disk.close, handle)
+  return disk.address:sub(1, 8) .. "/muxos-boot-dump.txt"
+end
+
 -- Booted bare there's nothing to return to: wait, then restart.
 if bare then
-  local ok, err = pcall(main)
-  if not ok then say("error: " .. tostring(err)) end
+  local ok, err = xpcall(main, debug.traceback)
+  if not ok then
+    say("error: " .. tostring(err))
+    local where = crashDump(tostring(err))
+    if where then say("Dump: " .. where) end
+  end
   ask("Press Enter to restart.")
   computer.shutdown(true)
 end

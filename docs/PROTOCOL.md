@@ -120,17 +120,21 @@ it reads files through the filesystem component. It runs in the mod's
 sandbox (machine.lua), so what OpenOS would add (event, io, ...) isn't
 there; kernal/muxos.lua builds what it needs itself.
 
-When nothing boots, it doesn't just crash: it writes on the screen
-every disk the computer can see, with its label and which muxos files
-are on it, and why any file that was there wouldn't load. Then it stops
-with the same text as its error, for the Analyzer. If the installer
-itself fails, its error and traceback go on the screen too. Either way
-it writes `/muxos-boot-dump.txt` -- the error, memory and energy, every
-component, and each disk's label, size and root listing -- to the
-installer floppy, or else the first writable disk, for debugging. The
-floppy's `/init.lua` does the same under the stock BIOS. So a floppy
-the computer can't see (no drive, or a rack drive that isn't connected
-to this server) is visible at a glance (install 10).
+The BIOS keeps to finding, loading and starting a system. While it
+looks for the installer floppy it shows one line, and it keeps looking
+for 5 seconds, rescanning on each signal, since a rack's drive can
+attach just after power-on. If nothing boots, it lists every disk the
+computer can see, with its label and root files (crude output: one
+`gpu.set` per line), writes `/muxos-boot-dump.txt` (the error, memory,
+energy, every component, each disk's label, size and root listing) to
+the first writable disk, and stops with the same text as its error.
+OpenComputers' own crash screen and the Analyzer show it.
+
+Crashes in the installer are the installer's to handle, not the
+BIOS's: booted bare, it catches its own errors, shows the error and
+traceback on its console, writes the same dump (to the floppy, else
+any writable disk), and waits for Enter to restart. The floppy's
+`/init.lua` only loads and starts it; if it can't, it stops with why.
 
 This matters because a surprising amount of what looks like "the Lua
 sandbox" in OpenComputers is actually OpenOS, not the mod. Verified
