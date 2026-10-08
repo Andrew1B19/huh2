@@ -30,7 +30,7 @@
 -- untouched.
 
 local VERSION = "0.1.2" -- set by tools/build.lua
-local DAT_SIZE = 294496 -- the data file's exact size, set by tools/build.lua
+local DAT_SIZE = 294773 -- the data file's exact size, set by tools/build.lua
 local INIT_LUA = "-- The muxos installer floppy's boot file, installed as /init.lua at the\
 -- floppy's root next to muxos-installer.lua. Any BIOS that boots /init.lua\
 -- runs it -- the stock OpenComputers Lua BIOS every computer starts with\
@@ -170,10 +170,10 @@ else
     while true do
       local name, _, char, code = computer.pullSignal()
       if name == "key_down" then
-        if code == 28 then
+        if code == 28 or code == 156 or char == 13 then -- Enter, either one
           write("\n")
           return trim(line)
-        elseif code == 14 then
+        elseif code == 14 or char == 8 then -- Backspace
           if #line > 0 then
             line = line:sub(1, -2)
             if x > 1 then x = x - 1 elseif y > 1 then x, y = w, y - 1 end

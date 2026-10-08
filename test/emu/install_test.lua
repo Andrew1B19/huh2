@@ -562,5 +562,31 @@ do
 end
 print("  OK")
 
+print("install 14: workers waiting for a kernal don't flood the network (they used to set each other off)")
+do
+  local storm = Emulator.new()
+  local count = 0
+  local workers = {}
+  for i = 1, 3 do
+    local w = storm:newNode("worker")
+    local m = w.components[storm:addModem(w)].methods
+    local real = m.broadcast
+    m.broadcast = function(...) count = count + 1 return real(...) end
+    storm:addEeprom(w, readFile(REPO_ROOT .. "/node/bios.lua"))
+    workers[i] = w
+  end
+  local listener = storm:newNode("kernal")
+  storm:addModem(listener)
+  for _, w in ipairs(workers) do storm:boot(w) end
+  local steps, deadline = 0, storm.now + 10
+  while storm.now < deadline and steps < 5000 do
+    if not storm:step() then break end
+    steps = steps + 1
+  end
+  assert(storm.now >= deadline and count <= 9,
+    count .. " broadcasts in " .. storm.now .. " simulated s: the workers are flooding the network")
+end
+print("  OK")
+
 os.execute('rm -rf "' .. TMP .. '"')
 print("ALL OK")
