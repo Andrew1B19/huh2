@@ -1,5 +1,7 @@
 # muxos files are LF everywhere, including Windows checkouts
 # (core.autocrlf). The build and the installer depend on exact bytes.
 * text=auto eol=lf
-# The built installer carries every file's exact byte count: never convert it.
+# The installer's data file carries every file's exact byte count: never
+# convert it (nor the program that goes with it).
 dist/muxos-installer.lua -text
+dist/muxos-installer.dat -text

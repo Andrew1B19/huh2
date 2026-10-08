@@ -19,13 +19,14 @@ end
 local TMP = os.tmpname()
 os.remove(TMP)
 os.execute('mkdir -p "' .. TMP .. '"')
-local BUNDLE, FLOPPY = TMP .. "/muxos-installer.lua", TMP .. "/floppy"
+local BUNDLE, DATA = TMP .. "/muxos-installer.lua", TMP .. "/muxos-installer.dat"
 
 print("install 1: the build is clean, deterministic, and dist/ is up to date")
-assert(os.execute('lua5.3 "' .. REPO_ROOT .. '/tools/build.lua" --out "' .. BUNDLE .. '" --floppy "' .. FLOPPY .. '" >/dev/null'),
+assert(os.execute('lua5.3 "' .. REPO_ROOT .. '/tools/build.lua" --out "' .. BUNDLE .. '" >/dev/null'),
   "tools/build.lua failed")
-assert(readFile(BUNDLE) == readFile(REPO_ROOT .. "/dist/muxos-installer.lua"),
-  "dist/muxos-installer.lua is stale: run lua5.3 tools/build.lua")
+assert(readFile(BUNDLE) == readFile(REPO_ROOT .. "/dist/muxos-installer.lua")
+  and readFile(DATA) == readFile(REPO_ROOT .. "/dist/muxos-installer.dat"),
+  "dist/ is stale: run lua5.3 tools/build.lua")
 print("  OK")
 
 local emu = Emulator.new()
@@ -163,23 +164,15 @@ do
 end
 print("  OK")
 
-print("install 4: the floppy layout installs the same files")
+print("install 4: without its data file next to it, the installer says so")
 do
-  local node = emu:newNode("other")
-  emu:addModem(node)
-  emu:addGpuScreen(node, 50, 30)
-  local files = {}
-  emu:addFilesystem(node, files)
-  local floppyMedium = emu:addFilesystem(node, {})
-  emu:addEeprom(node, "-- the OpenOS BIOS")
-  local code, out = runInstaller(FLOPPY .. "/install.lua", openosFor(node, floppyMedium), {"1", "y"}, "kernal")
-  assert(code == 0, "floppy install failed:\n" .. out)
-  assert(out:find("Installing muxos 0.1.2", 1, true), "a fresh install:\n" .. out)
-  for path, data in pairs(disk) do
-    if path ~= "/.muxos-version" and path ~= "/home/keep.txt" then
-      assert(files[path] == data, "floppy install differs at " .. path)
-    end
-  end
+  local alone = TMP .. "/alone"
+  os.execute('mkdir -p "' .. alone .. '"')
+  local f = assert(io.open(alone .. "/muxos-installer.lua", "wb"))
+  f:write(readFile(BUNDLE))
+  f:close()
+  local code, out = runInstaller(alone .. "/muxos-installer.lua", openosFor(emu:newNode("alone"), nil), nil, "worker")
+  assert(code == 1 and out:find("muxos-installer.dat is missing", 1, true), "a missing data file is explained:\n" .. out)
 end
 print("  OK")
 
@@ -289,9 +282,11 @@ do
   local function concat(...) return (table.concat({...}, "/"):gsub("//+", "/")) end
   local target = core.resolve_target("abc")
   local plan = core.file_plan(cfg, core.order(cfg, "muxos-installer"), target, concat)
-  assert(#plan == 1 and plan[1].path == "muxos/dist/muxos-installer.lua"
-    and plan[1].file == "/mnt/abc/muxos-installer.lua", "the installer lands at the floppy's root, where the BIOS looks")
-  assert(readFile(REPO_ROOT .. "/" .. plan[1].path:gsub("^muxos/", "")) == readFile(BUNDLE), "the entry names the built installer")
+  local files = {}
+  for _, p in ipairs(plan) do files[p.file] = p.path end
+  assert(#plan == 2 and files["/mnt/abc/muxos-installer.lua"] == "muxos/dist/muxos-installer.lua"
+    and files["/mnt/abc/muxos-installer.dat"] == "muxos/dist/muxos-installer.dat",
+    "the installer and its data file land at the floppy's root, where the BIOS looks")
   assert(not cfg["muxos-installer"].launcher, "no launcher: a /muxos.lua on the floppy would be booted as the kernal")
   local selfPlan = core.file_plan(cfg, core.order(cfg, "opm-mxe"), "/", concat)
   local dests = {}
@@ -308,17 +303,21 @@ do
   -- Every text file to CRLF, as a converting checkout would.
   -- (Only "\n" becomes "\r\n", like git; a last line without one stays as is.)
   assert(os.execute('find "' .. copy .. '" -type f -exec perl -pi -e "s/\\n/\\r\\n/" {} +'))
-  local out = TMP .. "/crlf-installer.lua"
+  local out = TMP .. "/crlf/out/muxos-installer.lua"
   assert(os.execute('lua5.3 "' .. copy .. '/tools/build.lua" --out "' .. out .. '" >/dev/null'), "the build fails on a CRLF checkout")
-  assert(readFile(out) == readFile(BUNDLE), "a CRLF checkout builds a different installer")
+  assert(readFile(out) == readFile(BUNDLE) and readFile(out:gsub("lua$", "dat")) == readFile(DATA),
+    "a CRLF checkout builds a different installer")
 
-  local converted = TMP .. "/converted-installer.lua"
-  local f = assert(io.open(converted, "wb"))
-  f:write((readFile(BUNDLE):gsub("\n", "\r\n")))
-  f:close()
+  local converted = TMP .. "/converted/muxos-installer.lua"
+  os.execute('mkdir -p "' .. TMP .. '/converted"')
+  for _, pair in ipairs({{converted, BUNDLE}, {converted:gsub("lua$", "dat"), DATA}}) do
+    local f = assert(io.open(pair[1], "wb"))
+    f:write((readFile(pair[2]):gsub("\n", "\r\n")))
+    f:close()
+  end
   local node = emu:newNode("crlf")
   local code, outText = runInstaller(converted, openosFor(node, nil), nil, "kernal", "--yes")
-  assert(code == 1 and outText:find("line endings were converted to CRLF", 1, true),
+  assert(code == 1 and outText:find("line endings converted to CRLF", 1, true),
     "a CRLF-converted installer explains itself:\n" .. outText)
 end
 print("  OK")
@@ -330,7 +329,7 @@ do
   local _, screen, bufs = emu:addGpuScreen(node, 80, 25)
   local hdd = {}
   local hddAddr = emu:addFilesystem(node, hdd)
-  emu:addFilesystem(node, {["/muxos-installer.lua"] = readFile(BUNDLE)})
+  emu:addFilesystem(node, {["/muxos-installer.lua"] = readFile(BUNDLE), ["/muxos-installer.dat"] = readFile(DATA)})
   local eeprom = emu:addEeprom(node, readFile(REPO_ROOT .. "/kernal/bios.lua"))
   local function screenText()
     local rows = {}

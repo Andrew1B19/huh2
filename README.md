@@ -82,10 +82,13 @@ kernal/compositor.lua  the only file that touches the real gpu for window conten
 kernal/bitmap.lua      half-block/braille pixel-grid encoder for "bit windows" -- OC's gpu
                        hardware has no pixel API, so this is sub-cell encoding on top of the
                        same character grid. Loaded by compositor.lua via loadSibling().
-installer/install.lua  the installer (runs on OpenOS): installs the kernal, flashes EEPROMs.
+installer/install.lua  the installer (bare from the kernal BIOS, or on OpenOS): installs the
+                       kernal, flashes EEPROMs.
 tools/build.lua        builds it, with everything it installs, into dist/ (see "Installing").
-dist/muxos-installer.lua  the built single-file installer.
+dist/muxos-installer.lua  the built installer program, and
+dist/muxos-installer.dat  its data file (everything it installs); the two go together.
 test/emu/install_test.lua runs that installer on emulated hardware and boots the result.
+test/emu/openos_test.lua  runs it under real OpenOS (fetched on first run) and flashes an EEPROM.
 kernal/lib/            OpenOS libraries for legacy programs (vendored unchanged, MIT),
                        installed as /lib on the kernal's disk; see kernal/lib/README.md.
 node/bios.lua         worker EEPROM image: tiny network-boot stub, fetches node/runtime.lua
@@ -161,20 +164,27 @@ flash a kernal BIOS onto an EEPROM, and worker BIOSes onto the rest.
 
 ### 1. Make the installer floppy
 
+The installer is two files, and both go at the root of the floppy:
+
+- `muxos-installer.lua`, the program (about 22 KB);
+- `muxos-installer.dat`, everything it installs (about 290 KB).
+
+Ways to get them there:
+
 - **With opm (LewisHost.Net catalog):** copy this repository into
   oc-programs as `muxos/` and merge `dist/programs.cfg`'s entries into
   the catalog. On an OpenOS computer, `opm pull muxos-installer <floppy>`
-  puts the installer at the floppy's root.
-- **With an internet card:** `wget` `dist/muxos-installer.lua` from the
-  repository's raw URL onto a floppy's root.
-- **By copying:** put `dist/muxos-installer.lua` at the root of the
-  floppy's folder in your world save,
+  puts both files at the floppy's root.
+- **With an internet card:** `wget` both `dist/` files from the
+  repository's raw URLs onto a floppy's root.
+- **By copying:** put both `dist/` files at the root of the floppy's
+  folder in your world save,
   `saves/<world>/opencomputers/<disk address>/`.
 
-The file is about 310 KB and fits on a floppy. Running it on OpenOS
-loads it whole, so that computer needs plenty of memory (two tier 3
-sticks is comfortable). `lua5.3 tools/build.lua --floppy <dir>` makes a
-file-by-file layout that needs much less, but it only runs on OpenOS.
+The program is kept small on purpose: a floppy is OpenComputers' slowest
+disk, and the installer starts in a second or two instead of loading
+300 KB first. It reads the data file only as it needs it (flashing
+EEPROMs reads just the first few KB).
 
 ### 2. Flash the EEPROMs (on an OpenOS computer, with the floppy in)
 

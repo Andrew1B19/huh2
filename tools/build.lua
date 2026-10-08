@@ -1,9 +1,9 @@
 -- Builds the muxos installer. Run from anywhere with plain Lua 5.3:
 --
---   lua5.3 tools/build.lua                  dist/muxos-installer.lua
---   lua5.3 tools/build.lua --floppy <dir>   also a floppy layout in <dir>:
---                                           install.lua + files/
---   lua5.3 tools/build.lua --out <file>     the single-file installer elsewhere
+--   lua5.3 tools/build.lua               dist/muxos-installer.lua (the program)
+--                                        + dist/muxos-installer.dat (its files)
+--   lua5.3 tools/build.lua --out <file>  the same pair elsewhere (<file>.lua
+--                                        and, next to it, the .dat)
 --
 -- Checks first, and builds nothing if any fails: every file compiles,
 -- both EEPROM images fit in 4096 bytes, and the kernal and worker runtime
@@ -39,7 +39,11 @@ end
 
 -- What gets installed: target path on the kernal's disk -> repo file.
 -- /eeprom/* are the BIOS images the installer flashes, not disk files.
+-- The BIOS images come first: flashing EEPROMs needs only them, so the
+-- installer stops reading there instead of streaming the whole payload.
 local FILES = {
+  {"/eeprom/kernal.lua", "kernal/bios.lua"},
+  {"/eeprom/worker.lua", "node/bios.lua"},
   {"/muxos.lua", "kernal/muxos.lua"},
   {"/compositor.lua", "kernal/compositor.lua"},
   {"/bitmap.lua", "kernal/bitmap.lua"},
@@ -51,8 +55,6 @@ end
 -- OPM, the package manager, ships with muxos.
 FILES[#FILES + 1] = {"/bin/opm.mxe", "opm/opm.mxe"}
 FILES[#FILES + 1] = {"/lib/mxe/opm_core.lua", "opm/opm_core.lua"}
-FILES[#FILES + 1] = {"/eeprom/kernal.lua", "kernal/bios.lua"}
-FILES[#FILES + 1] = {"/eeprom/worker.lua", "node/bios.lua"}
 
 local function build()
   local errors = {}
@@ -95,60 +97,39 @@ local function build()
   return {version = version, installer = installer, contents = contents}
 end
 
--- The payload rides in a long comment, at a bracket level no file uses.
-local function bundle(b)
-  local level = 1
-  local function clash(eq)
-    local close = "]" .. eq .. "]"
-    for _, data in ipairs(b.contents) do
-      if data:find(close, 1, true) then return true end
-    end
-    return false
-  end
-  while clash(("="):rep(level)) do level = level + 1 end
-  local eq = ("="):rep(level)
-  local out = {b.installer, "\n--[" .. eq .. "[MUXOS-PAYLOAD " .. b.version .. "\n", "@@MANIFEST " .. #FILES .. "\n"}
+-- The payload: every file the installer installs, in the data file next
+-- to it (muxos-installer.dat). Kept out of the program itself so OpenOS --
+-- and the kernal BIOS, booting bare -- only load a small program: loading
+-- runs at floppy speed, and a 300 KB program took tens of seconds to
+-- start. The installer reads the data file as it needs it.
+local function payload(b)
+  local out = {"--[[MUXOS-PAYLOAD " .. b.version .. "\n", "@@MANIFEST " .. #FILES .. "\n"}
   for i, entry in ipairs(FILES) do out[#out + 1] = #b.contents[i] .. " " .. entry[1] .. "\n" end
   for i, entry in ipairs(FILES) do
     out[#out + 1] = "@@ " .. #b.contents[i] .. " " .. entry[1] .. "\n"
     out[#out + 1] = b.contents[i]
     out[#out + 1] = "\n"
   end
-  out[#out + 1] = "@@END\n]" .. eq .. "]\n"
+  out[#out + 1] = "@@END\n"
   return table.concat(out)
 end
 
-local function floppy(b, dir)
-  os.execute('mkdir -p "' .. dir .. '/files"')
-  writeFile(dir .. "/install.lua", b.installer)
-  local manifest = {}
-  for i, entry in ipairs(FILES) do
-    local target = dir .. "/files" .. entry[1]
-    os.execute('mkdir -p "' .. target:match("^(.*)/[^/]*$") .. '"')
-    writeFile(target, b.contents[i])
-    manifest[#manifest + 1] = #b.contents[i] .. " " .. entry[1]
-  end
-  writeFile(dir .. "/files/MANIFEST", table.concat(manifest, "\n") .. "\n")
-end
-
-local out, floppyDir = ROOT .. "/dist/muxos-installer.lua", nil
+local out = ROOT .. "/dist/muxos-installer.lua"
 local i = 1
 while arg[i] do
-  if arg[i] == "--floppy" then floppyDir = arg[i + 1] i = i + 2
-  elseif arg[i] == "--out" then out = arg[i + 1] i = i + 2
+  if arg[i] == "--out" then out = arg[i + 1] i = i + 2
   else io.stderr:write("unknown argument " .. arg[i] .. "\n") os.exit(2) end
 end
+local dat = out:gsub("%.lua$", "") .. ".dat"
 
 local b, err = build()
 if not b then
   io.stderr:write("build failed:\n" .. err .. "\n")
   os.exit(1)
 end
-local single = bundle(b)
+local data = payload(b)
 os.execute('mkdir -p "' .. (out:match("^(.*)/[^/]*$") or ".") .. '"')
-writeFile(out, single)
-print(string.format("muxos %s: %s (%d files, %.1f KB)", b.version, out, #FILES, #single / 1024))
-if floppyDir then
-  floppy(b, floppyDir)
-  print("floppy layout: " .. floppyDir)
-end
+writeFile(out, b.installer)
+writeFile(dat, data)
+print(string.format("muxos %s: %s (%.1f KB) + %s (%d files, %.1f KB)", b.version, out, #b.installer / 1024,
+  dat, #FILES, #data / 1024))

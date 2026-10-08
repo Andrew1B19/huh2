@@ -106,7 +106,8 @@ with `/muxos.lua`, then any disk with `/muxos-installer.lua` at its root.
 That last one is the installer floppy; the BIOS runs it as
 `installer(diskAddress, path)` with no OpenOS. The installer detects that
 it's bare (no `require`), draws its own console on the GPU, reads its
-payload through the floppy's filesystem component, and points the EEPROM
+payload (`muxos-installer.dat`, next to it) through the floppy's
+filesystem component, and points the EEPROM
 at the disk it installs to. So an empty computer needs nothing but the
 kernal BIOS and the floppy, and an installed system always wins over a
 forgotten floppy (`test/emu/install_test.lua`, install 9).

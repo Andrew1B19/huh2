@@ -180,7 +180,7 @@ local function hostComputerAPI(node)
     addUser = function() return nil, "not supported" end,
     removeUser = function() return false end,
     isRobot = function() return false end,
-    tmpAddress = function() return nil end,
+    tmpAddress = function() return node.tmpAddress end,
     getArchitecture = function() return "Lua 5.3" end,
     getArchitectures = function() return {"Lua 5.3"} end,
     setArchitecture = function() return false end,
@@ -297,12 +297,15 @@ end
 -- its boot filesystem.
 function Emulator:addEeprom(node, code, data)
   data = data or ""
+  local label = "EEPROM"
   return self:addComponent(node, "eeprom", {
     get = function() return code end,
     set = function(c) code = c; return true end,
     getData = function() return data end,
     setData = function(d) data = d or ""; return true end,
     getSize = function() return 4096 end,
+    getLabel = function() return label end,
+    setLabel = function(l) label = l return label end,
   })
 end
 
