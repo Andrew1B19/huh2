@@ -30,7 +30,7 @@
 -- untouched.
 
 local VERSION = "0.1.2" -- set by tools/build.lua
-local DAT_SIZE = 294574 -- the data file's exact size, set by tools/build.lua
+local DAT_SIZE = 294567 -- the data file's exact size, set by tools/build.lua
 local INIT_LUA = "-- The muxos installer floppy's boot file, installed as /init.lua at the\
 -- floppy's root next to muxos-installer.lua. Any BIOS that boots /init.lua\
 -- runs it -- the stock OpenComputers Lua BIOS every computer starts with\
@@ -87,9 +87,11 @@ local function fail(text, disk)\
   end\
   error(text, 0)\
 end\
+-- Opened directly, like the stock BIOS does, rather than asking `exists`.\
 local function has(address)\
-  local ok, found = pcall(invoke, address, \"exists\", path)\
-  return ok and found\
+  local handle = call(address, \"open\", path)\
+  if handle then call(address, \"close\", handle) end\
+  return handle ~= nil\
 end\
 local address = computer.getBootAddress and computer.getBootAddress()\
 if not (address and has(address)) then\
