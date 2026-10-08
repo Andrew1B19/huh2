@@ -286,9 +286,11 @@ local inputBuffer = ""       -- the REPL's line being typed
 local consolePartial = ""    -- program output not yet ended by a newline
 local commandBusy = false    -- a command is running; see handleKeyDown
 
+-- A window like any other, with a title bar (gmux-style): it can be
+-- minimized, moved and resized. Its close button minimizes it instead.
 local consoleW, consoleH = termW, math.max(CONSOLE_MIN_H, math.floor(termH / 2))
-local consoleWin = gpu and compositor.createWindow({title = "console", x = 1, y = termH - consoleH + 1,
-  width = consoleW, height = consoleH, layer = CONSOLE_LAYER, text = true, decorated = false}) or nil
+local consoleWin = gpu and compositor.createWindow({title = "console", x = 1, y = termH - consoleH,
+  width = consoleW, height = consoleH, layer = CONSOLE_LAYER, text = true}) or nil
 
 local function consoleOwnsScreen()
   return compositor.exclusiveOwner() == "console"
@@ -298,6 +300,8 @@ end
 -- window otherwise.
 local function viewSize()
   if consoleOwnsScreen() then return termW, termH end
+  local win = consoleWin and compositor.getWindow(consoleWin.id)
+  if win then return win.width, win.height end -- resized by hand too
   return consoleW, consoleH
 end
 
@@ -1927,7 +1931,11 @@ end
 -- Forward-declared; assigned once everything it calls exists.
 local runCommand
 
-local KEY_PAGEUP, KEY_PAGEDOWN = 0xC9, 0xD1
+-- UI constants, in one table (the main chunk is near Lua's 200-local
+-- limit): PgUp/PgDn key codes, how long Ctrl+Alt+C is held for console
+-- mode, and the narrowest a window can be resized to (room for the
+-- title bar's buttons).
+local UI = {KEY_PAGEUP = 0xC9, KEY_PAGEDOWN = 0xD1, CONSOLE_HOLD_SECONDS = 1, MIN_WINDOW_WIDTH = 8}
 
 -- Keys typed while a command is still running. Handling them inline
 -- used to run a second command NESTED inside the first one's wait;
@@ -1949,9 +1957,8 @@ local function exitFullscreen()
   consoleDirty = true
 end
 
--- Ctrl+Alt+C, held for CONSOLE_HOLD_SECONDS: the kernal-level
+-- Ctrl+Alt+C, held for UI.CONSOLE_HOLD_SECONDS: the kernal-level
 -- interrupt that drops into the full-screen kernal console.
-local CONSOLE_HOLD_SECONDS = 1
 local comboPressedAt, comboHoldFired = nil, false
 
 local function consoleInterrupt()
@@ -2034,8 +2041,8 @@ local function handleKeyDown(char, code)
     return
   end
   -- Scrolling never waits behind a running command.
-  if code == KEY_PAGEUP then scrollConsole(select(2, viewSize()) - 1) return end
-  if code == KEY_PAGEDOWN then scrollConsole(-(select(2, viewSize()) - 1)) return end
+  if code == UI.KEY_PAGEUP then scrollConsole(select(2, viewSize()) - 1) return end
+  if code == UI.KEY_PAGEDOWN then scrollConsole(-(select(2, viewSize()) - 1)) return end
   if commandBusy and foregroundJob and feedForeground(char, code) then return end
   if commandBusy then
     queuedKeys[#queuedKeys + 1] = {char, code}
@@ -2106,7 +2113,6 @@ end
 -- A resized window's owner gets {"window_resized", id, width, height}.
 -- Nothing here while one owner has the whole screen.
 local currentGrab = nil
-local MIN_WINDOW_WIDTH = 8 -- room for the title bar's buttons
 
 local function windowProcess(win)
   local job = win.ownerJobId and jobs[win.ownerJobId]
@@ -2119,9 +2125,107 @@ local function notifyResized(win)
 end
 
 local function closeWindow(win)
+  -- The console can't go away: closing it minimizes it.
+  if consoleWin and win.id == consoleWin.id then compositor.minimize(win.id, true) return end
   local job = windowProcess(win)
   compositor.close(win.id)
   if job then controlJob(job.id, "KILL", "killed (window closed)") end
+end
+
+-- --- The desktop: gmux's -- a background and a column of app icons ---
+--
+-- A full-screen text window on the lowest layer, under the console and
+-- every other window. Its icons are the console and every program in
+-- /bin and /usr/bin (.mxe preferred over .lua, like the launcher);
+-- touching one starts it, as if typed at the console with a trailing
+-- "&" (a legacy program gets its own terminal window). Rebuilt at boot
+-- and on `comp`, so newly installed programs appear.
+-- One local (the kernal's main chunk is near Lua's 200-local limit).
+local desktop = {apps = {}, ICON_W = 9, ICON_H = 5, -- 4 rows of art, then the name
+  ART = {"/-------\\", "| -|... |", "|- | ...|", "\\-------/"}}
+do
+  local okDepth, depth = pcall(function() return gpu and gpu.getDepth() end)
+  local mono = okDepth and depth == 1
+  desktop.win = gpu and compositor.createWindow({title = "desktop", x = 1, y = 1, width = termW, height = termH,
+    layer = -2000, text = true, decorated = false,
+    bg = mono and 0x000000 or 0x444444, fg = mono and 0xFFFFFF or 0x44FFFF}) or nil
+end
+
+function desktop.perColumn()
+  return math.max(1, math.floor((termH - 2) / (desktop.ICON_H + 1)))
+end
+
+function desktop.scan()
+  local apps, seen = {{name = "console", console = true}}, {console = true}
+  for _, dir in ipairs(PROGRAM_PATH) do
+    local names = tryInvoke(fsAddr, "list", dir)
+    if type(names) == "table" then
+      table.sort(names)
+      for _, n in ipairs(names) do
+        local base = n:match("^(.-)%.mxe$") or n:match("^(.-)%.lua$")
+        if base and not seen[base] then
+          local path = resolveProgram(base) -- .mxe first, like typing it
+          if path then
+            seen[base] = true
+            apps[#apps + 1] = {name = base, path = path}
+          end
+        end
+      end
+    end
+  end
+  desktop.apps = apps
+end
+
+function desktop.render()
+  if not desktop.win then return end
+  local W, H = desktop.ICON_W, desktop.ICON_H
+  local rows = {}
+  for y = 1, termH do rows[y] = (" "):rep(termW) end
+  local per = desktop.perColumn()
+  for i, app in ipairs(desktop.apps) do
+    local x, y = 2 + (i - 1) // per * (W + 1), 2 + (i - 1) % per * (H + 1)
+    if x + W - 1 <= termW then
+      local name = app.name:sub(1, W)
+      local art = desktop.ART
+      local lines = {art[1], art[2], art[3], art[4], (" "):rep((W - #name) // 2) .. name}
+      for j, text in ipairs(lines) do
+        local r = y + j - 1
+        if r <= termH then rows[r] = rows[r]:sub(1, x - 1) .. text .. rows[r]:sub(x + #text) end
+      end
+    end
+  end
+  compositor.setText(desktop.win.id, rows)
+end
+
+function desktop.refresh()
+  desktop.scan()
+  desktop.render()
+end
+
+function desktop.showConsole()
+  if not consoleWin then return end
+  local win = compositor.getWindow(consoleWin.id)
+  if win and win.minimized then compositor.minimize(consoleWin.id, false) end
+  compositor.raise(consoleWin.id)
+  compositor.setFocus(consoleWin.id)
+  consoleDirty = true
+end
+
+-- A touch on the desktop: the icon under it, if any, starts.
+function desktop.touch(lx, ly)
+  local W, H, per = desktop.ICON_W, desktop.ICON_H, desktop.perColumn()
+  local col, colOff = (lx - 2) // (W + 1), (lx - 2) % (W + 1)
+  local row, rowOff = (ly - 2) // (H + 1), (ly - 2) % (H + 1)
+  if lx < 2 or ly < 2 or colOff >= W or rowOff >= H or row >= per then return end
+  local app = desktop.apps[col * per + row + 1]
+  if not app then return end
+  if app.console then desktop.showConsole() return end
+  local id, addrOrErr = launchProgram(app.path, {})
+  if id then
+    print("[" .. id .. "] " .. app.path .. " started on " .. addrOrErr)
+  else
+    print("error: " .. tostring(addrOrErr))
+  end
 end
 
 local function handleTouch(name, x, y, button)
@@ -2134,7 +2238,7 @@ local function handleTouch(name, x, y, button)
       if grab.kind == "move" then
         compositor.move(win.id, x - grab.dx, y)
       else
-        local w = math.max(MIN_WINDOW_WIDTH, x - win.x + 1)
+        local w = math.max(UI.MIN_WINDOW_WIDTH, x - win.x + 1)
         local h = math.max(1, y - compositor.bodyTop(win) + 1)
         if (w ~= win.width or h ~= win.height) and compositor.resize(win.id, w, h) then notifyResized(win) end
       end
@@ -2144,6 +2248,10 @@ local function handleTouch(name, x, y, button)
   end
   local win, part, lx, ly = compositor.hitTest(x, y)
   if not win then return end
+  if desktop.win and win.id == desktop.win.id then
+    if name == "touch" then desktop.touch(lx, ly) end
+    return
+  end
   if name == "touch" then
     compositor.setFocus(win.id)
     compositor.raise(win.id)
@@ -2205,7 +2313,7 @@ local function tick(timeout)
       handleModemMessage(a3, a4, a6)
     end
     if comboPressedAt and not comboHoldFired and heldKeys[KEY_C] and isControlDown() and isAltDown()
-        and computer.uptime() - comboPressedAt >= CONSOLE_HOLD_SECONDS then
+        and computer.uptime() - comboPressedAt >= UI.CONSOLE_HOLD_SECONDS then
       comboHoldFired = true
       consoleInterrupt()
     end
@@ -2491,11 +2599,12 @@ runCommand = function(line)
     w, h, x, y = tonumber(w), tonumber(h), tonumber(x), tonumber(y)
     if not w then
       print("usage: console <width> <height> [x y]  (default: docked bottom-left)")
-    elseif w < CONSOLE_MIN_W or h < CONSOLE_MIN_H or w > termW or h > termH then
-      print(string.format("console size must be between %dx%d and %dx%d", CONSOLE_MIN_W, CONSOLE_MIN_H, termW, termH))
+    elseif w < CONSOLE_MIN_W or h < CONSOLE_MIN_H or w > termW or h > termH - 1 then
+      print(string.format("console size must be between %dx%d and %dx%d", CONSOLE_MIN_W, CONSOLE_MIN_H, termW, termH - 1))
     else
-      x, y = x or 1, y or (termH - h + 1)
-      if x + w - 1 > termW or y + h - 1 > termH then
+      -- y is the title bar's row; the text is below it.
+      x, y = x or 1, y or (termH - h)
+      if x + w - 1 > termW or y + h > termH then
         print("that doesn't fit on the screen")
       else
         compositor.setGeometry(consoleWin.id, x, y, w, h)
@@ -2543,7 +2652,8 @@ runCommand = function(line)
     if consoleOwnsScreen() then compositor.setExclusive(nil) end
     scrollOffset = 0
     consoleDirty = true
-    print("compositor restored -- all windows shown")
+    desktop.refresh()
+    print("desktop restored -- all windows shown")
   elseif line:match("^focus%s") then
     -- Manual stand-in for the gesture that will eventually move focus
     -- for real (there's no mouse/click component anywhere in this
@@ -2635,11 +2745,12 @@ print("  migrate <job id> [node] | drain|undrain <node>")
 print("  spawn <node> <lua code>")
 print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
 print("  console <width> <height> [x y] -- resize/move the console window")
-print("  comp -- leave console mode (hold Ctrl+Alt+C to enter it; a press exits fullscreen); PgUp/PgDn or the wheel scroll")
+print("  comp -- back to the desktop from console mode (hold Ctrl+Alt+C to enter it; a press exits fullscreen); PgUp/PgDn or the wheel scroll")
 print("  focus <window id> -- moves keyboard focus (manual stand-in -- no mouse/click gesture exists yet)")
 print("  bitdemo <halfblock|braille> <x> <y> -- draws a test pattern as a bit window")
 print("  bus (every component in the cluster) | components <node> | call <node> <component addr> <method> [args table]")
 print("(<node> is either a [n] index from 'nodes' or a full node address)")
+desktop.refresh()
 discover(1)
 listNodes()
 

@@ -795,7 +795,7 @@ do
 end
 typeLine("windows")
 emu:advance(1)
-assertScreenContains('"console"  50x15 at (1,16)', "the console starts as the bottom half of the screen")
+assertScreenContains('"console"  50x15 at (1,15)', "the console starts as the bottom half of the screen (title bar on row 15)")
 print("  OK -- only the frame buffer is full-screen; the 50x15 console has no video buffer at all")
 
 print("test 21: console scrollback with PgUp/PgDn and the mouse wheel")
@@ -840,7 +840,7 @@ if not screenHas(("w"):rep(30)) or screenHas(("w"):rep(31)) then
 end
 typeLine("windows")
 emu:advance(1)
-assertScreenContains('"console"  30x8 at (1,23)', "console resized and docked bottom-left")
+assertScreenContains('"console"  30x8 at (1,22)', "console resized and docked bottom-left (title bar on row 22)")
 typeLine("console 5 2")
 emu:advance(0.5)
 assertScreenContains("console size must be between", "too-small size refused")
@@ -1319,5 +1319,66 @@ for i = 1, 3 do
   assertScreenContains("mt39-" .. i, "three 2s sleepers on one node all finish within 3s (they'd take 6s queued)")
 end
 print("  OK -- processes on one node wait concurrently instead of queueing")
+
+print("test 40: the desktop -- gmux's background and app icons; touching one starts it")
+do
+  -- A fresh cluster, so no earlier test's windows cover the icons.
+  local demu = Emulator.new()
+  local k = demu:newNode("kernal")
+  demu:addModem(k)
+  local _, dscreen, dbufs = demu:addGpuScreen(k, 80, 25)
+  local files = {}
+  for name, data in pairs(kernalFiles) do files[name] = data end
+  files["/usr/bin/greeter.lua"] = 'print("hello from the desktop") io.read()'
+  demu:addEeprom(k, readFile(REPO_ROOT .. "/kernal/bios.lua"), demu:addFilesystem(k, files))
+  local w = demu:newNode("worker")
+  demu:addModem(w)
+  demu:addEeprom(w, readFile(REPO_ROOT .. "/node/bios.lua"))
+  demu:boot(k)
+  demu:boot(w)
+  demu:advance(4)
+  local function cells(x, y, n)
+    local row, out = dbufs[0].cells[y] or {}, {}
+    for i = 0, n - 1 do out[#out + 1] = (row[x + i] and row[x + i].char) or " " end
+    return table.concat(out)
+  end
+  local function text()
+    local rows = {}
+    for y = 1, dbufs[0].h do rows[y] = cells(1, y, dbufs[0].w) end
+    return table.concat(rows, "\n")
+  end
+  local function dtouch(x, y)
+    demu:injectSignal(k, "touch", dscreen, x, y, 0, "tester")
+    demu:advance(1)
+  end
+  -- The icon whose name row reads `name`: returns its art's middle cell.
+  local function iconOf(name)
+    for y = 6, dbufs[0].h do
+      for x = 2, dbufs[0].w - 8, 10 do
+        if cells(x, y - 4, 9) == "/-------\\" and cells(x, y, 9):match("^%s*(.-)%s*$") == name then return x + 4, y - 2 end
+      end
+    end
+  end
+  assert(iconOf("console"), "the console is a desktop icon:\n" .. text())
+  -- The console is a window with a title bar: minimize it, then the
+  -- icons it covered show.
+  dtouch(80 - 5, 13)
+  local hx, hy = iconOf("greeter")
+  assert(iconOf("opm") and hx, "/bin's opm and /usr/bin's greeter are icons once the console is out of the way:\n" .. text())
+  dtouch(hx, hy)
+  for _ = 1, 20 do
+    if text():find("hello from the desktop", 1, true) then break end
+    demu:advance(0.5)
+  end
+  assert(text():find("hello from the desktop", 1, true), "touching its icon started it in its own window:\n" .. text())
+  dtouch(80 - 1, 1) -- close the program's window
+  local cx, cy = iconOf("console")
+  dtouch(cx, cy)
+  assert(text():find("muxos> _", 1, true), "the console icon brings the console back:\n" .. text())
+  -- Its close button minimizes it rather than losing it.
+  dtouch(80 - 1, 13)
+  assert(not text():find("muxos> _", 1, true) and text():find("console", 1, true), "closing the console minimizes it:\n" .. text())
+end
+print("  OK -- icons for the console and every program; touching one starts it; the console minimizes")
 
 print("ALL OK")

@@ -333,7 +333,7 @@ muxos> processes
 muxos> spawn 1 return 42
 muxos> window hello 5 5 20 5 gpu.set(1,1,"hi from the kernal")
 muxos> windows
-muxos> comp
+muxos> comp                   (back to the desktop from console mode)
 muxos> console 80 20
 muxos> hello world            (runs /bin/hello.mxe or /bin/hello.lua)
 muxos> hello world &          (in the background)
@@ -555,10 +555,19 @@ too. Keys, wheel and touch input go to the focused window's process
 "Window decorations"). Verified in `test/emu/integration_test.lua`
 (tests 14, 28, 32).
 
+muxos starts on a desktop, as gmux does: a background with a column of
+app icons at the top left -- the console, and every program in `/bin`
+and `/usr/bin`. Touching an icon starts that program (a legacy `.lua`
+program opens in its own terminal window); the console icon brings the
+console back. `comp` returns to the desktop from console mode and
+rescans for newly installed programs (test 40).
+
 The console keeps its text in regular memory (500 lines of scrollback)
-and has no video buffer: it's a resizable text window (`console <w> <h>`,
-bottom half of the screen by default) painted into the frame buffer, or,
-in console mode, drawn straight onto the screen. It has scrollback
+and has no video buffer: it's a text window with a title bar, like any
+other (minimize, move, resize; its close button minimizes it), docked in
+the bottom half of the screen by default (`console <w> <h>` resizes it),
+painted into the frame buffer, or, in console mode, drawn straight onto
+the screen. It has scrollback
 (PgUp/PgDn, mouse wheel) and queues input while a command runs. Nodes are tracked
 for liveness without a heartbeat (probes answered at job yield points;
 a silent node's jobs become `lost`), finished-job history is capped at
