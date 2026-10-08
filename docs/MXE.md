@@ -218,6 +218,26 @@ granted too, transitively, and loaded before it (test 37).
     form-encoded.
 
   The internet card can be on any node in the cluster (test 37).
+- `thread`: threads within one process. Each thread is scheduled by its
+  node like a process of its own, so one that waits (`sleep`,
+  `pull_event`, `readLine`, any `gmuxapi`/`fs` call) holds up only
+  itself; the others and the main code keep running. Threads share the
+  process's environment, windows, output and job id. Pausing or killing
+  the process, or its main code ending, applies to all of them (test 42).
+  - `t = thread.create(fn, ...)` starts `fn(...)`;
+  - `ok, result = t:join([timeout])` waits for it (`nil, "timeout"` if
+    it's still running then);
+  - `t:status()` returns `"running"` or `"dead"`; `t:kill()` ends it;
+  - `thread.yield()` lets the others run.
+
+  An error in a thread nobody joins is printed to the console.
+
+**Desktop icon (header fields).** `icon = {"row 1", "row 2", "row 3",
+"row 4"}` (9 columns each, centered if shorter) and `icon_color =
+0xRRGGBB` (or a list, one color per row) give the program its own icon
+on the desktop. Any program, `.lua` included, can instead have a
+`<name>.icon` file next to it: up to 4 rows of art, optionally after a
+first line `#RRGGBB` (test 43).
 
 ## 6. Migration (optional)
 

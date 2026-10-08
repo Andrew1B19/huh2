@@ -371,6 +371,7 @@ end
 
 local function satisfied(w)
   if w.cooperate then return true end
+  if w.thread and w.thread.done then return true end
   if w.rpc and rpcReplies[w.rpc] then return true end
   if w.events then
     local q = eventQueues[w.events]
@@ -976,6 +977,51 @@ local BUILTIN_LIBRARIES = {
         return args, options
       end,
     }
+  end,
+  -- Threads within one process: thread.create(fn, ...) runs fn(...)
+  -- alongside the rest of the process. Each thread is scheduled by this
+  -- node like a process of its own, so a thread waiting (sleep,
+  -- pull_event, readLine, any kernal call) holds up only itself -- the
+  -- others, and the process's main code, keep running. They share the
+  -- process's environment, windows, output and job id; pausing, killing
+  -- or the process ending applies to all of them.
+  --   t = thread.create(fn, ...)       start one
+  --   ok, result = t:join([timeout])    wait for it (nil, "timeout" if
+  --                                     it's still running then)
+  --   t:status()                        "running" | "dead"
+  --   t:kill()                          end it
+  --   thread.yield()                    let the others run
+  -- An error in a thread nobody joins is printed to the console.
+  thread = function(id)
+    local count = 0
+    local lib = {}
+    local Thread = {}
+    Thread.__index = Thread
+    function Thread:status() return self.done and "dead" or "running" end
+    function Thread:kill()
+      if not self.done then self.killRequested = true end
+    end
+    function Thread:join(timeout)
+      self.joined = true
+      if not self.done then
+        wait({thread = self, deadline = timeout and (computer.uptime() + timeout)})
+      end
+      if not self.done then return nil, "timeout" end
+      return self.ok, self.result
+    end
+    function lib.create(fn, ...)
+      if type(fn) ~= "function" then error("bad argument #1 to thread.create (function expected)", 2) end
+      count = count + 1
+      local args = table.pack(...)
+      local t = setmetatable({}, Thread)
+      local entry = {id = id .. "/thread" .. count, jobId = id, thread = t,
+        co = coroutine.create(function() return fn(table.unpack(args, 1, args.n)) end)}
+      procs[entry.id] = entry
+      procOrder[#procOrder + 1] = entry.id
+      return t
+    end
+    function lib.yield() wait(COOPERATE) end
+    return lib
   end,
   -- HTTP over whichever internet card the bus offers, this node's first
   -- (docs/MXE.md section 7.6).
@@ -2226,6 +2272,25 @@ end
 -- A process ended: clean up after it and tell the kernal how.
 local function finishProc(p, ok, result, migratedState)
   removeProc(p)
+  if p.thread then
+    -- A thread: recorded on its handle for join(); nothing goes to the
+    -- kernal. An error nobody is joining is printed.
+    local t = p.thread
+    t.done, t.ok, t.result = true, ok, result
+    if not ok and result ~= KILLED and not t.joined then
+      printTo(p.jobId)("thread error: " .. tostring(result))
+      flushOutput(p.jobId)
+    end
+    return
+  end
+  -- The process is over: so are its threads.
+  for _, otherId in ipairs({table.unpack(procOrder)}) do
+    local other = procs[otherId]
+    if other and other.thread and other.jobId == p.id then
+      removeProc(other)
+      other.thread.done, other.thread.ok, other.thread.result = true, false, KILLED
+    end
+  end
   local id = p.id
   local endHook = jobEndHooks[id]
   jobEndHooks[id] = nil
@@ -2251,7 +2316,8 @@ end
 -- killed or migrating process is "runnable" so that happens; a paused
 -- one isn't.
 local function runnable(p)
-  local state = controlState[p.id]
+  if p.thread and p.thread.killRequested then return true end
+  local state = controlState[p.jobId or p.id]
   if state == "KILL" or state == "MIGRATE" then return true end
   if state == "PAUSE" then return false end
   return not p.started or p.wait == nil or satisfied(p.wait)
@@ -2259,7 +2325,13 @@ end
 
 -- Runs `p` until it next waits, yields or ends.
 local function stepProc(p)
-  local state = controlState[p.id]
+  local state = controlState[p.jobId or p.id]
+  if p.thread then
+    -- A thread follows its process: killed with it; not moved (the
+    -- process restarts from the top on its new node, threads and all).
+    if state == "KILL" or state == "MIGRATE" or p.thread.killRequested then return finishProc(p, false, KILLED) end
+    state = nil
+  end
   if state == "KILL" then return finishProc(p, false, KILLED) end
   if state == "MIGRATE" then
     if not p.started then
@@ -2272,7 +2344,7 @@ local function stepProc(p)
   end
   local first = not p.started
   p.started, p.wait = true, nil
-  current, currentJobId = p, p.id
+  current, currentJobId = p, p.jobId or p.id
   local ok, a, b
   if first then
     ok, a, b = coroutine.resume(p.co, p.args)
@@ -2284,7 +2356,7 @@ local function stepProc(p)
   if coroutine.status(p.co) == "dead" then return finishProc(p, true, a) end
   -- A bare coroutine.yield() from the program is a cooperative yield.
   p.wait = (a == WAIT and type(b) == "table") and b or COOPERATE
-  flushOutput(p.id)
+  flushOutput(p.jobId or p.id)
 end
 
 -- A JOB from the kernal becomes a process: compiled in the environment
@@ -2366,7 +2438,7 @@ while true do
     end
     -- (A paused process's deadline doesn't count: it can't run until
     -- resumed, and its passed deadline would make this spin.)
-    local deadline = controlState[p.id] ~= "PAUSE" and p.wait and p.wait.deadline
+    local deadline = controlState[p.jobId or p.id] ~= "PAUSE" and p.wait and p.wait.deadline
     if deadline then timeout = math.min(timeout, math.max(0, deadline - computer.uptime())) end
   end
   for n = 1, MAX_SIGNALS_PER_ROUND do

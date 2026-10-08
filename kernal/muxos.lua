@@ -294,7 +294,7 @@ local commandBusy = false    -- a command is running; see handleKeyDown
 local shell = nil
 
 local consoleW, consoleH = termW, math.max(CONSOLE_MIN_H, math.floor(termH / 2))
-local consoleWin = gpu and compositor.createWindow({title = "console", x = 1, y = termH - consoleH,
+local consoleWin = gpu and compositor.createWindow({title = "console", x = 1, y = termH - consoleH - 1,
   width = consoleW, height = consoleH, layer = CONSOLE_LAYER, text = true}) or nil
 
 local function consoleOwnsScreen()
@@ -735,7 +735,7 @@ end
 -- the program. Either way, the scheduler places it.
 local PROGRAM_PATH = {"/bin", "/usr/bin"}
 -- Libraries built into the worker runtime rather than shipped from disk.
-local BUILTIN_MXE_LIBRARIES = {mux = true, http = true}
+local BUILTIN_MXE_LIBRARIES = {mux = true, http = true, thread = true}
 -- Searched in order (docs/MXE.md section 5).
 local MXE_LIBRARY_DIRS = {"/lib/mxe/", "/usr/lib/mxe/"}
 
@@ -777,7 +777,8 @@ local function readManifest(source)
   local ok, runErr = coroutine.resume(co)
   if not ok then return nil, "bad .mxe header: " .. tostring(runErr) end
   return {muxos = env.muxos, libraries = env.libraries, requires = env.requires, name = env.name,
-    version = env.version, description = env.description, author = env.author}
+    version = env.version, description = env.description, author = env.author,
+    icon = env.icon, icon_color = env.icon_color}
 end
 
 local function versionParts(v)
@@ -1750,7 +1751,10 @@ local function handleDrawWindow(msg)
   elseif win.ownerJobId ~= caller.id and not (win.ownerJobId and isDescendantOf(win.ownerJobId, caller.id)) then
     reply = "window " .. tostring(msg.windowId) .. " belongs to another process"
   end
-  if not reply and type(msg.width) == "number" and type(msg.height) == "number"
+  -- width/height resize the window -- except with pixels, where they're
+  -- the pixel grid's own size (bitmap.lua needs it) and the image is
+  -- drawn within the window as it is.
+  if not reply and not msg.pixels and type(msg.width) == "number" and type(msg.height) == "number"
       and (msg.width ~= win.width or msg.height ~= win.height) then
     local ok, err = compositor.setGeometry(win.id, win.x, win.y, msg.width, msg.height)
     if not ok then reply = err end
@@ -2148,14 +2152,61 @@ local desktop = {apps = {}, ICON_W = 9, ICON_H = 5, -- 4 rows of art, then the n
   ART = {"/-------\\", "| -|... |", "|- | ...|", "\\-------/"}}
 do
   local okDepth, depth = pcall(function() return gpu and gpu.getDepth() end)
-  local mono = okDepth and depth == 1
+  desktop.mono = okDepth and depth == 1
+  -- gmux's colors: background, icon art (its "secondary"), text.
+  desktop.colors = desktop.mono and {bg = 0x000000, art = 0xFFFFFF, text = 0xFFFFFF, accent = 0xFFFFFF}
+    or {bg = 0x444444, art = 0xFF8844, text = 0xFFFFFF, accent = 0x44FFFF}
   desktop.win = gpu and compositor.createWindow({title = "desktop", x = 1, y = 1, width = termW, height = termH,
-    layer = -2000, text = true, decorated = false,
-    bg = mono and 0x000000 or 0x444444, fg = mono and 0xFFFFFF or 0x44FFFF}) or nil
+    layer = -2000, text = true, decorated = false, bg = desktop.colors.bg, fg = desktop.colors.text}) or nil
 end
 
 function desktop.perColumn()
-  return math.max(1, math.floor((termH - 2) / (desktop.ICON_H + 1)))
+  return math.max(1, math.floor((termH - 3) / (desktop.ICON_H + 1))) -- above the taskbar
+end
+
+-- A text cell-width-exact: cut or padded (centered) to `width` columns.
+function desktop.fit(text, width, center)
+  text = tostring(text or "")
+  local len = utf8.len(text) or #text
+  if len > width then
+    return text:sub(1, (utf8.offset(text, width + 1) or (width + 1)) - 1)
+  end
+  local pad = width - len
+  local left = center and pad // 2 or 0
+  return (" "):rep(left) .. text .. (" "):rep(pad - left)
+end
+
+-- A program's own icon, if it has one: an .mxe header's
+--   icon = {"row 1", "row 2", "row 3", "row 4"}  (9 columns each)
+--   icon_color = 0xRRGGBB                        (or one per row)
+-- or, for any program, a <name>.icon file next to it: up to 4 rows of
+-- art, optionally after a first line "#RRGGBB" giving its color.
+function desktop.iconOf(path)
+  local art, color
+  local source = path:match("%.mxe$") and readFile(path)
+  if source then
+    local manifest = readManifest(source)
+    if manifest and type(manifest.icon) == "table" then art, color = manifest.icon, manifest.icon_color end
+  end
+  if not art then
+    local text = readFile((path:gsub("%.[^./]*$", "")) .. ".icon")
+    if text then
+      art = {}
+      for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        local hex = #art == 0 and not color and line:match("^#(%x%x%x%x%x%x)%s*$")
+        if hex then color = tonumber(hex, 16) elseif #art < 4 then art[#art + 1] = line end
+      end
+      while #art > 0 and art[#art] == "" do art[#art] = nil end
+    end
+  end
+  if not art or #art == 0 then return nil end
+  local rows, colors = {}, {}
+  for i = 1, 4 do
+    rows[i] = desktop.fit(art[i], desktop.ICON_W, true)
+    local c = type(color) == "table" and color[i] or color
+    colors[i] = (not desktop.mono and math.type(c) == "integer") and c or nil
+  end
+  return {rows = rows, colors = colors}
 end
 
 function desktop.scan()
@@ -2170,7 +2221,8 @@ function desktop.scan()
           local path = resolveProgram(base) -- .mxe first, like typing it
           if path then
             seen[base] = true
-            apps[#apps + 1] = {name = base, path = path}
+            local ok, icon = pcall(desktop.iconOf, path)
+            apps[#apps + 1] = {name = base, path = path, icon = ok and icon or nil}
           end
         end
       end
@@ -2179,24 +2231,40 @@ function desktop.scan()
   desktop.apps = apps
 end
 
+-- Rows of colored spans, from {x, text, fg} pieces placed on each row.
+function desktop.spans(width, placed)
+  table.sort(placed, function(a, b) return a[1] < b[1] end)
+  local row, col = {}, 1
+  for _, piece in ipairs(placed) do
+    if piece[1] > col then row[#row + 1] = {(" "):rep(piece[1] - col)} col = piece[1] end
+    row[#row + 1] = {piece[2], piece[3], piece[4]}
+    col = col + (utf8.len(piece[2]) or #piece[2])
+  end
+  if col <= width then row[#row + 1] = {(" "):rep(width - col + 1)} end
+  return row
+end
+
 function desktop.render()
   if not desktop.win then return end
-  local W, H = desktop.ICON_W, desktop.ICON_H
-  local rows = {}
-  for y = 1, termH do rows[y] = (" "):rep(termW) end
+  local W, H, C = desktop.ICON_W, desktop.ICON_H, desktop.colors
+  local placed = {}
+  for y = 1, termH do placed[y] = {} end
   local per = desktop.perColumn()
   for i, app in ipairs(desktop.apps) do
     local x, y = 2 + (i - 1) // per * (W + 1), 2 + (i - 1) % per * (H + 1)
     if x + W - 1 <= termW then
-      local name = app.name:sub(1, W)
-      local art = desktop.ART
-      local lines = {art[1], art[2], art[3], art[4], (" "):rep((W - #name) // 2) .. name}
-      for j, text in ipairs(lines) do
-        local r = y + j - 1
-        if r <= termH then rows[r] = rows[r]:sub(1, x - 1) .. text .. rows[r]:sub(x + #text) end
+      for j = 1, 4 do
+        if y + j - 1 <= termH then
+          local art = app.icon and app.icon.rows[j] or desktop.ART[j]
+          local fg = app.icon and app.icon.colors[j] or C.art
+          table.insert(placed[y + j - 1], {x, art, fg})
+        end
       end
+      if y + 4 <= termH then table.insert(placed[y + 4], {x, desktop.fit(app.name, W, true), C.text}) end
     end
   end
+  local rows = {}
+  for y = 1, termH do rows[y] = desktop.spans(termW, placed[y]) end
   compositor.setText(desktop.win.id, rows)
 end
 
@@ -2214,14 +2282,8 @@ function desktop.showConsole()
   consoleDirty = true
 end
 
--- A touch on the desktop: the icon under it, if any, starts.
-function desktop.touch(lx, ly)
-  local W, H, per = desktop.ICON_W, desktop.ICON_H, desktop.perColumn()
-  local col, colOff = (lx - 2) // (W + 1), (lx - 2) % (W + 1)
-  local row, rowOff = (ly - 2) // (H + 1), (ly - 2) % (H + 1)
-  if lx < 2 or ly < 2 or colOff >= W or rowOff >= H or row >= per then return end
-  local app = desktop.apps[col * per + row + 1]
-  if not app then return end
+-- Starts an app from the desktop, the start menu or the taskbar.
+function desktop.launch(app)
   if app.console then desktop.showConsole() return end
   local id, addrOrErr = launchProgram(app.path, {})
   if id then
@@ -2229,6 +2291,148 @@ function desktop.touch(lx, ly)
   else
     print("error: " .. tostring(addrOrErr))
   end
+end
+
+-- A touch on the desktop: the icon under it, if any, starts.
+function desktop.touch(lx, ly)
+  local W, H, per = desktop.ICON_W, desktop.ICON_H, desktop.perColumn()
+  local col, colOff = (lx - 2) // (W + 1), (lx - 2) % (W + 1)
+  local row, rowOff = (ly - 2) // (H + 1), (ly - 2) % (H + 1)
+  if lx < 2 or ly < 2 or colOff >= W or rowOff >= H or row >= per then return end
+  local app = desktop.apps[col * per + row + 1]
+  if app then desktop.launch(app) end
+end
+
+-- --- The taskbar: a start button, a button per window, and a clock ---
+--
+-- The bottom row, above every window. Touching a window's button
+-- restores and raises it -- or minimizes it, if it's already the
+-- focused window on top. The start button opens a menu of every app
+-- (the desktop's icons can be covered by windows).
+desktop.bar = {buttons = {}, signature = nil, nextCheck = 0}
+desktop.bar.win = gpu and compositor.createWindow({title = "taskbar", x = 1, y = termH, width = termW, height = 1,
+  layer = 3000, text = true, decorated = false, bg = 0x222222, fg = 0xFFFFFF}) or nil
+-- (A new window takes the focus: the console has it at boot.)
+if consoleWin then compositor.setFocus(consoleWin.id) end
+
+function desktop.bar.windows()
+  local list = {}
+  for _, w in ipairs(compositor.listWindows()) do
+    if w.id ~= (desktop.win and desktop.win.id) and w.id ~= (desktop.bar.win and desktop.bar.win.id)
+        and w.id ~= (desktop.menu and desktop.menu.id) then
+      list[#list + 1] = w
+    end
+  end
+  table.sort(list, function(a, b) return a.id < b.id end)
+  return list
+end
+
+function desktop.bar.render(list)
+  local C, focus = desktop.colors, compositor.getFocus()
+  local okClock, clock = pcall(os.date, "%H:%M")
+  if not okClock or type(clock) ~= "string" then
+    local t = math.floor(computer.uptime())
+    clock = string.format("%d:%02d", t // 3600, t // 60 % 60)
+  end
+  clock = " " .. clock .. " "
+  local placed, buttons = {}, {}
+  local start = desktop.mono and "[muxos]" or " \u{2261} muxos "
+  placed[#placed + 1] = {1, start, desktop.mono and 0xFFFFFF or 0x000000, desktop.mono and 0x000000 or C.accent}
+  buttons[#buttons + 1] = {from = 1, to = utf8.len(start), start = true}
+  local x, limit = utf8.len(start) + 2, termW - #clock
+  for _, w in ipairs(list) do
+    local label = " " .. desktop.fit(w.title, math.min(14, utf8.len(w.title) or #w.title)) .. " "
+    local width = utf8.len(label) or #label
+    if x + width - 1 > limit then break end
+    local fg, bg = 0xFFFFFF, 0x555555
+    if w.minimized then
+      fg, bg = 0x999999, 0x333333
+    elseif focus and focus.id == w.id then
+      fg, bg = 0x000000, 0xFFFFFF
+    end
+    if desktop.mono then fg, bg = 0xFFFFFF, 0x000000 end
+    placed[#placed + 1] = {x, label, fg, bg}
+    buttons[#buttons + 1] = {from = x, to = x + width - 1, window = w.id}
+    x = x + width + 1
+  end
+  placed[#placed + 1] = {termW - #clock + 1, clock, 0xFFFFFF, nil}
+  desktop.bar.buttons = buttons
+  compositor.setText(desktop.bar.win.id, {desktop.spans(termW, placed)})
+end
+
+-- Redraws the bar when its windows, focus or the clock changed --
+-- checked at most twice a second, from tick(), or at once when forced.
+function desktop.bar.update(force)
+  if not desktop.bar.win or compositor.exclusiveOwner() then return end
+  local now = computer.uptime()
+  if not force and now < desktop.bar.nextCheck then return end
+  desktop.bar.nextCheck = now + 0.5
+  local list = desktop.bar.windows()
+  local focus = compositor.getFocus()
+  local parts = {focus and focus.id or 0, math.floor(now / 30)}
+  for _, w in ipairs(list) do parts[#parts + 1] = w.id .. w.title .. tostring(w.minimized) end
+  local okClock, clock = pcall(os.date, "%H:%M")
+  parts[#parts + 1] = okClock and tostring(clock) or ""
+  local signature = table.concat(parts, "|")
+  if force or signature ~= desktop.bar.signature then
+    desktop.bar.signature = signature
+    desktop.bar.render(list)
+  end
+end
+
+function desktop.bar.touch(lx)
+  for _, b in ipairs(desktop.bar.buttons) do
+    if lx >= b.from and lx <= b.to then
+      if b.start then
+        desktop.toggleMenu()
+      else
+        local win = compositor.getWindow(b.window)
+        local focus = compositor.getFocus()
+        local top -- the topmost ordinary window showing
+        for _, w in ipairs(compositor.listWindows()) do
+          if w.id ~= desktop.bar.win.id and w.id ~= (desktop.menu and desktop.menu.id) and not w.minimized then
+            top = w
+            break
+          end
+        end
+        if win then
+          if not win.minimized and focus and focus.id == win.id and top and top.id == win.id then
+            compositor.minimize(win.id, true)
+          else
+            if win.minimized then compositor.minimize(win.id, false) end
+            compositor.raise(win.id)
+            compositor.setFocus(win.id)
+          end
+        end
+      end
+      break
+    end
+  end
+  desktop.bar.update(true)
+end
+
+-- The start menu: every app, one per row, just above the start button.
+function desktop.toggleMenu()
+  if desktop.menu then
+    compositor.close(desktop.menu.id)
+    desktop.menu = nil
+    return
+  end
+  local rows, width = {}, 8
+  for _, app in ipairs(desktop.apps) do width = math.max(width, (utf8.len(app.name) or #app.name) + 2) end
+  local height = math.min(#desktop.apps, termH - 2)
+  for i = 1, height do rows[i] = " " .. desktop.fit(desktop.apps[i].name, width - 1) end
+  local focus = compositor.getFocus()
+  desktop.menu = compositor.createWindow({title = "menu", x = 1, y = termH - height, width = width, height = height,
+    layer = 2900, text = true, decorated = false, bg = 0xFFFFFF, fg = 0x000000})
+  if focus then compositor.setFocus(focus.id) end -- the menu doesn't take it
+  if desktop.menu then compositor.setText(desktop.menu.id, rows) end
+end
+
+function desktop.menuTouch(ly)
+  local app = desktop.apps[ly]
+  desktop.toggleMenu()
+  if app then desktop.launch(app) end
 end
 
 local function handleTouch(name, x, y, button)
@@ -2251,6 +2455,15 @@ local function handleTouch(name, x, y, button)
   end
   local win, part, lx, ly = compositor.hitTest(x, y)
   if not win then return end
+  if desktop.menu and win.id ~= desktop.menu.id and name == "touch" then desktop.toggleMenu() end
+  if desktop.menu and win.id == desktop.menu.id then
+    if name == "touch" then desktop.menuTouch(ly) end
+    return
+  end
+  if desktop.bar.win and win.id == desktop.bar.win.id then
+    if name == "touch" then desktop.bar.touch(lx) end
+    return
+  end
   if desktop.win and win.id == desktop.win.id then
     if name == "touch" then desktop.touch(lx, ly) end
     return
@@ -2325,6 +2538,7 @@ local function tick(timeout)
     sweepStaleOrphans()
     checkLiveness()
     renderConsole()
+    desktop.bar.update()
     compositor.flush()
   end)
   if not ok then
@@ -2792,12 +3006,12 @@ runCommand = function(line)
     w, h, x, y = tonumber(w), tonumber(h), tonumber(x), tonumber(y)
     if not w then
       print("usage: console <width> <height> [x y]  (default: docked bottom-left)")
-    elseif w < CONSOLE_MIN_W or h < CONSOLE_MIN_H or w > termW or h > termH - 1 then
-      print(string.format("console size must be between %dx%d and %dx%d", CONSOLE_MIN_W, CONSOLE_MIN_H, termW, termH - 1))
+    elseif w < CONSOLE_MIN_W or h < CONSOLE_MIN_H or w > termW or h > termH - 2 then
+      print(string.format("console size must be between %dx%d and %dx%d", CONSOLE_MIN_W, CONSOLE_MIN_H, termW, termH - 2))
     else
-      -- y is the title bar's row; the text is below it.
-      x, y = x or 1, y or (termH - h)
-      if x + w - 1 > termW or y + h > termH then
+      -- y is the title bar's row; the text is below it, above the taskbar.
+      x, y = x or 1, y or (termH - h - 1)
+      if x + w - 1 > termW or y + h > termH - 1 then
         print("that doesn't fit on the screen")
       else
         compositor.setGeometry(consoleWin.id, x, y, w, h)
