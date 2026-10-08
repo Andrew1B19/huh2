@@ -149,22 +149,41 @@ end
 
 -- The disk this installer is on and its path there: the BIOS says when
 -- booted bare; on OpenOS it's found from the program's own path.
+--
+-- On OpenOS, debug.getinfo(1) doesn't name this file: OpenComputers wraps
+-- getinfo, so level 1 is the wrapper. So walk up to the first frame that
+-- is a .lua file. A relative name (`lua muxos-installer.lua`) is resolved
+-- against the working directory. OpenOS's $_ is only a last resort: it
+-- names the program the shell started, which is /bin/lua.lua under `lua`.
+local function programPath()
+  local shell = require("shell")
+  if debug and debug.getinfo then
+    for level = 1, 10 do
+      local ok, info = pcall(debug.getinfo, level, "S")
+      if not ok or not info then break end
+      local src = info.source and info.source:match("^[@=](.+%.lua)$")
+      if src then
+        src = shell.resolve(src)
+        if src and osfs.exists(src) and not osfs.isDirectory(src) then return src end
+      end
+    end
+  end
+  local underscore = os.getenv and os.getenv("_")
+  if underscore and osfs.exists(underscore) then return underscore end
+end
+
 local function findMedium()
   if bare then
     local address, path = launchArgs[1], launchArgs[2]
     if type(address) ~= "string" or type(path) ~= "string" then return nil, "booted without its disk's address" end
     return {address = address, fs = component.proxy(address), path = path}
   end
-  local info = debug and debug.getinfo and debug.getinfo(1, "S")
-  local full = info and info.source and info.source:match("^[@=](.+)$")
-  if not (full and osfs.exists(full)) then
-    full = os.getenv and os.getenv("_")
-    if not (full and osfs.exists(full)) then return nil, "can't tell where this installer is" end
-  end
+  local full = programPath()
+  if not full then return nil, "can't tell where this installer is" end
   local fs, mount = osfs.get(full)
   if not fs then return nil, "can't tell which disk " .. full .. " is on" end
   local rel = full:sub(#mount + 1):gsub("^/*", "/")
-  return {address = fs.address, fs = fs, path = rel}
+  return {address = fs.address, fs = fs, path = rel, osPath = full}
 end
 
 -- A buffered reader over a file on a filesystem component: line() and
@@ -213,15 +232,27 @@ end
 -- to n more bytes of it (nil at its end). fn returning true stops there.
 local function bundledPayload(fs, path)
   local f = openReader(fs, path)
-  if not f then return nil end
+  if not f then return nil, "not there" end
+  local first
   while true do
     local line = f.line()
-    if not line then f.close() return nil end
+    first = first or line
+    if not line then
+      f.close()
+      return nil, "it's there, but isn't a muxos data file (it starts: "
+        .. string.format("%q", (first or ""):sub(1, 40)) .. ")"
+    end
     if line:match("^%-%-%[=*%[MUXOS%-PAYLOAD") then
       if line:sub(-1) == "\r" then
         f.close()
         return nil, "the installer's data file had its line endings converted to CRLF, which breaks it -- "
           .. "download it again as-is (raw, not through a converting checkout)"
+      end
+      local version = line:match("^%-%-%[=*%[MUXOS%-PAYLOAD (%S+)")
+      if VERSION ~= "dev" and version and version ~= VERSION then
+        f.close()
+        return nil, "it's the data file for muxos " .. version .. ", but this installer is " .. VERSION
+          .. " -- get both files again, together"
       end
       break
     end
@@ -265,14 +296,52 @@ local function bundledPayload(fs, path)
 end
 
 local medium, mediumErr = findMedium()
+local DAT_NAME = "muxos-installer.dat"
+
+-- OpenOS's own files, for reading the data file by its OpenOS path: the
+-- same calls as a filesystem component, so openReader works on it.
+local osFiles = {
+  open = function(path) return io.open(path, "rb") end,
+  read = function(handle, n) return handle:read(n) end,
+  close = function(handle) handle:close() end,
+}
 
 -- The files to install are in muxos-installer.dat, next to this program.
+-- Looked for there first, then at the root of every disk. If it isn't
+-- found, the error lists every place tried and why each didn't do.
 local function findPayload()
-  if not medium then return nil, mediumErr end
-  local dat = medium.path:gsub("%.lua$", "") .. ".dat"
-  local payload, err = bundledPayload(medium.fs, dat)
+  local tried, seen = {}, {}
+  local function try(fs, path, where, key)
+    if key then
+      if seen[key] then return end
+      seen[key] = true
+    end
+    local payload, err = bundledPayload(fs, path)
+    if payload then return payload end
+    tried[#tried + 1] = "  " .. where .. ": " .. tostring(err)
+  end
+  local payload
+  if medium then
+    local dat = medium.path:gsub("[^/]*$", "") .. DAT_NAME
+    local where = medium.osPath and medium.osPath:gsub("[^/]*$", "") .. DAT_NAME
+      or "disk " .. tostring(medium.address):sub(1, 8) .. " " .. dat
+    payload = try(medium.fs, dat, where, tostring(medium.address) .. dat)
+    if not payload and medium.osPath then
+      payload = try(osFiles, (medium.osPath:gsub("[^/]*$", "") .. DAT_NAME), where .. " (through OpenOS)")
+    end
+  else
+    tried[#tried + 1] = "  next to the installer: " .. tostring(mediumErr)
+  end
+  if not payload then
+    for address in component.list("filesystem") do
+      payload = try(component.proxy(address), "/" .. DAT_NAME, "disk " .. address:sub(1, 8) .. " /" .. DAT_NAME,
+        address .. "/" .. DAT_NAME)
+      if payload then break end
+    end
+  end
   if payload then return payload end
-  return nil, err or (dat .. " is missing -- copy it next to the installer (the two files go together)")
+  return nil, "can't find " .. DAT_NAME .. " (it goes next to muxos-installer.lua; the two files go together). Looked at:\n"
+    .. table.concat(tried, "\n")
 end
 
 -- --- EEPROM ---

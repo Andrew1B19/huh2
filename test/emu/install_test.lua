@@ -77,9 +77,11 @@ local function openosFor(node, medium, eepromOf)
   }
   local filesystem = {
     exists = function(p) local f = io.open(p, "rb") if f then f:close() return true end return false end,
+    isDirectory = function() return false end,
     get = function() return mediumFs, "/" end,
   }
-  return {component = component, computer = computer, filesystem = filesystem}
+  local shell = {resolve = function(p) return p end}
+  return {component = component, computer = computer, filesystem = filesystem, shell = shell}
 end
 
 -- Runs an installer file with arguments; `answers` feed io.read (a
@@ -172,7 +174,21 @@ do
   f:write(readFile(BUNDLE))
   f:close()
   local code, out = runInstaller(alone .. "/muxos-installer.lua", openosFor(emu:newNode("alone"), nil), nil, "worker")
-  assert(code == 1 and out:find("muxos-installer.dat is missing", 1, true), "a missing data file is explained:\n" .. out)
+  assert(code == 1 and out:find("can't find muxos-installer.dat", 1, true)
+    and out:find(alone .. "/muxos-installer.dat: not there", 1, true), "a missing data file is explained:\n" .. out)
+  -- A data file from another version is named as such, not used.
+  local f = assert(io.open(alone .. "/muxos-installer.dat", "wb"))
+  f:write((readFile(DATA):gsub("^(%-%-%[%[MUXOS%-PAYLOAD )%S+", "%10.0.1")))
+  f:close()
+  code, out = runInstaller(alone .. "/muxos-installer.lua", openosFor(emu:newNode("alone"), nil), nil, "worker")
+  assert(code == 1 and out:find("data file for muxos 0.0.1, but this installer is 0.1.2", 1, true),
+    "a mismatched data file is explained:\n" .. out)
+  -- One that isn't next to the program is found on any disk's root.
+  local other = emu:newNode("alone")
+  emu:addEeprom(other, "")
+  emu:addFilesystem(other, {["/muxos-installer.dat"] = readFile(DATA)})
+  code, out = runInstaller(alone .. "/muxos-installer.lua", openosFor(other, nil), {""}, "check")
+  assert(code == 0 and out:find("blank", 1, true), "the data file on another disk was found:\n" .. out)
 end
 print("  OK")
 
