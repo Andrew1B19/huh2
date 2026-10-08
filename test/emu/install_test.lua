@@ -318,6 +318,9 @@ do
     and files["/mnt/abc/init.lua"] == "muxos/dist/floppy/init.lua",
     "the installer, its data file and the boot file land at the floppy's root, where the BIOS looks")
   assert(not cfg["muxos-installer"].launcher, "no launcher: a /muxos.lua on the floppy would be booted as the kernal")
+  local demoPlan = core.file_plan(cfg, core.order(cfg, "muxos-demo"), core.resolve_target(nil), concat)
+  assert(#demoPlan == 1 and demoPlan[1].file == "/usr/bin/demo.mxe" and demoPlan[1].path == "muxos/apps/demo.mxe",
+    "the demo is its own package, installed on muxos's PATH")
   local selfPlan = core.file_plan(cfg, core.order(cfg, "opm-mxe"), "/", concat)
   local dests = {}
   for _, p in ipairs(selfPlan) do dests[p.file] = p.path end

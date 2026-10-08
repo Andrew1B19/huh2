@@ -387,10 +387,10 @@ refuses the call unless the sender currently holds
 time. This exists for the one legitimate reason to go around the
 compositor: a fullscreen app that wants to own the whole display and
 draw without the compositor's buffer/blit indirection, not for every job
-doing a stray `gpu.set()`. **Not released automatically if its holder
-disappears** (reboots, crashes, loses power) -- a real gap, flagged
-rather than silently handled; recovering from that today means
-restarting the kernal.
+doing a stray `gpu.set()`. Released when its holder's node goes down,
+or by force with Ctrl+Alt+C -- but **not** when the holding program
+ends while its node stays up (the grant is per node, not per job): a
+gap, flagged.
 
 `node/runtime.lua`'s `gpu` face is affected by this too: its remote
 fallback (used when a worker has no local gpu) goes through the exact
@@ -440,7 +440,8 @@ minimize (collapse to the title bar) is how a window gets out of the
 way while its program keeps running. The old plan of a closed window
 becoming a toolbar icon (icon from the window's bitmap, else the
 program's name, else one supplied through the API) is kept here in case
-a toolbar is built for minimized windows later; nothing of it is built.
+a toolbar is built for minimized windows later. (A taskbar is built now --
+a button per window, minimized ones included -- see README.md.)
 
 ## Scheduler
 
@@ -1332,8 +1333,8 @@ The difference is what each sees:
   another process on the same node. The native API it sees through it
   is read-only, and it has no `debug` and no raw `component` (test 27).
 
-Not built yet: the legacy environment, which needs the launcher to tell
-legacy from `.mxe`.
+The legacy environment is built too (gmux-style virtual components,
+OpenOS libraries, the OS filesystem; tests 33-35).
 
 A kernal system bus (a dbus-like named-service/signal bus) is a
 possible later addition for `.mxe` programs to talk to kernal services
@@ -1646,10 +1647,9 @@ Collected in one place:
   implementation plus eventual GERTi access, while legacy sees an
   emulated modem; keyboard input should be delivered directly to
   whichever `.mxe` job currently has focus, instead of via a virtual
-  keyboard component. Window-focus tracking itself is now scaffolded
-  (see "Window-focus tracking" above) -- what's still open is the
-  networking side entirely (the modem kernel module, GERTi access) and
-  the actual keyboard-delivery wiring on top of that scaffolding.
+  keyboard component. Keyboard delivery is built (keys go to the
+  focused window's process, test 28); what's still open is the
+  networking side entirely (the modem kernel module, GERTi access).
 
 **Resolved while building the rest of this section**: "what the kernal
 does when every worker is already busy" turned out to already have an
