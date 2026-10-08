@@ -70,7 +70,7 @@ node.tmpAddress = emu:addFilesystem(node, {})
 local floppy = emu:addFilesystem(node, {
   ["/muxos-installer.lua"] = readFile(REPO_ROOT .. "/dist/muxos-installer.lua"),
   ["/muxos-installer.dat"] = readFile(REPO_ROOT .. "/dist/muxos-installer.dat"),
-})
+}, "floppy") -- so OpenOS mounts it at /mnt/flo
 local eeprom = emu:addEeprom(node, readFile(assets .. "/lua/bios.lua"), hdd)
 
 local function screen()
@@ -131,6 +131,28 @@ typeLine("/mnt/*/muxos-installer.lua check")
 if not waitFor("the muxos worker BIOS, this version") then fail("check didn't recognize the worker BIOS") end
 typeLine("q")
 if not waitFor("/home #") then fail("check didn't finish") end
+print("  OK")
+
+-- However it's started, it finds its data file. OpenComputers wraps
+-- debug.getinfo and OpenOS's $_ names /bin/lua.lua under `lua`, so the
+-- installer's idea of its own path is easy to get wrong.
+print("openos 4: it finds its data file however it's started")
+local mnt = "/mnt/flo"
+for _, start in ipairs({
+  {"lua " .. mnt .. "/muxos-installer.lua check"},
+  {"cd " .. mnt, "./muxos-installer.lua check"},
+  {"cd " .. mnt, "lua muxos-installer.lua check"},
+  {"cd " .. mnt, mnt .. "/muxos-installer.lua check"},
+}) do
+  typeLine("clear")
+  emu:advance(0.5)
+  for _, line in ipairs(start) do typeLine(line) emu:advance(0.5) end
+  if not waitFor("the muxos worker BIOS, this version") then fail("`" .. table.concat(start, "; ") .. "` didn't work") end
+  typeLine("q")
+  emu:advance(0.5)
+  typeLine("cd /home")
+  if not waitFor("/home #") then fail("`" .. table.concat(start, "; ") .. "` didn't finish") end
+end
 print("  OK")
 
 print("ALL OK")

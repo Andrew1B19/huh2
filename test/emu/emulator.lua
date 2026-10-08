@@ -111,8 +111,10 @@ function Emulator:newNode(kind)
   return node
 end
 
-function Emulator:addComponent(node, ctype, methods)
-  local addr = self:allocAddress(ctype)
+-- `prefix` names the address (default: the type), e.g. so OpenOS mounts a
+-- filesystem at a known /mnt/<first 3 characters>.
+function Emulator:addComponent(node, ctype, methods, prefix)
+  local addr = self:allocAddress(prefix or ctype)
   node.components[addr] = {type = ctype, methods = methods}
   node.componentOrder[#node.componentOrder + 1] = addr
   return addr
@@ -181,6 +183,7 @@ local function hostComputerAPI(node)
     removeUser = function() return false end,
     isRobot = function() return false end,
     tmpAddress = function() return node.tmpAddress end,
+    getProgramLocations = function() return {} end,
     getArchitecture = function() return "Lua 5.3" end,
     getArchitectures = function() return {"Lua 5.3"} end,
     setArchitecture = function() return false end,
@@ -312,7 +315,7 @@ end
 -- Filesystem: in-memory, pre-populated from `files` (path -> content).
 -- `read`'s handle convention (a plain number, not an io.open()-style
 -- object) matches the real component filesystem API this wraps.
-function Emulator:addFilesystem(node, files)
+function Emulator:addFilesystem(node, files, prefix)
   local handles = {}
   local nextHandle = 1
   local dirs = {["/"] = true}
@@ -425,7 +428,7 @@ function Emulator:addFilesystem(node, files)
     spaceTotal = function() return 1048576 end,
     isReadOnly = function() return false end,
     getLabel = function() return "kernal" end,
-  })
+  }, prefix)
 end
 
 -- GPU + screen (Tier 3): buffer 0 is always the screen, matching the

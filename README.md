@@ -254,6 +254,11 @@ Errors the Analyzer can show:
   else. Re-flash it with `worker` or `bios`. When flashing, just pressing
   Enter means yes. The installer re-reads every EEPROM it writes and only
   says "Flashed" if every byte matches.
+- **"can't find muxos-installer.dat ... Looked at: ..."** (on screen,
+  from the installer): the installer looks next to itself, then at the
+  root of every disk, and lists each place with why it didn't do: "not
+  there", a file that isn't a muxos data file, or one from another
+  version. Put both files from the same build at the floppy's root.
 - **"failed loading bios: ..."**: the EEPROM holds code that doesn't
   compile; re-flash it.
 - **"not enough memory"**: add RAM (two tier 3 sticks is comfortable for
