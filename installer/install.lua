@@ -127,10 +127,10 @@ else
     while true do
       local name, _, char, code = computer.pullSignal()
       if name == "key_down" then
-        if code == 28 then
+        if code == 28 or code == 156 or char == 13 then -- Enter, either one
           write("\n")
           return trim(line)
-        elseif code == 14 then
+        elseif code == 14 or char == 8 then -- Backspace
           if #line > 0 then
             line = line:sub(1, -2)
             if x > 1 then x = x - 1 elseif y > 1 then x, y = w, y - 1 end

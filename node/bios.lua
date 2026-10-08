@@ -44,13 +44,17 @@ local code
 -- the only place a worker learns that; runtime.lua treats it as
 -- authoritative from then on (see its header).
 local kernalAddr
+-- Re-announce only after 5 s with no chunk -- on a timer, never in
+-- reaction to other traffic. (Reacting to any message made workers set
+-- each other off: every BOOT broadcast woke the others into sending
+-- theirs, a storm that flooded every computer on the network.)
+local quietSince = computer.uptime()
 while not code do
-  local name, _, from, port, _, data = pullSignal(5)
-  local gotChunk = false
+  local name, _, from, port, _, data = pullSignal(math.max(0, quietSince + 5 - computer.uptime()))
   if name == "modem_message" and port == PORT and type(data) == "string" then
     local i, n, chunk = data:match("^CODE (%d+)/(%d+) (.*)$")
     if i then
-      gotChunk = true
+      quietSince = computer.uptime()
       i, n = tonumber(i), tonumber(n)
       chunks[i] = chunk
       local haveAll = true
@@ -63,10 +67,9 @@ while not code do
       end
     end
   end
-  if not code and not gotChunk then
-    -- Nothing arrived: re-announce. Not on every chunk, which would
-    -- restart the kernal's whole chunked send each time.
+  if not code and computer.uptime() >= quietSince + 5 then
     requestBoot()
+    quietSince = computer.uptime()
   end
 end
 
