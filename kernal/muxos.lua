@@ -735,7 +735,7 @@ end
 -- the program. Either way, the scheduler places it.
 local PROGRAM_PATH = {"/bin", "/usr/bin"}
 -- Libraries built into the worker runtime rather than shipped from disk.
-local BUILTIN_MXE_LIBRARIES = {mux = true, http = true, thread = true}
+local BUILTIN_MXE_LIBRARIES = {mux = true, http = true, thread = true, modem = true}
 -- Searched in order (docs/MXE.md section 5).
 local MXE_LIBRARY_DIRS = {"/lib/mxe/", "/usr/lib/mxe/"}
 
@@ -1077,9 +1077,101 @@ end
 -- Defined with the FS handler below.
 local closeJobFiles
 
+-- --- Networking for programs: a raw modem API over the kernal's card ---
+--
+-- Programs anywhere in the cluster share the kernal's network card, so a
+-- program's network address is the kernal's -- the same wherever it runs
+-- or moves to. NET requests open/close ports (any but the cluster's
+-- own, PORT), send and broadcast; a modem_message on a port a program
+-- opened reaches it as an event shaped like OpenComputers' signal,
+-- {"modem_message", receiver, from, port, distance, ...} (the receiver
+-- being the kernal's card). A program's ports are released when it ends.
+local net = {ports = {}} -- port -> {[job id] = true}
+
+function net.release(id)
+  for port, owners in pairs(net.ports) do
+    if owners[id] then
+      owners[id] = nil
+      if next(owners) == nil then
+        net.ports[port] = nil
+        tryInvoke(modemAddr, "close", port)
+      end
+    end
+  end
+end
+
+-- One NET request from a running program: a result, or nil and why.
+function net.handle(job, msg)
+  local op, port = msg.op, msg.port
+  if op == "info" then
+    return {address = modemAddr, maxPacketSize = tryInvoke(modemAddr, "maxPacketSize") or 8192,
+      wireless = tryInvoke(modemAddr, "isWireless") == true}
+  end
+  if op ~= "send" or port ~= nil then
+    if math.type(port) ~= "integer" or port < 1 or port > 65535 then return nil, "bad port: " .. tostring(port) end
+    if port == PORT then return nil, "port " .. PORT .. " is the cluster's own" end
+  end
+  if op == "open" then
+    local owners = net.ports[port] or {}
+    if next(owners) == nil and not tryInvoke(modemAddr, "isOpen", port) then
+      local ok, err = tryInvoke(modemAddr, "open", port)
+      if not ok and err then return nil, tostring(err) end
+    end
+    local was = owners[job.id] == true
+    owners[job.id] = true
+    net.ports[port] = owners
+    return not was
+  elseif op == "close" then
+    local owners = net.ports[port]
+    if not owners or not owners[job.id] then return false end
+    owners[job.id] = nil
+    if next(owners) == nil then
+      net.ports[port] = nil
+      tryInvoke(modemAddr, "close", port)
+    end
+    return true
+  elseif op == "isOpen" then
+    return net.ports[port] ~= nil and net.ports[port][job.id] == true
+  elseif op == "send" or op == "broadcast" then
+    local data = type(msg.data) == "table" and msg.data or {}
+    for i = 1, data.n or #data do
+      local t = type(data[i])
+      if t ~= "nil" and t ~= "boolean" and t ~= "number" and t ~= "string" then
+        return nil, "a modem message can only carry nil, booleans, numbers and strings"
+      end
+    end
+    local ok, err
+    if op == "send" then
+      if type(msg.address) ~= "string" then return nil, "bad address" end
+      ok, err = tryInvoke(modemAddr, "send", msg.address, port, table.unpack(data, 1, data.n or #data))
+    else
+      ok, err = tryInvoke(modemAddr, "broadcast", port, table.unpack(data, 1, data.n or #data))
+    end
+    if not ok and err then return nil, tostring(err) end
+    return ok == true
+  end
+  return nil, "unknown NET operation: " .. tostring(op)
+end
+
+-- A modem_message the kernal's card received (`sig`, the whole signal):
+-- to every program that opened its port.
+function net.deliver(sig)
+  local owners = net.ports[sig[4]]
+  if not owners then return end
+  local event = {"modem_message", sig[2], sig[3], sig[4], sig[5]} -- as OpenComputers signals it
+  for i = 6, sig.n do event[#event + 1] = sig[i] end
+  for id in pairs(owners) do
+    local job = jobs[id]
+    if job and job.status == "running" then
+      send({type = "EVENT", from = selfAddr, to = job.node, jobId = id, event = event})
+    end
+  end
+end
+
 local function finishJob(id, status, result, err)
   local job = jobs[id]
   closeJobFiles(id)
+  net.release(id)
   runningJobs[id] = nil
   runningCount = runningCount - 1
   local node = nodes[job.node]
@@ -1899,6 +1991,15 @@ local function handleModemMessage(from, port, data)
     handleGetWindows(msg)
   elseif msg.type == "DRAWWINDOW" then
     handleDrawWindow(msg)
+  elseif msg.type == "NET" then
+    local job = callerJob(msg)
+    local result, err
+    if job then result, err = net.handle(job, msg) else err = "not called from a running process" end
+    if err then
+      send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
+    else
+      send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = result})
+    end
   elseif msg.type == "REQUESTFULLSCREEN" then
     handleRequestFullscreen(msg)
   elseif msg.type == "RELEASEFULLSCREEN" then
@@ -2513,8 +2614,10 @@ end
 -- kernal's ONLY coroutine now -- not just killing a background thread
 -- the REPL could still survive without, but the whole event loop.
 local function tick(timeout)
-  local name, a2, a3, a4, a5, a6 = pullSignal(timeout)
+  local sig = table.pack(pullSignal(timeout))
+  local name, a2, a3, a4, a5, a6 = table.unpack(sig, 1, 6)
   local ok, err = pcall(function()
+    if name == "modem_message" and a4 ~= PORT then net.deliver(sig) end
     if name == "key_down" then
       handleKeyDown(a3, a4)
     elseif name == "key_up" then

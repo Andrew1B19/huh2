@@ -531,10 +531,8 @@ hang a job calling `gmuxapi.*` forever -- see docs/PROTOCOL.md's
 **Not built yet** -- what the design describes that doesn't exist, checked
 against the code (not just this document):
 
-- **Networking for programs.** Network cards aren't on the cluster bus,
-  so no program can use a modem. The design calls for a kernal modem
-  module for `.mxe` programs (and GERTi access), and an emulated modem
-  for legacy programs.
+- **GERTi** networking for programs (the raw modem API is built: the
+  `modem` library and legacy programs' `modem` component).
 - **Remote component signals.** Calling another node's components works
   (the bus), but their signals (`redstone_changed`, an internet card's
   events, ...) don't reach programs on other nodes.

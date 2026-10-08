@@ -1023,6 +1023,40 @@ local BUILTIN_LIBRARIES = {
     function lib.yield() wait(COOPERATE) end
     return lib
   end,
+  -- A raw modem API: the network, through the kernal's card -- so the
+  -- program's address is the kernal's wherever it runs. Messages on its
+  -- open ports arrive through gmuxapi.pull_event shaped like
+  -- OpenComputers' signal: {"modem_message", receiver, from, port,
+  -- distance, ...}.
+  --   modem.address, modem.maxPacketSize(), modem.isWireless()
+  --   modem.open(port), modem.close(port), modem.isOpen(port)
+  --   modem.send(address, port, ...), modem.broadcast(port, ...)
+  -- (Port 4477 is the cluster's own.) Ports close when the process ends.
+  modem = function()
+    local function call(op, fields)
+      fields = fields or {}
+      fields.op, fields.caller = op, currentJobId
+      local result, err = remoteRequest("NET", fields)
+      if err then error(err, 3) end
+      return result
+    end
+    local info
+    local function getInfo()
+      info = info or call("info")
+      return info
+    end
+    return setmetatable({
+      open = function(port) return call("open", {port = port}) end,
+      close = function(port) return call("close", {port = port}) end,
+      isOpen = function(port) return call("isOpen", {port = port}) end,
+      send = function(address, port, ...)
+        return call("send", {address = address, port = port, data = table.pack(...)})
+      end,
+      broadcast = function(port, ...) return call("broadcast", {port = port, data = table.pack(...)}) end,
+      maxPacketSize = function() return getInfo().maxPacketSize end,
+      isWireless = function() return getInfo().wireless end,
+    }, {__index = function(_, k) if k == "address" then return getInfo().address end end})
+  end,
   -- HTTP over whichever internet card the bus offers, this node's first
   -- (docs/MXE.md section 7.6).
   http = function()
@@ -1560,6 +1594,34 @@ local function virtualDevices(ctx)
   }
   local keyboard = {type = "keyboard", address = VKEYBOARD_ADDRESS}
   ctx.devices = {[VGPU_ADDRESS] = v.proxy, [VSCREEN_ADDRESS] = screen, [VKEYBOARD_ADDRESS] = keyboard}
+  -- A modem, emulated over the kernal's NET service (the raw modem API
+  -- .mxe programs get): its address is the kernal's card, the program's
+  -- real address on the network; modem_message signals arrive as usual.
+  if kernalAddr then
+    local function call(op, fields)
+      fields = fields or {}
+      fields.op, fields.caller = op, ctx.id
+      local result, err = remoteRequest("NET", fields)
+      if err then error(err, 3) end
+      return result
+    end
+    local strength, wake = 400, nil
+    ctx.devices[kernalAddr] = {
+      type = "modem", address = kernalAddr,
+      open = function(port) return call("open", {port = port}) end,
+      close = function(port) return call("close", {port = port}) end,
+      isOpen = function(port) return call("isOpen", {port = port}) end,
+      send = function(address, port, ...) return call("send", {address = address, port = port, data = table.pack(...)}) end,
+      broadcast = function(port, ...) return call("broadcast", {port = port, data = table.pack(...)}) end,
+      maxPacketSize = function() return call("info").maxPacketSize end,
+      isWireless = function() return call("info").wireless end,
+      isWired = function() return true end,
+      getStrength = function() return strength end,
+      setStrength = function(n) strength = tonumber(n) or strength return strength end,
+      getWakeMessage = function() return wake end,
+      setWakeMessage = function(m) wake = m return m end,
+    }
+  end
   -- The kernal's disk, the OS filesystem (see "Legacy filesystem").
   if ctx.fsAddress then
     local fsProxy = {type = "filesystem", address = ctx.fsAddress}

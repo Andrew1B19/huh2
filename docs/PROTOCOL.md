@@ -690,8 +690,11 @@ an internet card on any node.
 **Not on the bus:**
 - gpu, screen and keyboard: the compositor owns them, and programs get
   windows and input instead;
-- network cards and tunnels: the cluster's own link (networking for
-  programs is still deferred);
+- network cards and tunnels: the cluster's own link. Programs network
+  through the kernal's card instead: the `modem` library for `.mxe`
+  programs and a virtual `modem` component for legacy programs, over the
+  kernal's `NET` service (raw modem API: open/close/send/broadcast; test
+  45). GERTi access is for later;
 - EEPROMs and computer components: node firmware and power control;
 - the kernal's boot disk: programs reach it as the OS filesystem (`FS`),
   with its own handle bookkeeping.

@@ -1600,4 +1600,59 @@ do
 end
 print("  OK -- four threads, strips on the workers, a half-block image and braille graphics, q to quit")
 
+print("test 45: networking -- a raw modem API for .mxe programs and a modem for legacy ones")
+do
+  -- An ordinary OpenComputers machine elsewhere on the network: it
+  -- answers anything on ports 123 and 124 with "pong:<what it got>".
+  local outside = emu:newNode("outside")
+  local outsideModem = emu:addModem(outside)
+  emu:addEeprom(outside, [==[
+local m = component.list("modem")()
+component.invoke(m, "open", 123)
+component.invoke(m, "open", 124)
+while true do
+  local name, _, from, port, _, a, b = computer.pullSignal()
+  if name == "modem_message" then component.invoke(m, "send", from, port, "pong:" .. tostring(a), b) end
+end
+]==])
+  emu:boot(outside)
+  kernalFiles["/bin/net45.mxe"] = [==[--[[mxe
+libraries = {"modem"}
+]]
+local modem = require("modem")
+print("NET45 open=" .. tostring(modem.open(123)))
+print("NET45 reserved=" .. tostring(pcall(modem.open, 4477)))
+modem.broadcast(123, "hello", 7)
+local e = gmuxapi.pull_event(3)
+print("NET45 got " .. tostring(e and e[1]) .. " " .. tostring(e and e[6]) .. " " .. tostring(e and e[7]))
+print("NET45 me=" .. tostring(modem.address))
+modem.send(e[3], 123, "direct", 8)
+e = gmuxapi.pull_event(3)
+print("NET45 direct " .. tostring(e and e[6]) .. " " .. tostring(e and e[7]))
+]==]
+  kernalFiles["/usr/bin/net45legacy.lua"] = [==[
+local component = require("component")
+local event = require("event")
+local m = component.modem
+m.open(124)
+m.broadcast(124, "legacy", 9)
+local _, _, from, port, _, a, b = event.pull(3, "modem_message")
+print("LNET45 " .. tostring(port) .. " " .. tostring(a) .. " " .. tostring(b) .. " " .. tostring(m.address == component.modem.address))
+]==]
+  typeLine("net45")
+  emu:advance(4)
+  assertScreenContains("NET45 open=true", "an .mxe opens a port")
+  assertScreenContains("NET45 reserved=false", "the cluster's own port is refused")
+  assertScreenContains("NET45 got modem_message pong:hello 7", "a broadcast's answer arrives as an event")
+  assertScreenContains("NET45 me=" .. kernal.modemAddr, "a program's address is the kernal's card")
+  assertScreenContains("NET45 direct pong:direct 8", "send to one address")
+  emu:advance(1)
+  assert(not kernal.modemOpenPorts[123], "the program's port was closed when it ended")
+  typeLine("net45legacy")
+  emu:advance(4)
+  assertScreenContains("LNET45 124 pong:legacy 9 true", "a legacy program's modem, with OpenOS's event.pull")
+  closeWindowAt(1, 50)
+end
+print("  OK -- programs open ports, send, broadcast and receive through the kernal's card; ports close at exit")
+
 print("ALL OK")

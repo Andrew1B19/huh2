@@ -218,6 +218,20 @@ granted too, transitively, and loaded before it (test 37).
     form-encoded.
 
   The internet card can be on any node in the cluster (test 37).
+- `modem`: a raw modem API, through the kernal's network card, so a
+  program's address on the network is the kernal's card, wherever the
+  program runs or moves to (test 45).
+  - `modem.address`, `modem.maxPacketSize()`, `modem.isWireless()`;
+  - `modem.open(port)`, `modem.close(port)`, `modem.isOpen(port)`;
+  - `modem.send(address, port, ...)`, `modem.broadcast(port, ...)`;
+    messages carry nil, booleans, numbers and strings.
+
+  Messages on the program's open ports arrive through
+  `gmuxapi.pull_event()` shaped like OpenComputers' signal:
+  `{"modem_message", receiver, from, port, distance, ...}`. Port 4477 is
+  the cluster's own and can't be opened. A program's ports close when it
+  ends. Legacy programs get the same as an ordinary `modem` component
+  (`component.modem`, `modem_message` through `event.pull`).
 - `thread`: threads within one process. Each thread is scheduled by its
   node like a process of its own, so one that waits (`sleep`,
   `pull_event`, `readLine`, any `gmuxapi`/`fs` call) holds up only
