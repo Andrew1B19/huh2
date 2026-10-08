@@ -47,6 +47,7 @@ local FILES = {
   {"/eeprom/worker.lua", "node/bios.lua"},
   {"/muxos.lua", "kernal/muxos.lua"},
   {"/compositor.lua", "kernal/compositor.lua"},
+  {"/shell.lua", "kernal/shell.lua"},
   {"/bitmap.lua", "kernal/bitmap.lua"},
   {"/runtime.lua", "node/runtime.lua"},
 }

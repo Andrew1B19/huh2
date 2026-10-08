@@ -288,6 +288,11 @@ local commandBusy = false    -- a command is running; see handleKeyDown
 
 -- A window like any other, with a title bar (gmux-style): it can be
 -- minimized, moved and resized. Its close button minimizes it instead.
+-- The POSIX-style shell (kernal/shell.lua), loaded once the program
+-- launcher it hands programs to exists (below); declared here for the
+-- prompt, which shows its working directory.
+local shell = nil
+
 local consoleW, consoleH = termW, math.max(CONSOLE_MIN_H, math.floor(termH / 2))
 local consoleWin = gpu and compositor.createWindow({title = "console", x = 1, y = termH - consoleH,
   width = consoleW, height = consoleH, layer = CONSOLE_LAYER, text = true}) or nil
@@ -334,7 +339,7 @@ local function liveLine()
     if consolePartial ~= "" then return consolePartial .. "_" end
     return nil
   end
-  return "muxos> " .. inputBuffer .. "_"
+  return "muxos:" .. (shell and shell.cwd() or "/") .. "> " .. inputBuffer .. "_"
 end
 
 local function totalRows(width)
@@ -459,13 +464,11 @@ end
 -- Same key-code constants OpenOS's own lib/keyboard.lua uses internally
 -- (verified against its source) -- just tracked by hand here since
 -- there's no keyboard.pressedCodes table to read without it.
-local KEY_BACK, KEY_ENTER = 0x0E, 0x1C
-local KEY_LCONTROL, KEY_RCONTROL = 0x1D, 0x9D
-local KEY_LMENU, KEY_RMENU = 0x38, 0xB8
-local KEY_C = 0x2E
+-- Key codes, in one table (the main chunk is near Lua's 200-local limit).
+local KEYS = {BACK = 0x0E, ENTER = 0x1C, LCONTROL = 0x1D, RCONTROL = 0x9D, LMENU = 0x38, RMENU = 0xB8, C = 0x2E}
 local heldKeys = {}
-local function isControlDown() return heldKeys[KEY_LCONTROL] or heldKeys[KEY_RCONTROL] end
-local function isAltDown() return heldKeys[KEY_LMENU] or heldKeys[KEY_RMENU] end
+local function isControlDown() return heldKeys[KEYS.LCONTROL] or heldKeys[KEYS.RCONTROL] end
+local function isAltDown() return heldKeys[KEYS.LMENU] or heldKeys[KEYS.RMENU] end
 
 -- Every message over the modem is chunked, not just boot's CODE --
 -- even a tiny PING gets wrapped as one chunk, uniformly, rather than
@@ -2000,10 +2003,10 @@ local function feedForeground(char, code)
   local job = jobs[foregroundJob]
   if not job or job.status ~= "running" then return false end
   deliverEvent(job, {"key_down", char, code})
-  if code == KEY_ENTER then
+  if code == KEYS.ENTER then
     consoleAppend(consolePartial)
     consolePartial, foregroundTyped = "", ""
-  elseif code == KEY_BACK then
+  elseif code == KEYS.BACK then
     local len = utf8.len(foregroundTyped)
     if len and len > 0 then
       local cut = utf8.offset(foregroundTyped, -1)
@@ -2026,7 +2029,7 @@ local function handleKeyDown(char, code)
   heldKeys[code] = true
   -- Ctrl+Alt+C was OpenOS's own interrupt shortcut; muxos has no OpenOS
   -- underneath, so it's reclaimed as the kernal's console interrupt.
-  if code == KEY_C and isControlDown() and isAltDown() then
+  if code == KEYS.C and isControlDown() and isAltDown() then
     -- Key repeat sends more key_downs while it's held; only the first
     -- one is a press.
     if not comboPressedAt then
@@ -2048,10 +2051,10 @@ local function handleKeyDown(char, code)
     queuedKeys[#queuedKeys + 1] = {char, code}
     return
   end
-  if code == KEY_ENTER then
+  if code == KEYS.ENTER then
     local line = inputBuffer
     inputBuffer = ""
-    consoleAppend("muxos> " .. line)
+    consoleAppend("muxos:" .. (shell and shell.cwd() or "/") .. "> " .. line)
     scrollOffset = 0
     commandBusy = true
     consoleDirty = true
@@ -2063,7 +2066,7 @@ local function handleKeyDown(char, code)
       local key = table.remove(queuedKeys, 1)
       handleKeyDown(key[1], key[2])
     end
-  elseif code == KEY_BACK then
+  elseif code == KEYS.BACK then
     local len = utf8.len(inputBuffer)
     if len and len > 0 then
       inputBuffer = inputBuffer:sub(1, utf8.offset(inputBuffer, -1) - 1)
@@ -2085,7 +2088,7 @@ end
 
 local function handleKeyUp(char, code)
   heldKeys[code] = nil
-  if code == KEY_C or not (isControlDown() and isAltDown()) then
+  if code == KEYS.C or not (isControlDown() and isAltDown()) then
     comboPressedAt = nil
   end
   local target = focusedProcess()
@@ -2312,7 +2315,7 @@ local function tick(timeout)
     elseif name == "modem_message" then
       handleModemMessage(a3, a4, a6)
     end
-    if comboPressedAt and not comboHoldFired and heldKeys[KEY_C] and isControlDown() and isAltDown()
+    if comboPressedAt and not comboHoldFired and heldKeys[KEYS.C] and isControlDown() and isAltDown()
         and computer.uptime() - comboPressedAt >= UI.CONSOLE_HOLD_SECONDS then
       comboHoldFired = true
       consoleInterrupt()
@@ -2679,6 +2682,59 @@ function updates.run()
     version, #staged, biosNote))
 end
 
+-- muxos's own console commands, by first word: inside a shell line
+-- (`nodes; ls`) these still reach runCommand, not the program path.
+do
+local KERNAL_COMMANDS = {}
+for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
+    .. "bus components call pause resume kill migrate drain undrain update reboot quit exit"):gmatch("%S+") do
+  KERNAL_COMMANDS[name] = true
+end
+-- A disk without shell.lua (upgraded by hand) still boots; `update`
+-- from the installer floppy brings it.
+local shellOk, shellFactory = pcall(loadSibling, "shell.lua")
+if not shellOk then print("no shell (" .. tostring(shellFactory) .. ") -- run `update` with the installer floppy in") end
+shell = shellOk and shellFactory({
+  invoke = tryInvoke, root = fsAddr, tmp = computer.tmpAddress(), list = component.list,
+  write = consoleWrite,
+  width = function() return (viewSize()) end,
+  clear = function()
+    for i = #consoleLines, 1, -1 do consoleLines[i] = nil end
+    scrollOffset, consoleDirty = 0, true
+  end,
+  sleep = function(seconds)
+    local deadline = computer.uptime() + seconds
+    while computer.uptime() < deadline do tick(deadline - computer.uptime()) end
+  end,
+  info = {version = MUXOS_VERSION, address = selfAddr or computer.address(), uptime = computer.uptime,
+    memory = function() return computer.freeMemory(), computer.totalMemory() end},
+  -- Not built in: a muxos command, or a program OpenOS-shell style (a
+  -- legacy program has its own window, as in gmux, so the console
+  -- doesn't wait for it; & runs any program in the background).
+  external = function(argv, background)
+    if KERNAL_COMMANDS[argv[1]] then
+      runCommand(table.concat(argv, " "))
+      return 0
+    end
+    local path = resolveProgram(argv[1])
+    if not path then
+      print("sh: " .. argv[1] .. ": command not found")
+      return 127
+    end
+    local id, addrOrErr = launchProgram(path, {table.unpack(argv, 2)})
+    if not id then
+      print("error: " .. addrOrErr)
+      return 1
+    elseif background or path:match("%.lua$") then
+      print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
+      return 0
+    end
+    runForeground(id)
+    return jobs[id] and jobs[id].status == "done" and 0 or 1
+  end,
+}) or nil
+end
+
 runCommand = function(line)
   if not line or line == "quit" or line == "exit" then
     shutdown(false)
@@ -2849,28 +2905,10 @@ runCommand = function(line)
         if err then print("error: " .. err) else print(serialize(result)) end
       end
     end
-  elseif line ~= "" then
-    -- Not a built-in: run it as a program, OpenOS-shell style. A
-    -- trailing "&" runs it in the background.
-    local words = {}
-    for word in line:gmatch("%S+") do words[#words + 1] = word end
-    local background = words[#words] == "&"
-    if background then table.remove(words) end
-    local path = words[1] and resolveProgram(words[1])
-    if not path then
-      print("unknown command")
-      return
-    end
-    local id, addrOrErr = launchProgram(path, {table.unpack(words, 2)})
-    if not id then
-      print("error: " .. addrOrErr)
-    elseif background or path:match("%.lua$") then
-      -- A legacy program has its own window (its terminal), as in
-      -- gmux, so the console doesn't wait for it.
-      print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
-    else
-      runForeground(id)
-    end
+  elseif line:match("%S") then
+    -- Everything else is a shell line: POSIX-style commands, pipes and
+    -- redirection, programs (kernal/shell.lua).
+    if shell then shell.run(line) else print("no shell -- run `update` with the installer floppy in") end
   end
 end
 
@@ -2888,6 +2926,7 @@ print("  focus <window id> -- moves keyboard focus (manual stand-in -- no mouse/
 print("  bitdemo <halfblock|braille> <x> <y> -- draws a test pattern as a bit window")
 print("  bus (every component in the cluster) | components <node> | call <node> <component addr> <method> [args table]")
 print("(<node> is either a [n] index from 'nodes' or a full node address)")
+if shell then print("shell: ls cd cat cp mv rm mkdir grep ... with | > >> < ; && || -- type 'help'") end
 desktop.refresh()
 discover(1)
 listNodes()

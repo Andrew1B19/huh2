@@ -395,7 +395,7 @@ do
   -- The floppy is still in: the installed system boots first.
   emu:boot(node)
   emu:advance(3)
-  assert(screenText():find("muxos> _", 1, true), "muxos booted from the hard disk:\n" .. screenText())
+  assert(screenText():find("muxos:/home> _", 1, true), "muxos booted from the hard disk:\n" .. screenText())
 end
 print("  OK")
 
@@ -609,12 +609,13 @@ do
     return table.concat(out)
   end
   local current = parsePayload(readFile(DATA))
-  -- An installed kernal, as the installer leaves it.
+  -- An installed kernal, as the installer leaves it -- but upgraded by
+  -- hand with only muxos.lua copied, so there's no shell.lua yet.
   local disk = {["/.muxos-version"] = "0.1.1\n"}
   local kernalBios
   for _, f in ipairs(current) do
     if f.path == "/eeprom/kernal.lua" then kernalBios = f.data
-    elseif not f.path:match("^/eeprom/") then disk[f.path] = f.data end
+    elseif not f.path:match("^/eeprom/") and f.path ~= "/shell.lua" then disk[f.path] = f.data end
   end
   -- The new version: one more program, and a changed kernal BIOS.
   local newBios = kernalBios .. "-- the next version\n"
@@ -650,7 +651,10 @@ do
   end
   emu:boot(node)
   emu:advance(3)
-  assert(text():find("muxos> _", 1, true), "muxos booted:\n" .. text())
+  assert(text():find("muxos:/> _", 1, true), "muxos booted without its shell:\n" .. text())
+  typeLine("ls")
+  assert(text():find("no shell -- run `update` with the installer floppy in", 1, true),
+    "without its shell it says how to get it:\n" .. text())
 
   -- A damaged data file changes nothing.
   local good = floppyFiles["/muxos-installer.dat"]
@@ -671,7 +675,9 @@ do
   assert(node.status == "dead", "reboot restarts the computer")
   emu:boot(node)
   emu:advance(3)
-  assert(text():find("muxos> _", 1, true), "the new version boots:\n" .. text())
+  assert(text():find("muxos:/home> _", 1, true), "the new version boots:\n" .. text())
+  typeLine("echo shell works > /home/after.txt")
+  assert(disk["/home/after.txt"] == "shell works\n", "update brought the shell")
 end
 print("  OK")
 

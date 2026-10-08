@@ -79,6 +79,8 @@ kernal/compositor.lua  the only file that touches the real gpu for window conten
                        registry, Z-order, occlusion culling, dirty tracking, a persistent
                        frame buffer, draw-code execution, blit-to-screen. Read off the boot
                        filesystem by muxos.lua's loadSibling(), not require()/dofile().
+kernal/shell.lua       the console's POSIX-style shell: ls, cd, cat, cp, grep, ... with pipes,
+                       redirection, variables and globs (see "The shell").
 kernal/bitmap.lua      half-block/braille pixel-grid encoder for "bit windows" -- OC's gpu
                        hardware has no pixel API, so this is sub-cell encoding on top of the
                        same character grid. Loaded by compositor.lua via loadSibling().
@@ -575,6 +577,39 @@ too. Keys, wheel and touch input go to the focused window's process
 (see docs/PROTOCOL.md's "Window focus and keyboard delivery" and
 "Window decorations"). Verified in `test/emu/integration_test.lua`
 (tests 14, 28, 32).
+
+### The shell
+
+The console is a POSIX-style shell (`kernal/shell.lua`), to a
+reasonable degree of `sh`. The prompt shows the working directory
+(`muxos:/home> `; home is `/home`).
+
+- **Syntax:** `'...'` and `"..."` quoting and `\` escapes; `$VAR`,
+  `${VAR}`, `$?`, `VAR=value`, `export`, `unset`; `~`; globs (`*`, `?`,
+  `[...]`) in any path component; `#` comments; pipes `|`; redirection
+  `>`, `>>`, `<`, `2>`, `2>>`, `2>&1` (and `/dev/null`); lists `;`, `&&`,
+  `||`; and `&` to run a program in the background.
+- **Built in, busybox-style:** `ls [-a -l -1]`, `cd`, `pwd`, `cat`, `echo
+  [-n]`, `printf`, `mkdir [-p]`, `rmdir`, `rm [-r -f]`, `cp [-r]`, `mv`,
+  `touch`, `head`/`tail [-n N]`, `wc [-l -w -c]`, `grep [-i -v -n -c -F]`,
+  `sort [-r -n -u]`, `uniq [-c]`, `tee [-a]`, `tr [-d]`, `cut`, `seq`,
+  `basename`, `dirname`, `which`, `type`, `test`/`[`, `true`, `false`,
+  `sleep`, `env`, `set`, `export`, `unset`, `date`, `uptime`, `uname`,
+  `hostname`, `whoami`, `df`, `du [-s]`, `free`, `clear`, `help`. They run
+  on the kernal itself against its disks, so they're instant and need no
+  workers.
+- **Disks:** `/` is the kernal's disk and `/tmp` its tmpfs. Every other
+  disk, the installer floppy included, is `/mnt/<first characters of its
+  address>`, as in OpenOS.
+- **Everything else** is a program on `$PATH` (`/bin`, `/usr/bin`: `.mxe`
+  or legacy `.lua`) or one of muxos's own commands (`nodes`, `run`,
+  `update`, ...), which mix into shell lines (`nodes; ls`). A program's
+  output goes to the console, so it can't be piped or redirected.
+- **Not done:** command substitution, here-documents, functions and
+  control flow (`if`, `for`, `while`). `grep` takes Lua patterns rather
+  than POSIX regular expressions (`grep -F` matches plain text).
+
+Tested in `test/emu/integration_test.lua`, test 41.
 
 muxos starts on a desktop, as gmux does: a background with a column of
 app icons at the top left -- the console, and every program in `/bin`
