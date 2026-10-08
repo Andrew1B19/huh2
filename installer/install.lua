@@ -1,7 +1,8 @@
 -- muxos installer. Runs two ways:
---   * booted bare by the kernal BIOS from a disk that has no muxos on it
---     yet -- a floppy with this file at its root, as /muxos-installer.lua
---     (no OpenOS anywhere): it draws its own console and reads the keyboard;
+--   * booted bare from the installer floppy -- by the floppy's /init.lua
+--     (installer/init.lua, which the stock Lua BIOS boots) or by the muxos
+--     kernal BIOS, which finds /muxos-installer.lua itself. No OpenOS
+--     anywhere: it draws its own console and reads the keyboard;
 --   * as a program on OpenOS:
 --       muxos-installer.lua                     menu
 --       muxos-installer.lua kernal [options]    install muxos on a disk and

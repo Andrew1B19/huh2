@@ -103,7 +103,9 @@ the same way a worker never has one.
 
 The kernal BIOS boots, in order: the disk the EEPROM remembers, any disk
 with `/muxos.lua`, then any disk with `/muxos-installer.lua` at its root.
-That last one is the installer floppy; the BIOS runs it as
+That last one is the installer floppy. (The floppy also has an
+`/init.lua`, so the stock Lua BIOS boots it the same way: an empty
+computer needs no muxos BIOS to start installing.) The BIOS runs it as
 `installer(diskAddress, path)` with no OpenOS. The installer detects that
 it's bare (no `require`), draws its own console on the GPU, reads its
 payload (`muxos-installer.dat`, next to it) through the floppy's

@@ -155,4 +155,55 @@ for _, start in ipairs({
 end
 print("  OK")
 
+-- The floppy boots on its own: an empty computer with nothing but the
+-- stock Lua BIOS (what every computer starts with) and the floppy.
+print("openos 5: the stock Lua BIOS boots the floppy into the installer, which installs muxos")
+do
+  local bare = emu:newNode("bare")
+  emu:addModem(bare)
+  local _, bareScreen, bareBufs = emu:addGpuScreen(bare, 80, 25)
+  local hdd = {}
+  local hddAddr = emu:addFilesystem(bare, hdd)
+  emu:addFilesystem(bare, {
+    ["/init.lua"] = readFile(REPO_ROOT .. "/dist/floppy/init.lua"),
+    ["/muxos-installer.lua"] = readFile(REPO_ROOT .. "/dist/muxos-installer.lua"),
+    ["/muxos-installer.dat"] = readFile(REPO_ROOT .. "/dist/muxos-installer.dat"),
+  })
+  local bareEeprom = emu:addEeprom(bare, readFile(assets .. "/lua/bios.lua"))
+  local function text()
+    local rows = {}
+    for y = 1, bareBufs[0].h do
+      local row, chars = bareBufs[0].cells[y] or {}, {}
+      for x = 1, bareBufs[0].w do chars[x] = (row[x] and row[x].char) or " " end
+      rows[#rows + 1] = table.concat(chars)
+    end
+    return table.concat(rows, "\n")
+  end
+  local function answer(line)
+    for i = 1, #line do
+      emu:injectSignal(bare, "key_down", bareScreen, line:byte(i), 0, "tester")
+      emu:step()
+    end
+    emu:injectSignal(bare, "key_down", bareScreen, 13, 0x1C, "tester")
+    emu:advance(1)
+  end
+  emu:boot(bare)
+  emu:advance(3)
+  if not text():find("muxos 0.1.2 installer (booted from", 1, true) then error("the floppy didn't boot:\n" .. text(), 0) end
+  answer("1")
+  answer("1")
+  answer("y")
+  emu:advance(5)
+  if not text():find("muxos 0.1.2 is installed.", 1, true) then error("it didn't install:\n" .. text(), 0) end
+  local em = bare.components[bareEeprom].methods
+  if em.get() ~= readFile(REPO_ROOT .. "/kernal/bios.lua") or em.getData() ~= hddAddr then
+    error("the kernal BIOS wasn't flashed over the stock one, pointing at the disk", 0)
+  end
+  answer("y")
+  emu:boot(bare)
+  emu:advance(3)
+  if not text():find("muxos> _", 1, true) then error("muxos didn't boot from the disk:\n" .. text(), 0) end
+end
+print("  OK")
+
 print("ALL OK")

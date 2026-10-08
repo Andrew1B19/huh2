@@ -2,6 +2,7 @@
 --
 --   lua5.3 tools/build.lua               dist/muxos-installer.lua (the program)
 --                                        + dist/muxos-installer.dat (its files)
+--                                        + dist/floppy/init.lua (boots it)
 --   lua5.3 tools/build.lua --out <file>  the same pair elsewhere (<file>.lua
 --                                        and, next to it, the .dat)
 --
@@ -93,8 +94,11 @@ local function build()
   if n ~= 1 then errors[#errors + 1] = "installer/install.lua has no VERSION line to fill in" end
   local ok, err = load(installer, "=installer/install.lua", "t")
   if not ok then errors[#errors + 1] = err end
+  local init = readFile("installer/init.lua")
+  ok, err = load(init, "=installer/init.lua", "t")
+  if not ok then errors[#errors + 1] = err end
   if #errors > 0 then return nil, table.concat(errors, "\n") end
-  return {version = version, installer = installer, contents = contents}
+  return {version = version, installer = installer, init = init, contents = contents}
 end
 
 -- The payload: every file the installer installs, in the data file next
@@ -121,6 +125,8 @@ while arg[i] do
   else io.stderr:write("unknown argument " .. arg[i] .. "\n") os.exit(2) end
 end
 local dat = out:gsub("%.lua$", "") .. ".dat"
+-- The floppy's /init.lua, so the stock Lua BIOS boots the installer.
+local initOut = (out:match("^(.*)/[^/]*$") or ".") .. "/floppy/init.lua"
 
 local b, err = build()
 if not b then
@@ -134,8 +140,9 @@ if sized ~= 1 then
   io.stderr:write("build failed:\ninstaller/install.lua has no DAT_SIZE line to fill in\n")
   os.exit(1)
 end
-os.execute('mkdir -p "' .. (out:match("^(.*)/[^/]*$") or ".") .. '"')
+os.execute('mkdir -p "' .. (out:match("^(.*)/[^/]*$") or ".") .. '/floppy"')
 writeFile(out, b.installer)
+writeFile(initOut, b.init)
 writeFile(dat, data)
-print(string.format("muxos %s: %s (%.1f KB) + %s (%d files, %.1f KB)", b.version, out, #b.installer / 1024,
-  dat, #FILES, #data / 1024))
+print(string.format("muxos %s: %s (%.1f KB) + %s (%d files, %.1f KB) + %s", b.version, out, #b.installer / 1024,
+  dat, #FILES, #data / 1024, initOut))
