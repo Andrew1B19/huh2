@@ -399,7 +399,7 @@ do
 end
 print("  OK")
 
-print("install 10: a kernal BIOS that can't boot shows why on the screen (and in the Analyzer)")
+print("install 10: a kernal BIOS that can't boot says why (screen, Analyzer, and a dump)")
 do
   local function crash(files)
     local node = emu:newNode("bare")
@@ -424,8 +424,10 @@ do
     error("no crash logged")
   end
   local why, screen = crash(nil)
-  assert(why:find("muxos: nothing to boot", 1, true) and why:find("Put the installer floppy", 1, true), why)
-  assert(screen:find("muxos: nothing to boot. Disks this computer can see, and their files:", 1, true),
+  assert(why:find("muxos: no system; looking for the installer floppy...", 1, true)
+    and why:find("Nothing to boot. Disks this computer can see, and their files:", 1, true)
+    and why:find("Put the installer floppy", 1, true), why)
+  assert(screen:find("Nothing to boot. Disks this computer can see, and their files:", 1, true),
     "shown on the screen:\n" .. screen)
   local files = {["/muxos-installer.lua"] = "this is not lua (", ["/notes.txt"] = "hi"}
   why, screen = crash(files)
@@ -439,11 +441,10 @@ do
   assert(screen:find('": muxos-installer.lua notes.txt', 1, true), "each disk's files are on the screen:\n" .. screen)
   assert(why:find("filesyst/muxos-installer.lua: ", 1, true), why)
   assert(screen:find("filesyst/muxos-installer.lua: ", 1, true), "the load error is on the screen:\n" .. screen)
-  files = {["/muxos-installer.lua"] = "error('broken on purpose')"}
-  why, screen = crash(files)
-  assert((files["/muxos-boot-dump.txt"] or ""):find("stack traceback", 1, true), "the installer's traceback is dumped")
-  assert(why:find("muxos installer stopped: /muxos-installer.lua:1: broken on purpose", 1, true), why)
-  assert(screen:find("muxos installer stopped: /muxos-installer.lua:1: broken on purpose", 1, true), "shown on the screen:\n" .. screen)
+  -- An installer that can't even start crashes the machine with its error
+  -- (OpenComputers' crash screen shows it); the BIOS doesn't wrap it.
+  why = crash({["/muxos-installer.lua"] = "error('broken on purpose')"})
+  assert(why:find("/muxos-installer.lua:1: broken on purpose", 1, true), why)
 end
 print("  OK")
 
@@ -462,7 +463,38 @@ do
 end
 print("  OK")
 
-print("install 12: the kernal BIOS waits for a floppy whose drive attaches just after power-on (a rack's)")
+print("install 12: the installer handles its own crash: error and traceback on its console, a dump on the floppy")
+do
+  local node = emu:newNode("bare")
+  local _, screen, bufs = emu:addGpuScreen(node, 100, 30)
+  local floppyFiles = {["/muxos-installer.lua"] = readFile(BUNDLE), ["/muxos-installer.dat"] = readFile(DATA)}
+  emu:addFilesystem(node, floppyFiles, "floppy", 512 * 1024)
+  local eeprom = emu:addEeprom(node, readFile(REPO_ROOT .. "/kernal/bios.lua"))
+  emu:boot(node)
+  emu:advance(2)
+  node.components[eeprom].methods.get = function() error("EEPROM on fire") end
+  emu:injectSignal(node, "key_down", screen, string.byte("2"), 0, "tester")
+  emu:step()
+  emu:injectSignal(node, "key_down", screen, 13, 0x1C, "tester")
+  emu:advance(2)
+  local rows = {}
+  for y = 1, bufs[0].h do
+    local row, chars = bufs[0].cells[y] or {}, {}
+    for x = 1, bufs[0].w do chars[x] = (row[x] and row[x].char) or " " end
+    rows[#rows + 1] = table.concat(chars)
+  end
+  local text = table.concat(rows, "\n")
+  assert(text:find("error: ", 1, true) and text:find("EEPROM on fire", 1, true) and text:find("stack traceback", 1, true)
+    and text:find("Dump: floppy%-%d*/muxos%-boot%-dump%.txt") and text:find("Press Enter to restart.", 1, true),
+    "the crash is on the installer's console:\n" .. text)
+  local dump = floppyFiles["/muxos-boot-dump.txt"] or ""
+  assert(dump:find("muxos installer crash dump (0.1.2)", 1, true) and dump:find("EEPROM on fire", 1, true)
+    and dump:find("stack traceback", 1, true) and dump:find("memory %d+/%d+")
+    and dump:find("filesystem \"[^\n]*: muxos%-installer%.dat muxos%-installer%.lua"), "the dump:\n" .. dump)
+end
+print("  OK")
+
+print("install 13: the kernal BIOS waits for a floppy whose drive attaches just after power-on (a rack's)")
 do
   local node = emu:newNode("bare")
   local _, _, bufs = emu:addGpuScreen(node, 80, 25)

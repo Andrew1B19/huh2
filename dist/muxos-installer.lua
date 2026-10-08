@@ -30,63 +30,23 @@
 -- untouched.
 
 local VERSION = "0.1.2" -- set by tools/build.lua
-local DAT_SIZE = 294655 -- the data file's exact size, set by tools/build.lua
+local DAT_SIZE = 294496 -- the data file's exact size, set by tools/build.lua
 local INIT_LUA = "-- The muxos installer floppy's boot file, installed as /init.lua at the\
 -- floppy's root next to muxos-installer.lua. Any BIOS that boots /init.lua\
 -- runs it -- the stock OpenComputers Lua BIOS every computer starts with\
 -- -- so an empty computer boots this floppy straight into the installer,\
 -- with no OpenOS and no muxos BIOS. (The muxos kernal BIOS finds\
 -- /muxos-installer.lua itself.) Installing flashes the kernal BIOS.\
--- Anything that goes wrong is shown on the screen and dumped to a file.\
+-- If it can't start the installer it stops with why; the installer\
+-- handles (and dumps) its own crashes.\
 local invoke, path = component.invoke, \"/muxos-installer.lua\"\
-local gpu, screen = component.list(\"gpu\")(), component.list(\"screen\")()\
--- On failure: the error on the screen, and a dump -- the error, the\
--- machine, every component and every disk's root listing -- written to\
--- /muxos-boot-dump.txt on this floppy (else any writable disk), for\
--- debugging. Then stop, with the error for the Analyzer.\
 local function call(a, m, ...)\
   local r = table.pack(pcall(invoke, a, m, ...))\
   if r[1] then return table.unpack(r, 2, r.n) end\
   return nil, r[2]\
 end\
-local function fail(text, disk)\
-  local shown = {text}\
-  local d = {\"muxos floppy init.lua boot dump\", text, \"\",\
-    \"uptime \" .. computer.uptime() .. \"  memory \" .. computer.freeMemory() .. \"/\" .. computer.totalMemory()\
-    .. \"  energy \" .. computer.energy() .. \"/\" .. computer.maxEnergy(),\
-    \"boot address \" .. tostring(computer.getBootAddress and computer.getBootAddress())}\
-  local tmp = computer.tmpAddress()\
-  for a, t in component.list() do\
-    local x = a .. \" \" .. t\
-    if t == \"filesystem\" then\
-      x = x .. \" \\\"\" .. tostring(call(a, \"getLabel\")) .. \"\\\" ro=\" .. tostring(call(a, \"isReadOnly\"))\
-        .. \" \" .. tostring(call(a, \"spaceUsed\")) .. \"/\" .. tostring(call(a, \"spaceTotal\")) .. \": \"\
-        .. table.concat(call(a, \"list\", \"/\") or {}, \" \")\
-      if not disk and a ~= tmp and not call(a, \"isReadOnly\") then disk = a end\
-    end\
-    d[#d + 1] = x\
-  end\
-  if disk and call(disk, \"isReadOnly\") then disk = nil end\
-  local h = disk and call(disk, \"open\", \"/muxos-boot-dump.txt\", \"w\")\
-  if h then\
-    call(disk, \"write\", h, table.concat(d, \"\\n\") .. \"\\n\")\
-    call(disk, \"close\", h)\
-    shown[#shown + 1] = \"Dump: \" .. disk:sub(1, 8) .. \"/muxos-boot-dump.txt\"\
-  end\
-  if gpu and screen then\
-    pcall(invoke, gpu, \"bind\", screen)\
-    local w, h = invoke(gpu, \"getResolution\")\
-    invoke(gpu, \"fill\", 1, 1, w, h, \" \")\
-    local y = 1\
-    for line in (table.concat(shown, \"\\n\") .. \"\\n\"):gmatch(\"([^\\n]*)\\n\") do\
-      while #line > 0 and y <= h do\
-        invoke(gpu, \"set\", 1, y, line:sub(1, w))\
-        line, y = line:sub(w + 1), y + 1\
-      end\
-    end\
-  end\
-  error(text, 0)\
-end\
+-- Stops with the error, which OpenComputers' crash screen shows.\
+local function fail(text) error(text, 0) end\
 -- Opened directly, like the stock BIOS does, rather than asking `exists`.\
 local function has(address)\
   local handle = call(address, \"open\", path)\
@@ -102,19 +62,18 @@ if not (address and has(address)) then\
 end\
 if not address then fail(\"muxos installer: \" .. path .. \" isn't on any disk -- copy it next to this init.lua\") end\
 local handle, why = call(address, \"open\", path)\
-if not handle then fail(\"muxos installer: can't open \" .. path .. \": \" .. tostring(why), address) end\
+if not handle then fail(\"muxos installer: can't open \" .. path .. \": \" .. tostring(why)) end\
 local chunks = {}\
 repeat\
   local data, why = call(address, \"read\", handle, math.maxinteger or math.huge)\
-  if not data and why then fail(\"muxos installer: reading \" .. path .. \" failed: \" .. tostring(why), address) end\
+  if not data and why then fail(\"muxos installer: reading \" .. path .. \" failed: \" .. tostring(why)) end\
   chunks[#chunks + 1] = data\
 until not data\
 call(address, \"close\", handle)\
 local installer, err = load(table.concat(chunks), \"=\" .. path)\
 chunks = nil\
-if not installer then fail(\"muxos installer didn't load: \" .. tostring(err), address) end\
-local ok, failure = xpcall(installer, debug.traceback, address, path)\
-if not ok then fail(\"muxos installer stopped: \" .. tostring(failure), address) end\
+if not installer then fail(\"muxos installer didn't load: \" .. tostring(err)) end\
+return installer(address, path)\
 " -- the floppy's /init.lua (installer/init.lua), set by tools/build.lua
 local CHUNK = 8192
 
@@ -906,10 +865,43 @@ local function main()
   return 0
 end
 
+-- A crash, booted bare: the error and traceback on the console, and a
+-- dump -- the error, the machine, every component and every disk's root
+-- listing -- written to /muxos-boot-dump.txt on the installer's disk
+-- (else any writable disk), for debugging.
+local function crashDump(err)
+  local function try(f, ...) local ok, a, b = pcall(f, ...) if ok then return a, b end end
+  local d = {"muxos installer crash dump (" .. VERSION .. ")", err, "",
+    "uptime " .. computer.uptime() .. "  memory " .. computer.freeMemory() .. "/" .. computer.totalMemory()
+    .. "  energy " .. computer.energy() .. "/" .. computer.maxEnergy()}
+  local tmp, disk = computer.tmpAddress and computer.tmpAddress()
+  if medium and not try(medium.fs.isReadOnly) then disk = medium.fs end
+  for address, kind in component.list() do
+    local line = address .. " " .. kind
+    if kind == "filesystem" then
+      local fs = component.proxy(address)
+      line = line .. ' "' .. tostring(try(fs.getLabel)) .. '" ro=' .. tostring(try(fs.isReadOnly)) .. " "
+        .. tostring(try(fs.spaceUsed)) .. "/" .. tostring(try(fs.spaceTotal)) .. ": "
+        .. table.concat(try(fs.list, "/") or {}, " ")
+      if not disk and address ~= tmp and try(fs.isReadOnly) == false then disk = fs end
+    end
+    d[#d + 1] = line
+  end
+  local handle = disk and try(disk.open, "/muxos-boot-dump.txt", "w")
+  if not handle then return nil end
+  try(disk.write, handle, table.concat(d, "\n") .. "\n")
+  try(disk.close, handle)
+  return disk.address:sub(1, 8) .. "/muxos-boot-dump.txt"
+end
+
 -- Booted bare there's nothing to return to: wait, then restart.
 if bare then
-  local ok, err = pcall(main)
-  if not ok then say("error: " .. tostring(err)) end
+  local ok, err = xpcall(main, debug.traceback)
+  if not ok then
+    say("error: " .. tostring(err))
+    local where = crashDump(tostring(err))
+    if where then say("Dump: " .. where) end
+  end
   ask("Press Enter to restart.")
   computer.shutdown(true)
 end

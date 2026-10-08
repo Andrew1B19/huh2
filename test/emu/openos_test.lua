@@ -267,27 +267,38 @@ do
 end
 print("  OK")
 
--- The floppy's /init.lua shows a failing installer on the screen.
-print("openos 5b: under the stock BIOS, an installer that fails says so on the screen and dumps to the floppy")
+-- Under the stock BIOS too, the installer handles its own crash: on its
+-- console, with a dump on the floppy.
+print("openos 5b: under the stock BIOS, an installer crash is on its console and dumped to the floppy")
 do
   local bare = emu:newNode("bare")
-  local _, _, bareBufs = emu:addGpuScreen(bare, 80, 25)
+  local _, bareScreen, bareBufs = emu:addGpuScreen(bare, 100, 30)
   local floppyFiles = {
     ["/init.lua"] = readFile(REPO_ROOT .. "/dist/floppy/init.lua"),
-    ["/muxos-installer.lua"] = "error('broken on purpose')",
+    ["/muxos-installer.lua"] = readFile(REPO_ROOT .. "/dist/muxos-installer.lua"),
+    ["/muxos-installer.dat"] = readFile(REPO_ROOT .. "/dist/muxos-installer.dat"),
   }
-  emu:addFilesystem(bare, floppyFiles)
-  emu:addEeprom(bare, readFile(assets .. "/lua/bios.lua"))
+  emu:addFilesystem(bare, floppyFiles, nil, 512 * 1024)
+  local bareEeprom = emu:addEeprom(bare, readFile(assets .. "/lua/bios.lua"))
   emu:boot(bare)
+  emu:advance(3)
+  bare.components[bareEeprom].methods.get = function() error("EEPROM on fire") end
+  emu:injectSignal(bare, "key_down", bareScreen, string.byte("2"), 0, "tester")
+  emu:step()
+  emu:injectSignal(bare, "key_down", bareScreen, 13, 0x1C, "tester")
   emu:advance(2)
-  local row, chars = bareBufs[0].cells[1] or {}, {}
-  for x = 1, 80 do chars[x] = (row[x] and row[x].char) or " " end
-  if bare.status ~= "dead" or not table.concat(chars):find("muxos installer stopped: /muxos-installer.lua:1: broken", 1, true) then
-    error("the failure isn't on the screen: " .. table.concat(chars), 0)
+  local rows = {}
+  for y = 1, bareBufs[0].h do
+    local row, chars = bareBufs[0].cells[y] or {}, {}
+    for x = 1, bareBufs[0].w do chars[x] = (row[x] and row[x].char) or " " end
+    rows[#rows + 1] = table.concat(chars)
+  end
+  local text = table.concat(rows, "\n")
+  if not (text:find("EEPROM on fire", 1, true) and text:find("Dump: ", 1, true)) then
+    error("the crash isn't on the console:\n" .. text, 0)
   end
   local dump = floppyFiles["/muxos-boot-dump.txt"] or ""
-  if not (dump:find("muxos floppy init.lua boot dump", 1, true) and dump:find("broken on purpose", 1, true)
-      and dump:find("stack traceback", 1, true) and dump:find("memory %d+/%d+")) then
+  if not (dump:find("muxos installer crash dump", 1, true) and dump:find("stack traceback", 1, true)) then
     error("no dump on the floppy:\n" .. dump, 0)
   end
 end

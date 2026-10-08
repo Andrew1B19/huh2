@@ -9,23 +9,19 @@ local list, tmp = component.list, computer.tmpAddress()
 local eeprom, gpu, screen = list("eeprom")(), list("gpu")(), list("screen")()
 if gpu and screen then call(gpu, "bind", screen) end
 
+-- Crude screen output: one line each, top down. The final error is
+-- shown by OpenComputers' own crash screen.
 local lines = {}
 local function say(text)
   lines[#lines + 1] = text
-  if gpu and screen then
-    local w, h = call(gpu, "getResolution")
-    if #lines == 1 then call(gpu, "fill", 1, 1, w, h, " ") end
-    if #lines > h then
-      call(gpu, "copy", 1, 2, w, h - 1, 0, -1)
-      call(gpu, "fill", 1, h, w, 1, " ")
-    end
-    call(gpu, "set", 1, math.min(#lines, h), text)
-  end
+  if gpu and screen then call(gpu, "set", 1, #lines, text) end
 end
+if gpu and screen then call(gpu, "fill", 1, 1, 160, 50, " ") end
 
 -- Failure: dump to a writable disk, stop.
-local function stop(text, floppy)
+local function stop(text)
   say(text)
+  local disk
   local d = {"muxos BIOS dump", table.concat(lines, "\n"), "",
     "uptime " .. computer.uptime() .. "  memory " .. computer.freeMemory() .. "/" .. computer.totalMemory()
     .. "  energy " .. computer.energy() .. "/" .. computer.maxEnergy(), "eeprom data " .. tostring(call(eeprom, "getData"))}
@@ -35,15 +31,15 @@ local function stop(text, floppy)
       x = x .. " \"" .. tostring(call(a, "getLabel")) .. "\" ro=" .. tostring(call(a, "isReadOnly"))
         .. " " .. tostring(call(a, "spaceUsed")) .. "/" .. tostring(call(a, "spaceTotal")) .. ": "
         .. table.concat(call(a, "list", "/") or {}, " ")
-      if not floppy and a ~= tmp and not call(a, "isReadOnly") then floppy = a end
+      if not disk and a ~= tmp and not call(a, "isReadOnly") then disk = a end
     end
     d[#d + 1] = x
   end
-  local h = floppy and call(floppy, "open", "/muxos-boot-dump.txt", "w")
+  local h = disk and call(disk, "open", "/muxos-boot-dump.txt", "w")
   if h then
-    call(floppy, "write", h, table.concat(d, "\n") .. "\n")
-    call(floppy, "close", h)
-    say("Dump: " .. floppy:sub(1, 8) .. "/muxos-boot-dump.txt")
+    call(disk, "write", h, table.concat(d, "\n") .. "\n")
+    call(disk, "close", h)
+    say("Dump: " .. disk:sub(1, 8) .. "/muxos-boot-dump.txt")
   end
   error(table.concat(lines, "\n"), 0)
 end
@@ -87,7 +83,9 @@ if init then
   return init()
 end
 
--- The installer, retried for 5 s: a rack's drive can attach late.
+-- The installer (it handles its own crashes), retried for 5 s: a rack's
+-- drive can attach late.
+say("muxos: no system; looking for the installer floppy...")
 local wait = computer.uptime() + 5
 repeat
   problems = {}
@@ -95,16 +93,13 @@ repeat
     local installer = try(a, "/muxos-installer.lua")
     if installer then
       computer.beep(800, 0.2)
-      local ok, err = xpcall(installer, debug.traceback, a, "/muxos-installer.lua")
-      if ok then return end
-      lines = {}
-      stop("muxos installer stopped: " .. tostring(err), not call(a, "isReadOnly") and a)
+      return installer(a, "/muxos-installer.lua")
     end
   end
   computer.pullSignal(1)
 until computer.uptime() > wait
 
-say("muxos: nothing to boot. Disks this computer can see, and their files:")
+say("Nothing to boot. Disks this computer can see, and their files:")
 for a in list("filesystem") do
   local names, why = call(a, "list", "/")
   say("  " .. a:sub(1, 8) .. (a == tmp and " (tmpfs)" or "") .. " \"" .. tostring(call(a, "getLabel") or "")
