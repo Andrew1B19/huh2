@@ -150,7 +150,11 @@ Every `.mxe` sees these globals, read-only. Its own globals are its own.
 - `gmuxapi`, the gmux application API, muxos-shaped:
   - **processes:** `get_processes()`, `get_process(id)`,
     `create_headless_process{code, name, orphan_policy, args, node}`,
-    `create_graphics_process{...}`, `get_orphans(name)`,
+    `create_graphics_process{...}` (like the headless one, plus a
+    window the child owns: in the child, `gpu` is a virtual gpu drawing
+    into it, sized `width` x `height`, and keys typed into it reach the
+    child's `pull_event`; returns `{process, window}`; test 48),
+    `get_orphans(name)`,
     `launch(nameOrPath, args)`, `pause_process(id)`,
     `resume_process(id)`, `kill_process(id)` (own descendants only);
   - **windows:** `create_window{title, x, y, width, height, code |

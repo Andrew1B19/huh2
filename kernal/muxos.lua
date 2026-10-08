@@ -673,7 +673,7 @@ local awaiting = {}
 -- SPAWN carrying an explicit `parent` (its own job id, which
 -- node/runtime.lua now exposes to running job code as the global
 -- `jobId`) sets these.
-local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy, program)
+local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy, program, window)
   if targetAddr then
     if not nodes[targetAddr] then return nil, "unknown node: " .. tostring(targetAddr) end
     if nodes[targetAddr].down then return nil, "node is down: " .. targetAddr end
@@ -711,7 +711,10 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
   if parent and jobs[id].orphanPolicy == "orphan" then
     registerOrphanCandidate(appName, id)
   end
-  send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args, program = program})
+  -- `window`: a graphics process's own window, which it draws into.
+  if window then window.ownerJobId = id end
+  send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args, program = program,
+    windowId = window and window.id, width = window and window.width, height = window and window.height})
   return id, targetAddr
 end
 
@@ -1650,12 +1653,31 @@ local function handleSpawn(msg)
       return
     end
   end
-  local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node, msg.parent, msg.appName, msg.orphanPolicy)
+  -- create_graphics_process: the window first, so its id goes with the
+  -- job; the job becomes its owner.
+  local window
+  if type(msg.graphics) == "table" then
+    local g = msg.graphics
+    local err
+    window, err = compositor.createWindow({title = tostring(g.title or "graphics"), x = g.x, y = g.y,
+      width = tonumber(g.width) or 40, height = tonumber(g.height) or 12,
+      resizable = g.resizable, decorated = g.decorated,
+      code = "gpu.setBackground(0x000000) gpu.fill(1, 1, " .. (tonumber(g.width) or 40) .. ", "
+        .. (tonumber(g.height) or 12) .. ", ' ')"})
+    if not window then
+      send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
+      return
+    end
+  end
+  local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node, msg.parent, msg.appName, msg.orphanPolicy,
+    nil, window)
   if not jobId then
+    if window then compositor.close(window.id) end
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = targetAddr})
     return
   end
-  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {id = jobId, node = targetAddr}})
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id,
+    result = {id = jobId, node = targetAddr, window = window and compositor.describe(window)}})
 end
 
 -- gmuxapi.get_orphans(name): hands back the still-unclaimed orphan

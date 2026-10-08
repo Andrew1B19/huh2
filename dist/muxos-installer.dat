@@ -2,11 +2,11 @@
 @@MANIFEST 25
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-132239 /muxos.lua
+133308 /muxos.lua
 38633 /compositor.lua
 42021 /shell.lua
 6492 /bitmap.lua
-104267 /runtime.lua
+104635 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 2088 /lib/bit32.lua
 4513 /lib/buffer.lua
@@ -219,7 +219,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 132239 /muxos.lua
+@@ 133308 /muxos.lua
 -- muxos kernal "init" for huh2. This REPLACES OpenOS on the kernal --
 -- it is the entire resident environment, not a program that runs under
 -- one. kernal/bios.lua (this node's own tiny EEPROM image, mirroring
@@ -895,7 +895,7 @@ local awaiting = {}
 -- SPAWN carrying an explicit `parent` (its own job id, which
 -- node/runtime.lua now exposes to running job code as the global
 -- `jobId`) sets these.
-local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy, program)
+local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy, program, window)
   if targetAddr then
     if not nodes[targetAddr] then return nil, "unknown node: " .. tostring(targetAddr) end
     if nodes[targetAddr].down then return nil, "node is down: " .. targetAddr end
@@ -933,7 +933,10 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
   if parent and jobs[id].orphanPolicy == "orphan" then
     registerOrphanCandidate(appName, id)
   end
-  send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args, program = program})
+  -- `window`: a graphics process's own window, which it draws into.
+  if window then window.ownerJobId = id end
+  send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args, program = program,
+    windowId = window and window.id, width = window and window.width, height = window and window.height})
   return id, targetAddr
 end
 
@@ -1872,12 +1875,31 @@ local function handleSpawn(msg)
       return
     end
   end
-  local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node, msg.parent, msg.appName, msg.orphanPolicy)
+  -- create_graphics_process: the window first, so its id goes with the
+  -- job; the job becomes its owner.
+  local window
+  if type(msg.graphics) == "table" then
+    local g = msg.graphics
+    local err
+    window, err = compositor.createWindow({title = tostring(g.title or "graphics"), x = g.x, y = g.y,
+      width = tonumber(g.width) or 40, height = tonumber(g.height) or 12,
+      resizable = g.resizable, decorated = g.decorated,
+      code = "gpu.setBackground(0x000000) gpu.fill(1, 1, " .. (tonumber(g.width) or 40) .. ", "
+        .. (tonumber(g.height) or 12) .. ", ' ')"})
+    if not window then
+      send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
+      return
+    end
+  end
+  local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node, msg.parent, msg.appName, msg.orphanPolicy,
+    nil, window)
   if not jobId then
+    if window then compositor.close(window.id) end
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = targetAddr})
     return
   end
-  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {id = jobId, node = targetAddr}})
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id,
+    result = {id = jobId, node = targetAddr, window = window and compositor.describe(window)}})
 end
 
 -- gmuxapi.get_orphans(name): hands back the still-unclaimed orphan
@@ -5819,7 +5841,7 @@ end
 
 return M
 
-@@ 104267 /runtime.lua
+@@ 104635 /runtime.lua
 -- Worker runtime for huh2. NOT flashed anywhere -- this lives on the
 -- KERNAL's filesystem (as a sibling file of kernal/muxos.lua) and gets
 -- served, as plain source text, to each worker over the modem at boot
@@ -6557,30 +6579,24 @@ gmuxapi = {
   -- job and creates a window of the requested size, but the job's own
   -- `gpu` face still targets the kernal's PRIMARY screen directly, not
   -- this window's buffer. Flagged, not silently pretended to work.
+  -- Like create_headless_process, plus a window the child owns and draws
+  -- into: in the child, `gpu` is a virtual gpu (OpenComputers' gpu API)
+  -- whose drawing lands in that window -- its size options.width x
+  -- options.height (default 40x12) -- and keys typed while the window
+  -- has focus reach the child's pull_event. The kernal makes the window
+  -- with the child, so it exists before the child's first draw.
   create_graphics_process = function(options)
     options = options or {}
     if not options.code then
       return nil, "create_graphics_process needs options.code (a Lua source string)"
     end
+    local width, height = tonumber(options.width) or 40, tonumber(options.height) or 12
     local proc, procErr = remoteRequest("SPAWN", {code = options.code, args = options.args, node = options.node,
-      parent = currentJobId, appName = options.name, orphanPolicy = options.orphan_policy})
+      parent = currentJobId, appName = options.name, orphanPolicy = options.orphan_policy,
+      graphics = {title = options.title or options.name or "graphics", x = options.x, y = options.y,
+        width = width, height = height, resizable = options.resizable, decorated = options.title_bar}})
     if not proc then return nil, procErr end
-    -- `ownerJobId = proc.id` links this window to the job it was just
-    -- created FOR, not to whichever node happened to make this
-    -- CREATEWINDOW request (this call itself can run on a totally
-    -- different node than the child it just spawned). This is the one
-    -- piece of scaffolding focus-based keyboard delivery actually
-    -- needs from this call: given a focused window, the kernal can
-    -- look up its ownerJobId and, from there, jobs[ownerJobId].node --
-    -- no separate bookkeeping required. See kernal/compositor.lua's
-    -- M.setFocus/M.getFocus for the tracking side of this.
-    local win, winErr = remoteRequest("CREATEWINDOW", {
-      title = options.name, x = options.x, y = options.y, width = options.width, height = options.height,
-      resizable = options.resizable, decorated = options.title_bar, ownerJobId = proc.id,
-      caller = currentJobId,
-    })
-    if not win then return {process = proc}, winErr end
-    return {process = proc, window = win}
+    return {process = {id = proc.id, node = proc.node}, window = proc.window}
   end,
 
   -- Also stands in for gmux's separate create_window_buffer: gmux draws
@@ -8441,7 +8457,17 @@ local function spawnProc(msg)
       end
     end
   else
-    chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t", newProcessEnv(msg.id))
+    local env = newProcessEnv(msg.id)
+    if msg.windowId then
+      -- A graphics process (create_graphics_process): its `gpu` draws
+      -- into its own window -- a virtual gpu, as a legacy program has.
+      local ctx = {id = msg.id, name = "graphics", windowId = msg.windowId,
+        screenSize = {tonumber(msg.width) or 40, (tonumber(msg.height) or 12) + 1}}
+      ctx.vgpu = newVirtualGpu(ctx, tonumber(msg.width) or 40, tonumber(msg.height) or 12)
+      graphicsFlushers[msg.id] = function(force) flushVirtualGpu(ctx, force) end
+      rawset(env, "gpu", ctx.vgpu.proxy)
+    end
+    chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t", env)
     entry = chunk
   end
   if not chunk then

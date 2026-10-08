@@ -1745,4 +1745,39 @@ print("L47 done")
 end
 print("  OK -- shell, process, thread, tty, buffer, uuid and note work for legacy programs")
 
+print("test 48: create_graphics_process -- the child's gpu draws into its own window, and gets its keys")
+do
+  kernalFiles["/bin/gfx48.mxe"] = [==[
+local child = [[
+gpu.setBackground(0x0000FF)
+gpu.setForeground(0xFFFFFF)
+local w, h = gpu.getResolution()
+gpu.fill(1, 1, w, h, " ")
+gpu.set(2, 1, "GFX48 " .. w .. "x" .. h)
+local e
+repeat e = gmuxapi.pull_event(20) until not e or e[1] == "key_down"
+gpu.set(2, 2, "key=" .. (e and string.char(e[2]) or "none"))
+sleep(5)
+]]
+local r = assert(gmuxapi.create_graphics_process({code = child, title = "gfx48", x = 5, y = 4, width = 20, height = 3}))
+print("G48 window=" .. tostring(r.window and r.window.id) .. " owner=" .. tostring(r.window and r.window.ownerJobId == r.process.id))
+]==]
+  typeLine("gfx48")
+  emu:advance(3)
+  assertScreenContains("G48 window=", "create_graphics_process returns the window")
+  assertScreenContains("owner=true", "...owned by the child")
+  assertScreenContains("GFX48 20x3", "the child's gpu drew into its window, at the window's size")
+  local gx = renderScreen():gsub("\n", ""):find("GFX48", 1, true)
+  local row = screenBuffers[0].cells[5] or {}
+  local blue = 0
+  for x = 5, 24 do if row[x] and row[x].bg == 0x0000FF then blue = blue + 1 end end
+  assert(blue >= 18, "the child's background color is in its window (" .. blue .. " cells)")
+  touch("touch", 10, 6)
+  emu:injectSignal(kernal, "key_down", screenAddr, string.byte("k"), 0x25, "tester")
+  emu:advance(2)
+  assertScreenContains("key=k", "keys typed into the window reach the child")
+  touch("touch", 5, 25)
+end
+print("  OK -- a graphics process draws into its own window with its gpu, and receives its keys")
+
 print("ALL OK")

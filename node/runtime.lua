@@ -735,30 +735,24 @@ gmuxapi = {
   -- job and creates a window of the requested size, but the job's own
   -- `gpu` face still targets the kernal's PRIMARY screen directly, not
   -- this window's buffer. Flagged, not silently pretended to work.
+  -- Like create_headless_process, plus a window the child owns and draws
+  -- into: in the child, `gpu` is a virtual gpu (OpenComputers' gpu API)
+  -- whose drawing lands in that window -- its size options.width x
+  -- options.height (default 40x12) -- and keys typed while the window
+  -- has focus reach the child's pull_event. The kernal makes the window
+  -- with the child, so it exists before the child's first draw.
   create_graphics_process = function(options)
     options = options or {}
     if not options.code then
       return nil, "create_graphics_process needs options.code (a Lua source string)"
     end
+    local width, height = tonumber(options.width) or 40, tonumber(options.height) or 12
     local proc, procErr = remoteRequest("SPAWN", {code = options.code, args = options.args, node = options.node,
-      parent = currentJobId, appName = options.name, orphanPolicy = options.orphan_policy})
+      parent = currentJobId, appName = options.name, orphanPolicy = options.orphan_policy,
+      graphics = {title = options.title or options.name or "graphics", x = options.x, y = options.y,
+        width = width, height = height, resizable = options.resizable, decorated = options.title_bar}})
     if not proc then return nil, procErr end
-    -- `ownerJobId = proc.id` links this window to the job it was just
-    -- created FOR, not to whichever node happened to make this
-    -- CREATEWINDOW request (this call itself can run on a totally
-    -- different node than the child it just spawned). This is the one
-    -- piece of scaffolding focus-based keyboard delivery actually
-    -- needs from this call: given a focused window, the kernal can
-    -- look up its ownerJobId and, from there, jobs[ownerJobId].node --
-    -- no separate bookkeeping required. See kernal/compositor.lua's
-    -- M.setFocus/M.getFocus for the tracking side of this.
-    local win, winErr = remoteRequest("CREATEWINDOW", {
-      title = options.name, x = options.x, y = options.y, width = options.width, height = options.height,
-      resizable = options.resizable, decorated = options.title_bar, ownerJobId = proc.id,
-      caller = currentJobId,
-    })
-    if not win then return {process = proc}, winErr end
-    return {process = proc, window = win}
+    return {process = {id = proc.id, node = proc.node}, window = proc.window}
   end,
 
   -- Also stands in for gmux's separate create_window_buffer: gmux draws
@@ -2619,7 +2613,17 @@ local function spawnProc(msg)
       end
     end
   else
-    chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t", newProcessEnv(msg.id))
+    local env = newProcessEnv(msg.id)
+    if msg.windowId then
+      -- A graphics process (create_graphics_process): its `gpu` draws
+      -- into its own window -- a virtual gpu, as a legacy program has.
+      local ctx = {id = msg.id, name = "graphics", windowId = msg.windowId,
+        screenSize = {tonumber(msg.width) or 40, (tonumber(msg.height) or 12) + 1}}
+      ctx.vgpu = newVirtualGpu(ctx, tonumber(msg.width) or 40, tonumber(msg.height) or 12)
+      graphicsFlushers[msg.id] = function(force) flushVirtualGpu(ctx, force) end
+      rawset(env, "gpu", ctx.vgpu.proxy)
+    end
+    chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t", env)
     entry = chunk
   end
   if not chunk then

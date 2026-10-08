@@ -536,9 +536,6 @@ against the code (not just this document):
 - **OpenOS's `vt100`** escape-sequence library and `pipe` for legacy
   programs (`shell`, `process`, `thread`, `tty`, `buffer`, `uuid` and
   `note` are built).
-- **`create_graphics_process` for `.mxe`:** it creates the child and a
-  window, but the child's `gpu` isn't wired to that window (legacy
-  programs do get their own virtual gpu drawn into their window).
 - **A desktop wallpaper** (a bit-window background); the desktop is a
   plain color.
 - **The console's line editor:** no history, no cursor movement within
