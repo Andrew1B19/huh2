@@ -215,16 +215,27 @@ print("  OK")
 print("install 5b: a kernal BIOS EEPROM, for an empty computer to boot the installer floppy with")
 do
   local spare = emu:newNode("spare")
-  local spareEeprom = emu:addEeprom(spare, "-- blank")
+  local spareEeprom = emu:addEeprom(spare, "") -- as crafted: empty
   local function eepromOf(asProxy)
     if not asProxy then return spareEeprom end
     local p = {address = spareEeprom, type = "eeprom"}
     for name, fn in pairs(spare.components[spareEeprom].methods) do p[name] = fn end
     return p
   end
-  local code, out = runInstaller(BUNDLE, openosFor(kernal, medium, eepromOf), {"y", "q"}, "bios")
+  local os_ = openosFor(kernal, medium, eepromOf)
+  local code, out = runInstaller(BUNDLE, os_, {"q"}, "check")
+  assert(code == 0 and out:find("blank -- nothing on it", 1, true), "check calls a new EEPROM blank:\n" .. out)
+  -- Enter alone flashes: you put the EEPROM in to flash it.
+  code, out = runInstaller(BUNDLE, os_, {"", "q"}, "bios")
   assert(code == 0 and out:find("1 kernal EEPROM(s) flashed.", 1, true), "kernal BIOS flashing:\n" .. out)
+  assert(out:find("now holds blank", 1, true) and out:find("the muxos kernal BIOS, this version", 1, true)
+    and out:find("checked byte for byte", 1, true), "it says what the EEPROM held before and after:\n" .. out)
   assert(spare.components[spareEeprom].methods.get() == readFile(REPO_ROOT .. "/kernal/bios.lua"), "it holds the kernal BIOS")
+  code, out = runInstaller(BUNDLE, os_, {"q"}, "check")
+  assert(out:find("the muxos kernal BIOS, this version", 1, true), "check recognizes it:\n" .. out)
+  code, out = runInstaller(BUNDLE, os_, {"n", "q"}, "worker")
+  assert(out:find("Skipped -- not flashed.", 1, true) and out:find("0 worker EEPROM(s) flashed.", 1, true),
+    "answering no says so:\n" .. out)
 end
 print("  OK")
 

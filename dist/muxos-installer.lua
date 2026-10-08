@@ -11,6 +11,7 @@
 --       muxos-installer.lua bios [options]      flash kernal BIOS EEPROMs, for
 --                                               computers that will boot this
 --                                               installer from a floppy
+--       muxos-installer.lua check               say which BIOS an EEPROM holds
 --     Options: --disk=<address prefix or label> (kernal target), --yes
 --     (don't ask; take the only disk), --count=<n> (worker: flash n
 --     EEPROMs), --reboot (kernal: reboot when done).
@@ -129,9 +130,12 @@ else
   end
 end
 
-local function confirm(prompt)
+-- `defaultYes`: Enter alone means yes (for steps you're plainly there
+-- to do, like flashing the EEPROM you just put in).
+local function confirm(prompt, defaultYes)
   if assumeYes then return true end
-  local a = (ask(prompt .. " [y/N] ") or ""):lower()
+  local a = (ask(prompt .. (defaultYes and " [Y/n] " or " [y/N] ")) or ""):lower()
+  if a == "" then return defaultYes == true end
   return a == "y" or a == "yes"
 end
 
@@ -290,19 +294,6 @@ local function findPayload()
   payload = floppyPayload(medium.fs, (medium.path:match("^(.*)/[^/]*$")))
   if payload then return payload end
   return nil, "no files to install next to " .. medium.path
-end
-
--- Reads one (small) file of the payload whole.
-local function readPayloadFile(payload, wanted)
-  local found
-  payload.each(function(path, _, read)
-    if path == wanted then
-      local parts = {}
-      for data in read, CHUNK do parts[#parts + 1] = data end
-      found = table.concat(parts)
-    end
-  end)
-  return found
 end
 
 -- --- EEPROM ---
@@ -486,8 +477,52 @@ local BIOSES = {
   kernal = {path = "/eeprom/kernal.lua", label = "muxos kernal", name = "kernal"},
 }
 
+-- Both BIOS images from the payload, in one pass.
+local function readBioses(payload)
+  local images = {}
+  payload.each(function(path, _, read)
+    for _, bios in pairs(BIOSES) do
+      if path == bios.path then
+        local parts = {}
+        for data in read, CHUNK do parts[#parts + 1] = data end
+        images[bios.name] = table.concat(parts)
+      end
+    end
+  end)
+  return images
+end
+
+-- What an EEPROM holds, in words.
+local function describeEeprom(eeprom, images)
+  local code = eeprom.get() or ""
+  local label = eeprom.getLabel and eeprom.getLabel() or ""
+  if code == "" then return "blank -- nothing on it (a computer says \"no bios found\")" end
+  for name, image in pairs(images) do
+    if code == image then return "the muxos " .. name .. " BIOS, this version (" .. #code .. " bytes)" end
+  end
+  if label:match("^muxos ") then
+    return "a " .. label .. " BIOS from a different muxos version (" .. #code .. " bytes) -- reflash it"
+  end
+  return "something else: \"" .. label .. "\", " .. #code .. " bytes"
+end
+
+-- Identifies the EEPROM in this computer, and the next ones swapped in.
+local function checkEeproms(payload)
+  local images = readBioses(payload)
+  while true do
+    local eeprom = currentEeprom()
+    say(eeprom and ("EEPROM " .. eeprom.address:sub(1, 8) .. ": " .. describeEeprom(eeprom, images))
+      or "No EEPROM in this computer.")
+    if assumeYes then break end
+    local answer = ask("Swap in another EEPROM and press Enter, or q to finish: ")
+    if not answer or answer:lower() == "q" then break end
+  end
+  return true
+end
+
 local function flashEeproms(payload, bios)
-  local code = readPayloadFile(payload, bios.path)
+  local images = readBioses(payload)
+  local code = images[bios.name]
   if not code then return nil, "the " .. bios.name .. " BIOS is missing from the installer" end
   say("Flashes the muxos " .. bios.name .. " BIOS (" .. #code .. " bytes) onto EEPROMs, one after another:")
   say("put an EEPROM in this computer, flash it, swap in the next.")
@@ -501,13 +536,19 @@ local function flashEeproms(payload, bios)
       say("No EEPROM in this computer.")
     elseif eeprom.address == last then
       say("That's the EEPROM that was just flashed -- swap in the next one.")
-    elseif confirm("Flash EEPROM " .. eeprom.address:sub(1, 8) .. " as a muxos " .. bios.name .. "?") then
-      local addr, err = flash(code, bios.label, "")
-      if addr then
-        count, last = count + 1, addr
-        say("Flashed " .. bios.name .. " EEPROM " .. count .. " (" .. addr:sub(1, 8) .. ").")
+    else
+      say("EEPROM " .. eeprom.address:sub(1, 8) .. " now holds " .. describeEeprom(eeprom, images) .. ".")
+      if confirm("Flash it as a muxos " .. bios.name .. "?", true) then
+        local addr, err = flash(code, bios.label, "")
+        if addr then
+          count, last = count + 1, addr
+          say("Flashed " .. bios.name .. " EEPROM " .. count .. " (" .. addr:sub(1, 8) .. "): "
+            .. describeEeprom(eeprom, images) .. ", checked byte for byte.")
+        else
+          say("Couldn't flash it: " .. err)
+        end
       else
-        say("Couldn't flash it: " .. err)
+        say("Skipped -- not flashed.")
       end
     end
     if want and count >= want then break end
@@ -533,9 +574,10 @@ local function main()
     say("  1) install the kernal on this computer")
     say("  2) flash worker EEPROMs")
     say("  3) flash kernal BIOS EEPROMs (for computers that will boot this installer)")
-    say("  4) quit")
+    say("  4) check which BIOS an EEPROM holds")
+    say("  5) quit")
     local pick = ask("> ")
-    mode = ({["1"] = "kernal", ["2"] = "worker", ["3"] = "bios"})[pick or ""]
+    mode = ({["1"] = "kernal", ["2"] = "worker", ["3"] = "bios", ["4"] = "check"})[pick or ""]
     if not mode then return 0 end
   end
   local ok, failure
@@ -550,8 +592,10 @@ local function main()
     ok, failure = flashEeproms(payload, BIOSES.worker)
   elseif mode == "bios" then
     ok, failure = flashEeproms(payload, BIOSES.kernal)
+  elseif mode == "check" then
+    ok, failure = checkEeproms(payload)
   else
-    say("usage: muxos-installer.lua [kernal|worker|bios] [--disk=<address|label>] [--yes] [--count=<n>] [--reboot]")
+    say("usage: muxos-installer.lua [kernal|worker|bios|check] [--disk=<address|label>] [--yes] [--count=<n>] [--reboot]")
     return 1
   end
   if not ok then

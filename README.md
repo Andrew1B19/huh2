@@ -220,6 +220,35 @@ worker versions and wire code match. `lua5.3 test/emu/install_test.lua`
 runs the built installer against emulated hardware, including booting
 an empty computer from the installer floppy, and boots the result.
 
+### Troubleshooting
+
+Workers have no screen, so a worker can only tell you things by beeping.
+A worker that's working is **silent**: it waits for the kernal, asking
+every 5 seconds.
+
+| Sound / light | Meaning |
+|---|---|
+| Worker: one low, long beep, then nothing | Its BIOS ran, but it has no network card. |
+| Worker: one short high beep | It got the runtime from the kernal, but couldn't load it. |
+| **Two beeps and a flashing red light** (any computer) | OpenComputers itself: the machine crashed. Shift-right-click the case with an **Analyzer** to read the error. |
+| Kernal: one short high beep | Normal: muxos is starting. |
+| Kernal: one short medium beep | Normal: no muxos installed, so it's starting the installer floppy. |
+
+Errors the Analyzer can show:
+
+- **"no bios found; install a configured EEPROM"**: that computer's
+  EEPROM is empty (or missing). It was never flashed. Run the installer's
+  **check** mode (`muxos-installer.lua check`, or menu option 4) with
+  the EEPROM in an OpenOS computer. It says whether the EEPROM is blank,
+  holds this version's muxos worker or kernal BIOS, or holds something
+  else. Re-flash it with `worker` or `bios`. When flashing, just pressing
+  Enter means yes. The installer re-reads every EEPROM it writes and only
+  says "Flashed" if every byte matches.
+- **"failed loading bios: ..."**: the EEPROM holds code that doesn't
+  compile; re-flash it.
+- **"not enough memory"**: add RAM (two tier 3 sticks is comfortable for
+  a worker, which compiles a roughly 90 KB runtime when it boots).
+
 ### Installing by hand
 
 - Flash `node/bios.lua` onto each worker's EEPROM and `kernal/bios.lua`
