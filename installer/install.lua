@@ -16,11 +16,12 @@
 --     (don't ask; take the only disk), --count=<n> (worker: flash n
 --     EEPROMs), --reboot (kernal: reboot when done).
 --
--- tools/build.lua makes two forms of this file: dist/muxos-installer.lua,
--- with every file it installs carried in a comment at its end (one file
--- to wget, copy or opm onto a floppy), and a floppy layout, install.lua
--- next to a files/ directory. Either way the files are streamed from
--- where they are, never all held in memory. On the target disk each file
+-- tools/build.lua makes this program (dist/muxos-installer.lua) and its
+-- data file (dist/muxos-installer.dat, every file it installs). The two
+-- go side by side, e.g. at a floppy's root. The program is small so it
+-- starts fast -- loading runs at floppy speed -- and the data file is
+-- streamed as needed, never all held in memory: the BIOS images come
+-- first, so flashing EEPROMs reads only those. On the target disk each file
 -- is first written as <name>.new and only swapped in once all of them are
 -- written, so a disk that fills up mid-install leaves the old system
 -- untouched.
@@ -209,7 +210,7 @@ end
 
 -- A payload: `files`, a list of {path, size}, and each(fn), calling
 -- fn(path, size, read) for every file in order, where read(n) returns up
--- to n more bytes of it (nil at its end).
+-- to n more bytes of it (nil at its end). fn returning true stops there.
 local function bundledPayload(fs, path)
   local f = openReader(fs, path)
   if not f then return nil end
@@ -219,7 +220,7 @@ local function bundledPayload(fs, path)
     if line:match("^%-%-%[=*%[MUXOS%-PAYLOAD") then
       if line:sub(-1) == "\r" then
         f.close()
-        return nil, "this installer's line endings were converted to CRLF, which breaks it -- "
+        return nil, "the installer's data file had its line endings converted to CRLF, which breaks it -- "
           .. "download it again as-is (raw, not through a converting checkout)"
       end
       break
@@ -254,7 +255,7 @@ local function bundledPayload(fs, path)
         remaining = remaining - #data
         return data
       end
-      fn(name, size, read)
+      if fn(name, size, read) then break end
       while remaining > 0 do read(CHUNK) end
       g.bytes(1) -- the newline after each file
     end
@@ -263,37 +264,15 @@ local function bundledPayload(fs, path)
   return payload
 end
 
-local function floppyPayload(fs, dir)
-  local m = openReader(fs, dir .. "/files/MANIFEST")
-  if not m then return nil end
-  local files = {}
-  for line in m.line do
-    local size, name = line:match("^(%d+) (.+)$")
-    if size then files[#files + 1] = {path = name, size = tonumber(size)} end
-  end
-  m.close()
-  local payload = {files = files}
-  function payload.each(fn)
-    for _, file in ipairs(files) do
-      local g = openReader(fs, dir .. "/files" .. file.path)
-      if not g then error("missing from the installer: " .. file.path, 0) end
-      fn(file.path, file.size, g.bytes)
-      g.close()
-    end
-  end
-  return payload
-end
-
 local medium, mediumErr = findMedium()
 
+-- The files to install are in muxos-installer.dat, next to this program.
 local function findPayload()
   if not medium then return nil, mediumErr end
-  local payload, err = bundledPayload(medium.fs, medium.path)
+  local dat = medium.path:gsub("%.lua$", "") .. ".dat"
+  local payload, err = bundledPayload(medium.fs, dat)
   if payload then return payload end
-  if err then return nil, err end
-  payload = floppyPayload(medium.fs, (medium.path:match("^(.*)/[^/]*$")))
-  if payload then return payload end
-  return nil, "no files to install next to " .. medium.path
+  return nil, err or (dat .. " is missing -- copy it next to the installer (the two files go together)")
 end
 
 -- --- EEPROM ---
@@ -488,6 +467,7 @@ local function readBioses(payload)
         images[bios.name] = table.concat(parts)
       end
     end
+    return images.worker ~= nil and images.kernal ~= nil
   end)
   return images
 end
