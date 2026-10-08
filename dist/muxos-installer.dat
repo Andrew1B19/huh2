@@ -2,7 +2,7 @@
 @@MANIFEST 19
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-109812 /muxos.lua
+115857 /muxos.lua
 37750 /compositor.lua
 6492 /bitmap.lua
 90428 /runtime.lua
@@ -213,7 +213,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 109812 /muxos.lua
+@@ 115857 /muxos.lua
 -- muxos kernal "init" for huh2. This REPLACES OpenOS on the kernal --
 -- it is the entire resident environment, not a program that runs under
 -- one. kernal/bios.lua (this node's own tiny EEPROM image, mirroring
@@ -2762,9 +2762,146 @@ local function printWindows()
   end
 end
 
+-- --- `update`: a new muxos from the installer floppy ---
+--
+-- Reads the installer's data file (/muxos-installer.dat) from whichever
+-- disk has it -- the installer floppy -- and installs its files onto this
+-- kernal's disk the installer's way: each is written as <name>.new and
+-- they're only swapped in once every one is written, so a failure
+-- (a damaged file, a full disk) changes nothing. The kernal BIOS is
+-- re-flashed too if it differs, keeping its boot address. `reboot`
+-- starts the new version. Workers fetch their runtime from the kernal
+-- when they start, so restarting them picks it up; their BIOS sits on
+-- their own EEPROMs, out of reach -- the installer flashes those.
+local updates = {DAT = "/muxos-installer.dat", CHUNK = 8192}
+
+-- A whole file off a disk, keeping the kernal responsive meanwhile (a
+-- floppy gives about one read per tick).
+function updates.read(addr, path)
+  local h, err = tryInvoke(addr, "open", path)
+  if not h then return nil, tostring(err) end
+  local parts = {}
+  while true do
+    local data, readErr = tryInvoke(addr, "read", h, math.huge)
+    if not data then
+      tryInvoke(addr, "close", h)
+      if readErr then return nil, tostring(readErr) end
+      return table.concat(parts)
+    end
+    parts[#parts + 1] = data
+    if #parts % 16 == 0 then tick(0) end
+  end
+end
+
+-- The data file's files, checked against its manifest: {path, data}...
+function updates.parse(data)
+  local version, pos = data:match("^%-%-%[=*%[MUXOS%-PAYLOAD ([^\n]+)\n()")
+  if not version then return nil, "not a muxos installer data file" end
+  if version:sub(-1) == "\r" then return nil, "its line endings were converted to CRLF -- copy it again as-is" end
+  local count
+  count, pos = data:match("^@@MANIFEST (%d+)\n()", pos)
+  if not count then return nil, "damaged (no manifest)" end
+  for _ = 1, tonumber(count) do
+    pos = data:match("^[^\n]*\n()", pos)
+    if not pos then return nil, "damaged (manifest)" end
+  end
+  local files = {}
+  for _ = 1, tonumber(count) do
+    local size, path, at = data:match("^@@ (%d+) ([^\n]+)\n()", pos)
+    if not size then return nil, "damaged (cut short?)" end
+    size = tonumber(size)
+    local content = data:sub(at, at + size - 1)
+    if #content ~= size then return nil, "damaged (cut short)" end
+    files[#files + 1] = {path = path, data = content}
+    pos = at + size + 1
+  end
+  if data:sub(pos, pos + 5) ~= "@@END\n" then return nil, "damaged (no end marker)" end
+  return files, version
+end
+
+function updates.run()
+  local source
+  for addr in component.list("filesystem") do
+    if addr ~= fsAddr and tryInvoke(addr, "exists", updates.DAT) then source = addr break end
+  end
+  if not source then
+    print("update: no disk has " .. updates.DAT .. " -- put the installer floppy (with the new files) in a drive")
+    return
+  end
+  print("update: reading " .. source:sub(1, 8) .. updates.DAT .. " (a floppy is slow -- about 10 s)...")
+  local data, err = updates.read(source, updates.DAT)
+  local files, version
+  if data then files, version = updates.parse(data) end
+  if not files then
+    print("update: " .. source:sub(1, 8) .. updates.DAT .. ": " .. tostring(err or version) .. " -- nothing was changed")
+    return
+  end
+  data = nil
+  local needed, staged, kernalBios = 4096, {}, nil
+  for _, f in ipairs(files) do
+    if not f.path:match("^/eeprom/") then needed = needed + #f.data end
+  end
+  local free = (tryInvoke(fsAddr, "spaceTotal") or 0) - (tryInvoke(fsAddr, "spaceUsed") or 0)
+  if free < needed then
+    print(string.format("update: the disk has %d KB free and the update needs %d KB -- nothing was changed",
+      free // 1024, needed // 1024))
+    return
+  end
+  local function abandon(why)
+    for _, path in ipairs(staged) do tryInvoke(fsAddr, "remove", path .. ".new") end
+    print("update: " .. why .. " -- nothing was changed")
+  end
+  for _, f in ipairs(files) do
+    if f.path == "/eeprom/kernal.lua" then
+      kernalBios = f.data
+    elseif not f.path:match("^/eeprom/") then
+      local dir = f.path:match("^(.*)/[^/]+$")
+      if dir and dir ~= "" then tryInvoke(fsAddr, "makeDirectory", dir) end
+      local h, openErr = tryInvoke(fsAddr, "open", f.path .. ".new", "w")
+      if not h then return abandon("can't write " .. f.path .. ".new: " .. tostring(openErr)) end
+      staged[#staged + 1] = f.path
+      for i = 1, #f.data, updates.CHUNK do
+        if not tryInvoke(fsAddr, "write", h, f.data:sub(i, i + updates.CHUNK - 1)) then
+          tryInvoke(fsAddr, "close", h)
+          return abandon("writing " .. f.path .. " failed (disk full?)")
+        end
+      end
+      tryInvoke(fsAddr, "close", h)
+      if tryInvoke(fsAddr, "size", f.path .. ".new") ~= #f.data then return abandon("short write: " .. f.path) end
+      tick(0)
+    end
+  end
+  -- Everything is written: swap the new files in.
+  for _, path in ipairs(staged) do
+    if tryInvoke(fsAddr, "exists", path) then tryInvoke(fsAddr, "remove", path) end
+    if not tryInvoke(fsAddr, "rename", path .. ".new", path) then
+      print("update: couldn't move " .. path .. " into place -- run update again")
+      return
+    end
+  end
+  local h = tryInvoke(fsAddr, "open", "/.muxos-version", "w")
+  if h then tryInvoke(fsAddr, "write", h, version .. "\n") tryInvoke(fsAddr, "close", h) end
+  local biosNote = ""
+  if kernalBios and eepromAddr and tryInvoke(eepromAddr, "get") ~= kernalBios then
+    tryInvoke(eepromAddr, "set", kernalBios)
+    if tryInvoke(eepromAddr, "get") == kernalBios then
+      tryInvoke(eepromAddr, "setLabel", "muxos kernal")
+      biosNote = "; the kernal BIOS was re-flashed"
+    else
+      biosNote = "; re-flashing the kernal BIOS FAILED (the old one is still there)"
+    end
+  end
+  print(string.format("update: muxos %s installed (%d files)%s. Type `reboot` to start it, then restart the workers.",
+    version, #staged, biosNote))
+end
+
 runCommand = function(line)
   if not line or line == "quit" or line == "exit" then
     shutdown(false)
+  elseif line == "reboot" then
+    shutdown(true)
+  elseif line == "update" then
+    updates.run()
   elseif line == "discover" then
     discover(1)
     listNodes()
@@ -2955,7 +3092,8 @@ end
 
 print("muxos kernal -- " .. selfAddr)
 print("commands:")
-print("  discover | nodes | ping <node> [count] | quit")
+print("  discover | nodes | ping <node> [count] | quit | reboot")
+print("  update -- install a new muxos from the installer floppy's muxos-installer.dat")
 print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job id>")
 print("  migrate <job id> [node] | drain|undrain <node>")
 print("  spawn <node> <lua code>")

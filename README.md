@@ -229,9 +229,30 @@ floppy and the installer starts; choose **1) install the kernal**. It:
 - flashes the muxos kernal BIOS onto this computer's EEPROM, pointed at
   that disk.
 
-Reboot and muxos starts. Running the installer again (boot the floppy,
-or from OpenOS: `muxos-installer.lua kernal`) upgrades in place and
-keeps your own files.
+Reboot and muxos starts.
+
+### Updating
+
+Put the new installer files on the floppy (all three, as in step 1),
+put it in a drive the kernal can see, and at the muxos console type:
+
+```
+muxos> update
+muxos> reboot
+```
+
+`update` reads `muxos-installer.dat` from the floppy (a floppy is slow:
+about 10 seconds), checks it against its own manifest, and installs its
+files onto the kernal's disk -- each written as `<name>.new` and only
+swapped in once all are written, so a damaged file or a full disk
+changes nothing. It re-flashes the kernal's EEPROM too if the kernal
+BIOS changed, keeping its boot address, and keeps your own files.
+After `reboot`, restart the workers so they fetch the new runtime. A
+worker BIOS change (rare) still needs the installer's **2) flash worker
+EEPROMs**.
+
+(From OpenOS, `muxos-installer.lua kernal` with the kernal's disk in
+that computer also upgrades in place.)
 
 ### 3. Flash the worker EEPROMs
 
