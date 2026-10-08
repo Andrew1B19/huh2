@@ -528,17 +528,35 @@ bugs no isolated unit mock could have (a compositor `flush()` that
 wiped the console's own output, and a job-preemption design that could
 hang a job calling `gmuxapi.*` forever -- see docs/PROTOCOL.md's
 "Hardening found by actually running the real files together").
-Not yet built: a real scheduler (load balancing beyond round-robin, async
-futures/callbacks for `submit()` itself, not just `SPAWN`), more of the OpenOS userland for legacy
-programs, e.g. `buffer` and `shell` (see docs/PROTOCOL.md's OpenOS-compatibility
-section for the intended shape), per-job isolated drawing surfaces (so
-`create_graphics_process`'s job and its window are actually wired
-together -- true for bit windows too now), an actual toolbar/icons/
-wallpaper built with the bit-window encoder (the encoder works, nothing
-composites a desktop with it yet), the REPL's own line editor (append/backspace only -- no
-history, no cursor movement within a line), multi-monitor support
-(explicitly deferred until the single-GPU case works end to end), and
-anything workload-specific.
+**Not built yet** -- what the design describes that doesn't exist, checked
+against the code (not just this document):
+
+- **Networking for programs.** Network cards aren't on the cluster bus,
+  so no program can use a modem. The design calls for a kernal modem
+  module for `.mxe` programs (and GERTi access), and an emulated modem
+  for legacy programs.
+- **Remote component signals.** Calling another node's components works
+  (the bus), but their signals (`redstone_changed`, an internet card's
+  events, ...) don't reach programs on other nodes.
+- **OpenOS libraries for legacy programs:** `shell` (`shell.parse`,
+  `shell.resolve`, working directory, ...), `buffer` (a stub that
+  errors), the full `process` library, OpenOS's `thread`, `uuid`,
+  `note`, `tty`/`vt100`. Programs that `require` these fail.
+- **`create_graphics_process` for `.mxe`:** it creates the child and a
+  window, but the child's `gpu` isn't wired to that window (legacy
+  programs do get their own virtual gpu drawn into their window).
+- **A desktop wallpaper** (a bit-window background); the desktop is a
+  plain color.
+- **The console's line editor:** no history, no cursor movement within
+  a line, no paste.
+- **Fullscreen grant:** released if its node goes down, or with Ctrl+Alt+C,
+  but not when the holding program ends while its node stays up.
+- **The scheduler:** places work on the live worker with the fewest
+  running jobs (round-robin among equals); nothing load-aware beyond
+  that.
+- **Deferred or undecided by design:** multi-monitor support, a kernal
+  system bus (dbus-like) for `.mxe` programs, and OPM's interface to the
+  kernal.
 
 **The `.mxe` process model, partially built**: parent/child jobs are
 real now -- `gmuxapi.create_headless_process`/`create_graphics_process`
@@ -622,7 +640,10 @@ Tested in `test/emu/integration_test.lua`, test 41.
   cover the icons. It has a button per window: touching one restores and
   raises it, or minimizes it if it's already the focused window on top.
   The clock is on the right.
-- **`demo`** (`/bin/demo.mxe`, with its own icon): muxos's test program.
+- **`demo`** (the `muxos-demo` package, with its own icon): muxos's test
+  program. It's not part of the installer. On muxos, `opm pull
+  muxos-demo` installs it as `/usr/bin/demo.mxe`. Or pull it to a floppy
+  from OpenOS and, in muxos, `cp /mnt/<floppy>/bin/demo.mxe /usr/bin/`.
   - Four threads run at once: an image thread, a braille-graphics thread,
     a status thread, and the main thread waiting for `q`.
   - It computes a Mandelbrot image in strips, each in a child process

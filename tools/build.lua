@@ -56,8 +56,6 @@ for _, rel in ipairs(listDir("kernal/lib")) do
 end
 -- OPM, the package manager, ships with muxos.
 FILES[#FILES + 1] = {"/bin/opm.mxe", "opm/opm.mxe"}
--- The demo: threads, child processes, color and braille graphics.
-FILES[#FILES + 1] = {"/bin/demo.mxe", "apps/demo.mxe"}
 FILES[#FILES + 1] = {"/lib/mxe/opm_core.lua", "opm/opm_core.lua"}
 
 local function build()
