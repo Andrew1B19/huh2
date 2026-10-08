@@ -68,6 +68,7 @@ local function breathe()
 end
 
 local say, ask
+local page = function() end -- bare: clear the screen (below)
 if not bare then
   say = function(...) print(...) end
   ask = function(prompt)
@@ -83,9 +84,17 @@ else
   if gpu then
     if screenAddr then gpu.bind(screenAddr) end
     w, h = gpu.getResolution()
+    -- What the screen actually shows can be smaller than the resolution.
+    local ok, vw, vh = pcall(gpu.getViewport)
+    if ok and tonumber(vw) and tonumber(vh) then w, h = math.min(w, vw), math.min(h, vh) end
     gpu.setBackground(0x000000)
     gpu.setForeground(0xFFFFFF)
     gpu.fill(1, 1, w, h, " ")
+  end
+  -- A fresh screen for the next question, so its prompt starts at the top.
+  page = function()
+    if gpu then gpu.fill(1, 1, w, h, " ") end
+    x, y = 1, 1
   end
   local function newline()
     x = 1
@@ -138,11 +147,29 @@ end
 
 -- `defaultYes`: Enter alone means yes (for steps you're plainly there
 -- to do, like flashing the EEPROM you just put in).
+-- Anything other than yes or no asks again.
 local function confirm(prompt, defaultYes)
   if assumeYes then return true end
-  local a = (ask(prompt .. (defaultYes and " [Y/n] " or " [y/N] ")) or ""):lower()
-  if a == "" then return defaultYes == true end
-  return a == "y" or a == "yes"
+  while true do
+    local a = ask(prompt .. (defaultYes and " [Y/n] " or " [y/N] "))
+    if not a then return defaultYes == true end -- no input left
+    a = a:lower()
+    if a == "" then return defaultYes == true end
+    if a == "y" or a == "yes" then return true end
+    if a == "n" or a == "no" then return false end
+    say("Please answer y or n.")
+  end
+end
+
+-- A number from 1 to n; anything else asks again. q (or no input) cancels.
+local function pickNumber(prompt, n)
+  while true do
+    local a = ask(prompt)
+    if not a or a:lower() == "q" then return nil end
+    local pick = tonumber(a)
+    if pick and pick == math.floor(pick) and pick >= 1 and pick <= n then return pick end
+    say("Type a number from 1 to " .. n .. ", or q to cancel.")
+  end
 end
 
 local function human(bytes)
@@ -426,14 +453,15 @@ local function chooseDisk(disks)
     return nil, "no writable disk matches " .. options.disk
   end
   if #disks == 0 then return nil, "no writable disk found (the installer's own disk doesn't count)" end
+  page()
   say("Disks:")
   for i, d in ipairs(disks) do
     say(string.format("  %d) %s  %s  %s free", i, d.address:sub(1, 8), d.label ~= "" and d.label or "(no label)",
       human(d.free)))
   end
   if #disks == 1 and assumeYes then return disks[1] end
-  local pick = tonumber(ask("Install muxos on which disk? "))
-  if not pick or not disks[pick] then return nil, "no disk chosen" end
+  local pick = pickNumber("Install muxos on which disk? ", #disks)
+  if not pick then return nil, "no disk chosen" end
   return disks[pick]
 end
 
@@ -697,6 +725,7 @@ local function makeFloppy(payload)
   elseif #disks == 0 then
     return nil, "no disk to write it to: put a floppy in a drive this computer can see"
   else
+    page()
     say("Disks (not this computer's own" .. (root and " OpenOS disk" or "") .. "):")
     for i, d in ipairs(disks) do
       say(string.format("  %d) %s  %s%s  %s, %s free%s", i, d.address:sub(1, 8),
@@ -704,7 +733,7 @@ local function makeFloppy(payload)
         human(d.total), human(d.free), d.floppy and "  <- floppy" or ""))
     end
     local only = #disks == 1 and disks[1].floppy
-    local pick = only and assumeYes and 1 or tonumber(ask("Write the installer floppy to which disk? "))
+    local pick = only and assumeYes and 1 or pickNumber("Write the installer floppy to which disk? ", #disks)
     disk = pick and disks[pick]
   end
   if not disk then return nil, "no disk chosen" end
@@ -775,31 +804,14 @@ local function placementWarnings()
   end
 end
 
-local function main()
-  say("muxos " .. VERSION .. " installer" .. (bare and " (booted from " .. tostring(medium and medium.address or "?"):sub(1, 8) .. ")" or ""))
-  local payload, err = findPayload()
-  if not payload then
-    say("error: " .. tostring(err))
-    return 1
-  end
-  placementWarnings()
-  local mode = positional[1]
-  if not mode then
-    say("  1) install the kernal on this computer")
-    say("  2) flash worker EEPROMs")
-    say("  3) flash kernal BIOS EEPROMs (for computers that will boot this installer)")
-    say("  4) check which BIOS an EEPROM holds")
-    say("  5) make an installer floppy")
-    say("  6) quit")
-    local pick = ask("> ")
-    mode = ({["1"] = "kernal", ["2"] = "worker", ["3"] = "bios", ["4"] = "check", ["5"] = "floppy"})[pick or ""]
-    if not mode then return 0 end
-  end
+local MODES = {"kernal", "worker", "bios", "check", "floppy"}
+
+local function run(mode, payload)
   local ok, failure
   if mode == "kernal" then
     ok, failure = installKernal(payload)
     if ok then
-      if options.reboot or (not assumeYes and confirm("Reboot into muxos now?")) then computer.shutdown(true) end
+      if options.reboot or (not assumeYes and confirm("Reboot into muxos now?", bare)) then computer.shutdown(true) end
       say("Reboot this computer to start muxos. Workers boot from the network once flashed.")
       if bare then say("(The EEPROM now boots the installed disk first; the floppy can stay in.)") end
     end
@@ -811,15 +823,47 @@ local function main()
     ok, failure = makeFloppy(payload)
   elseif mode == "check" then
     ok, failure = checkEeproms(payload)
-  else
-    say("usage: muxos-installer.lua [kernal|worker|bios|check|floppy] [--disk=<address|label>] [--yes] [--count=<n>] [--reboot]")
+  end
+  if not ok then say("error: " .. tostring(failure)) end
+  return ok
+end
+
+local function main()
+  local title = "muxos " .. VERSION .. " installer"
+    .. (bare and " (booted from " .. tostring(medium and medium.address or "?"):sub(1, 8) .. ")" or "")
+  say(title)
+  local payload, err = findPayload()
+  if not payload then
+    say("error: " .. tostring(err))
     return 1
   end
-  if not ok then
-    say("error: " .. tostring(failure))
-    return 1
+  placementWarnings()
+  local mode = positional[1]
+  if mode then
+    local known = false
+    for _, m in ipairs(MODES) do known = known or m == mode end
+    if not known then
+      say("usage: muxos-installer.lua [kernal|worker|bios|check|floppy] [--disk=<address|label>] [--yes] [--count=<n>] [--reboot]")
+      return 1
+    end
+    return run(mode, payload) and 0 or 1
   end
-  return 0
+  -- The menu, until quit. A wrong key asks again; after each action it
+  -- comes back here (booted bare there's nothing else to go back to).
+  while true do
+    page()
+    say(title)
+    say("  1) install the kernal on this computer")
+    say("  2) flash worker EEPROMs")
+    say("  3) flash kernal BIOS EEPROMs (for computers that will boot this installer)")
+    say("  4) check which BIOS an EEPROM holds")
+    say("  5) make an installer floppy")
+    say(bare and "  6) quit (restarts the computer)" or "  6) quit")
+    local pick = pickNumber("> ", 6)
+    if not pick or pick == 6 then return 0 end
+    run(MODES[pick], payload)
+    if not ask("Press Enter to go back to the menu.") then return 0 end
+  end
 end
 
 -- A crash, booted bare: the error and traceback on the console, and a
@@ -851,15 +895,16 @@ local function crashDump(err)
   return disk.address:sub(1, 8) .. "/muxos-boot-dump.txt"
 end
 
--- Booted bare there's nothing to return to: wait, then restart.
+-- Booted bare there's nothing to return to: quitting restarts. A crash
+-- is shown and dumped first.
 if bare then
   local ok, err = xpcall(main, debug.traceback)
   if not ok then
     say("error: " .. tostring(err))
     local where = crashDump(tostring(err))
     if where then say("Dump: " .. where) end
+    ask("Press Enter to restart.")
   end
-  ask("Press Enter to restart.")
   computer.shutdown(true)
 end
 return main()

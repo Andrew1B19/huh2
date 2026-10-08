@@ -463,6 +463,56 @@ do
 end
 print("  OK")
 
+print("install 11b: on a small screen, wrong keys ask again, each question starts at the top, and actions return to the menu")
+do
+  local node = emu:newNode("bare")
+  local _, screen, bufs = emu:addGpuScreen(node, 50, 16) -- a tier 1 screen
+  for _ = 1, 4 do emu:addFilesystem(node, {}, nil, 4194304) end
+  emu:addFilesystem(node, {["/muxos-installer.lua"] = readFile(BUNDLE), ["/muxos-installer.dat"] = readFile(DATA)}, "floppy", 512 * 1024)
+  emu:addEeprom(node, readFile(REPO_ROOT .. "/kernal/bios.lua"))
+  local function text()
+    local rows = {}
+    for y = 1, bufs[0].h do
+      local row, chars = bufs[0].cells[y] or {}, {}
+      for x = 1, bufs[0].w do chars[x] = (row[x] and row[x].char) or " " end
+      rows[#rows + 1] = table.concat(chars)
+    end
+    return table.concat(rows, "\n")
+  end
+  local function answer(line)
+    for i = 1, #line do
+      emu:injectSignal(node, "key_down", screen, line:byte(i), 0, "tester")
+      emu:advance(0.02)
+    end
+    emu:injectSignal(node, "key_down", screen, 13, 0x1C, "tester")
+    emu:advance(0.5)
+  end
+  emu:boot(node)
+  emu:advance(3)
+  answer("x")
+  answer("9")
+  assert(node.status == "running" and text():find("Type a number from 1 to 6, or q to cancel.", 1, true),
+    "a wrong menu key asks again:\n" .. text())
+  answer("4")
+  answer("q")
+  assert(text():find("Press Enter to go back to the menu.", 1, true), "check mode finished:\n" .. text())
+  answer("")
+  assert(text():find("^muxos 0.1.2 installer") and text():find("6) quit (restarts the computer)", 1, true),
+    "back at the menu, on a fresh screen:\n" .. text())
+  answer("1")
+  local t = text()
+  assert(t:find("^Disks:") and t:find("Install muxos on which disk?", 1, true), "the disk question starts at the top:\n" .. t)
+  answer("z")
+  assert(text():find("Type a number from 1 to 4, or q to cancel.", 1, true), "a wrong disk answer asks again:\n" .. text())
+  answer("q")
+  assert(text():find("error: no disk chosen", 1, true) and text():find("Press Enter to go back to the menu.", 1, true),
+    "q cancels back toward the menu:\n" .. text())
+  answer("")
+  answer("6")
+  assert(node.status == "dead", "quit restarts the computer")
+end
+print("  OK")
+
 print("install 12: the installer handles its own crash: error and traceback on its console, a dump on the floppy")
 do
   local node = emu:newNode("bare")
