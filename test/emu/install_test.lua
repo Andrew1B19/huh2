@@ -25,7 +25,8 @@ print("install 1: the build is clean, deterministic, and dist/ is up to date")
 assert(os.execute('lua5.3 "' .. REPO_ROOT .. '/tools/build.lua" --out "' .. BUNDLE .. '" >/dev/null'),
   "tools/build.lua failed")
 assert(readFile(BUNDLE) == readFile(REPO_ROOT .. "/dist/muxos-installer.lua")
-  and readFile(DATA) == readFile(REPO_ROOT .. "/dist/muxos-installer.dat"),
+  and readFile(DATA) == readFile(REPO_ROOT .. "/dist/muxos-installer.dat")
+  and readFile(TMP .. "/floppy/init.lua") == readFile(REPO_ROOT .. "/dist/floppy/init.lua"),
   "dist/ is stale: run lua5.3 tools/build.lua")
 print("  OK")
 
@@ -312,9 +313,10 @@ do
   local plan = core.file_plan(cfg, core.order(cfg, "muxos-installer"), target, concat)
   local files = {}
   for _, p in ipairs(plan) do files[p.file] = p.path end
-  assert(#plan == 2 and files["/mnt/abc/muxos-installer.lua"] == "muxos/dist/muxos-installer.lua"
-    and files["/mnt/abc/muxos-installer.dat"] == "muxos/dist/muxos-installer.dat",
-    "the installer and its data file land at the floppy's root, where the BIOS looks")
+  assert(#plan == 3 and files["/mnt/abc/muxos-installer.lua"] == "muxos/dist/muxos-installer.lua"
+    and files["/mnt/abc/muxos-installer.dat"] == "muxos/dist/muxos-installer.dat"
+    and files["/mnt/abc/init.lua"] == "muxos/dist/floppy/init.lua",
+    "the installer, its data file and the boot file land at the floppy's root, where the BIOS looks")
   assert(not cfg["muxos-installer"].launcher, "no launcher: a /muxos.lua on the floppy would be booted as the kernal")
   local selfPlan = core.file_plan(cfg, core.order(cfg, "opm-mxe"), "/", concat)
   local dests = {}
@@ -394,6 +396,29 @@ do
   emu:boot(node)
   emu:advance(3)
   assert(screenText():find("muxos> _", 1, true), "muxos booted from the hard disk:\n" .. screenText())
+end
+print("  OK")
+
+print("install 10: a kernal BIOS that can't boot says why (the Analyzer shows it)")
+do
+  local function crash(files)
+    local node = emu:newNode("bare")
+    emu:addGpuScreen(node, 80, 25)
+    if files then emu:addFilesystem(node, files) end
+    emu:addEeprom(node, readFile(REPO_ROOT .. "/kernal/bios.lua"))
+    local mark = #emu.log
+    emu:boot(node)
+    emu:advance(2)
+    assert(node.status == "dead", "the BIOS stopped")
+    for i = mark + 1, #emu.log do
+      if emu.log[i].node == node.address and emu.log[i].msg:find("^halted") then return emu.log[i].msg end
+    end
+    error("no crash logged")
+  end
+  local why = crash(nil)
+  assert(why:find("no /muxos.lua or /muxos-installer.lua on 0 disk(s) (is the installer floppy in a disk drive?)", 1, true), why)
+  why = crash({["/muxos-installer.lua"] = "this is not lua ("})
+  assert(why:find("nothing would load: filesyst/muxos-installer.lua: ", 1, true), why)
 end
 print("  OK")
 

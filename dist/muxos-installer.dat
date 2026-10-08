@@ -1,6 +1,6 @@
 --[[MUXOS-PAYLOAD 0.1.2
 @@MANIFEST 19
-3204 /eeprom/kernal.lua
+3854 /eeprom/kernal.lua
 2443 /eeprom/worker.lua
 105317 /muxos.lua
 37750 /compositor.lua
@@ -19,7 +19,7 @@
 1832 /lib/transforms.lua
 7328 /bin/opm.mxe
 5892 /lib/mxe/opm_core.lua
-@@ 3204 /eeprom/kernal.lua
+@@ 3854 /eeprom/kernal.lua
 -- The kernal's own EEPROM image. muxos REPLACES OpenOS on the kernal --
 -- it is not a program that runs on top of it -- so there is no stock
 -- OpenOS /init.lua in this picture at all, and this is not a thin
@@ -64,35 +64,46 @@ do
   end
 end
 
+-- Loads `path` from a disk: the chunk, or nil and why (nil alone when
+-- the file isn't there). Read in pieces joined once, to spare memory.
 local function tryLoadFrom(address, path)
+  if not boot_invoke(address, "exists", path) then return nil end
   local handle, reason = boot_invoke(address, "open", path)
   if not handle then
     return nil, reason
   end
-  local buffer = ""
+  local chunks = {}
   repeat
     local data, reason = boot_invoke(address, "read", handle, math.maxinteger or math.huge)
     if not data and reason then
       return nil, reason
     end
-    buffer = buffer .. (data or "")
+    chunks[#chunks + 1] = data
   until not data
   boot_invoke(address, "close", handle)
-  return load(buffer, "=" .. path)
+  return load(table.concat(chunks), "=" .. path)
 end
 
 -- Boot order: the disk the EEPROM remembers, then any disk with
 -- /muxos.lua, then a disk with the muxos installer (a floppy made by
 -- opm or the build), which runs here with no OpenOS. An installed system
--- always wins, so a forgotten installer floppy doesn't reinstall.
-local init, reason
+-- always wins, so a forgotten installer floppy doesn't reinstall. If
+-- nothing boots, the error (the Analyzer shows it) says what was tried.
+local why, disks = {}, 0
+local function try(address, path)
+  local chunk, reason = tryLoadFrom(address, path)
+  if not chunk and reason then why[#why + 1] = address:sub(1, 8) .. path .. ": " .. tostring(reason) end
+  return chunk
+end
+local init
 if getBootAddress() then
-  init, reason = tryLoadFrom(getBootAddress(), "/muxos.lua")
+  init = try(getBootAddress(), "/muxos.lua")
 end
 if not init then
   setBootAddress()
   for address in component.list("filesystem") do
-    init, reason = tryLoadFrom(address, "/muxos.lua")
+    if address ~= computer.tmpAddress() then disks = disks + 1 end
+    init = try(address, "/muxos.lua")
     if init then
       setBootAddress(address)
       break
@@ -101,7 +112,7 @@ if not init then
 end
 if not init then
   for address in component.list("filesystem") do
-    local installer = tryLoadFrom(address, "/muxos-installer.lua")
+    local installer = try(address, "/muxos-installer.lua")
     if installer then
       computer.beep(800, 0.2)
       return installer(address, "/muxos-installer.lua")
@@ -109,7 +120,8 @@ if not init then
   end
 end
 if not init then
-  error("no bootable medium found" .. (reason and (": " .. tostring(reason)) or ""), 0)
+  error(#why > 0 and "nothing would load: " .. table.concat(why, "; ")
+    or "no /muxos.lua or /muxos-installer.lua on " .. disks .. " disk(s) (is the installer floppy in a disk drive?)", 0)
 end
 computer.beep(1000, 0.2)
 return init()

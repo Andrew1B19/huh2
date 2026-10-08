@@ -5,3 +5,4 @@
 # convert it (nor the program that goes with it).
 dist/muxos-installer.lua -text
 dist/muxos-installer.dat -text
+dist/floppy/init.lua -text

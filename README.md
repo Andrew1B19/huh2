@@ -146,28 +146,34 @@ serve, the installer) passes standalone.
 
 ### How it fits together
 
-The kernal computer never needs OpenOS. Its EEPROM holds the muxos kernal
-BIOS, which boots, in order:
+The installer floppy boots by itself. It has an `/init.lua`, which is
+what the stock Lua BIOS (the EEPROM every computer comes with) boots. So
+an empty computer with its stock EEPROM and the floppy in starts
+straight into the installer, with no OpenOS. Installing muxos flashes
+the muxos kernal BIOS over the stock one.
+
+The kernal BIOS boots, in order:
 
 1. the disk it remembers;
 2. any disk with `/muxos.lua` (an installed muxos);
 3. any disk with `/muxos-installer.lua` at its root (the installer
-   floppy).
+   floppy, for reinstalling or flashing workers).
 
-So a computer with nothing but the kernal BIOS and the installer floppy
-boots straight into the installer. Once muxos is installed it boots
-first, so the floppy can stay in.
+Once muxos is installed it boots first, so the floppy can stay in.
 
 The installer also runs as an ordinary program on OpenOS, with the same
-menu. That's how the first EEPROMs get flashed: any OpenOS computer can
-flash a kernal BIOS onto an EEPROM, and worker BIOSes onto the rest.
+menu.
 
 ### 1. Make the installer floppy
 
-The installer is two files, and both go at the root of the floppy:
+The installer is three files, and all go at the root of the floppy:
 
-- `muxos-installer.lua`, the program (about 22 KB);
+- `init.lua`, which boots it (under 1 KB);
+- `muxos-installer.lua`, the program (about 26 KB);
 - `muxos-installer.dat`, everything it installs (about 290 KB).
+
+Only ever put them on a floppy: an `/init.lua` on a computer's own disk
+would replace what boots it.
 
 Together they need about 320 KB of the floppy's 512 KB, so start from an
 empty floppy: an older copy of the installer left on it (the old
@@ -179,10 +185,11 @@ Ways to get them there:
 - **With opm (LewisHost.Net catalog):** copy this repository into
   oc-programs as `muxos/` and merge `dist/programs.cfg`'s entries into
   the catalog. On an OpenOS computer, `opm pull muxos-installer <floppy>`
-  puts both files at the floppy's root.
-- **With an internet card:** `wget` both `dist/` files from the
+  puts all three at the floppy's root.
+- **With an internet card:** `wget` `dist/floppy/init.lua`,
+  `dist/muxos-installer.lua` and `dist/muxos-installer.dat` from the
   repository's raw URLs onto a floppy's root.
-- **By copying:** put both `dist/` files at the root of the floppy's
+- **By copying:** put those three files at the root of the floppy's
   folder in your world save,
   `saves/<world>/opencomputers/<disk address>/`.
 
@@ -191,26 +198,11 @@ disk, and the installer starts in a second or two instead of loading
 300 KB first. It reads the data file only as it needs it (flashing
 EEPROMs reads just the first few KB).
 
-### 2. Flash the EEPROMs (on an OpenOS computer, with the floppy in)
+### 2. Install the kernal
 
-```
-/mnt/<floppy>/muxos-installer.lua bios     one kernal BIOS EEPROM
-/mnt/<floppy>/muxos-installer.lua worker   the three worker EEPROMs
-```
-
-Each mode flashes the EEPROM in that computer, then asks you to swap in
-the next one: take the EEPROM out, put the next one in, and press Enter.
-Type `q` when done. `--count=<n>` stops after n. Put this computer's own
-EEPROM back afterwards.
-
-(A kernal booted from the installer floppy can flash worker EEPROMs the
-same way, from its menu. Put the kernal BIOS EEPROM back in afterwards.)
-
-### 3. Install the kernal
-
-Put the kernal BIOS EEPROM and the installer floppy in the kernal
-computer and turn it on. The installer starts; choose **1) install the
-kernal**. It:
+Put the installer floppy in the kernal computer (in its floppy slot or a
+disk drive next to it) and turn it on. Its stock EEPROM boots the
+floppy and the installer starts; choose **1) install the kernal**. It:
 
 - lists the writable disks and asks which one to use (the installer's
   own disk isn't offered);
@@ -219,12 +211,28 @@ kernal**. It:
 - writes muxos and the OpenOS libraries for legacy programs. Each file
   goes in as `<name>.new` and they're all swapped in at the end, so a
   disk that fills up mid-install changes nothing;
-- points the EEPROM at that disk.
+- flashes the muxos kernal BIOS onto this computer's EEPROM, pointed at
+  that disk.
 
-Reboot and muxos starts. Workers boot from the network as soon as
-they're powered on, in any order. Running the installer again (from
-OpenOS: `muxos-installer.lua kernal`) upgrades in place and keeps your
-own files.
+Reboot and muxos starts. Running the installer again (boot the floppy,
+or from OpenOS: `muxos-installer.lua kernal`) upgrades in place and
+keeps your own files.
+
+### 3. Flash the worker EEPROMs
+
+From the installer's menu, **2) flash worker EEPROMs**, on any computer
+that boots the floppy with its stock EEPROM, or on OpenOS:
+
+```
+/mnt/<floppy>/muxos-installer.lua worker   the three worker EEPROMs
+/mnt/<floppy>/muxos-installer.lua bios     kernal BIOS EEPROMs (optional)
+```
+
+Each mode flashes the EEPROM in that computer, then asks you to swap in
+the next one: take the EEPROM out, put the next one in, and press Enter.
+Type `q` when done. `--count=<n>` stops after n. Put this computer's own
+EEPROM back afterwards. Workers boot from the network as soon as they're
+powered on, in any order.
 
 OpenOS options: `--disk=<address prefix or label>`, `--yes` (no
 questions), `--count=<n>`, `--reboot`.
@@ -234,6 +242,8 @@ both BIOS images fit an EEPROM (4096 bytes), and that the kernal and
 worker versions and wire code match. `lua5.3 test/emu/install_test.lua`
 runs the built installer against emulated hardware, including booting
 an empty computer from the installer floppy, and boots the result.
+`lua5.3 test/emu/openos_test.lua` does it with OpenComputers' own stock
+BIOS and real OpenOS (fetched on first run).
 
 ### Troubleshooting
 
@@ -248,6 +258,8 @@ every 5 seconds.
 | **Two beeps and a flashing red light** (any computer) | OpenComputers itself: the machine crashed. Shift-right-click the case with an **Analyzer** to read the error. |
 | Kernal: one short high beep | Normal: muxos is starting. |
 | Kernal: one short medium beep | Normal: no muxos installed, so it's starting the installer floppy. |
+| Kernal: **two beeps, flashing red**, Analyzer says "no /muxos.lua or /muxos-installer.lua on ..." | The muxos kernal BIOS found nothing to boot: the floppy isn't in a drive this computer sees, or isn't the installer floppy. |
+| Kernal: same, Analyzer says "nothing would load: ..." | It found the files but couldn't load them; the message says why for each (e.g. not enough memory). |
 
 Errors the Analyzer can show:
 
