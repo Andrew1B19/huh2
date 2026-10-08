@@ -30,7 +30,7 @@
 -- untouched.
 
 local VERSION = "0.1.2" -- set by tools/build.lua
-local DAT_SIZE = 299268 -- the data file's exact size, set by tools/build.lua
+local DAT_SIZE = 305313 -- the data file's exact size, set by tools/build.lua
 local INIT_LUA = "-- The muxos installer floppy's boot file, installed as /init.lua at the\
 -- floppy's root next to muxos-installer.lua. Any BIOS that boots /init.lua\
 -- runs it -- the stock OpenComputers Lua BIOS every computer starts with\

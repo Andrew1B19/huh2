@@ -588,5 +588,92 @@ do
 end
 print("  OK")
 
+print("install 15: `update` in muxos installs a new version from the installer floppy, BIOS included")
+do
+  -- The payload's files, and a way to write a modified payload back out.
+  local function parsePayload(data)
+    local files, pos = {}, data:find("@@ ", 1, true)
+    while true do
+      local size, path, at = data:match("^@@ (%d+) ([^\n]+)\n()", pos)
+      if not size then break end
+      files[#files + 1] = {path = path, data = data:sub(at, at + tonumber(size) - 1)}
+      pos = at + tonumber(size) + 1
+    end
+    return files
+  end
+  local function writePayload(version, files)
+    local out = {"--[[MUXOS-PAYLOAD " .. version .. "\n", "@@MANIFEST " .. #files .. "\n"}
+    for _, f in ipairs(files) do out[#out + 1] = #f.data .. " " .. f.path .. "\n" end
+    for _, f in ipairs(files) do out[#out + 1] = "@@ " .. #f.data .. " " .. f.path .. "\n" .. f.data .. "\n" end
+    out[#out + 1] = "@@END\n"
+    return table.concat(out)
+  end
+  local current = parsePayload(readFile(DATA))
+  -- An installed kernal, as the installer leaves it.
+  local disk = {["/.muxos-version"] = "0.1.1\n"}
+  local kernalBios
+  for _, f in ipairs(current) do
+    if f.path == "/eeprom/kernal.lua" then kernalBios = f.data
+    elseif not f.path:match("^/eeprom/") then disk[f.path] = f.data end
+  end
+  -- The new version: one more program, and a changed kernal BIOS.
+  local newBios = kernalBios .. "-- the next version\n"
+  local newer = {}
+  for _, f in ipairs(current) do
+    newer[#newer + 1] = {path = f.path, data = f.path == "/eeprom/kernal.lua" and newBios or f.data}
+  end
+  newer[#newer + 1] = {path = "/bin/newprog.lua", data = 'print("new")'}
+  local floppyFiles = {["/muxos-installer.dat"] = writePayload("0.1.3", newer)}
+
+  local node = emu:newNode("kernal")
+  emu:addModem(node)
+  local _, screen, bufs = emu:addGpuScreen(node, 80, 25)
+  local diskAddr = emu:addFilesystem(node, disk)
+  local floppy = emu:addFilesystem(node, floppyFiles, "floppy", 512 * 1024)
+  local eeprom = emu:addEeprom(node, kernalBios, diskAddr)
+  local function text()
+    local rows = {}
+    for y = 1, bufs[0].h do
+      local row, chars = bufs[0].cells[y] or {}, {}
+      for x = 1, bufs[0].w do chars[x] = (row[x] and row[x].char) or " " end
+      rows[#rows + 1] = table.concat(chars)
+    end
+    return table.concat(rows, "\n")
+  end
+  local function typeLine(line)
+    for i = 1, #line do
+      emu:injectSignal(node, "key_down", screen, line:byte(i), 0, "tester")
+      emu:step()
+    end
+    emu:injectSignal(node, "key_down", screen, 13, 0x1C, "tester")
+    emu:advance(3)
+  end
+  emu:boot(node)
+  emu:advance(3)
+  assert(text():find("muxos> _", 1, true), "muxos booted:\n" .. text())
+
+  -- A damaged data file changes nothing.
+  local good = floppyFiles["/muxos-installer.dat"]
+  floppyFiles["/muxos-installer.dat"] = good:sub(1, #good // 2)
+  typeLine("update")
+  assert(text():find("nothing was changed", 1, true), "a damaged data file is refused:\n" .. text())
+  assert(not disk["/bin/newprog.lua"] and disk["/.muxos-version"] == "0.1.1\n", "nothing changed")
+  floppyFiles["/muxos-installer.dat"] = good
+
+  typeLine("update")
+  assert(text():find("update: muxos 0.1.3 installed", 1, true) and text():find("the kernal BIOS was re-flashed", 1, true),
+    "update reports what it did:\n" .. text())
+  assert(disk["/bin/newprog.lua"] == 'print("new")' and disk["/.muxos-version"] == "0.1.3\n", "the new files are installed")
+  for path in pairs(disk) do assert(not path:match("%.new$"), "left a staged file behind: " .. path) end
+  local em = node.components[eeprom].methods
+  assert(em.get() == newBios and em.getData() == diskAddr, "the kernal BIOS was re-flashed, still booting the same disk")
+  typeLine("reboot")
+  assert(node.status == "dead", "reboot restarts the computer")
+  emu:boot(node)
+  emu:advance(3)
+  assert(text():find("muxos> _", 1, true), "the new version boots:\n" .. text())
+end
+print("  OK")
+
 os.execute('rm -rf "' .. TMP .. '"')
 print("ALL OK")
