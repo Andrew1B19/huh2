@@ -28,7 +28,7 @@
 -- untouched.
 
 local VERSION = "0.1.2" -- set by tools/build.lua
-local DAT_SIZE = 294488 -- the data file's exact size, set by tools/build.lua
+local DAT_SIZE = 294404 -- the data file's exact size, set by tools/build.lua
 local CHUNK = 8192
 
 -- --- Platform: OpenOS, or bare from the kernal BIOS ---

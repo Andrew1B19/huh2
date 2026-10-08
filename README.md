@@ -258,8 +258,8 @@ every 5 seconds.
 | **Two beeps and a flashing red light** (any computer) | OpenComputers itself: the machine crashed. Shift-right-click the case with an **Analyzer** to read the error. |
 | Kernal: one short high beep | Normal: muxos is starting. |
 | Kernal: one short medium beep | Normal: no muxos installed, so it's starting the installer floppy. |
-| Kernal: **two beeps, flashing red**, Analyzer says "no /muxos.lua or /muxos-installer.lua on ..." | The muxos kernal BIOS found nothing to boot: the floppy isn't in a drive this computer sees, or isn't the installer floppy. |
-| Kernal: same, Analyzer says "nothing would load: ..." | It found the files but couldn't load them; the message says why for each (e.g. not enough memory). |
+| Kernal: **two beeps, flashing red**, and the screen says "muxos: nothing to boot" | The muxos kernal BIOS found nothing to boot. Under that line it lists every disk the computer can see, its label, and which muxos files are on it. If the floppy isn't listed, the computer can't see it: a case needs a floppy slot (tier 3) or a Disk Drive block next to it; a rack server needs the rack's disk drive connected to it. If it's listed without `muxos-installer.lua`, the files aren't on it. |
+| Kernal: two beeps, flashing red, and the screen says "muxos installer stopped: ..." | The installer started but crashed; the screen shows the error and where. |
 
 Errors the Analyzer can show:
 

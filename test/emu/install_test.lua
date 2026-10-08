@@ -399,26 +399,41 @@ do
 end
 print("  OK")
 
-print("install 10: a kernal BIOS that can't boot says why (the Analyzer shows it)")
+print("install 10: a kernal BIOS that can't boot shows why on the screen (and in the Analyzer)")
 do
   local function crash(files)
     local node = emu:newNode("bare")
-    emu:addGpuScreen(node, 80, 25)
+    local _, _, bufs = emu:addGpuScreen(node, 100, 25)
     if files then emu:addFilesystem(node, files) end
     emu:addEeprom(node, readFile(REPO_ROOT .. "/kernal/bios.lua"))
     local mark = #emu.log
     emu:boot(node)
     emu:advance(2)
     assert(node.status == "dead", "the BIOS stopped")
+    local rows = {}
+    for y = 1, bufs[0].h do
+      local row, chars = bufs[0].cells[y] or {}, {}
+      for x = 1, bufs[0].w do chars[x] = (row[x] and row[x].char) or " " end
+      rows[#rows + 1] = table.concat(chars)
+    end
     for i = mark + 1, #emu.log do
-      if emu.log[i].node == node.address and emu.log[i].msg:find("^halted") then return emu.log[i].msg end
+      if emu.log[i].node == node.address and emu.log[i].msg:find("^halted") then
+        return emu.log[i].msg, table.concat(rows, "\n")
+      end
     end
     error("no crash logged")
   end
-  local why = crash(nil)
-  assert(why:find("no /muxos.lua or /muxos-installer.lua on 0 disk(s) (is the installer floppy in a disk drive?)", 1, true), why)
-  why = crash({["/muxos-installer.lua"] = "this is not lua ("})
-  assert(why:find("nothing would load: filesyst/muxos-installer.lua: ", 1, true), why)
+  local why, screen = crash(nil)
+  assert(why:find("muxos: nothing to boot", 1, true) and why:find("  none", 1, true)
+    and why:find("Put the installer floppy", 1, true), why)
+  assert(screen:find("muxos: nothing to boot. Disks this computer can see:", 1, true), "shown on the screen:\n" .. screen)
+  why, screen = crash({["/muxos-installer.lua"] = "this is not lua (", ["/notes.txt"] = "hi"})
+  assert(why:find('": muxos-installer.lua\n', 1, true)
+    and why:find("filesyst/muxos-installer.lua: ", 1, true), why)
+  assert(screen:find("filesyst/muxos-installer.lua: ", 1, true), "the load error is on the screen:\n" .. screen)
+  why, screen = crash({["/muxos-installer.lua"] = "error('broken on purpose')"})
+  assert(why:find("muxos installer stopped: /muxos-installer.lua:1: broken on purpose", 1, true), why)
+  assert(screen:find("muxos installer stopped: /muxos-installer.lua:1: broken on purpose", 1, true), "shown on the screen:\n" .. screen)
 end
 print("  OK")
 
