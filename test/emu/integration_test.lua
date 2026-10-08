@@ -178,7 +178,8 @@ print("missing=" .. tostring(ok) .. " " .. (tostring(err):match("module 'nosuchm
 }
 -- The vendored OpenOS libraries, installed as /lib on the kernal's disk.
 for _, rel in ipairs({"serialization", "text", "sides", "colors", "keyboard", "transforms", "internet",
-    "core/full_keyboard", "core/full_text", "core/full_transforms"}) do
+    "buffer", "uuid", "bit32", "note",
+    "core/full_keyboard", "core/full_text", "core/full_transforms", "core/full_buffer"}) do
   kernalFiles["/lib/" .. rel .. ".lua"] = readFile(REPO_ROOT .. "/kernal/lib/" .. rel .. ".lua")
 end
 emu:addFilesystem(kernal, kernalFiles)
@@ -1694,5 +1695,54 @@ print("LSIG46 " .. tostring(addr) .. " " .. tostring(side) .. " " .. tostring(ne
   closeWindowAt(1, 50)
 end
 print("  OK -- redstone_changed from a worker's card and the kernal's own reach .mxe and legacy programs")
+
+print("test 47: OpenOS libraries for legacy programs -- shell, process, thread, tty, buffer, uuid, note")
+do
+  kernalFiles["/usr/bin/helper47.lua"] = 'print("helper ran") return 7'
+  kernalFiles["/usr/bin/libs47.lua"] = [==[
+local shell = require("shell")
+local args, opts = shell.parse("a", "-xy", "--name=v", "--", "-z")
+print("L47 parse " .. table.concat(args, ",") .. " " .. tostring(opts.x) .. tostring(opts.y) .. opts.name)
+print("L47 resolve " .. tostring(shell.resolve("helper47", "lua")))
+shell.setWorkingDirectory("/usr")
+print("L47 cwd " .. shell.getWorkingDirectory() .. " " .. shell.resolve("bin/x"))
+local ok, result = shell.execute("helper47")
+print("L47 execute " .. tostring(ok) .. " " .. tostring(result))
+local id = require("uuid").next()
+print("L47 uuid " .. tostring(#id == 36 and id:match("^%x+%-%x+%-4%x+%-[89ab]%x+%-%x+$") ~= nil))
+local chunks = {"line one\n", "line two\n"}
+local stream = {read = function() return table.remove(chunks, 1) end, close = function() end}
+local b = require("buffer").new("r", stream)
+print("L47 buffer " .. tostring(b:read("l")) .. "|" .. tostring(b:read("l")))
+local thread = require("thread")
+local t0 = require("computer").uptime()
+local a = thread.create(function() os.sleep(1) end)
+local c = thread.create(function() os.sleep(1) end)
+thread.waitForAll({a, c})
+print(string.format("L47 threads %s %s %.1f", a:status(), c:status(), require("computer").uptime() - t0))
+local co = require("process").load(function(x) return x * 3 end)
+print("L47 process " .. tostring(select(2, coroutine.resume(co, 5))) .. " " .. tostring(require("process").info().path))
+local w, h = require("tty").getViewport()
+print("L47 tty " .. tostring(w > 0 and h > 0))
+require("note").play(60, 0.05)
+print("L47 done")
+]==]
+  typeLine("libs47")
+  emu:advance(6)
+  assertScreenContains("helper ran", "shell.execute started the helper in its own window")
+  closeWindowAt(1, 50) -- the helper's, on top
+  assertScreenContains("L47 parse a,-z truetruev", "shell.parse")
+  assertScreenContains("L47 resolve /usr/bin/helper47.lua", "shell.resolve on the PATH")
+  assertScreenContains("L47 cwd /usr /usr/bin/x", "the working directory, and resolving against it")
+  assertScreenContains("L47 execute true 7", "shell.execute runs a program and waits for its result")
+  assertScreenContains("L47 uuid true", "uuid.next")
+  assertScreenContains("L47 buffer line one|line two", "buffer over a stream")
+  assertScreenContains("L47 threads dead dead 1.", "OpenOS threads run concurrently; waitForAll")
+  assertScreenContains("L47 process 15 /usr/bin/libs47.lua", "process.load and process.info")
+  assertScreenContains("L47 tty true", "tty.getViewport")
+  assertScreenContains("L47 done", "note.play")
+  closeWindowAt(1, 50)
+end
+print("  OK -- shell, process, thread, tty, buffer, uuid and note work for legacy programs")
 
 print("ALL OK")

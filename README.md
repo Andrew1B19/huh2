@@ -533,10 +533,9 @@ against the code (not just this document):
 
 - **GERTi** networking for programs (the raw modem API is built: the
   `modem` library and legacy programs' `modem` component).
-- **OpenOS libraries for legacy programs:** `shell` (`shell.parse`,
-  `shell.resolve`, working directory, ...), `buffer` (a stub that
-  errors), the full `process` library, OpenOS's `thread`, `uuid`,
-  `note`, `tty`/`vt100`. Programs that `require` these fail.
+- **OpenOS's `vt100`** escape-sequence library and `pipe` for legacy
+  programs (`shell`, `process`, `thread`, `tty`, `buffer`, `uuid` and
+  `note` are built).
 - **`create_graphics_process` for `.mxe`:** it creates the child and a
   window, but the child's `gpu` isn't wired to that window (legacy
   programs do get their own virtual gpu drawn into their window).

@@ -808,7 +808,7 @@ end
 -- worker runtime and never looked up here.
 local LEGACY_PACKAGE_PATH = {"/lib/?.lua", "/usr/lib/?.lua", "/lib/?/init.lua", "/usr/lib/?/init.lua"}
 local LEGACY_FACES = {component = true, computer = true, event = true, term = true, unicode = true,
-  process = true, buffer = true, package = true, filesystem = true}
+  process = true, package = true, filesystem = true, shell = true, thread = true, tty = true}
 local MAX_PREFETCH = 32
 local moduleCache = {} -- path -> {source, modified}
 

@@ -386,6 +386,9 @@ end
 local function satisfied(w)
   if w.cooperate then return true end
   if w.thread and w.thread.done then return true end
+  if w.anyThread then
+    for _, t in ipairs(w.anyThread) do if t.done then return true end end
+  end
   if w.rpc and rpcReplies[w.rpc] then return true end
   if w.events then
     local q = eventQueues[w.events]
@@ -1011,7 +1014,12 @@ local BUILTIN_LIBRARIES = {
     local lib = {}
     local Thread = {}
     Thread.__index = Thread
-    function Thread:status() return self.done and "dead" or "running" end
+    function Thread:status()
+      if self.done then return "dead" end
+      return self.suspended and "suspended" or "running"
+    end
+    function Thread:suspend() if not self.done then self.suspended = true end return self end
+    function Thread:resume() self.suspended = nil return self end
     function Thread:kill()
       if not self.done then self.killRequested = true end
     end
@@ -1035,6 +1043,15 @@ local BUILTIN_LIBRARIES = {
       return t
     end
     function lib.yield() wait(COOPERATE) end
+    -- The thread running now (nil in the process's main code).
+    function lib.current() return current and current.thread end
+    -- Waits until any of `threads` ends (or `timeout` passes).
+    function lib.waitForAny(threads, timeout)
+      for _, t in ipairs(threads) do if t.done then return true end end
+      wait({anyThread = threads, deadline = timeout and (computer.uptime() + timeout)})
+      for _, t in ipairs(threads) do if t.done then return true end end
+      return nil, "timeout"
+    end
     return lib
   end,
   -- A raw modem API: the network, through the kernal's card -- so the
@@ -2127,15 +2144,158 @@ local LEGACY_FACES = {
   unicode = function()
     return readOnly(hostUnicode or {}, "unicode")
   end,
+  -- OpenOS's process library: this program's own process, and
+  -- process.load (a file or function as a coroutine to resume).
   process = function(ctx)
-    local info = {path = ctx.path, command = ctx.path, env = {}, data = {}}
-    return setmetatable({
-      info = function() return info end,
-      running = function() return ctx.path end,
-    }, getmetatable(unavailable("process")))
+    local info = {path = ctx.path, command = ctx.path, env = ctx.osEnv, data = {}}
+    local p = {}
+    function p.info() return info end
+    function p.running() return ctx.path, info.env, info.command end
+    function p.findProcess() return info end
+    function p.list() return {info} end
+    function p.load(path, env, init, name)
+      local chunk, err = path, nil
+      if type(path) ~= "function" then
+        local resolved = ctx.require("shell").resolve(tostring(path), "lua") or tostring(path)
+        chunk, err = ctx.env.loadfile(resolved, "bt", env)
+      end
+      if not chunk then return nil, err end
+      return coroutine.create(function(...)
+        if init then init() end
+        return chunk(...)
+      end)
+    end
+    return setmetatable(p, getmetatable(unavailable("process")))
   end,
-  buffer = function()
-    return unavailable("buffer")
+  -- OpenOS's shell library, for programs: arguments, the working
+  -- directory and PATH (os.getenv's PWD and PATH), resolving names,
+  -- aliases, and execute -- which launches the program as its own
+  -- process, as the console would, and waits for it.
+  shell = function(ctx)
+    local env, aliases = ctx.osEnv, {}
+    local function fs() return ctx.require("filesystem") end
+    local function canonical(path)
+      local parts = {}
+      for part in path:gmatch("[^/]+") do
+        if part == ".." then parts[#parts] = nil elseif part ~= "." then parts[#parts + 1] = part end
+      end
+      return "/" .. table.concat(parts, "/")
+    end
+    local sh = {}
+    function sh.getWorkingDirectory() return env.PWD or "/" end
+    function sh.setWorkingDirectory(dir)
+      local path = sh.resolve(dir)
+      if not fs().isDirectory(path) then return nil, "not a directory" end
+      env.PWD = path
+      return true
+    end
+    function sh.getPath() return env.PATH end
+    function sh.setPath(value) env.PATH = value end
+    function sh.resolve(path, ext)
+      path = tostring(path)
+      if ext then
+        if not path:find("/", 1, true) then
+          for dir in (env.PATH or ""):gmatch("[^:]+") do
+            dir = sh.resolve(dir)
+            for _, candidate in ipairs({dir .. "/" .. path, dir .. "/" .. path .. "." .. ext}) do
+              if fs().exists(candidate) and not fs().isDirectory(candidate) then return candidate end
+            end
+          end
+          return nil, "file not found"
+        end
+        local p = sh.resolve(path)
+        if fs().exists(p) and not fs().isDirectory(p) then return p end
+        if fs().exists(p .. "." .. ext) then return p .. "." .. ext end
+        return nil, "file not found"
+      end
+      if path:sub(1, 1) == "~" then path = (env.HOME or "/home") .. path:sub(2) end
+      if path:sub(1, 1) ~= "/" then path = (env.PWD or "/") .. "/" .. path end
+      return canonical(path)
+    end
+    -- OpenOS's rules: -abc sets a, b, c; --name and --name=value; --
+    -- ends options; - and everything else is an argument.
+    function sh.parse(...)
+      local args, options, ended = {}, {}, false
+      for i = 1, select("#", ...) do
+        local a = tostring((select(i, ...)))
+        if ended or a == "-" or a:sub(1, 1) ~= "-" then
+          args[#args + 1] = a
+        elseif a == "--" then
+          ended = true
+        elseif a:sub(1, 2) == "--" then
+          local k, v = a:match("^%-%-([^=]+)=(.*)$")
+          if k then options[k] = v else options[a:sub(3)] = true end
+        else
+          for c in a:sub(2):gmatch(".") do options[c] = true end
+        end
+      end
+      return args, options
+    end
+    function sh.getAlias(name) return aliases[name] end
+    function sh.setAlias(name, value) aliases[name] = value end
+    function sh.aliases() return pairs(aliases) end
+    function sh.getShell() return "/bin/sh" end
+    function sh.setShell() end
+    function sh.execute(command, _, ...)
+      local words = {}
+      for w in tostring(command or ""):gmatch("%S+") do words[#words + 1] = w end
+      for i = 1, select("#", ...) do words[#words + 1] = tostring((select(i, ...))) end
+      local name = table.remove(words, 1)
+      if not name then return true end
+      name = aliases[name] or name
+      local launched, err = remoteRequest("LAUNCH", {path = name, args = words, caller = ctx.id})
+      if not launched then return false, err end
+      while true do
+        local job = remoteRequest("GETPROCESS", {jobId = launched.id})
+        if not job or job.status ~= "running" then
+          return job ~= nil and job.status == "done", job and (job.result or job.error)
+        end
+        wait({deadline = computer.uptime() + 0.2})
+      end
+    end
+    return sh
+  end,
+  -- OpenOS's thread library, on the runtime's threads: create, current,
+  -- waitForAll/waitForAny, and handles with resume/suspend/kill/status/
+  -- join/detach/attach.
+  thread = function(ctx)
+    local lib = BUILTIN_LIBRARIES.thread(ctx.id)
+    local t = {}
+    function t.create(fn, ...)
+      local handle = lib.create(fn, ...)
+      handle.detach = function(self) return self end
+      handle.attach = function(self) return self end
+      handle.getProcess = function() return ctx.require("process").info() end
+      return handle
+    end
+    t.current = lib.current
+    function t.waitForAll(threads, timeout)
+      local deadline = timeout and (computer.uptime() + timeout)
+      for _, th in ipairs(threads) do
+        local ok, err = th:join(deadline and math.max(0, deadline - computer.uptime()))
+        if ok == nil and err == "timeout" then return nil, "timeout" end
+      end
+      return true
+    end
+    function t.waitForAny(threads, timeout) return lib.waitForAny(threads, timeout) end
+    return t
+  end,
+  -- OpenOS's tty, over the program's own terminal (term).
+  tty = function(ctx)
+    local term = ctx.require("term")
+    local tty = {
+      getViewport = term.getViewport, getCursor = term.getCursor, setCursor = term.setCursor,
+      getCursorBlink = term.getCursorBlink, setCursorBlink = term.setCursorBlink,
+      gpu = term.gpu, getGPU = term.gpu, getScreen = term.screen, getKeyboard = term.keyboard,
+      isAvailable = term.isAvailable, write = term.write, clear = term.clear, clearLine = term.clearLine,
+      window = {},
+    }
+    tty.stream = {
+      write = function(_, value) term.write(value) return true end,
+      read = function() return term.read() end,
+      close = function() end,
+    }
+    return tty
   end,
   -- gmux-style: the process's own virtual gpu, screen and keyboard,
   -- the OS filesystem, and every other component in the cluster over
@@ -2393,6 +2553,7 @@ end
 -- one isn't.
 local function runnable(p)
   if p.thread and p.thread.killRequested then return true end
+  if p.thread and p.thread.suspended then return false end
   local state = controlState[p.jobId or p.id]
   if state == "KILL" or state == "MIGRATE" then return true end
   if state == "PAUSE" then return false end
