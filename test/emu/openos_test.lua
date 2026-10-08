@@ -268,14 +268,15 @@ end
 print("  OK")
 
 -- The floppy's /init.lua shows a failing installer on the screen.
-print("openos 5b: under the stock BIOS, an installer that fails says so on the screen")
+print("openos 5b: under the stock BIOS, an installer that fails says so on the screen and dumps to the floppy")
 do
   local bare = emu:newNode("bare")
   local _, _, bareBufs = emu:addGpuScreen(bare, 80, 25)
-  emu:addFilesystem(bare, {
+  local floppyFiles = {
     ["/init.lua"] = readFile(REPO_ROOT .. "/dist/floppy/init.lua"),
     ["/muxos-installer.lua"] = "error('broken on purpose')",
-  })
+  }
+  emu:addFilesystem(bare, floppyFiles)
   emu:addEeprom(bare, readFile(assets .. "/lua/bios.lua"))
   emu:boot(bare)
   emu:advance(2)
@@ -283,6 +284,11 @@ do
   for x = 1, 80 do chars[x] = (row[x] and row[x].char) or " " end
   if bare.status ~= "dead" or not table.concat(chars):find("muxos installer stopped: /muxos-installer.lua:1: broken", 1, true) then
     error("the failure isn't on the screen: " .. table.concat(chars), 0)
+  end
+  local dump = floppyFiles["/muxos-boot-dump.txt"] or ""
+  if not (dump:find("muxos floppy init.lua boot dump", 1, true) and dump:find("broken on purpose", 1, true)
+      and dump:find("stack traceback", 1, true) and dump:find("memory %d+/%d+")) then
+    error("no dump on the floppy:\n" .. dump, 0)
   end
 end
 print("  OK")

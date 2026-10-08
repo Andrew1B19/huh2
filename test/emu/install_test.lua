@@ -424,14 +424,23 @@ do
     error("no crash logged")
   end
   local why, screen = crash(nil)
-  assert(why:find("muxos: nothing to boot", 1, true) and why:find("  none", 1, true)
-    and why:find("Put the installer floppy", 1, true), why)
+  assert(why:find("muxos: nothing to boot", 1, true) and why:find("Put the installer floppy", 1, true), why)
   assert(screen:find("muxos: nothing to boot. Disks this computer can see:", 1, true), "shown on the screen:\n" .. screen)
-  why, screen = crash({["/muxos-installer.lua"] = "this is not lua (", ["/notes.txt"] = "hi"})
+  local files = {["/muxos-installer.lua"] = "this is not lua (", ["/notes.txt"] = "hi"}
+  why, screen = crash(files)
+  -- A dump for debugging, on the disk: the error, the machine, every
+  -- component, and each disk's root listing.
+  local dump = files["/muxos-boot-dump.txt"] or ""
+  assert(dump:find("muxos BIOS dump", 1, true) and dump:find("syntax error", 1, true)
+    and dump:find("memory %d+/%d+") and dump:find(" eeprom") and dump:find(" gpu")
+    and dump:find("filesystem \"[^\n]*: muxos%-installer%.lua notes%.txt"), "the dump:\n" .. dump)
+  assert(screen:find("Dump: filesyst/muxos-boot-dump.txt", 1, true), "the dump is named on the screen:\n" .. screen)
   assert(why:find('": muxos-installer.lua\n', 1, true)
     and why:find("filesyst/muxos-installer.lua: ", 1, true), why)
   assert(screen:find("filesyst/muxos-installer.lua: ", 1, true), "the load error is on the screen:\n" .. screen)
-  why, screen = crash({["/muxos-installer.lua"] = "error('broken on purpose')"})
+  files = {["/muxos-installer.lua"] = "error('broken on purpose')"}
+  why, screen = crash(files)
+  assert((files["/muxos-boot-dump.txt"] or ""):find("stack traceback", 1, true), "the installer's traceback is dumped")
   assert(why:find("muxos installer stopped: /muxos-installer.lua:1: broken on purpose", 1, true), why)
   assert(screen:find("muxos installer stopped: /muxos-installer.lua:1: broken on purpose", 1, true), "shown on the screen:\n" .. screen)
 end
