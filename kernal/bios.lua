@@ -1,4 +1,4 @@
--- muxos kernal BIOS. See docs/PROTOCOL.md, "The kernal is bare-metal".
+-- muxos kernal BIOS; see docs/PROTOCOL.md.
 local invoke = component.invoke
 local function call(a, m, ...)
   local r = table.pack(pcall(invoke, a, m, ...))
@@ -23,7 +23,7 @@ local function say(text)
   end
 end
 
--- On failure: dump to the floppy (else a writable disk), then stop.
+-- Failure: dump to a writable disk, stop.
 local function stop(text, floppy)
   say(text)
   local d = {"muxos BIOS dump", table.concat(lines, "\n"), "",
@@ -48,8 +48,7 @@ local function stop(text, floppy)
   error(table.concat(lines, "\n"), 0)
 end
 
--- Opened directly, like the stock BIOS: "not found" is just absence,
--- anything else is reported.
+-- Opened directly, like the stock BIOS.
 local function loadFrom(a, path)
   local h, why = call(a, "open", path)
   if not h then return nil, why ~= path and why ~= "file not found" and why or nil end
@@ -88,16 +87,22 @@ if init then
   return init()
 end
 
-for a in list("filesystem") do
-  local installer = try(a, "/muxos-installer.lua")
-  if installer then
-    computer.beep(800, 0.2)
-    local ok, err = xpcall(installer, debug.traceback, a, "/muxos-installer.lua")
-    if ok then return end
-    lines = {}
-    stop("muxos installer stopped: " .. tostring(err), not call(a, "isReadOnly") and a)
+-- The installer, retried for 5 s: a rack's drive can attach late.
+local wait = computer.uptime() + 5
+repeat
+  problems = {}
+  for a in list("filesystem") do
+    local installer = try(a, "/muxos-installer.lua")
+    if installer then
+      computer.beep(800, 0.2)
+      local ok, err = xpcall(installer, debug.traceback, a, "/muxos-installer.lua")
+      if ok then return end
+      lines = {}
+      stop("muxos installer stopped: " .. tostring(err), not call(a, "isReadOnly") and a)
+    end
   end
-end
+  computer.pullSignal(1)
+until computer.uptime() > wait
 
 say("muxos: nothing to boot. Disks this computer can see, and their files:")
 for a in list("filesystem") do

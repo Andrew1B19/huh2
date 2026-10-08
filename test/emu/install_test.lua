@@ -408,7 +408,7 @@ do
     emu:addEeprom(node, readFile(REPO_ROOT .. "/kernal/bios.lua"))
     local mark = #emu.log
     emu:boot(node)
-    emu:advance(2)
+    emu:advance(8) -- it waits 5 s for a late floppy first
     assert(node.status == "dead", "the BIOS stopped")
     local rows = {}
     for y = 1, bufs[0].h do
@@ -459,6 +459,24 @@ do
   local row, chars = bufs[0].cells[1] or {}, {}
   for x = 1, 80 do chars[x] = (row[x] and row[x].char) or " " end
   assert(table.concat(chars):find("muxos 0.1.2 installer (booted from", 1, true), "it booted the installer: " .. table.concat(chars))
+end
+print("  OK")
+
+print("install 12: the kernal BIOS waits for a floppy whose drive attaches just after power-on (a rack's)")
+do
+  local node = emu:newNode("bare")
+  local _, _, bufs = emu:addGpuScreen(node, 80, 25)
+  emu:addFilesystem(node, {}) -- the node's own empty disk
+  emu:addEeprom(node, readFile(REPO_ROOT .. "/kernal/bios.lua"))
+  emu:boot(node)
+  emu:advance(2)
+  assert(node.status == "running", "still waiting, not crashed")
+  local floppy = emu:addFilesystem(node, {["/muxos-installer.lua"] = readFile(BUNDLE), ["/muxos-installer.dat"] = readFile(DATA)})
+  emu:injectSignal(node, "component_added", floppy, "filesystem")
+  emu:advance(2)
+  local row, chars = bufs[0].cells[1] or {}, {}
+  for x = 1, 80 do chars[x] = (row[x] and row[x].char) or " " end
+  assert(table.concat(chars):find("muxos 0.1.2 installer (booted from", 1, true), "it booted the late floppy: " .. table.concat(chars))
 end
 print("  OK")
 
