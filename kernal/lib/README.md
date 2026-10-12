@@ -9,11 +9,11 @@ Vendored unchanged from OpenOS (MightyPirates/OpenComputers,
 `OPENOS_LICENSE`:
 
 - `serialization.lua`, `text.lua`, `sides.lua`, `colors.lua`, `keyboard.lua`, `internet.lua`,
-  `transforms.lua`
-- `core/full_keyboard.lua`, `core/full_text.lua`, `core/full_transforms.lua`
-  (loaded lazily by the above through `package.delay`)
+  `transforms.lua`, `buffer.lua`, `uuid.lua`, `bit32.lua`, `note.lua`
+- `core/full_keyboard.lua`, `core/full_text.lua`, `core/full_transforms.lua`,
+  `core/full_buffer.lua` (loaded lazily by the above through `package.delay`)
 
 To add a library, drop it in `/lib` (or `/usr/lib`) on the kernal's disk.
 Machine-level modules (`component`, `computer`, `event`, `term`, `unicode`,
-`process`, `buffer`, `package`) are provided by the worker
-runtime itself, not by files here.
+`process`, `package`, `filesystem`, `shell`, `thread`, `tty`) are provided by
+the worker runtime itself, not by files here.

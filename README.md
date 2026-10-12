@@ -443,8 +443,9 @@ access is blocked" instead of quietly drawing on the kernal's live
 screen; use `gmuxapi.create_window()` for ordinary output.
 `gmuxapi.request_fullscreen()`/`release_fullscreen()` are the one way
 through, for a fullscreen app that genuinely wants to own the display
-directly -- first-come-first-served, one holder at a time, NOT released
-automatically if its holder disappears. See docs/PROTOCOL.md's
+directly -- first-come-first-served, one holder at a time, released when
+the program holding it ends or its node goes down (or by pressing
+Ctrl+Alt+C). See docs/PROTOCOL.md's
 "The compositor" section.
 
 `node/runtime.lua`'s `gmuxapi` table is muxos's translation of gmux's
@@ -531,32 +532,17 @@ hang a job calling `gmuxapi.*` forever -- see docs/PROTOCOL.md's
 **Not built yet** -- what the design describes that doesn't exist, checked
 against the code (not just this document):
 
-- **Networking for programs.** Network cards aren't on the cluster bus,
-  so no program can use a modem. The design calls for a kernal modem
-  module for `.mxe` programs (and GERTi access), and an emulated modem
-  for legacy programs.
-- **Remote component signals.** Calling another node's components works
-  (the bus), but their signals (`redstone_changed`, an internet card's
-  events, ...) don't reach programs on other nodes.
-- **OpenOS libraries for legacy programs:** `shell` (`shell.parse`,
-  `shell.resolve`, working directory, ...), `buffer` (a stub that
-  errors), the full `process` library, OpenOS's `thread`, `uuid`,
-  `note`, `tty`/`vt100`. Programs that `require` these fail.
-- **`create_graphics_process` for `.mxe`:** it creates the child and a
-  window, but the child's `gpu` isn't wired to that window (legacy
-  programs do get their own virtual gpu drawn into their window).
-- **A desktop wallpaper** (a bit-window background); the desktop is a
-  plain color.
-- **The console's line editor:** no history, no cursor movement within
-  a line, no paste.
-- **Fullscreen grant:** released if its node goes down, or with Ctrl+Alt+C,
-  but not when the holding program ends while its node stays up.
+- **GERTi** networking for programs (the raw modem API is built: the
+  `modem` library and legacy programs' `modem` component).
+- **OpenOS's `vt100`** escape-sequence library and `pipe` for legacy
+  programs (`shell`, `process`, `thread`, `tty`, `buffer`, `uuid` and
+  `note` are built).
 - **The scheduler:** places work on the live worker with the fewest
   running jobs (round-robin among equals); nothing load-aware beyond
   that.
 - **Deferred or undecided by design:** multi-monitor support, a kernal
   system bus (dbus-like) for `.mxe` programs, and OPM's interface to the
-  kernal.
+  kernal (OPM will update the kernal and its modules through it).
 
 **The `.mxe` process model, partially built**: parent/child jobs are
 real now -- `gmuxapi.create_headless_process`/`create_graphics_process`
@@ -639,7 +625,14 @@ Tested in `test/emu/integration_test.lua`, test 41.
   (**≡ muxos**), whose menu lists every app, which is handy when windows
   cover the icons. It has a button per window: touching one restores and
   raises it, or minimizes it if it's already the focused window on top.
-  The clock is on the right.
+  A minimized window is hidden entirely; its button is how it comes
+  back. When the buttons don't fit, titles shrink, and past that a
+  **+N** button opens a menu of every window. The clock is on the right.
+- **Wallpaper:** `wallpaper <file>` shows a PPM image (P3 or P6, the
+  format most image editors can export) behind the desktop's icons,
+  stretched to the screen as half-block cells. It's kept across reboots
+  in `/etc/wallpaper`; `wallpaper none` goes back to the plain desktop,
+  and `wallpaper` alone says which is set (test 49).
 - **`demo`** (the `muxos-demo` package, with its own icon): muxos's test
   program. It's not part of the installer. On muxos, `opm pull
   muxos-demo` installs it as `/usr/bin/demo.mxe`. Or pull it to a floppy
@@ -667,7 +660,13 @@ other (minimize, move, resize; its close button minimizes it), docked in
 the bottom half of the screen by default (`console <w> <h>` resizes it),
 painted into the frame buffer, or, in console mode, drawn straight onto
 the screen. It has scrollback
-(PgUp/PgDn, mouse wheel) and queues input while a command runs. Nodes are tracked
+(PgUp/PgDn, mouse wheel) and queues input while a command runs. Its
+line editor (`kernal/lineedit.lua`) has history (Up/Down; the line being
+typed comes back past the newest entry), cursor movement (Left/Right,
+Home/End, ^A/^E), Backspace/Delete, ^U/^K (cut before/after the
+cursor) and ^W (cut a word). Pasting (Minecraft's paste, OpenComputers'
+`clipboard` signal) types the text in, each newline an Enter; a focused
+program gets the `clipboard` signal instead (test 50). Nodes are tracked
 for liveness without a heartbeat (probes answered at job yield points;
 a silent node's jobs become `lost`), finished-job history is capped at
 100 without source, and `get_orphans` only hands out real orphans (with

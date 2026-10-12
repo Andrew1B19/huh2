@@ -347,9 +347,23 @@ end
 -- kernal knows a busy node is alive, with no heartbeat); a reply to an
 -- RPC is kept for the process awaiting it; everything else from the
 -- kernal is handled at once (handleMessage).
-receive = function(name, _, from, port, _, data)
+receive = function(name, ...)
   if name == "component_added" or name == "component_removed" then reportComponents() return end
-  if name ~= "modem_message" or noteControl(port, data) then return end
+  if name ~= "modem_message" then
+    -- A signal from one of this node's bus components (redstone_changed,
+    -- an internet card's events, ...): to the kernal, which hands it to
+    -- every running program in the cluster.
+    local addr = ...
+    if kernalAddr and type(addr) == "string" then
+      local ok, ctype = pcall(component.type, addr)
+      if ok and ctype and not BUS_EXCLUDED[ctype] then
+        send({type = "SIGNAL", from = nodeId, to = kernalAddr, signal = table.pack(name, ...)})
+      end
+    end
+    return
+  end
+  local _, from, port, _, data = ...
+  if noteControl(port, data) then return end
   if port ~= PORT or type(data) ~= "string" then return end
   local payload = reassemble(from, data)
   local msg = payload and deserialize(payload)
@@ -372,6 +386,9 @@ end
 local function satisfied(w)
   if w.cooperate then return true end
   if w.thread and w.thread.done then return true end
+  if w.anyThread then
+    for _, t in ipairs(w.anyThread) do if t.done then return true end end
+  end
   if w.rpc and rpcReplies[w.rpc] then return true end
   if w.events then
     local q = eventQueues[w.events]
@@ -718,30 +735,24 @@ gmuxapi = {
   -- job and creates a window of the requested size, but the job's own
   -- `gpu` face still targets the kernal's PRIMARY screen directly, not
   -- this window's buffer. Flagged, not silently pretended to work.
+  -- Like create_headless_process, plus a window the child owns and draws
+  -- into: in the child, `gpu` is a virtual gpu (OpenComputers' gpu API)
+  -- whose drawing lands in that window -- its size options.width x
+  -- options.height (default 40x12) -- and keys typed while the window
+  -- has focus reach the child's pull_event. The kernal makes the window
+  -- with the child, so it exists before the child's first draw.
   create_graphics_process = function(options)
     options = options or {}
     if not options.code then
       return nil, "create_graphics_process needs options.code (a Lua source string)"
     end
+    local width, height = tonumber(options.width) or 40, tonumber(options.height) or 12
     local proc, procErr = remoteRequest("SPAWN", {code = options.code, args = options.args, node = options.node,
-      parent = currentJobId, appName = options.name, orphanPolicy = options.orphan_policy})
+      parent = currentJobId, appName = options.name, orphanPolicy = options.orphan_policy,
+      graphics = {title = options.title or options.name or "graphics", x = options.x, y = options.y,
+        width = width, height = height, resizable = options.resizable, decorated = options.title_bar}})
     if not proc then return nil, procErr end
-    -- `ownerJobId = proc.id` links this window to the job it was just
-    -- created FOR, not to whichever node happened to make this
-    -- CREATEWINDOW request (this call itself can run on a totally
-    -- different node than the child it just spawned). This is the one
-    -- piece of scaffolding focus-based keyboard delivery actually
-    -- needs from this call: given a focused window, the kernal can
-    -- look up its ownerJobId and, from there, jobs[ownerJobId].node --
-    -- no separate bookkeeping required. See kernal/compositor.lua's
-    -- M.setFocus/M.getFocus for the tracking side of this.
-    local win, winErr = remoteRequest("CREATEWINDOW", {
-      title = options.name, x = options.x, y = options.y, width = options.width, height = options.height,
-      resizable = options.resizable, decorated = options.title_bar, ownerJobId = proc.id,
-      caller = currentJobId,
-    })
-    if not win then return {process = proc}, winErr end
-    return {process = proc, window = win}
+    return {process = {id = proc.id, node = proc.node}, window = proc.window}
   end,
 
   -- Also stands in for gmux's separate create_window_buffer: gmux draws
@@ -789,10 +800,10 @@ gmuxapi = {
   -- default, and this is how a node gets let through it, for the one
   -- legitimate case where bypassing the compositor's buffer/blit
   -- indirection is the point -- a fullscreen app that wants to own the
-  -- whole display. First-come-first-served, one holder at a time; NOT
-  -- released automatically if the holder disappears (reboots, crashes).
+  -- whole display. First-come-first-served, one holder at a time;
+  -- released when the process that asked ends, or its node goes down.
   request_fullscreen = function()
-    return remoteRequest("REQUESTFULLSCREEN")
+    return remoteRequest("REQUESTFULLSCREEN", {caller = currentJobId})
   end,
 
   release_fullscreen = function()
@@ -997,7 +1008,12 @@ local BUILTIN_LIBRARIES = {
     local lib = {}
     local Thread = {}
     Thread.__index = Thread
-    function Thread:status() return self.done and "dead" or "running" end
+    function Thread:status()
+      if self.done then return "dead" end
+      return self.suspended and "suspended" or "running"
+    end
+    function Thread:suspend() if not self.done then self.suspended = true end return self end
+    function Thread:resume() self.suspended = nil return self end
     function Thread:kill()
       if not self.done then self.killRequested = true end
     end
@@ -1021,7 +1037,50 @@ local BUILTIN_LIBRARIES = {
       return t
     end
     function lib.yield() wait(COOPERATE) end
+    -- The thread running now (nil in the process's main code).
+    function lib.current() return current and current.thread end
+    -- Waits until any of `threads` ends (or `timeout` passes).
+    function lib.waitForAny(threads, timeout)
+      for _, t in ipairs(threads) do if t.done then return true end end
+      wait({anyThread = threads, deadline = timeout and (computer.uptime() + timeout)})
+      for _, t in ipairs(threads) do if t.done then return true end end
+      return nil, "timeout"
+    end
     return lib
+  end,
+  -- A raw modem API: the network, through the kernal's card -- so the
+  -- program's address is the kernal's wherever it runs. Messages on its
+  -- open ports arrive through gmuxapi.pull_event shaped like
+  -- OpenComputers' signal: {"modem_message", receiver, from, port,
+  -- distance, ...}.
+  --   modem.address, modem.maxPacketSize(), modem.isWireless()
+  --   modem.open(port), modem.close(port), modem.isOpen(port)
+  --   modem.send(address, port, ...), modem.broadcast(port, ...)
+  -- (Port 4477 is the cluster's own.) Ports close when the process ends.
+  modem = function()
+    local function call(op, fields)
+      fields = fields or {}
+      fields.op, fields.caller = op, currentJobId
+      local result, err = remoteRequest("NET", fields)
+      if err then error(err, 3) end
+      return result
+    end
+    local info
+    local function getInfo()
+      info = info or call("info")
+      return info
+    end
+    return setmetatable({
+      open = function(port) return call("open", {port = port}) end,
+      close = function(port) return call("close", {port = port}) end,
+      isOpen = function(port) return call("isOpen", {port = port}) end,
+      send = function(address, port, ...)
+        return call("send", {address = address, port = port, data = table.pack(...)})
+      end,
+      broadcast = function(port, ...) return call("broadcast", {port = port, data = table.pack(...)}) end,
+      maxPacketSize = function() return getInfo().maxPacketSize end,
+      isWireless = function() return getInfo().wireless end,
+    }, {__index = function(_, k) if k == "address" then return getInfo().address end end})
   end,
   -- HTTP over whichever internet card the bus offers, this node's first
   -- (docs/MXE.md section 7.6).
@@ -1560,6 +1619,34 @@ local function virtualDevices(ctx)
   }
   local keyboard = {type = "keyboard", address = VKEYBOARD_ADDRESS}
   ctx.devices = {[VGPU_ADDRESS] = v.proxy, [VSCREEN_ADDRESS] = screen, [VKEYBOARD_ADDRESS] = keyboard}
+  -- A modem, emulated over the kernal's NET service (the raw modem API
+  -- .mxe programs get): its address is the kernal's card, the program's
+  -- real address on the network; modem_message signals arrive as usual.
+  if kernalAddr then
+    local function call(op, fields)
+      fields = fields or {}
+      fields.op, fields.caller = op, ctx.id
+      local result, err = remoteRequest("NET", fields)
+      if err then error(err, 3) end
+      return result
+    end
+    local strength, wake = 400, nil
+    ctx.devices[kernalAddr] = {
+      type = "modem", address = kernalAddr,
+      open = function(port) return call("open", {port = port}) end,
+      close = function(port) return call("close", {port = port}) end,
+      isOpen = function(port) return call("isOpen", {port = port}) end,
+      send = function(address, port, ...) return call("send", {address = address, port = port, data = table.pack(...)}) end,
+      broadcast = function(port, ...) return call("broadcast", {port = port, data = table.pack(...)}) end,
+      maxPacketSize = function() return call("info").maxPacketSize end,
+      isWireless = function() return call("info").wireless end,
+      isWired = function() return true end,
+      getStrength = function() return strength end,
+      setStrength = function(n) strength = tonumber(n) or strength return strength end,
+      getWakeMessage = function() return wake end,
+      setWakeMessage = function(m) wake = m return m end,
+    }
+  end
   -- The kernal's disk, the OS filesystem (see "Legacy filesystem").
   if ctx.fsAddress then
     local fsProxy = {type = "filesystem", address = ctx.fsAddress}
@@ -2051,15 +2138,158 @@ local LEGACY_FACES = {
   unicode = function()
     return readOnly(hostUnicode or {}, "unicode")
   end,
+  -- OpenOS's process library: this program's own process, and
+  -- process.load (a file or function as a coroutine to resume).
   process = function(ctx)
-    local info = {path = ctx.path, command = ctx.path, env = {}, data = {}}
-    return setmetatable({
-      info = function() return info end,
-      running = function() return ctx.path end,
-    }, getmetatable(unavailable("process")))
+    local info = {path = ctx.path, command = ctx.path, env = ctx.osEnv, data = {}}
+    local p = {}
+    function p.info() return info end
+    function p.running() return ctx.path, info.env, info.command end
+    function p.findProcess() return info end
+    function p.list() return {info} end
+    function p.load(path, env, init, name)
+      local chunk, err = path, nil
+      if type(path) ~= "function" then
+        local resolved = ctx.require("shell").resolve(tostring(path), "lua") or tostring(path)
+        chunk, err = ctx.env.loadfile(resolved, "bt", env)
+      end
+      if not chunk then return nil, err end
+      return coroutine.create(function(...)
+        if init then init() end
+        return chunk(...)
+      end)
+    end
+    return setmetatable(p, getmetatable(unavailable("process")))
   end,
-  buffer = function()
-    return unavailable("buffer")
+  -- OpenOS's shell library, for programs: arguments, the working
+  -- directory and PATH (os.getenv's PWD and PATH), resolving names,
+  -- aliases, and execute -- which launches the program as its own
+  -- process, as the console would, and waits for it.
+  shell = function(ctx)
+    local env, aliases = ctx.osEnv, {}
+    local function fs() return ctx.require("filesystem") end
+    local function canonical(path)
+      local parts = {}
+      for part in path:gmatch("[^/]+") do
+        if part == ".." then parts[#parts] = nil elseif part ~= "." then parts[#parts + 1] = part end
+      end
+      return "/" .. table.concat(parts, "/")
+    end
+    local sh = {}
+    function sh.getWorkingDirectory() return env.PWD or "/" end
+    function sh.setWorkingDirectory(dir)
+      local path = sh.resolve(dir)
+      if not fs().isDirectory(path) then return nil, "not a directory" end
+      env.PWD = path
+      return true
+    end
+    function sh.getPath() return env.PATH end
+    function sh.setPath(value) env.PATH = value end
+    function sh.resolve(path, ext)
+      path = tostring(path)
+      if ext then
+        if not path:find("/", 1, true) then
+          for dir in (env.PATH or ""):gmatch("[^:]+") do
+            dir = sh.resolve(dir)
+            for _, candidate in ipairs({dir .. "/" .. path, dir .. "/" .. path .. "." .. ext}) do
+              if fs().exists(candidate) and not fs().isDirectory(candidate) then return candidate end
+            end
+          end
+          return nil, "file not found"
+        end
+        local p = sh.resolve(path)
+        if fs().exists(p) and not fs().isDirectory(p) then return p end
+        if fs().exists(p .. "." .. ext) then return p .. "." .. ext end
+        return nil, "file not found"
+      end
+      if path:sub(1, 1) == "~" then path = (env.HOME or "/home") .. path:sub(2) end
+      if path:sub(1, 1) ~= "/" then path = (env.PWD or "/") .. "/" .. path end
+      return canonical(path)
+    end
+    -- OpenOS's rules: -abc sets a, b, c; --name and --name=value; --
+    -- ends options; - and everything else is an argument.
+    function sh.parse(...)
+      local args, options, ended = {}, {}, false
+      for i = 1, select("#", ...) do
+        local a = tostring((select(i, ...)))
+        if ended or a == "-" or a:sub(1, 1) ~= "-" then
+          args[#args + 1] = a
+        elseif a == "--" then
+          ended = true
+        elseif a:sub(1, 2) == "--" then
+          local k, v = a:match("^%-%-([^=]+)=(.*)$")
+          if k then options[k] = v else options[a:sub(3)] = true end
+        else
+          for c in a:sub(2):gmatch(".") do options[c] = true end
+        end
+      end
+      return args, options
+    end
+    function sh.getAlias(name) return aliases[name] end
+    function sh.setAlias(name, value) aliases[name] = value end
+    function sh.aliases() return pairs(aliases) end
+    function sh.getShell() return "/bin/sh" end
+    function sh.setShell() end
+    function sh.execute(command, _, ...)
+      local words = {}
+      for w in tostring(command or ""):gmatch("%S+") do words[#words + 1] = w end
+      for i = 1, select("#", ...) do words[#words + 1] = tostring((select(i, ...))) end
+      local name = table.remove(words, 1)
+      if not name then return true end
+      name = aliases[name] or name
+      local launched, err = remoteRequest("LAUNCH", {path = name, args = words, caller = ctx.id})
+      if not launched then return false, err end
+      while true do
+        local job = remoteRequest("GETPROCESS", {jobId = launched.id})
+        if not job or job.status ~= "running" then
+          return job ~= nil and job.status == "done", job and (job.result or job.error)
+        end
+        wait({deadline = computer.uptime() + 0.2})
+      end
+    end
+    return sh
+  end,
+  -- OpenOS's thread library, on the runtime's threads: create, current,
+  -- waitForAll/waitForAny, and handles with resume/suspend/kill/status/
+  -- join/detach/attach.
+  thread = function(ctx)
+    local lib = BUILTIN_LIBRARIES.thread(ctx.id)
+    local t = {}
+    function t.create(fn, ...)
+      local handle = lib.create(fn, ...)
+      handle.detach = function(self) return self end
+      handle.attach = function(self) return self end
+      handle.getProcess = function() return ctx.require("process").info() end
+      return handle
+    end
+    t.current = lib.current
+    function t.waitForAll(threads, timeout)
+      local deadline = timeout and (computer.uptime() + timeout)
+      for _, th in ipairs(threads) do
+        local ok, err = th:join(deadline and math.max(0, deadline - computer.uptime()))
+        if ok == nil and err == "timeout" then return nil, "timeout" end
+      end
+      return true
+    end
+    function t.waitForAny(threads, timeout) return lib.waitForAny(threads, timeout) end
+    return t
+  end,
+  -- OpenOS's tty, over the program's own terminal (term).
+  tty = function(ctx)
+    local term = ctx.require("term")
+    local tty = {
+      getViewport = term.getViewport, getCursor = term.getCursor, setCursor = term.setCursor,
+      getCursorBlink = term.getCursorBlink, setCursorBlink = term.setCursorBlink,
+      gpu = term.gpu, getGPU = term.gpu, getScreen = term.screen, getKeyboard = term.keyboard,
+      isAvailable = term.isAvailable, write = term.write, clear = term.clear, clearLine = term.clearLine,
+      window = {},
+    }
+    tty.stream = {
+      write = function(_, value) term.write(value) return true end,
+      read = function() return term.read() end,
+      close = function() end,
+    }
+    return tty
   end,
   -- gmux-style: the process's own virtual gpu, screen and keyboard,
   -- the OS filesystem, and every other component in the cluster over
@@ -2317,6 +2547,7 @@ end
 -- one isn't.
 local function runnable(p)
   if p.thread and p.thread.killRequested then return true end
+  if p.thread and p.thread.suspended then return false end
   local state = controlState[p.jobId or p.id]
   if state == "KILL" or state == "MIGRATE" then return true end
   if state == "PAUSE" then return false end
@@ -2382,7 +2613,17 @@ local function spawnProc(msg)
       end
     end
   else
-    chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t", newProcessEnv(msg.id))
+    local env = newProcessEnv(msg.id)
+    if msg.windowId then
+      -- A graphics process (create_graphics_process): its `gpu` draws
+      -- into its own window -- a virtual gpu, as a legacy program has.
+      local ctx = {id = msg.id, name = "graphics", windowId = msg.windowId,
+        screenSize = {tonumber(msg.width) or 40, (tonumber(msg.height) or 12) + 1}}
+      ctx.vgpu = newVirtualGpu(ctx, tonumber(msg.width) or 40, tonumber(msg.height) or 12)
+      graphicsFlushers[msg.id] = function(force) flushVirtualGpu(ctx, force) end
+      rawset(env, "gpu", ctx.vgpu.proxy)
+    end
+    chunk, loadErr = load("local args = ...\n" .. msg.code, "=job", "t", env)
     entry = chunk
   end
   if not chunk then
@@ -2442,9 +2683,9 @@ while true do
     if deadline then timeout = math.min(timeout, math.max(0, deadline - computer.uptime())) end
   end
   for n = 1, MAX_SIGNALS_PER_ROUND do
-    local name, a, b, c, d, e = computer.pullSignal(n == 1 and timeout or 0)
-    if not name then break end
-    receive(name, a, b, c, d, e)
+    local sig = table.pack(computer.pullSignal(n == 1 and timeout or 0))
+    if not sig[1] then break end
+    receive(table.unpack(sig, 1, sig.n))
   end
   if computer.uptime() - lastSweep >= SWEEP_EVERY then
     sweepStaleChunks()

@@ -267,6 +267,14 @@ end
 function Emulator:addModem(node)
   local addr = self:addComponent(node, "modem", {
     open = function(port) node.modemOpenPorts[port] = true; return true end,
+    close = function(port)
+      local was = node.modemOpenPorts[port] == true
+      node.modemOpenPorts[port] = nil
+      return was
+    end,
+    isOpen = function(port) return node.modemOpenPorts[port] == true end,
+    maxPacketSize = function() return 8192 end,
+    isWireless = function() return false end,
     broadcast = function(port, ...)
       for _, otherAddr in ipairs(node.emu.nodeOrder) do
         if otherAddr ~= node.address then

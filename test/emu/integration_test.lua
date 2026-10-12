@@ -45,6 +45,7 @@ local kernalFiles = {
   ["/compositor.lua"] = compositorSrc,
   ["/shell.lua"] = readFile(REPO_ROOT .. "/kernal/shell.lua"),
   ["/bitmap.lua"] = bitmapSrc,
+  ["/lineedit.lua"] = readFile(REPO_ROOT .. "/kernal/lineedit.lua"),
   ["/runtime.lua"] = runtimeSrc,
   -- Sample programs for the launcher (test 29).
   ["/bin/hello.mxe"] = [==[--[[mxe
@@ -178,7 +179,8 @@ print("missing=" .. tostring(ok) .. " " .. (tostring(err):match("module 'nosuchm
 }
 -- The vendored OpenOS libraries, installed as /lib on the kernal's disk.
 for _, rel in ipairs({"serialization", "text", "sides", "colors", "keyboard", "transforms", "internet",
-    "core/full_keyboard", "core/full_text", "core/full_transforms"}) do
+    "buffer", "uuid", "bit32", "note",
+    "core/full_keyboard", "core/full_text", "core/full_transforms", "core/full_buffer"}) do
   kernalFiles["/lib/" .. rel .. ".lua"] = readFile(REPO_ROOT .. "/kernal/lib/" .. rel .. ".lua")
 end
 emu:addFilesystem(kernal, kernalFiles)
@@ -413,8 +415,9 @@ assertScreenContains("blocked", "blocked again after release")
 print("  OK -- gpu.set succeeded while the grant was held, and was blocked again after releasing it")
 
 print("test 10: Ctrl+Alt+C -- a press exits fullscreen (releasing a stuck grant), holding it enters console mode")
--- worker 1 grabs the grant and deliberately never releases it (fire-and-forget spawn).
-typeLine('spawn 1 gmuxapi.request_fullscreen()')
+-- worker 1 grabs the grant and deliberately never releases it, hanging
+-- on to it like a stuck program (the grant goes when its process ends).
+typeLine('spawn 1 gmuxapi.request_fullscreen() sleep(12)')
 emu:advance(2)
 -- worker 2 trying to grab it now must be denied. The console is a
 -- compositor window, and compositing is suspended while a node owns the
@@ -684,7 +687,7 @@ print("  OK -- each worker reported the bad result as an error and still answere
 
 print("test 16: a forged `from` can't release someone else's fullscreen grant")
 pressCombo() -- leave console mode
-typeLine("spawn 1 gmuxapi.request_fullscreen()")
+typeLine("spawn 1 gmuxapi.request_fullscreen() sleep(10)") -- held while it runs
 emu:advance(2)
 local holder = screenAfter("spawn 1 gmuxapi"):match("spawned job %[%d+%] on (modem%-%x+)")
 assert(holder, "could not find the fullscreen holder's address")
@@ -1156,10 +1159,19 @@ assert(cellText(20, 4, 4) ~= "T3,2", "what was behind the old position shows aga
 print("  OK -- dragging the title bar moves the window")
 
 touch("touch", 38, 6)
-assert(cellText(30, 6, 6) == "deco32" and cellText(30, 7, 4) ~= "T3,2", "minimize collapses to the title bar")
-touch("touch", 38, 6)
-assert(cellText(30, 7, 4) == "T3,2", "minimize again restores the body")
-print("  OK -- minimize collapses the window to its title bar and back")
+assert(cellText(30, 6, 6) ~= "deco32" and cellText(30, 7, 4) ~= "T3,2", "minimize hides the whole window")
+-- This 50-column screen has more windows than taskbar room: titles
+-- shrink, and the "+N" button lists every window.
+local bar = cellText(1, 30, 50)
+local moreX = bar:find(" +", 1, true)
+assert(moreX and bar:find("con ", 1, true), "shrunken buttons and a +N button: " .. bar)
+touch("touch", moreX + 1, 30)
+local menuY
+for y = 1, 29 do if cellText(1, y, 50):find("deco32 (minimized)", 1, true) then menuY = y end end
+assert(menuY, "the window menu lists it as minimized:\n" .. renderScreen())
+touch("touch", cellText(1, menuY, 50):find("deco32", 1, true), menuY)
+assert(cellText(30, 6, 6) == "deco32" and cellText(30, 7, 4) == "T3,2", "the menu brings it back:\n" .. renderScreen())
+print("  OK -- minimize hides the window to the taskbar; its menu entry restores it")
 
 touch("touch", 40, 6)
 emu:advance(1)
@@ -1599,5 +1611,296 @@ do
   assert(c.text():find("demo: done", 1, true), "q ended the demo:\n" .. c.text())
 end
 print("  OK -- four threads, strips on the workers, a half-block image and braille graphics, q to quit")
+
+print("test 45: networking -- a raw modem API for .mxe programs and a modem for legacy ones")
+do
+  -- An ordinary OpenComputers machine elsewhere on the network: it
+  -- answers anything on ports 123 and 124 with "pong:<what it got>".
+  local outside = emu:newNode("outside")
+  local outsideModem = emu:addModem(outside)
+  emu:addEeprom(outside, [==[
+local m = component.list("modem")()
+component.invoke(m, "open", 123)
+component.invoke(m, "open", 124)
+while true do
+  local name, _, from, port, _, a, b = computer.pullSignal()
+  if name == "modem_message" then component.invoke(m, "send", from, port, "pong:" .. tostring(a), b) end
+end
+]==])
+  emu:boot(outside)
+  kernalFiles["/bin/net45.mxe"] = [==[--[[mxe
+libraries = {"modem"}
+]]
+local modem = require("modem")
+print("NET45 open=" .. tostring(modem.open(123)))
+print("NET45 reserved=" .. tostring(pcall(modem.open, 4477)))
+modem.broadcast(123, "hello", 7)
+local e = gmuxapi.pull_event(3)
+print("NET45 got " .. tostring(e and e[1]) .. " " .. tostring(e and e[6]) .. " " .. tostring(e and e[7]))
+print("NET45 me=" .. tostring(modem.address))
+modem.send(e[3], 123, "direct", 8)
+e = gmuxapi.pull_event(3)
+print("NET45 direct " .. tostring(e and e[6]) .. " " .. tostring(e and e[7]))
+]==]
+  kernalFiles["/usr/bin/net45legacy.lua"] = [==[
+local component = require("component")
+local event = require("event")
+local m = component.modem
+m.open(124)
+m.broadcast(124, "legacy", 9)
+local _, _, from, port, _, a, b = event.pull(3, "modem_message")
+print("LNET45 " .. tostring(port) .. " " .. tostring(a) .. " " .. tostring(b) .. " " .. tostring(m.address == component.modem.address))
+]==]
+  typeLine("net45")
+  emu:advance(4)
+  assertScreenContains("NET45 open=true", "an .mxe opens a port")
+  assertScreenContains("NET45 reserved=false", "the cluster's own port is refused")
+  assertScreenContains("NET45 got modem_message pong:hello 7", "a broadcast's answer arrives as an event")
+  assertScreenContains("NET45 me=" .. kernal.modemAddr, "a program's address is the kernal's card")
+  assertScreenContains("NET45 direct pong:direct 8", "send to one address")
+  emu:advance(1)
+  assert(not kernal.modemOpenPorts[123], "the program's port was closed when it ended")
+  typeLine("net45legacy")
+  emu:advance(4)
+  assertScreenContains("LNET45 124 pong:legacy 9 true", "a legacy program's modem, with OpenOS's event.pull")
+  closeWindowAt(1, 50)
+end
+print("  OK -- programs open ports, send, broadcast and receive through the kernal's card; ports close at exit")
+
+print("test 46: signals from any node's components reach programs anywhere in the cluster")
+do
+  kernalFiles["/bin/sig46.mxe"] = [==[
+local got = 0
+local deadline = computer.uptime() + 6
+while got < 2 and computer.uptime() < deadline do
+  local e = gmuxapi.pull_event(0.5)
+  if e and e[1] == "redstone_changed" then
+    got = got + 1
+    print("SIG46 " .. e[2] .. " side=" .. tostring(e[3]) .. " new=" .. tostring(e[5]))
+  end
+end
+]==]
+  kernalFiles["/usr/bin/sig46legacy.lua"] = [==[
+local event = require("event")
+local _, addr, side, old, new = event.pull(6, "redstone_changed")
+print("LSIG46 " .. tostring(addr) .. " " .. tostring(side) .. " " .. tostring(new))
+]==]
+  -- A redstone component on the kernal itself too, plugged in now.
+  local kernalRedstone = emu:addComponent(kernal, "redstone", {getInput = function() return 0 end})
+  emu:injectSignal(kernal, "component_added", kernalRedstone, "redstone")
+  emu:advance(0.5)
+  typeLine("sig46legacy")
+  typeLine("sig46 &")
+  emu:advance(2)
+  local worker1
+  for _, w in ipairs(workers) do
+    if w.components[redstoneAddr] then worker1 = w end
+  end
+  emu:injectSignal(worker1, "redstone_changed", redstoneAddr, 2, 0, 15)
+  emu:advance(1)
+  emu:injectSignal(kernal, "redstone_changed", kernalRedstone, 4, 3, 7)
+  emu:advance(2)
+  assertScreenContains("SIG46 " .. redstoneAddr .. " side=2 new=15", "a worker's redstone card's signal reached an .mxe")
+  assertScreenContains("SIG46 " .. kernalRedstone .. " side=4 new=7", "...and one on the kernal's own")
+  assertScreenContains("LSIG46 " .. redstoneAddr .. " 2 15", "a legacy program got it through event.pull")
+  closeWindowAt(1, 50)
+end
+print("  OK -- redstone_changed from a worker's card and the kernal's own reach .mxe and legacy programs")
+
+print("test 47: OpenOS libraries for legacy programs -- shell, process, thread, tty, buffer, uuid, note")
+do
+  kernalFiles["/usr/bin/helper47.lua"] = 'print("helper ran") return 7'
+  kernalFiles["/usr/bin/libs47.lua"] = [==[
+local shell = require("shell")
+local args, opts = shell.parse("a", "-xy", "--name=v", "--", "-z")
+print("L47 parse " .. table.concat(args, ",") .. " " .. tostring(opts.x) .. tostring(opts.y) .. opts.name)
+print("L47 resolve " .. tostring(shell.resolve("helper47", "lua")))
+shell.setWorkingDirectory("/usr")
+print("L47 cwd " .. shell.getWorkingDirectory() .. " " .. shell.resolve("bin/x"))
+local ok, result = shell.execute("helper47")
+print("L47 execute " .. tostring(ok) .. " " .. tostring(result))
+local id = require("uuid").next()
+print("L47 uuid " .. tostring(#id == 36 and id:match("^%x+%-%x+%-4%x+%-[89ab]%x+%-%x+$") ~= nil))
+local chunks = {"line one\n", "line two\n"}
+local stream = {read = function() return table.remove(chunks, 1) end, close = function() end}
+local b = require("buffer").new("r", stream)
+print("L47 buffer " .. tostring(b:read("l")) .. "|" .. tostring(b:read("l")))
+local thread = require("thread")
+local t0 = require("computer").uptime()
+local a = thread.create(function() os.sleep(1) end)
+local c = thread.create(function() os.sleep(1) end)
+thread.waitForAll({a, c})
+print(string.format("L47 threads %s %s %.1f", a:status(), c:status(), require("computer").uptime() - t0))
+local co = require("process").load(function(x) return x * 3 end)
+print("L47 process " .. tostring(select(2, coroutine.resume(co, 5))) .. " " .. tostring(require("process").info().path))
+local w, h = require("tty").getViewport()
+print("L47 tty " .. tostring(w > 0 and h > 0))
+require("note").play(60, 0.05)
+print("L47 done")
+]==]
+  typeLine("libs47")
+  emu:advance(6)
+  assertScreenContains("helper ran", "shell.execute started the helper in its own window")
+  closeWindowAt(1, 50) -- the helper's, on top
+  assertScreenContains("L47 parse a,-z truetruev", "shell.parse")
+  assertScreenContains("L47 resolve /usr/bin/helper47.lua", "shell.resolve on the PATH")
+  assertScreenContains("L47 cwd /usr /usr/bin/x", "the working directory, and resolving against it")
+  assertScreenContains("L47 execute true 7", "shell.execute runs a program and waits for its result")
+  assertScreenContains("L47 uuid true", "uuid.next")
+  assertScreenContains("L47 buffer line one|line two", "buffer over a stream")
+  assertScreenContains("L47 threads dead dead 1.", "OpenOS threads run concurrently; waitForAll")
+  assertScreenContains("L47 process 15 /usr/bin/libs47.lua", "process.load and process.info")
+  assertScreenContains("L47 tty true", "tty.getViewport")
+  assertScreenContains("L47 done", "note.play")
+  closeWindowAt(1, 50)
+end
+print("  OK -- shell, process, thread, tty, buffer, uuid and note work for legacy programs")
+
+print("test 48: create_graphics_process -- the child's gpu draws into its own window, and gets its keys")
+do
+  kernalFiles["/bin/gfx48.mxe"] = [==[
+local child = [[
+gpu.setBackground(0x0000FF)
+gpu.setForeground(0xFFFFFF)
+local w, h = gpu.getResolution()
+gpu.fill(1, 1, w, h, " ")
+gpu.set(2, 1, "GFX48 " .. w .. "x" .. h)
+local e
+repeat e = gmuxapi.pull_event(20) until not e or e[1] == "key_down"
+gpu.set(2, 2, "key=" .. (e and string.char(e[2]) or "none"))
+sleep(5)
+]]
+local r = assert(gmuxapi.create_graphics_process({code = child, title = "gfx48", x = 5, y = 4, width = 20, height = 3}))
+print("G48 window=" .. tostring(r.window and r.window.id) .. " owner=" .. tostring(r.window and r.window.ownerJobId == r.process.id))
+]==]
+  typeLine("gfx48")
+  emu:advance(3)
+  assertScreenContains("G48 window=", "create_graphics_process returns the window")
+  assertScreenContains("owner=true", "...owned by the child")
+  assertScreenContains("GFX48 20x3", "the child's gpu drew into its window, at the window's size")
+  local gx = renderScreen():gsub("\n", ""):find("GFX48", 1, true)
+  local row = screenBuffers[0].cells[5] or {}
+  local blue = 0
+  for x = 5, 24 do if row[x] and row[x].bg == 0x0000FF then blue = blue + 1 end end
+  assert(blue >= 18, "the child's background color is in its window (" .. blue .. " cells)")
+  touch("touch", 10, 6)
+  emu:injectSignal(kernal, "key_down", screenAddr, string.byte("k"), 0x25, "tester")
+  emu:advance(2)
+  assertScreenContains("key=k", "keys typed into the window reach the child")
+  touch("touch", 5, 25)
+end
+print("  OK -- a graphics process draws into its own window with its gpu, and receives its keys")
+
+print("test 49: a wallpaper -- a PPM image behind the desktop's icons")
+do
+  local c = newCluster(80, 25, {
+    ["/home/two.ppm"] = "P6\n# two pixels\n2 1\n255\n" .. string.char(255, 0, 0, 0, 0, 255),
+    ["/home/green.ppm"] = "P3 1 1 255\n0 255 0\n",
+    ["/home/bad.ppm"] = "P6 4 4 255\nxx",
+  }, 1)
+  local function bg(x, y) local cell = c.cell(x, y) return cell and cell.bg end
+  c.typeLine("wallpaper two.ppm")
+  c.emu:advance(1)
+  assert(bg(10, 1) == 0xFF0000 and bg(70, 1) == 0x0000FF,
+    string.format("a P6 image stretched over the screen (got %06x, %06x)", bg(10, 1) or 0, bg(70, 1) or 0))
+  assert(c.files["/etc/wallpaper"] == "/home/two.ppm\n", "remembered in /etc/wallpaper")
+  local ix, iy = c.find("/-------\\")
+  assert(ix and bg(ix, iy) == 0x444444, "icons sit on tiles of the desktop's color")
+  c.typeLine("wallpaper green.ppm")
+  c.emu:advance(1)
+  assert(bg(10, 1) == 0x00FF00 and bg(70, 1) == 0x00FF00, "a P3 image")
+  c.typeLine("wallpaper bad.ppm")
+  c.emu:advance(1)
+  assert(c.text():find("wallpaper: /home/bad.ppm: the image is cut short", 1, true), "a bad image is refused:\n" .. c.text())
+  assert(bg(10, 1) == 0x00FF00, "...and the wallpaper stays")
+  -- Kept across a reboot.
+  c.typeLine("reboot")
+  c.emu:boot(c.kernal)
+  c.emu:advance(4)
+  assert(bg(10, 1) == 0x00FF00, "the wallpaper comes back after a reboot")
+  c.typeLine("wallpaper none")
+  c.emu:advance(1)
+  assert(bg(10, 1) == 0x444444 and not c.files["/etc/wallpaper"], "wallpaper none: the plain desktop again")
+end
+print("  OK -- P6 and P3 wallpapers, stretched behind the icons, remembered across reboots, cleared")
+
+print("test 50: the console's line editor -- history, cursor movement, editing keys, paste")
+do
+  local c = newCluster(80, 25, {}, 1)
+  local LEFT, RIGHT, UP, DOWN, HOME, END_, DEL = 0xCB, 0xCD, 0xC8, 0xD0, 0xC7, 0xCF, 0xD3
+  local function prompt() -- the last prompt on screen: the live line
+    for y = 25, 1, -1 do
+      local row = c.cells(1, y, 80)
+      local at = row:find("muxos:/home> ", 1, true)
+      if at then
+        local x = utf8.len(row:sub(1, at - 1)) + 1
+        return (c.cells(x + 13, y, 40):gsub("%s+$", "")), x, y
+      end
+    end
+    error("no prompt:\n" .. c.text())
+  end
+  c.typeLine("echo one")
+  c.typeLine("echo two")
+  -- Up recalls the newest first; Down goes back toward the line being typed.
+  for _, ch in ipairs({"d", "r", "a", "f", "t"}) do c.key(ch:byte()) end
+  c.key(0, UP)
+  assert(prompt() == "echo two_", "Up: the last command (got " .. prompt() .. ")")
+  c.key(0, UP)
+  assert(prompt() == "echo one_", "Up again: the one before")
+  c.key(0, UP)
+  assert(prompt() == "echo one_", "...and no further")
+  c.key(0, DOWN)
+  c.key(0, DOWN)
+  assert(prompt() == "draft_", "Down past the newest: the line being typed comes back (got " .. prompt() .. ")")
+  -- Cursor movement: the cursor's character is drawn inverted.
+  c.key(0, HOME)
+  c.key(("X"):byte())
+  local text, x, y = prompt()
+  assert(text == "Xdraft", "Home, then typing inserts at the start (got " .. text .. ")")
+  local under = c.cell(x + 14, y)
+  assert(under.char == "d" and under.bg == 0xFFFFFF and under.fg == 0x000000, "the cursor is the inverted 'd'")
+  c.key(0, RIGHT) c.key(0, RIGHT)
+  c.key(0, DEL)
+  assert(prompt() == "Xdrft", "Delete removes the character under the cursor (got " .. prompt() .. ")")
+  c.key(0, LEFT)
+  c.key(8, 0x0E)
+  assert(prompt() == "Xrft", "Backspace removes the one before it (got " .. prompt() .. ")")
+  c.key(11) -- ^K
+  assert(prompt() == "X_", "^K cuts to the end (got " .. prompt() .. ")")
+  c.key(0, END_)
+  c.key(21) -- ^U
+  assert(prompt() == "_", "^U cuts to the start")
+  for ch in ("echo alpha beta"):gmatch(".") do c.key(ch:byte()) end
+  c.key(23) -- ^W
+  assert(prompt() == "echo alpha _", "^W cuts the last word (got " .. prompt() .. ")")
+  c.key(21)
+  -- Paste: each newline is an Enter, so a pasted script runs line by line.
+  c.emu:injectSignal(c.kernal, "clipboard", "kbd", "echo pasted1\necho pasted2\necho half", "tester")
+  c.emu:advance(1)
+  local screen = c.text()
+  assert(screen:find("\npasted1", 1, true) and screen:find("\npasted2", 1, true), "both pasted lines ran:\n" .. screen)
+  assert(prompt() == "echo half_", "the unfinished last line waits at the prompt (got " .. prompt() .. ")")
+  c.key(13, 0x1C)
+  c.emu:advance(0.5)
+  c.key(0, UP)
+  assert(prompt() == "echo half_", "pasted lines go into the history too")
+end
+print("  OK -- history, Home/End/arrows, Delete/Backspace, ^U ^K ^W, an inverted cursor, multi-line paste")
+
+print("test 51: the fullscreen grant is released when the program holding it ends")
+do
+  local c = newCluster(80, 25, {}, 1)
+  -- It draws over the whole screen, then ends without releasing.
+  c.typeLine('spawn 1 gmuxapi.request_fullscreen() gpu.fill(1, 1, 80, 25, " ") gpu.set(1, 1, "GRABBED") sleep(2)')
+  c.emu:advance(1)
+  assert(c.text():find("GRABBED", 1, true) and not c.text():find("muxos:/home>", 1, true),
+    "while it holds the grant, the screen is its:\n" .. c.text())
+  c.emu:advance(3)
+  assert(c.text():find("muxos:/home>", 1, true), "it ended without releasing: the desktop and console are back:\n" .. c.text())
+  c.typeLine('run local g, e = gmuxapi.request_fullscreen() local r = gmuxapi.release_fullscreen() return tostring(g ~= nil) .. "/" .. tostring(r ~= nil)')
+  c.emu:advance(2)
+  assert(c.text():find("true/true", 1, true), "and the grant is free for the next program:\n" .. c.text())
+end
+print("  OK -- a program that ends holding fullscreen gives the screen back")
 
 print("ALL OK")
