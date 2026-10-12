@@ -158,10 +158,27 @@ Every `.mxe` sees these globals, read-only. Its own globals are its own.
     `launch(nameOrPath, args)`, `pause_process(id)`,
     `resume_process(id)`, `kill_process(id)` (own descendants only);
   - **windows:** `create_window{title, x, y, width, height, code |
-    pixels, mode, bg, args, resizable, title_bar}`,
-    `draw_window(id, {code, args, pixels, clear, bg})`,
-    `get_windows()` (the windows of the program's session -- the screen
-    it was started from: the kernal's own, or a network terminal's);
+    pixels, mode, bg | cells, args, resizable, title_bar}`,
+    `draw_window(id, {code, args, pixels, cells, clear, bg})`,
+    `get_windows()` (every window of the program's user, wherever it's
+    shown: `{id, title, x, y, width, height, ownerJobId, user,
+    attached, session, status}`). `pixels` are encoded into cells on
+    the program's own node; `cells` are already-encoded cell runs
+    (`{y, x, fg, bg, text, x, fg, bg, text, ...}` per row -- what the
+    `bitmap` library makes). A window opens on the screen of the
+    session the program was started from -- the kernal's own or a
+    network terminal's -- and the program draws to that screen
+    directly.
+  - **persistence:** `set_persistent(true)` -- this program keeps
+    running when its user logs out (or their terminal hangs up). Its
+    windows are *detached* (shown nowhere) meanwhile, and every session
+    of that user lists them on its taskbar; touching one there brings
+    the window to that screen. The program hears
+    `{"window_detached", id}` and `{"window_attached", id, w, h}`; on
+    attaching, its last `draw_window`s are replayed, so it comes back
+    drawn (redraw whatever has changed since). `set_persistent(false)`
+    undoes it. Without it, a program is ended at logout (flag
+    `logout_ends_jobs`). Test 56.
   - **render targets** -- several processes, on several nodes, drawing
     one window frame by frame (the pipework for a rendering library):
     - `share_window(window, child, {x, y, w, h})` -- the window's owner
@@ -192,16 +209,17 @@ Every `.mxe` sees these globals, read-only. Its own globals are its own.
     `{"key_down", char, code}`, `{"key_up", ...}`,
     `{"touch"|"drag"|"drop", x, y, button}`, `{"scroll", x, y, dir}`,
     `{"window_resized", id, w, h}`, `{"clipboard", text}`;
-  - **display:** `request_fullscreen()`, `release_fullscreen()` (the
-    kernal's own screen only; a program in a terminal's session is
-    refused).
+  - **display:** `request_fullscreen()`, `release_fullscreen()` --
+    the whole screen of the program's session: the kernal's own, or a
+    network terminal's (its `gpu` calls then go to the terminal).
 - `component`: every component in the cluster over the bus, with
   OpenOS's API (`list`, `proxy`, `invoke`, `type`, `methods`,
   `isAvailable`, `getPrimary`, `component.<type>`). Primary prefers the
   program's own node. Open visibility, minus the display, network cards
   and firmware (docs/PROTOCOL.md, "Cluster component bus"; test 36).
-- `gpu`: drawing calls on the kernal's GPU. Refused unless the program
-  holds the fullscreen grant; windows are the normal way to draw.
+- `gpu`: drawing calls on its session's screen's GPU (the kernal's, or
+  a terminal's). Refused unless the program holds the fullscreen grant;
+  windows are the normal way to draw.
 
 **Cooperation.** A process runs until it yields. One that doesn't yield
 for the machine's limit (5 s by default) is ended with an error. Its
@@ -241,6 +259,17 @@ granted too, transitively, and loaded before it (test 37).
     `"value"`; `--` ends options; `-` and everything else is
     positional.
   - `mux.migratable(save)`, `mux.restored()`: migration (section 6).
+- `bitmap`: pixels into cells, on the program's own node (OC's GPUs
+  have no pixels: a "pixel" is half a cell, `"halfblock"`, or a braille
+  dot, `"braille"`). `pixels[row][col]` are colors (`0xRRGGBB`, or
+  `nil` for `bg`):
+  - `bitmap.cells(mode, pixels, width, height, bg)` returns `cells,
+    cols, rows`: cell runs ready for `create_window{cells}`,
+    `draw_window(id, {cells})` and `draw_region(id, frame, {cells})`.
+  - `bitmap.encode(mode, pixels, width, height, bg)` returns `grid,
+    cols, rows`, the cells themselves (`grid[row][col] = {char, fg,
+    bg}`), to change before drawing; `bitmap.runs(grid, cols, rows)`
+    makes them runs. Test 57.
 - `http`, over whichever internet card the bus offers (this node's
   first):
   - `http.get(url[, headers[, timeout]])` returns `body, status,

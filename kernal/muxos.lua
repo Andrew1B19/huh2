@@ -291,7 +291,9 @@ end
 local CHUNK_SIZE = 7000
 local nextMsgId = 1
 
-local function send(msg)
+-- `port`: the cluster's own unless given (the terminal port).
+local function send(msg, port)
+  port = port or PORT
   local payload = serialize(msg)
   local id = nextMsgId
   nextMsgId = nextMsgId + 1
@@ -300,7 +302,7 @@ local function send(msg)
     local chunk = payload:sub((i - 1) * CHUNK_SIZE + 1, i * CHUNK_SIZE)
     local frame = "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk
     -- Addressed messages go to that card only; only discovery broadcasts.
-    if msg.to then modem.send(msg.to, PORT, frame) else modem.broadcast(PORT, frame) end
+    if msg.to then modem.send(msg.to, port, frame) else modem.broadcast(port, frame) end
   end
 end
 
@@ -1067,6 +1069,7 @@ local function finishJob(id, status, result, err)
     fullscreen.node, fullscreen.job = nil, nil
     K.releaseScreen()
   end
+  if K.terminals then K.terminals.releaseFullscreen(id) end
   runningJobs[id] = nil
   runningCount = runningCount - 1
   local node = nodes[job.node]
@@ -1493,10 +1496,19 @@ local function handleRequestFullscreen(msg)
   end
   local job = jobs[msg.caller]
   job = job and job.status == "running" and job.node == msg.from and job or nil
-  -- The grant is the kernal's own screen: for its own session's programs.
-  if not K.console or (job and K.sessionOf(job) ~= K.console) then
-    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
-      error = "fullscreen is for programs on the kernal's own screen, not a terminal's"})
+  -- A program in a terminal's session gets that terminal's screen.
+  local S = job and K.sessionOf(job)
+  if S and S.kind == "terminal" then
+    local route, err = K.terminals.grantFullscreen(S, job)
+    if route then
+      send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {granted = true, route = route}})
+    else
+      send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
+    end
+    return
+  end
+  if not K.console then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "the kernal has no screen"})
     return
   end
   fullscreen.node, fullscreen.job = msg.from, job and job.id
@@ -1505,6 +1517,11 @@ local function handleRequestFullscreen(msg)
 end
 
 local function handleReleaseFullscreen(msg)
+  local caller = jobs[msg.caller]
+  if caller and caller.node == msg.from and K.terminals.releaseFullscreen(caller.id) then
+    send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {released = true}})
+    return
+  end
   if fullscreen.node ~= msg.from then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
       error = "you do not hold the fullscreen grant"})
@@ -1861,17 +1878,57 @@ end
 -- A process ended: its shares go, and each window's owner hears
 -- {"region_lost", window, process}.
 function K.dropShares(id)
+  for _, rec in pairs(K.win.byId) do
+    if rec.shares then rec.shares[id] = nil end
+  end
   for _, S in ipairs(K.sessions) do
-    for _, winId in ipairs(S.compositor.unshareAll(id)) do
+    for _, winId in ipairs(S.compositor and S.compositor.unshareAll(id) or {}) do
       local win = S.compositor.getWindow(winId)
       local owner = win and win.ownerJobId and K.liveJob(win.ownerJobId)
       if owner then K.deliverEvent(owner, {"region_lost", winId, id}) end
     end
   end
+  if K.terminals then K.terminals.jobEnded(id) end
+end
+
+-- A share of a window shown on a terminal (or nowhere): recorded in the
+-- registry, sent to the terminal (which checks the drawing).
+local function shareElsewhere(rec, caller, child, rect)
+  local S = rec.session and K.byId[rec.session]
+  if rect ~= nil then
+    local x, y = math.tointeger(rect.x or rect[1]), math.tointeger(rect.y or rect[2])
+    local w, h = math.tointeger(rect.w or rect[3]), math.tointeger(rect.h or rect[4])
+    if not (x and y and w and h) or x < 1 or y < 1 or w < 1 or h < 1 or x + w - 1 > rec.width or y + h - 1 > rec.height then
+      return nil, "the rectangle must be whole cells within the window (" .. rec.width .. "x" .. rec.height .. ")"
+    end
+    rect = {x = x, y = y, w = w, h = h}
+  end
+  rec.shares = rec.shares or {}
+  rec.shares[child.id] = rect
+  if S and S.display.share then S.display.share(rec.id, child.id, rect, child.node) end
+  if rect then K.win.hold(rec, child.id) end
+  return rect
 end
 
 local function handleRender(msg)
   local caller = callerJob(msg)
+  local rec = K.win.get(msg.windowId)
+  if msg.type == "SHAREWINDOW" and rec and not K.windowOwner(msg.windowId) then
+    local child = K.liveJob(msg.child)
+    local function fail(err) send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err}) end
+    if not caller then return fail("not called from a running process") end
+    if rec.owner ~= caller.id and not (rec.owner and isDescendantOf(rec.owner, caller.id)) then
+      return fail("window " .. rec.id .. " belongs to another process")
+    end
+    if not child or not isDescendantOf(child.id, caller.id) then
+      return fail("process " .. tostring(msg.child) .. " isn't a running descendant of yours")
+    end
+    local rect, err = shareElsewhere(rec, caller, child, msg.rect)
+    if msg.rect ~= nil and not rect then return fail(err) end
+    K.deliverEvent(child, rect and {"window_shared", rec.id, rect.x, rect.y, rect.w, rect.h} or {"window_unshared", rec.id})
+    send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
+    return
+  end
   local S, win = K.windowOwner(msg.windowId)
   local function reply(result, err)
     if msg.noReply then return end
@@ -2186,8 +2243,10 @@ local function tick(timeout)
     elseif name == "modem_message" then
       if a4 == PORT then
         handleModemMessage(a3, a4, a6)
-      elseif K.terminals then
-        K.terminals.message(a3, a4, a6)
+      elseif K.terminals and a4 == K.terminals.PORT and type(a6) == "string" then
+        local payload = reassemble(a3, a6)
+        local msg = payload and deserialize(payload)
+        if type(msg) == "table" and msg.from == a3 then K.terminals.message(a3, msg) end
       end
     end
     sweepStaleChunks()
@@ -2196,7 +2255,9 @@ local function tick(timeout)
     checkLiveness()
     if K.terminals then K.terminals.sweep() end
     for _, S in ipairs(K.sessions) do
-      K.framesPresented(S, S.compositor.renderTick(function(id) return K.expectedRegions(S, id) end))
+      if S.compositor then
+        K.framesPresented(S, S.compositor.renderTick(function(id) return K.expectedRegions(S, id) end))
+      end
       K.inSession(S, S.update)
     end
   end)
@@ -2927,9 +2988,14 @@ end
 
 -- opts: {gpu, kind = "local" | "terminal", address}.
 function K.newSession(opts)
+  opts.id = K.nextSession + 1
+  return K.addSession(K.sessionChunk(K, opts))
+end
+
+-- Registers a session made elsewhere (a terminal's, kernal/terminals.lua).
+function K.addSession(S)
   K.nextSession = K.nextSession + 1
-  opts.id = K.nextSession
-  local S = K.sessionChunk(K, opts)
+  S.id = K.nextSession
   K.sessions[#K.sessions + 1] = S
   K.byId[S.id] = S
   return S
@@ -2969,8 +3035,7 @@ end
 -- The kernal's own screen is the local session's; network terminals get
 -- sessions of their own (kernal/terminals.lua).
 if gpu and screenAddr then K.console = K.newSession({gpu = gpu, kind = "local"}) end
-K.terminals = loadSibling("terminals.lua")(K, {modem = modem, serialize = serialize, deserialize = deserialize,
-  vgpu = loadSibling("vgpu.lua")()})
+K.terminals = loadSibling("terminals.lua")(K, {modem = modem, send = send})
 print("muxos kernal -- " .. selfAddr)
 K.help()
 if K.shellFactory then

@@ -88,9 +88,14 @@ kernal/lineedit.lua    the console's line editor: history, cursor movement, past
 kernal/system.lua      kernal flags (/etc/kernal.cfg) and users (/etc/users).
 kernal/session.lua     a session: one screen's console, login, shell, compositor, desktop and
                        input -- the kernal's own screen, or a network terminal's.
-kernal/vgpu.lua        a GPU in Lua memory, for a terminal's session to draw with.
-kernal/terminals.lua   the terminal server: network terminals' sessions (see "Network terminals").
-apps/muxterm.lua       muxterm, the network terminal: an OpenOS program (its own package).
+kernal/vgpu.lua        a GPU in Lua memory, for a terminal whose GPU has no video buffers.
+kernal/windows.lua     the window registry: every program window, its owner and user, and the
+                       session showing it (see "Where windows live").
+kernal/terminals.lua   the terminal server: the kernal's side of network terminals' sessions.
+kernal/terminal.lua    the terminal runtime: a terminal's side of its session, run on the
+                       terminal (muxterm fetches it, with session/compositor/bitmap/...).
+apps/muxterm.lua       muxterm, the network terminal: an OpenOS program (its own package);
+                       only a bootstrap that fetches kernal/terminal.lua.
 installer/install.lua  the installer (bare from the kernal BIOS, or on OpenOS): installs the
                        kernal, flashes EEPROMs.
 tools/build.lua        builds it, with everything it installs, into dist/ (see "Installing").
@@ -351,8 +356,8 @@ Errors the Analyzer can show:
 - Flash `node/bios.lua` onto each worker's EEPROM and `kernal/bios.lua`
   onto the kernal's (`flash -q <file>` in OpenOS).
 - Copy `kernal/muxos.lua`, `compositor.lua`, `shell.lua`, `bitmap.lua`,
-  `lineedit.lua`, `system.lua`, `session.lua`, `vgpu.lua` and
-  `terminals.lua` (all in `kernal/`) and
+  `lineedit.lua`, `system.lua`, `session.lua`, `vgpu.lua`,
+  `windows.lua`, `terminals.lua` and `terminal.lua` (all in `kernal/`) and
   `node/runtime.lua` to the root of the kernal's disk, and `kernal/lib`
   to `/lib`.
 
@@ -419,6 +424,13 @@ character runs instead. `createWindow`'s `options.pixels`/
 `mode`/`bg` go through the exact same registry, Z-order, occlusion, and
 frame-buffer pipeline as a character-mode window -- `bitdemo` is just
 the REPL's way to see it work without typing a pixel grid by hand.
+
+A program's pixels are encoded on its own node, not at the screen: the
+runtime turns `pixels` into cells (runs of same-colored text) before
+sending, so neither the kernal nor a terminal spends time encoding. A
+program can also do it itself with the built-in `bitmap` library
+(`bitmap.cells`, `bitmap.encode`, `bitmap.runs`) and draw `cells` into
+any part of its window (docs/MXE.md; test 57).
 
 `ping <node> [count]` times a round-trip PING/PONG with that node (default
 3 tries) and reports min/avg/max in milliseconds -- useful for measuring
@@ -688,26 +700,59 @@ every other key, Ctrl+Alt+C included, goes to muxos.
 
 Internally the kernal's own screen and a terminal are the same thing --
 a *session* (`kernal/session.lua`), one per screen, each with its own
-console, line editor, shell, login, compositor, desktop and input. A
-terminal's session draws with a GPU kept in Lua memory
-(`kernal/vgpu.lua`); after each frame, the cells that changed go to the
-terminal as runs of same-colored text, which muxterm draws with its own
-GPU. Keys and touches come back the other way. Each session's commands
-run in a coroutine of their own, so a slow command at one screen never
-holds up another.
+console, line editor, login, compositor, desktop and input. The
+compositor lives where the screen is: a terminal runs its session's
+code itself (muxterm is only a bootstrap: it fetches
+`kernal/terminal.lua`, the session, compositor and encoder from the
+kernal, so a terminal always runs its kernal's version), and composites
+on its own GPU. What only the kernal can do -- the shell and its disks,
+logins, launching programs, the window registry -- the terminal asks the
+kernal for, on the terminal port. Each session's commands run in a
+coroutine of their own, so a slow command at one screen never holds up
+another.
 
+- **Programs draw straight to the terminal.** A window's *route* is the
+  address of the screen showing it and a per-window key; a program draws
+  there directly with that key (draws, regions, render settings), and
+  the terminal sends the window's input straight to the program's node.
+  The kernal isn't a hop in either direction.
+- **Fullscreen works on a terminal:** a program in a terminal's session
+  that takes the fullscreen grant gets that terminal's screen, and its
+  `gpu` calls go to the terminal (GPUCALL). Ctrl+Alt+C on the terminal
+  takes the screen back, as on the kernal's.
+- A terminal's GPU without video buffers (below tier 3) still works: the
+  session draws into a GPU in memory (`kernal/vgpu.lua`) and the changed
+  cells are copied onto the screen.
 - `who` lists who's logged in where; `users` lists every user.
 - The same user can be logged in at several screens at once.
 - A terminal that goes quiet for 10 seconds is hung up on (its session
-  logs out). The protocol is in `kernal/terminals.lua`.
-- The fullscreen grant is the kernal's own screen's: programs in a
-  terminal's session can't take it.
-- Memory: a terminal's screen and its windows live in the kernal's RAM
-  (roughly 50 bytes a cell) -- a few terminals are fine on a kernal with
-  tier 3 memory.
+  logs out). The protocol is in `kernal/terminals.lua` and
+  docs/PROTOCOL.md ("Network terminals").
 
-Tested in `test/emu/muxterm_test.lua` (real OpenOS running muxterm) and
-`test/emu/vgpu_test.lua`.
+Tested in `test/emu/muxterm_test.lua` (real OpenOS running muxterm: the
+login, both sessions at once, direct draws and input -- the packets are
+watched --, fullscreen on the terminal, a persistent program's window
+moving between the two screens, hanging up) and `test/emu/vgpu_test.lua`.
+
+### Where windows live
+
+A program's window belongs to its process and its user, not to a screen
+(`kernal/windows.lua`, the registry). It's shown by at most one session
+at a time and can move:
+
+- **Persistent programs:** an `.mxe` that calls
+  `gmuxapi.set_persistent(true)` keeps running after its user logs out
+  (or their terminal hangs up); its windows are *detached* -- shown
+  nowhere -- and the program hears `window_detached`. Programs that
+  didn't ask are ended at logout (flag `logout_ends_jobs`).
+- **Every session's taskbar lists all of its user's windows**, wherever
+  they are: those shown elsewhere, or nowhere, are marked (blue).
+  Touching one brings the window to this screen; the program hears
+  `window_attached` and the window's last drawing is replayed, so it
+  comes back with its content.
+
+Tested in `test/emu/integration_test.lua` (test 56) and
+`test/emu/muxterm_test.lua` (tests 7 and 8).
 
 ### The scheduler
 

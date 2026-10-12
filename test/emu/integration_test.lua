@@ -51,6 +51,7 @@ local kernalFiles = {
   ["/vgpu.lua"] = readFile(REPO_ROOT .. "/kernal/vgpu.lua"),
   ["/terminals.lua"] = readFile(REPO_ROOT .. "/kernal/terminals.lua"),
   ["/windows.lua"] = readFile(REPO_ROOT .. "/kernal/windows.lua"),
+  ["/terminal.lua"] = readFile(REPO_ROOT .. "/kernal/terminal.lua"),
   ["/etc/kernal.cfg"] = "login_required = false\n",
   ["/runtime.lua"] = runtimeSrc,
   -- Sample programs for the launcher (test 29).

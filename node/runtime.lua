@@ -123,6 +123,9 @@ local current = nil             -- the process being resumed right now
 local WAIT = {}                 -- what a process yields with, plus its condition
 local COOPERATE = {cooperate = true}
 local rpcWaiting, rpcReplies = {}, {} -- RPC id -> true while awaited; -> reply
+-- Terminals' screens showing windows of this node's processes (see
+-- "Window routes"): they may send input events and answers.
+local displays = {}
 local receive, handleMessage    -- defined below
 
 local function findModem()
@@ -380,8 +383,11 @@ receive = function(name, ...)
     return
   end
   -- Everything else runs code or touches hardware on this node, so it's
-  -- only accepted from the kernal itself, never from a peer.
-  if from ~= kernalAddr then return end
+  -- only accepted from the kernal itself, never from a peer -- except a
+  -- terminal's screen showing this node's windows: its input events and
+  -- its answers to what was asked of it.
+  if from ~= kernalAddr and not (displays[from]
+      and (msg.type == "EVENT" or msg.type == "RESULT" or msg.type == "ERROR")) then return end
   if msg.type == "RESULT" or msg.type == "ERROR" then
     if rpcWaiting[msg.id] then rpcReplies[msg.id] = msg end
     return
@@ -445,14 +451,16 @@ local RPC_TIMEOUT = 5
 -- node needs a resource it doesn't have locally (no screen of its own,
 -- say) and falls back to the kernal's hardware instead, at the cost of
 -- one network round trip instead of zero.
-local function remoteRequest(msgType, extra)
+-- Asks the kernal -- or `to`, a screen of a network terminal (on its
+-- `port`), for what's drawn there -- and waits for the answer.
+local function remoteRequest(msgType, extra, to, port)
   if not kernalAddr then
     return nil, "kernal address not known yet"
   end
   local id = nextId()
-  local msg = {type = msgType, from = nodeId, to = kernalAddr, id = id}
+  local msg = {type = msgType, from = nodeId, to = to or kernalAddr, id = id}
   for k, v in pairs(extra or {}) do msg[k] = v end
-  send(msg)
+  send(msg, port)
   -- RPC ids are this node's own counter; the kernal's JOB ids are a
   -- different counter, but only RESULT/ERROR count as replies.
   rpcWaiting[id] = true
@@ -461,7 +469,7 @@ local function remoteRequest(msgType, extra)
   rpcWaiting[id] = nil
   local reply = rpcReplies[id]
   rpcReplies[id] = nil
-  if not reply then return nil, "timed out waiting for kernal" end
+  if not reply then return nil, "timed out waiting for " .. (to and to ~= kernalAddr and "the terminal" or "kernal") end
   if reply.type == "RESULT" then return reply.result end
   return nil, reply.error
 end
@@ -483,6 +491,7 @@ local winRedraw = {}  -- window id -> function() redrawing it all (a virtual gpu
 
 local function setRoute(id, address, key, port)
   winRoutes[id] = {address = address or false, key = key, port = port}
+  if address and address ~= kernalAddr then displays[address] = true end
 end
 
 local function routeOf(id, caller)
@@ -501,7 +510,7 @@ local function sendDraw(id, msgType, fields, caller, noReply)
   if not r then return nil, err end
   if not r.address then return true end
   fields.windowId, fields.key, fields.caller = id, r.key, caller
-  if r.address == kernalAddr and not noReply then return remoteRequest(msgType, fields) end
+  if not noReply then return remoteRequest(msgType, fields, r.address, r.port) end
   fields.type, fields.from, fields.to, fields.id, fields.noReply = msgType, nodeId, r.address, nextId(), true
   send(fields, r.port)
   return true
@@ -624,7 +633,15 @@ end
 -- node has none. Cached after the first remote lookup so repeated calls
 -- don't pay for a LIST round trip every time.
 local remoteGpuAddr = nil
+-- Holding the fullscreen grant of a terminal's screen: its gpu.
+local screenRoute = nil
 local function faceGpu(method, ...)
+  if screenRoute then
+    local results, err = remoteRequest("GPUCALL", {method = method, args = table.pack(...), key = screenRoute.key},
+      screenRoute.address, screenRoute.port)
+    if not results then return nil, err end
+    return table.unpack(results, 1, results.n or #results)
+  end
   for addr in component.list("gpu") do
     return component.invoke(addr, method, ...)
   end
@@ -963,7 +980,14 @@ gmuxapi = {
   -- owner only): mode (split | alternate | tearing), deadline, stale
   -- (keep | clear), queue, chunk.
   render_config = function(id, options)
-    local config, err = remoteRequest("RENDERCONFIG", {windowId = id, options = options, caller = currentJobId})
+    local r = routeOf(id, currentJobId)
+    local config, err
+    if r and r.address and r.address ~= kernalAddr then
+      config, err = remoteRequest("RENDERCONFIG", {windowId = id, options = options, key = r.key, caller = currentJobId},
+        r.address, r.port)
+    else
+      config, err = remoteRequest("RENDERCONFIG", {windowId = id, options = options, caller = currentJobId})
+    end
     if config then renderChunks[id] = config.chunk end
     return config, err
   end,
@@ -977,7 +1001,7 @@ gmuxapi = {
   draw_region = function(id, frame, content)
     content = content or {}
     if renderChunks[id] == nil then
-      local config = remoteRequest("RENDERCONFIG", {windowId = id, caller = currentJobId})
+      local config = gmuxapi.render_config(id)
       renderChunks[id] = config and config.chunk or false
     end
     local chunk = renderChunks[id] or 4096
@@ -1037,11 +1061,20 @@ gmuxapi = {
   -- whole display. First-come-first-served, one holder at a time;
   -- released when the process that asked ends, or its node goes down.
   request_fullscreen = function()
-    return remoteRequest("REQUESTFULLSCREEN", {caller = currentJobId})
+    local grant, err = remoteRequest("REQUESTFULLSCREEN", {caller = currentJobId})
+    -- A terminal's screen: the gpu calls go there (GPUCALL), with its key.
+    if grant and grant.route then
+      screenRoute = {address = grant.route[1], key = grant.route[2], port = grant.route[3]}
+      displays[screenRoute.address] = true
+      grant.route = nil
+    end
+    return grant, err
   end,
 
   release_fullscreen = function()
-    return remoteRequest("RELEASEFULLSCREEN")
+    local done, err = remoteRequest("RELEASEFULLSCREEN", {caller = currentJobId})
+    if done then screenRoute = nil end
+    return done, err
   end,
 
   -- Hands back the still-unclaimed orphan handles (each {id, node})

@@ -62,15 +62,17 @@ function W.open(S, spec, owner)
   K.windowIds = K.windowIds + 1
   local id = K.windowIds
   local job = owner and K.jobs[owner]
+  local key = newKey()
   local shown = {}
   for k, v in pairs(spec) do shown[k] = v end
-  shown.id, shown.ownerJobId, shown.text = id, owner, nil
+  shown.id, shown.ownerJobId, shown.text, shown.key = id, owner, nil, key
+  shown.ownerNode = job and job.node
   local size, err = S.display.create(shown)
   if not size then return nil, err end
   local rec = {id = id, owner = owner, user = job and job.user or S.user, session = S.id,
     title = tostring(spec.title or ("window " .. id)), x = spec.x or 1, y = spec.y or 1,
     width = size.width, height = size.height, resizable = spec.resizable == true,
-    decorated = spec.decorated ~= false, key = newKey(), holders = {}}
+    decorated = spec.decorated ~= false, key = key, holders = {}}
   if owner then rec.holders[owner] = true end
   W.byId[id] = rec
   K.windowsChanged(rec.user)
@@ -100,14 +102,22 @@ function W.attach(rec, S)
   local old = rec.session and K.byId[rec.session]
   if old then pcall(old.display.remove, rec.id) end
   rec.session = nil
+  local key = newKey()
+  local job = rec.owner and K.jobs[rec.owner]
   local size, err = S.display.create({id = rec.id, title = rec.title, x = rec.x, y = rec.y,
     width = rec.width, height = rec.height, resizable = rec.resizable, decorated = rec.decorated,
-    ownerJobId = rec.owner, code = "gpu.setBackground(0x000000) gpu.fill(1, 1, " .. rec.width .. ", " .. rec.height .. ", ' ')"})
+    ownerJobId = rec.owner, ownerNode = job and job.node, key = key,
+    code = "gpu.setBackground(0x000000) gpu.fill(1, 1, " .. rec.width .. ", " .. rec.height .. ", ' ')"})
   if not size then
     K.windowsChanged(rec.user)
     return nil, err
   end
-  rec.session, rec.key = S.id, newKey()
+  rec.session, rec.key = S.id, key
+  -- Its shares go with it.
+  for jobId, rect in pairs(rec.shares or {}) do
+    local sharer = K.liveJob(jobId)
+    if sharer and S.display.share then S.display.share(rec.id, jobId, rect, sharer.node) end
+  end
   if rec.status and S.display.status then S.display.status(rec.id, rec.status) end
   announce(rec)
   K.windowsChanged(rec.user)

@@ -241,7 +241,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, muxos-shaped) -- summaries: no source, no result |
 | `GETPROCESS` | `from`, `to`, `id`, `jobId`                            | worker  | one job's full record (`gmuxapi.get_process(id)`) |
 | `CONTROL` | `from`, `to`, `id`, `jobId`, `verb`, `caller`                | worker  | pause/resume/kill one of the caller's own descendants (`gmuxapi.pause_process`/`resume_process`/`kill_process`) |
-| `EVENT`   | `from`, `to`, `jobId`, `event`                                | kernal  | an input event for a process on that node, read with `gmuxapi.pull_event` |
+| `EVENT`   | `from`, `to`, `jobId`, `event`                                | kernal, or a terminal showing the process's window | an input event for a process on that node, read with `gmuxapi.pull_event` |
 | `OUTPUT`  | `from`, `to`, `jobId`, `text`                                 | worker  | a process's printed output, for the console |
 | `LAUNCH`  | `from`, `to`, `id`, `path`, `args`, `caller`                  | worker  | launch a program as the caller's child (`gmuxapi.launch`) |
 | `FS`      | `from`, `to`, `id`, `op`, `args`, `caller`                    | worker  | a legacy process's filesystem call on the kernal's disk (`op` = a filesystem component method); handles are the kernal's own, per process |
@@ -253,14 +253,17 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `MIGRATEFAILED` | `from`, `to`, `jobId`, `error`                      | worker  | answer to `MIGRATE`: not moved (never opted in, save failed, or state can't be serialized); the process carries on |
 | `SPAWN`   | `from`, `to`, `id`, `code`, `args`, `node`                | worker  | "dispatch a new job" (gmux API's `create_headless_process`/`create_graphics_process`); replies immediately with a handle, doesn't wait for the job to finish |
 | `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId`, `resizable`, `decorated` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
-| `GETWINDOWS` | `from`, `to`, `id`, `caller`                            | worker  | "list the windows of my session" (gmux API's `get_windows()`) |
-| `DRAWWINDOW` | `from`, `to`, `id`, `windowId`, `code`, `args`, `pixels`, `mode`, `width`, `height`, `bg`, `clear`, `caller`, `noReply` | worker | redraw a window the calling process owns (`gmuxapi.draw_window`); with code, `width`/`height` different from the window's resize it first (resizable windows); `noReply` = sent without waiting, nothing comes back |
+| `GETWINDOWS` | `from`, `to`, `id`, `caller`                            | worker  | "list my user's windows, wherever they are" (gmux API's `get_windows()`) |
+| `WINDOWROUTE` | `from`, `to`, `id`, `windowId`, `caller`                | worker  | where a window the caller owns (or draws a share of) is shown: `{address, key, port, width, height}`, `address` nil while detached; the caller then hears `window_route` events when it moves (see "Window routes") |
+| `PERSIST` | `from`, `to`, `id`, `on`, `caller`                           | worker  | `gmuxapi.set_persistent(on)`: the process survives its user's logout |
+| `DRAWWINDOW` | `from`, `to`, `id`, `windowId`, `code`, `args`, `cells`, `width`, `height`, `bg`, `clear`, `key`, `caller`, `noReply` | worker | redraw a window the calling process owns (`gmuxapi.draw_window`), sent to the screen showing it (its route) with the window's `key`; with code, `width`/`height` different from the window's resize it first (resizable windows); `cells` are runs the worker encoded; `noReply` = sent without waiting, nothing comes back |
 | `SHAREWINDOW` | `from`, `to`, `id`, `windowId`, `child`, `rect`, `caller` | worker | share `rect` of a window the caller manages with a descendant (no `rect`: take it back) |
-| `RENDERCONFIG` | `from`, `to`, `id`, `windowId`, `options`, `caller` | worker | a window's render settings (setting them: its owner) |
-| `DRAWREGION` | `from`, `to`, `id`, `windowId`, `frame`, `pixels`/`width`/`height`/`mode`/`bg` or `text`, `x`, `y`, `offset`, `done`, `caller`, `noReply` | worker | a region of a frame, from a process sharing the window (or its owner) |
-| `REQUESTFULLSCREEN` | `from`, `to`, `id`, `caller`                      | worker  | "let me bypass the compositor and INVOKE the real gpu/screen directly"; `caller` is the asking process, whose end releases the grant |
-| `RELEASEFULLSCREEN` | `from`, `to`, `id`                                | worker  | give that grant back |
-| `RESULT`  | `from`, `to`, `id`, `result`                              | either  | success -- `JOB`'s return value, `LIST`'s address→type table, `INVOKE`'s list of return values, `GETPROCESSES`'s job list, `SPAWN`'s `{id, node}` handle, `CREATEWINDOW`'s window record, `GETWINDOWS`'s window list, or `REQUESTFULLSCREEN`/`RELEASEFULLSCREEN`'s `{granted/released = true}` |
+| `RENDERCONFIG` | `from`, `to`, `id`, `windowId`, `options`, `key`, `caller` | worker | a window's render settings (setting them: its owner); to the screen showing it |
+| `DRAWREGION` | `from`, `to`, `id`, `windowId`, `frame`, `cells` or `text`, `x`, `y`, `offset`, `done`, `key`, `caller`, `noReply` | worker | a region of a frame, from a process sharing the window (or its owner); to the screen showing it |
+| `GPUCALL` | `from`, `to`, `id`, `method`, `args`, `key`                  | worker  | a fullscreen program's `gpu` call on a network terminal's screen, with the grant's `key`; `RESULT` is the call's returns |
+| `REQUESTFULLSCREEN` | `from`, `to`, `id`, `caller`                      | worker  | "let me bypass the compositor and INVOKE the real gpu/screen directly" -- its session's screen; `caller` is the asking process, whose end releases the grant. For a terminal's session the answer carries `route = {address, key, port}`: the program's `gpu` calls go there as `GPUCALL` |
+| `RELEASEFULLSCREEN` | `from`, `to`, `id`, `caller`                      | worker  | give that grant back |
+| `RESULT`  | `from`, `to`, `id`, `result`                              | either  | success -- `JOB`'s return value, `LIST`'s address→type table, `INVOKE`'s list of return values, `GETPROCESSES`'s job list, `SPAWN`'s `{id, node}` handle, `CREATEWINDOW`'s window record (with its `route`, `key` and `port`), `GETWINDOWS`'s window list, or `REQUESTFULLSCREEN`/`RELEASEFULLSCREEN`'s `{granted/released = true}` |
 | `ERROR`   | `from`, `to`, `id`, `error`                               | either  | failure -- load error, runtime error, invoke error, a bad `SPAWN`/`CREATEWINDOW` request, a blocked display-component `INVOKE`, or a refused fullscreen request |
 
 **Addresses and sender checks.** Every `from`/`to` is a node's
@@ -1565,6 +1568,49 @@ under the machine's deadline).
 Compiled draw code is cached per window keyed by its source, so an app
 that redraws with the same code and new `args` doesn't recompile each
 time. Any other process is refused (test 28).
+
+### Window routes and network terminals -- BUILT
+
+**The registry.** `kernal/windows.lua` keeps every program window: its
+owner process and user, title and geometry, the session showing it (at
+most one), and a *key*, a random secret made when it's shown somewhere.
+A window shown nowhere is *detached*.
+
+**Routes.** A window's route is `{address, key, port}`: the screen
+showing it (the kernal, or a terminal) and its key. `CREATEWINDOW`'s
+answer carries it, a `create_graphics_process` child gets it in its
+`JOB` (`windowRoute`), and `WINDOWROUTE` asks for it. Draws
+(`DRAWWINDOW`, `DRAWREGION`, `RENDERCONFIG`) go to the route's address
+with the key; a screen refuses a draw without the window's current key.
+When a window moves, everyone holding its route gets
+`{"window_route", id, address, key, width, height, port}` (address
+false: detached); the runtime keeps a route cache per window, turns
+these into `window_attached`/`window_detached` for the program, and
+replays the window's last draws at the new screen. A worker accepts
+`EVENT`, `RESULT` and `ERROR` from a screen it has a route to, and
+nothing else from anyone but the kernal.
+
+**Terminals.** A network terminal runs its own session: muxterm (an
+OpenOS program) sends `TERMHELLO` on the terminal port (4478, flag
+`terminal_port`) and gets `TCODE`: `kernal/terminal.lua` and the
+session, compositor, encoder and line editor it runs. The terminal
+composites on its own GPU, sends its windows' input straight to the
+programs' nodes (`EVENT` on the cluster port), and asks the kernal (on
+the terminal port) for what only the kernal can do; the kernal keeps a
+proxy session for it (`kernal/terminals.lua`), which runs its commands
+and owns its processes, and whose display tells the terminal to open,
+remove and mark windows. The full message list is at the top of
+`kernal/terminals.lua`. A terminal or kernal that hears nothing from
+the other for 10 s hangs up; the session then ends as a logout.
+
+**Fullscreen on a terminal.** `REQUESTFULLSCREEN` from a process in a
+terminal's session grants that terminal's screen: the kernal sends the
+terminal `TFULL {node, job, key}` and the process the route; the
+process's `gpu` calls go to the terminal as `GPUCALL`s with the key.
+Releasing it, the process ending, or Ctrl+Alt+C on the terminal ends it.
+
+Tested in `test/emu/muxterm_test.lua` (packets watched: draws and input
+skip the kernal) and `test/emu/integration_test.lua` (tests 56, 57).
 
 ### Window focus and keyboard delivery -- BUILT
 

@@ -122,7 +122,7 @@ end
 function S.prompt()
   local user = S.user
   if not user then return "login: " end
-  local cwd, home = shell and shell.cwd() or "/", system.home(user)
+  local cwd, home = S.cwd(), system.home(user)
   if cwd == home then
     cwd = "~"
   elseif cwd:sub(1, #home + 1) == home .. "/" then
@@ -778,6 +778,7 @@ end
 function desktop.launch(app)
   if app.console then desktop.showConsole() return end
   local id, addrOrErr = launchProgram(app.path, {})
+  if id == true then return end -- asked; the kernal reports how it went
   if id then
     print("[" .. id .. "] " .. app.path .. " started on " .. addrOrErr)
   else
@@ -1159,7 +1160,7 @@ end
 
 -- The working directory: the shell's, else home.
 function S.cwd()
-  return shell and shell.cwd() or (S.user and system.home(S.user)) or "/"
+  return shell and shell.cwd() or S.remoteCwd or (S.user and system.home(S.user)) or "/"
 end
 
 -- A shell line: POSIX-style commands, pipes and redirection, programs

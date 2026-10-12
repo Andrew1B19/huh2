@@ -664,7 +664,7 @@ do
   emu:boot(node)
   emu:advance(3)
   typeLine("root")
-  assert(text():find("root@muxos:/> _", 1, true), "muxos booted without its shell:\n" .. text())
+  assert(text():find("root@muxos:~> _", 1, true), "muxos booted without its shell:\n" .. text())
   typeLine("ls")
   assert(text():find("no shell -- run `update` with the installer floppy in", 1, true),
     "without its shell it says how to get it:\n" .. text())
