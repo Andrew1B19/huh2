@@ -2387,33 +2387,161 @@ function desktop.spans(width, placed)
   return row
 end
 
+-- --- Wallpaper: a PPM image (P3 or P6), stretched over the screen in
+-- half-block cells (kernal/bitmap.lua) behind the icons. `wallpaper
+-- <file.ppm>` sets it (remembered in /etc/wallpaper), `wallpaper none`
+-- clears it.
+desktop.bitmap = loadSibling("bitmap.lua")()
+desktop.WALLPAPER_CONFIG = "/etc/wallpaper"
+desktop.MAX_WALLPAPER = 1024 * 1024
+
+-- A PPM image: width, height and pixel(x, y) -> 0xRRGGBB, or nil and why.
+function desktop.readPPM(data)
+  local pos, fields = 1, {}
+  while #fields < 4 do
+    local token, nextPos = data:match("^%s*([^%s#]+)()", pos)
+    if not token then
+      local comment = data:match("^%s*#[^\n]*\n()", pos)
+      if not comment then return nil, "not a PPM image (bad header)" end
+      pos = comment
+    else
+      fields[#fields + 1], pos = token, nextPos
+    end
+  end
+  local magic, w, h, maxval = fields[1], tonumber(fields[2]), tonumber(fields[3]), tonumber(fields[4])
+  if (magic ~= "P6" and magic ~= "P3") or not w or not h or not maxval or w < 1 or h < 1 or maxval < 1 or maxval > 255 then
+    return nil, "not a PPM image (only P3/P6 with 8-bit colors)"
+  end
+  local scale = 255 / maxval
+  local function rgb(r, g, b)
+    return (math.floor(r * scale) << 16) | (math.floor(g * scale) << 8) | math.floor(b * scale)
+  end
+  if magic == "P6" then
+    local start = pos + 1 -- one whitespace byte ends the header
+    if #data < start + w * h * 3 - 1 then return nil, "the image is cut short" end
+    return w, h, function(x, y)
+      local i = start + ((y - 1) * w + (x - 1)) * 3
+      return rgb(data:byte(i), data:byte(i + 1), data:byte(i + 2))
+    end
+  end
+  local values = {}
+  for n in data:sub(pos):gmatch("%d+") do values[#values + 1] = tonumber(n) end
+  if #values < w * h * 3 then return nil, "the image is cut short" end
+  return w, h, function(x, y)
+    local i = ((y - 1) * w + (x - 1)) * 3
+    return rgb(values[i + 1], values[i + 2], values[i + 3])
+  end
+end
+
+-- The wallpaper's cells for this screen, or nil and why.
+function desktop.wallpaperCells(path)
+  local size = tryInvoke(fsAddr, "size", path)
+  if not tryInvoke(fsAddr, "exists", path) then return nil, path .. ": no such file" end
+  if (size or 0) > desktop.MAX_WALLPAPER then return nil, path .. ": too big (1 MB at most)" end
+  local data = readFile(path)
+  if not data then return nil, path .. ": can't read it" end
+  local w, h, pixel = desktop.readPPM(data)
+  if not w then return nil, path .. ": " .. tostring(h) end
+  local pw, ph = termW, termH * 2
+  local pixels = {}
+  for y = 1, ph do
+    local row, sy = {}, math.floor((y - 1) * h / ph) + 1
+    for x = 1, pw do row[x] = pixel(math.floor((x - 1) * w / pw) + 1, sy) end
+    pixels[y] = row
+  end
+  return (desktop.bitmap.encode("halfblock", pixels, pw, ph, desktop.colors.bg))
+end
+
+function desktop.loadWallpaper()
+  desktop.wall = nil
+  local config = readFile(desktop.WALLPAPER_CONFIG)
+  local path = config and config:match("^%s*(.-)%s*$")
+  if not path or path == "" then return end
+  local cells, err = desktop.wallpaperCells(path)
+  if cells then desktop.wall = cells else print("wallpaper: " .. tostring(err)) end
+end
+
 function desktop.render()
   if not desktop.win then return end
   local W, H, C = desktop.ICON_W, desktop.ICON_H, desktop.colors
-  local placed = {}
-  for y = 1, termH do placed[y] = {} end
+  -- The background: the wallpaper's cells, or the plain color.
+  local grid = {}
+  for y = 1, termH do
+    local row, wall = {}, desktop.wall and desktop.wall[y]
+    for x = 1, termW do
+      local cell = wall and wall[x]
+      row[x] = cell and {cell.char, cell.fg, cell.bg} or {" ", C.text, C.bg}
+    end
+    grid[y] = row
+  end
+  -- The icons, each on a tile of the desktop's color.
   local per = desktop.perColumn()
+  local function put(x, y, text, fg)
+    if not grid[y] then return end
+    local i = 0
+    for _, code in utf8.codes(text) do
+      local cell = grid[y][x + i]
+      if cell then cell[1], cell[2], cell[3] = utf8.char(code), fg, C.bg end
+      i = i + 1
+    end
+  end
   for i, app in ipairs(desktop.apps) do
     local x, y = 2 + (i - 1) // per * (W + 1), 2 + (i - 1) % per * (H + 1)
     if x + W - 1 <= termW then
       for j = 1, 4 do
-        if y + j - 1 <= termH then
-          local art = app.icon and app.icon.rows[j] or desktop.ART[j]
-          local fg = app.icon and app.icon.colors[j] or C.art
-          table.insert(placed[y + j - 1], {x, art, fg})
-        end
+        put(x, y + j - 1, app.icon and app.icon.rows[j] or desktop.ART[j], app.icon and app.icon.colors[j] or C.art)
       end
-      if y + 4 <= termH then table.insert(placed[y + 4], {x, desktop.fit(app.name, W, true), C.text}) end
+      put(x, y + 4, desktop.fit(app.name, W, true), C.text)
     end
   end
+  -- Rows of spans: runs of cells sharing their colors.
   local rows = {}
-  for y = 1, termH do rows[y] = desktop.spans(termW, placed[y]) end
+  for y = 1, termH do
+    local spans, row, x = {}, grid[y], 1
+    while x <= termW do
+      local fg, bg, chars = row[x][2], row[x][3], {}
+      while x <= termW and row[x][2] == fg and row[x][3] == bg do
+        chars[#chars + 1] = row[x][1]
+        x = x + 1
+      end
+      spans[#spans + 1] = {table.concat(chars), fg, bg}
+    end
+    rows[y] = spans
+  end
   compositor.setText(desktop.win.id, rows)
 end
 
 function desktop.refresh()
   desktop.scan()
+  desktop.loadWallpaper()
   desktop.render()
+end
+
+-- The `wallpaper` command: <file.ppm> sets it, `none` clears it.
+function desktop.setWallpaper(arg)
+  if not arg or arg == "" then
+    local config = readFile(desktop.WALLPAPER_CONFIG)
+    print("wallpaper: " .. (config and config:match("^%s*(.-)%s*$") or "none")
+      .. "  (wallpaper <file.ppm> | wallpaper none)")
+    return
+  end
+  if arg == "none" then
+    tryInvoke(fsAddr, "remove", desktop.WALLPAPER_CONFIG)
+    desktop.wall = nil
+    desktop.render()
+    print("wallpaper cleared")
+    return
+  end
+  local path = arg
+  if path:sub(1, 1) ~= "/" then path = (shell and shell.cwd() or "/") .. "/" .. path end
+  local cells, err = desktop.wallpaperCells(path)
+  if not cells then print("wallpaper: " .. tostring(err)) return end
+  tryInvoke(fsAddr, "makeDirectory", "/etc")
+  local h = tryInvoke(fsAddr, "open", desktop.WALLPAPER_CONFIG, "w")
+  if h then tryInvoke(fsAddr, "write", h, path .. "\n") tryInvoke(fsAddr, "close", h) end
+  desktop.wall = cells
+  desktop.render()
+  print("wallpaper: " .. path)
 end
 
 function desktop.showConsole()
@@ -3047,7 +3175,7 @@ end
 do
 local KERNAL_COMMANDS = {}
 for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
-    .. "bus components call pause resume kill migrate drain undrain update reboot quit exit"):gmatch("%S+") do
+    .. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper"):gmatch("%S+") do
   KERNAL_COMMANDS[name] = true
 end
 -- A disk without shell.lua (upgraded by hand) still boots; `update`
@@ -3102,6 +3230,8 @@ runCommand = function(line)
     shutdown(true)
   elseif line == "update" then
     updates.run()
+  elseif line == "wallpaper" or line:match("^wallpaper%s") then
+    desktop.setWallpaper(line:match("^wallpaper%s+(.-)%s*$"))
   elseif line == "discover" then
     discover(1)
     listNodes()
@@ -3276,6 +3406,7 @@ print("muxos kernal -- " .. selfAddr)
 print("commands:")
 print("  discover | nodes | ping <node> [count] | quit | reboot")
 print("  update -- install a new muxos from the installer floppy's muxos-installer.dat")
+print("  wallpaper <file.ppm> | wallpaper none -- the desktop's background image")
 print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job id>")
 print("  migrate <job id> [node] | drain|undrain <node>")
 print("  spawn <node> <lua code>")

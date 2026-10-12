@@ -1780,4 +1780,37 @@ print("G48 window=" .. tostring(r.window and r.window.id) .. " owner=" .. tostri
 end
 print("  OK -- a graphics process draws into its own window with its gpu, and receives its keys")
 
+print("test 49: a wallpaper -- a PPM image behind the desktop's icons")
+do
+  local c = newCluster(80, 25, {
+    ["/home/two.ppm"] = "P6\n# two pixels\n2 1\n255\n" .. string.char(255, 0, 0, 0, 0, 255),
+    ["/home/green.ppm"] = "P3 1 1 255\n0 255 0\n",
+    ["/home/bad.ppm"] = "P6 4 4 255\nxx",
+  }, 1)
+  local function bg(x, y) local cell = c.cell(x, y) return cell and cell.bg end
+  c.typeLine("wallpaper two.ppm")
+  c.emu:advance(1)
+  assert(bg(10, 1) == 0xFF0000 and bg(70, 1) == 0x0000FF,
+    string.format("a P6 image stretched over the screen (got %06x, %06x)", bg(10, 1) or 0, bg(70, 1) or 0))
+  assert(c.files["/etc/wallpaper"] == "/home/two.ppm\n", "remembered in /etc/wallpaper")
+  local ix, iy = c.find("/-------\\")
+  assert(ix and bg(ix, iy) == 0x444444, "icons sit on tiles of the desktop's color")
+  c.typeLine("wallpaper green.ppm")
+  c.emu:advance(1)
+  assert(bg(10, 1) == 0x00FF00 and bg(70, 1) == 0x00FF00, "a P3 image")
+  c.typeLine("wallpaper bad.ppm")
+  c.emu:advance(1)
+  assert(c.text():find("wallpaper: /home/bad.ppm: the image is cut short", 1, true), "a bad image is refused:\n" .. c.text())
+  assert(bg(10, 1) == 0x00FF00, "...and the wallpaper stays")
+  -- Kept across a reboot.
+  c.typeLine("reboot")
+  c.emu:boot(c.kernal)
+  c.emu:advance(4)
+  assert(bg(10, 1) == 0x00FF00, "the wallpaper comes back after a reboot")
+  c.typeLine("wallpaper none")
+  c.emu:advance(1)
+  assert(bg(10, 1) == 0x444444 and not c.files["/etc/wallpaper"], "wallpaper none: the plain desktop again")
+end
+print("  OK -- P6 and P3 wallpapers, stretched behind the icons, remembered across reboots, cleared")
+
 print("ALL OK")
