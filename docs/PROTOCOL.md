@@ -173,7 +173,7 @@ plus the stock EEPROM image the mod itself ships,
 | `component.proxy(addr)` / dot-shorthand | `componentProxy(addr)`/`primaryComponent(ctype)` -- a metatable over `component.invoke`, duplicated (not shared) in `kernal/compositor.lua` too |
 | `event.pull`/`event.listen` | `tick(timeout)` -- one `pullSignal` call per invocation, dispatched inline by signal name; every wait in the program (REPL idle, `waitForReply`, `discover`) calls `tick()` instead of polling |
 | `thread.create` (the old background dispatcher) | nothing -- there is exactly one coroutine; see "Resolved, then resolved differently again" below for why the old two-"thread" design doesn't apply any more |
-| `io.read()`/`io.write()`, the REPL prompt | a `key_down`-driven line editor (`handleKeyDown`, `inputBuffer`) -- append/backspace only, no history or cursor movement within a line, a real gap against a proper shell, flagged rather than hidden |
+| `io.read()`/`io.write()`, the REPL prompt | a `key_down`-driven line editor (`handleKeyDown`, `kernal/lineedit.lua`): history, cursor movement, editing keys, and paste from the `clipboard` signal |
 | `print` (screen output) | a local `print` shadowing the native (server-console-only) one, routed through a minimal built-in text console (`termWrite`) -- fixed-width, scrolls one row at a time via `gpu.copy`/`gpu.fill`, no word-wrap or scrollback |
 | `keyboard.isControlDown()`/`isAltDown()`/`keys.c` | the same key-code constants OpenOS's own `lib/keyboard.lua` uses internally (verified against its source), tracked by hand in a `heldKeys` table updated from raw `key_down`/`key_up` signals |
 | `require`/`dofile` (loading sibling files) | `loadSibling(name)` -- reads a file directly off the boot filesystem component (rediscovered via the EEPROM's own stored boot address, the same way `kernal/bios.lua` found it) and `load()`s it; `compositor.lua` receives this same function as its own `...` argument so it can load `bitmap.lua` the identical way |
@@ -254,7 +254,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId`, `resizable`, `decorated` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
 | `GETWINDOWS` | `from`, `to`, `id`                                      | worker  | "list every window you know about" (gmux API's `get_windows()`) |
 | `DRAWWINDOW` | `from`, `to`, `id`, `windowId`, `code`, `args`, `pixels`, `mode`, `width`, `height`, `bg`, `clear`, `caller`, `noReply` | worker | redraw a window the calling process owns (`gmuxapi.draw_window`); with code, `width`/`height` different from the window's resize it first (resizable windows); `noReply` = sent without waiting, nothing comes back |
-| `REQUESTFULLSCREEN` | `from`, `to`, `id`                                | worker  | "let me bypass the compositor and INVOKE the real gpu/screen directly" |
+| `REQUESTFULLSCREEN` | `from`, `to`, `id`, `caller`                      | worker  | "let me bypass the compositor and INVOKE the real gpu/screen directly"; `caller` is the asking process, whose end releases the grant |
 | `RELEASEFULLSCREEN` | `from`, `to`, `id`                                | worker  | give that grant back |
 | `RESULT`  | `from`, `to`, `id`, `result`                              | either  | success -- `JOB`'s return value, `LIST`'s address→type table, `INVOKE`'s list of return values, `GETPROCESSES`'s job list, `SPAWN`'s `{id, node}` handle, `CREATEWINDOW`'s window record, `GETWINDOWS`'s window list, or `REQUESTFULLSCREEN`/`RELEASEFULLSCREEN`'s `{granted/released = true}` |
 | `ERROR`   | `from`, `to`, `id`, `error`                               | either  | failure -- load error, runtime error, invoke error, a bad `SPAWN`/`CREATEWINDOW` request, a blocked display-component `INVOKE`, or a refused fullscreen request |
@@ -381,16 +381,16 @@ through `INVOKE`, completely bypassing the compositor's window registry.
 `handleInvoke` now checks `isDisplayComponent(address)` (true for the
 kernal's own `component.gpu.address` or the screen it's bound to) and
 refuses the call unless the sender currently holds
-`exclusiveFullscreenOwner` -- a grant acquired via
+`fullscreen.node` -- a grant acquired via
 `gmuxapi.request_fullscreen()`/released via
 `gmuxapi.release_fullscreen()`, first-come-first-served, one holder at a
 time. This exists for the one legitimate reason to go around the
 compositor: a fullscreen app that wants to own the whole display and
 draw without the compositor's buffer/blit indirection, not for every job
-doing a stray `gpu.set()`. Released when its holder's node goes down,
-or by force with Ctrl+Alt+C -- but **not** when the holding program
-ends while its node stays up (the grant is per node, not per job): a
-gap, flagged.
+doing a stray `gpu.set()`. The grant lets the node through, and records
+the process that asked (`fullscreen.job`): it's released when that
+process ends (test 51), when the node goes down, or by force with
+Ctrl+Alt+C.
 
 `node/runtime.lua`'s `gpu` face is affected by this too: its remote
 fallback (used when a worker has no local gpu) goes through the exact
@@ -436,12 +436,10 @@ earlier note here said closing a window wouldn't end its program and
 that gmux behaves that way. It doesn't: gmux's `Window:close()` calls
 `process:kill()`. The decorations were then specified as "copy gmux",
 so close kills the owner process (see "Window decorations"), and
-minimize (collapse to the title bar) is how a window gets out of the
-way while its program keeps running. The old plan of a closed window
-becoming a toolbar icon (icon from the window's bitmap, else the
-program's name, else one supplied through the API) is kept here in case
-a toolbar is built for minimized windows later. (A taskbar is built now --
-a button per window, minimized ones included -- see README.md.)
+minimize is how a window gets out of the way while its program keeps
+running: it's hidden entirely, and its taskbar button (or the taskbar's
+"+N" window menu, when the buttons don't fit) brings it back -- see
+README.md.
 
 ## Scheduler
 
@@ -1022,8 +1020,9 @@ before `.lua`, exactly as typing the name resolves it. A touch on an
 icon starts the program as `name &` would (a legacy program gets its own
 terminal window); the console icon un-minimizes and raises the console.
 It's a text window, so it needs no video buffer; the icon list is
-rebuilt at boot and on `comp` (test 40). Icons are text art for now: a
-bitmap wallpaper or icons would still go through bit windows, as below.
+rebuilt at boot and on `comp` (test 40). Icons are text art; the
+wallpaper (`wallpaper <file>`, a PPM image) is half-block cells drawn
+into the desktop's own text window, behind the icons (test 49).
 
 Still not done: per-job isolated bit-window surfaces have the same gap
 `create_graphics_process` already has for character windows (see
@@ -1579,7 +1578,9 @@ buffer, so it costs no video memory.
 - **Title**: gmux's process prefix -- the window stays up after its
   process ends, marked ⏹ (done or killed) or ❌ (error, lost) -- then
   the title, cut short of the buttons.
-- **Minimize** (w-5): collapses to the title bar and back.
+- **Minimize** (w-5): hides the window (gmux collapsed it to its title
+  bar instead); its taskbar button restores it. Focus passes to the
+  topmost window still shown.
 - **Maximize** (w-3, `resizable` windows only): fills the screen and
   back.
 - **Close** (w-1): removes the window and kills its process, as in gmux.
