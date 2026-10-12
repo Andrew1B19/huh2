@@ -415,8 +415,9 @@ assertScreenContains("blocked", "blocked again after release")
 print("  OK -- gpu.set succeeded while the grant was held, and was blocked again after releasing it")
 
 print("test 10: Ctrl+Alt+C -- a press exits fullscreen (releasing a stuck grant), holding it enters console mode")
--- worker 1 grabs the grant and deliberately never releases it (fire-and-forget spawn).
-typeLine('spawn 1 gmuxapi.request_fullscreen()')
+-- worker 1 grabs the grant and deliberately never releases it, hanging
+-- on to it like a stuck program (the grant goes when its process ends).
+typeLine('spawn 1 gmuxapi.request_fullscreen() sleep(12)')
 emu:advance(2)
 -- worker 2 trying to grab it now must be denied. The console is a
 -- compositor window, and compositing is suspended while a node owns the
@@ -686,7 +687,7 @@ print("  OK -- each worker reported the bad result as an error and still answere
 
 print("test 16: a forged `from` can't release someone else's fullscreen grant")
 pressCombo() -- leave console mode
-typeLine("spawn 1 gmuxapi.request_fullscreen()")
+typeLine("spawn 1 gmuxapi.request_fullscreen() sleep(10)") -- held while it runs
 emu:advance(2)
 local holder = screenAfter("spawn 1 gmuxapi"):match("spawned job %[%d+%] on (modem%-%x+)")
 assert(holder, "could not find the fullscreen holder's address")
@@ -1158,10 +1159,19 @@ assert(cellText(20, 4, 4) ~= "T3,2", "what was behind the old position shows aga
 print("  OK -- dragging the title bar moves the window")
 
 touch("touch", 38, 6)
-assert(cellText(30, 6, 6) == "deco32" and cellText(30, 7, 4) ~= "T3,2", "minimize collapses to the title bar")
-touch("touch", 38, 6)
-assert(cellText(30, 7, 4) == "T3,2", "minimize again restores the body")
-print("  OK -- minimize collapses the window to its title bar and back")
+assert(cellText(30, 6, 6) ~= "deco32" and cellText(30, 7, 4) ~= "T3,2", "minimize hides the whole window")
+-- This 50-column screen has more windows than taskbar room: titles
+-- shrink, and the "+N" button lists every window.
+local bar = cellText(1, 30, 50)
+local moreX = bar:find(" +", 1, true)
+assert(moreX and bar:find("con ", 1, true), "shrunken buttons and a +N button: " .. bar)
+touch("touch", moreX + 1, 30)
+local menuY
+for y = 1, 29 do if cellText(1, y, 50):find("deco32 (minimized)", 1, true) then menuY = y end end
+assert(menuY, "the window menu lists it as minimized:\n" .. renderScreen())
+touch("touch", cellText(1, menuY, 50):find("deco32", 1, true), menuY)
+assert(cellText(30, 6, 6) == "deco32" and cellText(30, 7, 4) == "T3,2", "the menu brings it back:\n" .. renderScreen())
+print("  OK -- minimize hides the window to the taskbar; its menu entry restores it")
 
 touch("touch", 40, 6)
 emu:advance(1)
@@ -1876,5 +1886,21 @@ do
   assert(prompt() == "echo half_", "pasted lines go into the history too")
 end
 print("  OK -- history, Home/End/arrows, Delete/Backspace, ^U ^K ^W, an inverted cursor, multi-line paste")
+
+print("test 51: the fullscreen grant is released when the program holding it ends")
+do
+  local c = newCluster(80, 25, {}, 1)
+  -- It draws over the whole screen, then ends without releasing.
+  c.typeLine('spawn 1 gmuxapi.request_fullscreen() gpu.fill(1, 1, 80, 25, " ") gpu.set(1, 1, "GRABBED") sleep(2)')
+  c.emu:advance(1)
+  assert(c.text():find("GRABBED", 1, true) and not c.text():find("muxos:/home>", 1, true),
+    "while it holds the grant, the screen is its:\n" .. c.text())
+  c.emu:advance(3)
+  assert(c.text():find("muxos:/home>", 1, true), "it ended without releasing: the desktop and console are back:\n" .. c.text())
+  c.typeLine('run local g, e = gmuxapi.request_fullscreen() local r = gmuxapi.release_fullscreen() return tostring(g ~= nil) .. "/" .. tostring(r ~= nil)')
+  c.emu:advance(2)
+  assert(c.text():find("true/true", 1, true), "and the grant is free for the next program:\n" .. c.text())
+end
+print("  OK -- a program that ends holding fullscreen gives the screen back")
 
 print("ALL OK")

@@ -238,11 +238,11 @@ local function bodyTop(win)
   return win.y + titleRows(win)
 end
 
--- Everything the window covers on screen: title bar plus body, or just
--- the title bar while minimized.
+-- Everything the window covers on screen: title bar plus body -- or
+-- nothing while minimized (it's on the taskbar only).
 local function outerRect(win)
-  local h = win.minimized and titleRows(win) or win.height + titleRows(win)
-  return {x = win.x, y = win.y, w = win.width, h = h}
+  if win.minimized then return {x = win.x, y = win.y, w = 0, h = 0} end
+  return {x = win.x, y = win.y, w = win.width, h = win.height + titleRows(win)}
 end
 
 local function titleText(win)
@@ -767,6 +767,15 @@ function M.minimize(id, minimized)
   win.minimized = minimized or nil
   exposeRect(old)
   win.dirty = true
+  -- A minimized window gives up the focus, to the topmost one still shown.
+  if minimized and focusedId == id then
+    local next
+    for _, other in ipairs(windowOrder) do
+      local o = windows[other]
+      if o.decorated and not o.minimized then next = other break end
+    end
+    moveFocus(next)
+  end
   return true
 end
 

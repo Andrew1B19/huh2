@@ -235,7 +235,9 @@ local nextNode = 1
 -- case where going around the compositor is the point -- a fullscreen
 -- app that wants to own the whole display and draw without buffer/blit
 -- overhead. Only one node may hold it at a time.
-local exclusiveFullscreenOwner = nil
+-- `node` holds the grant; `job` is the process that asked for it, so the
+-- grant goes when that process ends even if its node stays up.
+local fullscreen = {node = nil, job = nil}
 
 -- The compositor is the only code in this whole project that makes a
 -- real gpu.* call for WINDOW content -- see compositor.lua's own header
@@ -1213,6 +1215,11 @@ local function finishJob(id, status, result, err)
   local job = jobs[id]
   closeJobFiles(id)
   net.release(id)
+  if fullscreen.job == id then
+    fullscreen.node, fullscreen.job = nil, nil
+    compositor.setExclusive(nil)
+    consoleDirty = true
+  end
   runningJobs[id] = nil
   runningCount = runningCount - 1
   local node = nodes[job.node]
@@ -1255,8 +1262,9 @@ local lastLivenessCheck = -math.huge
 local function markNodeDown(addr)
   nodes[addr].down = true
   print("node " .. addr .. " stopped responding -- marking it down")
-  if exclusiveFullscreenOwner == addr then
-    exclusiveFullscreenOwner = nil
+  if fullscreen.node == addr then
+    fullscreen.node = nil
+    fullscreen.job = nil
     compositor.setExclusive(nil)
     consoleDirty = true
   end
@@ -1613,7 +1621,7 @@ local function isDisplayComponent(address)
 end
 
 local function handleInvoke(msg)
-  if isDisplayComponent(msg.address) and msg.from ~= exclusiveFullscreenOwner then
+  if isDisplayComponent(msg.address) and msg.from ~= fullscreen.node then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
       error = "direct gpu/screen access is blocked -- use create_window, or gmuxapi.request_fullscreen() for exclusive access"})
     return
@@ -1637,23 +1645,26 @@ end
 -- holding the grant re-requesting it is a no-op success, but a second,
 -- different node is refused outright rather than queued.
 local function handleRequestFullscreen(msg)
-  if exclusiveFullscreenOwner and exclusiveFullscreenOwner ~= msg.from then
+  if fullscreen.node and fullscreen.node ~= msg.from then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
-      error = "fullscreen already held by " .. exclusiveFullscreenOwner})
+      error = "fullscreen already held by " .. fullscreen.node})
     return
   end
-  exclusiveFullscreenOwner = msg.from
+  fullscreen.node = msg.from
+  local job = jobs[msg.caller]
+  fullscreen.job = job and job.status == "running" and job.node == msg.from and job.id or nil
   compositor.setExclusive(msg.from)
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {granted = true}})
 end
 
 local function handleReleaseFullscreen(msg)
-  if exclusiveFullscreenOwner ~= msg.from then
+  if fullscreen.node ~= msg.from then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
       error = "you do not hold the fullscreen grant"})
     return
   end
-  exclusiveFullscreenOwner = nil
+  fullscreen.node = nil
+  fullscreen.job = nil
   compositor.setExclusive(nil)
   consoleDirty = true
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {released = true}})
@@ -2137,9 +2148,10 @@ local queuedKeys = {}
 -- fullscreen grant (force-released, so a crashed holder can't trap the
 -- screen), or console mode.
 local function exitFullscreen()
-  if exclusiveFullscreenOwner then
-    print("Ctrl+Alt+C: force-releasing fullscreen grant held by " .. exclusiveFullscreenOwner)
-    exclusiveFullscreenOwner = nil
+  if fullscreen.node then
+    print("Ctrl+Alt+C: force-releasing fullscreen grant held by " .. fullscreen.node)
+    fullscreen.node = nil
+    fullscreen.job = nil
   end
   compositor.setExclusive(nil)
   consoleDirty = true
@@ -2656,10 +2668,20 @@ function desktop.bar.render(list)
   placed[#placed + 1] = {1, start, desktop.mono and 0xFFFFFF or 0x000000, desktop.mono and 0x000000 or C.accent}
   buttons[#buttons + 1] = {from = 1, to = utf8.len(start), start = true}
   local x, limit = utf8.len(start) + 2, termW - #clock
-  for _, w in ipairs(list) do
-    local label = " " .. desktop.fit(w.title, math.min(14, utf8.len(w.title) or #w.title)) .. " "
+  -- Every window gets a button: titles shrink (14 characters down to 3)
+  -- until all fit; past that, a "+N" button lists the rest in a menu.
+  local room, title = limit - x + 2, 14 -- a button is title + 2 spaces + 1 gap
+  while title > 3 and #list * (title + 3) > room do title = title - 1 end
+  local shown, more = #list, nil
+  if #list * (title + 3) > room then
+    more = " +" .. #list .. " "
+    shown = math.max(0, (room - #more - 1) // (title + 3))
+    more = " +" .. (#list - shown) .. " "
+  end
+  for i = 1, shown do
+    local w = list[i]
+    local label = " " .. desktop.fit(w.title, math.min(title, utf8.len(w.title) or #w.title)) .. " "
     local width = utf8.len(label) or #label
-    if x + width - 1 > limit then break end
     local fg, bg = 0xFFFFFF, 0x555555
     if w.minimized then
       fg, bg = 0x999999, 0x333333
@@ -2670,6 +2692,10 @@ function desktop.bar.render(list)
     placed[#placed + 1] = {x, label, fg, bg}
     buttons[#buttons + 1] = {from = x, to = x + width - 1, window = w.id}
     x = x + width + 1
+  end
+  if more then
+    placed[#placed + 1] = {x, more, 0x000000, desktop.mono and 0xFFFFFF or C.accent}
+    buttons[#buttons + 1] = {from = x, to = x + #more - 1, more = true}
   end
   placed[#placed + 1] = {termW - #clock + 1, clock, 0xFFFFFF, nil}
   desktop.bar.buttons = buttons
@@ -2696,11 +2722,29 @@ function desktop.bar.update(force)
   end
 end
 
+-- Shows a window: restored if minimized, raised, focused.
+function desktop.bar.show(id)
+  local win = compositor.getWindow(id)
+  if not win then return end
+  if win.minimized then compositor.minimize(id, false) end
+  compositor.raise(id)
+  compositor.setFocus(id)
+end
+
 function desktop.bar.touch(lx)
   for _, b in ipairs(desktop.bar.buttons) do
     if lx >= b.from and lx <= b.to then
       if b.start then
         desktop.toggleMenu()
+      elseif b.more then
+        -- Every window, by title; touching one shows it.
+        local items = {}
+        for _, w in ipairs(desktop.bar.windows()) do
+          local id = w.id
+          items[#items + 1] = {label = w.title .. (w.minimized and " (minimized)" or ""),
+            action = function() desktop.bar.show(id) end}
+        end
+        desktop.toggleMenu(items, b.from)
       else
         local win = compositor.getWindow(b.window)
         local focus = compositor.getFocus()
@@ -2715,9 +2759,7 @@ function desktop.bar.touch(lx)
           if not win.minimized and focus and focus.id == win.id and top and top.id == win.id then
             compositor.minimize(win.id, true)
           else
-            if win.minimized then compositor.minimize(win.id, false) end
-            compositor.raise(win.id)
-            compositor.setFocus(win.id)
+            desktop.bar.show(win.id)
           end
         end
       end
@@ -2727,28 +2769,43 @@ function desktop.bar.touch(lx)
   desktop.bar.update(true)
 end
 
--- The start menu: every app, one per row, just above the start button.
-function desktop.toggleMenu()
+-- A menu above the taskbar, one item per row: the start menu (every
+-- app) by default, or the given items ({label, action}) at column x.
+-- Open already: closes it instead.
+function desktop.toggleMenu(items, x)
   if desktop.menu then
     compositor.close(desktop.menu.id)
-    desktop.menu = nil
+    desktop.menu, desktop.menuItems = nil, nil
     return
   end
+  if not items then
+    items = {}
+    for _, app in ipairs(desktop.apps) do
+      items[#items + 1] = {label = app.name, action = function() desktop.launch(app) end}
+    end
+  end
+  if #items == 0 then return end
   local rows, width = {}, 8
-  for _, app in ipairs(desktop.apps) do width = math.max(width, (utf8.len(app.name) or #app.name) + 2) end
-  local height = math.min(#desktop.apps, termH - 2)
-  for i = 1, height do rows[i] = " " .. desktop.fit(desktop.apps[i].name, width - 1) end
+  for _, item in ipairs(items) do width = math.max(width, (utf8.len(item.label) or #item.label) + 2) end
+  width = math.min(width, termW)
+  local height = math.min(#items, termH - 2)
+  for i = 1, height do rows[i] = " " .. desktop.fit(items[i].label, width - 1) end
   local focus = compositor.getFocus()
-  desktop.menu = compositor.createWindow({title = "menu", x = 1, y = termH - height, width = width, height = height,
+  desktop.menu = compositor.createWindow({title = "menu", x = math.max(1, math.min(x or 1, termW - width + 1)),
+    y = termH - height, width = width, height = height,
     layer = 2900, text = true, decorated = false, bg = 0xFFFFFF, fg = 0x000000})
   if focus then compositor.setFocus(focus.id) end -- the menu doesn't take it
-  if desktop.menu then compositor.setText(desktop.menu.id, rows) end
+  if desktop.menu then
+    desktop.menuItems = items
+    compositor.setText(desktop.menu.id, rows)
+  end
 end
 
 function desktop.menuTouch(ly)
-  local app = desktop.apps[ly]
+  local item = desktop.menuItems and desktop.menuItems[ly]
   desktop.toggleMenu()
-  if app then desktop.launch(app) end
+  if item then item.action() end
+  desktop.bar.update(true)
 end
 
 local function handleTouch(name, x, y, button)

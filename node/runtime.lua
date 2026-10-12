@@ -800,10 +800,10 @@ gmuxapi = {
   -- default, and this is how a node gets let through it, for the one
   -- legitimate case where bypassing the compositor's buffer/blit
   -- indirection is the point -- a fullscreen app that wants to own the
-  -- whole display. First-come-first-served, one holder at a time; NOT
-  -- released automatically if the holder disappears (reboots, crashes).
+  -- whole display. First-come-first-served, one holder at a time;
+  -- released when the process that asked ends, or its node goes down.
   request_fullscreen = function()
-    return remoteRequest("REQUESTFULLSCREEN")
+    return remoteRequest("REQUESTFULLSCREEN", {caller = currentJobId})
   end,
 
   release_fullscreen = function()
