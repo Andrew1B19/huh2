@@ -47,6 +47,8 @@ local kernalFiles = {
   ["/bitmap.lua"] = bitmapSrc,
   ["/lineedit.lua"] = readFile(REPO_ROOT .. "/kernal/lineedit.lua"),
   ["/system.lua"] = readFile(REPO_ROOT .. "/kernal/system.lua"),
+  ["/session.lua"] = readFile(REPO_ROOT .. "/kernal/session.lua"),
+  ["/vgpu.lua"] = readFile(REPO_ROOT .. "/kernal/vgpu.lua"),
   ["/etc/kernal.cfg"] = "login_required = false\n",
   ["/runtime.lua"] = runtimeSrc,
   -- Sample programs for the launcher (test 29).

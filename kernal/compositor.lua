@@ -41,7 +41,15 @@
 -- duplicated rather than shared (same "both sides keep their own copy"
 -- reasoning as the wire-protocol serializer in node/runtime.lua and
 -- kernal/muxos.lua).
-local loadSibling = ...
+--
+-- Each session has its own compositor: muxos.lua loads this file once
+-- per session, with `options`:
+--   gpu     the gpu to draw with (default: the kernal's own) -- a
+--           network terminal's session passes a kernal/vgpu.lua one
+--   nextId  a shared window-id allocator, so ids stay unique across
+--           sessions (default: this compositor's own counter)
+local loadSibling, options = ...
+options = options or {}
 local bitmap = loadSibling("bitmap.lua")()
 
 -- Our OWN tiny component-proxy helper -- NOT OpenOS's
@@ -102,6 +110,7 @@ local frameBuffer = nil
 local frameDamage = nil
 
 local function nextId()
+  if options.nextId then return options.nextId() end
   local id = nextWindowId
   nextWindowId = nextWindowId + 1
   return id
@@ -112,7 +121,7 @@ end
 -- doesn't change while muxos is running.
 local cachedGpu = nil
 local function kernalGpu()
-  if not cachedGpu then cachedGpu = primaryComponent("gpu") end
+  if not cachedGpu then cachedGpu = options.gpu or primaryComponent("gpu") end
   return cachedGpu
 end
 

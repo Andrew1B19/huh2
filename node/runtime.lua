@@ -788,7 +788,7 @@ gmuxapi = {
   end,
 
   get_windows = function()
-    return remoteRequest("GETWINDOWS")
+    return remoteRequest("GETWINDOWS", {caller = currentJobId})
   end,
 
   -- Not part of gmux's real API at all -- gmux never needs this,
