@@ -35,6 +35,8 @@ local FLAGS = {
     help = "only a process's own user (or root) can pause, resume or kill it"},
   {name = "logout_ends_jobs", type = "boolean", default = true,
     help = "logging out ends the processes started from that login"},
+  {name = "scheduler", type = "choice", choices = {"load", "count"}, default = "load",
+    help = "where new work goes: the worker with the lowest load average, or the fewest processes"},
   {name = "remote_terminals", type = "boolean", default = true, reboot = true,
     help = "network terminals (muxterm) can log in"},
   {name = "terminal_port", type = "number", default = 4478, min = 1, max = 65535, reboot = true,

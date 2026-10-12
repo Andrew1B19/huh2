@@ -604,7 +604,11 @@ function Emulator:_resume(node, ...)
     return
   end
   if type(a) == "number" and a < math.huge then
-    node.wakeAt = self.now + a
+    -- Even a 0 timeout moves time on a little, or a node that never
+    -- waits (a busy process) would stop the clock. (Real OC resumes a
+    -- yielded machine on a later server tick, 50 ms; the tests keep
+    -- that near zero so their timings stay about the logic.)
+    node.wakeAt = self.now + math.max(a, self.minYield or 0.001)
   elseif type(a) == "boolean" then
     node.status = "dead"
     self:_logf(node, a and "rebooting" or "shut down")
