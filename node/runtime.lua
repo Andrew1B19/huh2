@@ -155,7 +155,10 @@ local nodeId = modemAddr
 local CHUNK_SIZE = 7000
 local nextMsgId = 1
 
-local function send(msg)
+-- `port`: the cluster's own unless given (a terminal's screen listens on
+-- the terminal port).
+local function send(msg, port)
+  port = port or PORT
   local payload = serialize(msg)
   local id = nextMsgId
   nextMsgId = nextMsgId + 1
@@ -165,9 +168,9 @@ local function send(msg)
     local frame = "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk
     -- Addressed messages go to that card only; only discovery broadcasts.
     if msg.to then
-      component.invoke(modemAddr, "send", msg.to, PORT, frame)
+      component.invoke(modemAddr, "send", msg.to, port, frame)
     else
-      component.invoke(modemAddr, "broadcast", PORT, frame)
+      component.invoke(modemAddr, "broadcast", port, frame)
     end
   end
 end
@@ -240,8 +243,11 @@ local migrationHandlers = {}
 local eventQueues = {}
 local MAX_QUEUED_EVENTS = 64
 
+local windowRouted -- below, with the window routes
+
 local function queueEvent(id, event)
   if type(id) ~= "number" or type(event) ~= "table" then return end
+  if event[1] == "window_route" then event = windowRouted(id, event) end
   local q = eventQueues[id]
   if not q then q = {}; eventQueues[id] = q end
   if #q < MAX_QUEUED_EVENTS then q[#q + 1] = event end
@@ -458,6 +464,79 @@ local function remoteRequest(msgType, extra)
   if not reply then return nil, "timed out waiting for kernal" end
   if reply.type == "RESULT" then return reply.result end
   return nil, reply.error
+end
+
+-- --- Window routes ---
+--
+-- A program's window is drawn wherever it's shown now (see
+-- kernal/windows.lua): the kernal's own screen, a network terminal's,
+-- or nowhere while it's detached (its user logged out, the program
+-- kept running). The kernal tells every process holding a window's
+-- route when it moves ({"window_route", ...}, handled in queueEvent);
+-- drawing goes straight there. What a window was last drawn with is
+-- kept, so it's drawn again by itself when the window is shown on a new
+-- screen -- the program also hears {"window_attached", id, w, h} or
+-- {"window_detached", id}.
+local winRoutes = {}  -- window id -> {address (false: detached), key, port}
+local winDraws = {}   -- window id -> the draws since the last full one
+local winRedraw = {}  -- window id -> function() redrawing it all (a virtual gpu's)
+
+local function setRoute(id, address, key, port)
+  winRoutes[id] = {address = address or false, key = key, port = port}
+end
+
+local function routeOf(id, caller)
+  if winRoutes[id] then return winRoutes[id] end
+  local r, err = remoteRequest("WINDOWROUTE", {windowId = id, caller = caller})
+  if not r then return nil, err end
+  setRoute(id, r.address, r.key, r.port)
+  return winRoutes[id]
+end
+
+-- Sends a draw (DRAWWINDOW/DRAWREGION fields) to the window wherever it
+-- is shown; waits for the answer only from the kernal, and only unless
+-- `noReply`. Detached: nothing to send.
+local function sendDraw(id, msgType, fields, caller, noReply)
+  local r, err = routeOf(id, caller)
+  if not r then return nil, err end
+  if not r.address then return true end
+  fields.windowId, fields.key, fields.caller = id, r.key, caller
+  if r.address == kernalAddr and not noReply then return remoteRequest(msgType, fields) end
+  fields.type, fields.from, fields.to, fields.id, fields.noReply = msgType, nodeId, r.address, nextId(), true
+  send(fields, r.port)
+  return true
+end
+
+-- Keeps a window's draws since its last full one (clear ~= false).
+local function rememberDraw(id, draw)
+  if draw.clear ~= false then
+    winDraws[id] = {draw}
+  else
+    local list = winDraws[id] or {}
+    if #list < 16 then list[#list + 1] = draw end
+    winDraws[id] = list
+  end
+end
+
+-- The kernal moved a window: note where, draw it there, and tell the
+-- program.
+windowRouted = function(jobId, e)
+  local id = e[2]
+  local old = winRoutes[id]
+  setRoute(id, e[3], e[4], e[7])
+  if not e[3] then return {"window_detached", id} end
+  if not (old and old.key == e[4]) then
+    if winRedraw[id] then
+      winRedraw[id]()
+    else
+      for _, draw in ipairs(winDraws[id] or {}) do
+        local fields = {}
+        for k, v in pairs(draw) do fields[k] = v end
+        sendDraw(id, "DRAWWINDOW", fields, jobId, true)
+      end
+    end
+  end
+  return {"window_attached", id, e[5], e[6]}
 end
 
 -- id -> function(force): pushes a legacy process's virtual gpu changes
@@ -770,12 +849,22 @@ gmuxapi = {
     -- a 2D pixel grid encoded into half-block or braille sub-cell
     -- characters instead of running `code` -- OC's GPUs have no pixel
     -- API, so this is the only way to get anything bitmap-like.
-    return remoteRequest("CREATEWINDOW", {
+    local win, err = remoteRequest("CREATEWINDOW", {
       title = options.title, x = options.x, y = options.y,
       width = options.width, height = options.height, code = options.code,
       pixels = options.pixels, mode = options.mode, bg = options.bg, args = options.args,
       resizable = options.resizable, decorated = options.title_bar, caller = currentJobId,
     })
+    if win then
+      setRoute(win.id, win.route, win.key, win.port)
+      if options.code or options.pixels then
+        rememberDraw(win.id, {code = options.code, args = options.args, pixels = options.pixels, mode = options.mode,
+          width = options.pixels and options.width or nil, height = options.pixels and options.height or nil,
+          bg = options.bg})
+      end
+      win.route, win.key, win.port = nil, nil, nil
+    end
+    return win, err
   end,
 
   -- Redraw a window this process owns (or one owned by a descendant):
@@ -785,9 +874,19 @@ gmuxapi = {
   -- blanking it first. Same sandbox as create_window.
   draw_window = function(id, options)
     options = options or {}
-    return remoteRequest("DRAWWINDOW", {windowId = id, code = options.code, args = options.args,
-      pixels = options.pixels, mode = options.mode, width = options.width, height = options.height,
-      bg = options.bg, clear = options.clear, caller = currentJobId})
+    local draw = {code = options.code, args = options.args, pixels = options.pixels, mode = options.mode,
+      width = options.width, height = options.height, bg = options.bg, clear = options.clear}
+    rememberDraw(id, draw)
+    local fields = {}
+    for k, v in pairs(draw) do fields[k] = v end
+    return sendDraw(id, "DRAWWINDOW", fields, currentJobId)
+  end,
+
+  -- Keep running when this process's user logs out (on = true, or nil):
+  -- its windows wait, detached, for the user's next session, on whose
+  -- taskbar it shows. set_persistent(false) undoes it.
+  set_persistent = function(on)
+    return remoteRequest("PERSIST", {on = on ~= false, caller = currentJobId})
   end,
 
   get_windows = function()
@@ -1673,6 +1772,13 @@ local function flushVirtualGpu(ctx, force)
       return
     end
     ctx.windowId = win.id
+    setRoute(win.id, win.route, win.key, win.port)
+  end
+  -- Shown on a new screen: everything again.
+  winRedraw[ctx.windowId] = winRedraw[ctx.windowId] or function()
+    for y = 1, v.grid().h do v.dirtyRows[y] = true end
+    v.dirty = true
+    flushVirtualGpu(ctx, true)
   end
   local rows = {}
   for y in pairs(v.dirtyRows) do
@@ -1694,9 +1800,8 @@ local function flushVirtualGpu(ctx, force)
     end
   end
   v.dirtyRows, v.dirty, v.lastFlush = {}, false, now
-  send({type = "DRAWWINDOW", from = nodeId, to = kernalAddr, id = nextId(), windowId = ctx.windowId,
-    code = WINDOW_DRAW_CODE, args = {rows = rows}, clear = false, width = g.w, height = g.h,
-    caller = ctx.id, noReply = true})
+  sendDraw(ctx.windowId, "DRAWWINDOW", {code = WINDOW_DRAW_CODE, args = {rows = rows}, clear = false,
+    width = g.w, height = g.h}, ctx.id, true)
 end
 
 -- The process's virtual gpu, screen and keyboard: address -> proxy.
@@ -2986,6 +3091,8 @@ local function spawnProc(msg)
       -- into its own window -- a virtual gpu, as a legacy program has.
       local ctx = {id = msg.id, name = "graphics", windowId = msg.windowId,
         screenSize = {tonumber(msg.width) or 40, (tonumber(msg.height) or 12) + 1}}
+      local route = type(msg.windowRoute) == "table" and msg.windowRoute or {}
+      setRoute(msg.windowId, route[1], route[2], route[3])
       ctx.vgpu = newVirtualGpu(ctx, tonumber(msg.width) or 40, tonumber(msg.height) or 12)
       graphicsFlushers[msg.id] = function(force) flushVirtualGpu(ctx, force) end
       rawset(env, "gpu", ctx.vgpu.proxy)

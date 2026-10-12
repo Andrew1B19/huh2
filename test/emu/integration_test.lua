@@ -50,6 +50,7 @@ local kernalFiles = {
   ["/session.lua"] = readFile(REPO_ROOT .. "/kernal/session.lua"),
   ["/vgpu.lua"] = readFile(REPO_ROOT .. "/kernal/vgpu.lua"),
   ["/terminals.lua"] = readFile(REPO_ROOT .. "/kernal/terminals.lua"),
+  ["/windows.lua"] = readFile(REPO_ROOT .. "/kernal/windows.lua"),
   ["/etc/kernal.cfg"] = "login_required = false\n",
   ["/runtime.lua"] = runtimeSrc,
   -- Sample programs for the launcher (test 29).
@@ -1034,9 +1035,9 @@ emu:advance(2)
 assertScreenContains("R28=hi28", "the process received the keys and returned them")
 print("  OK -- keys went to the focused window's process (not the console), which redrew its window")
 
-typeLine([[run local ok, err = gmuxapi.draw_window(1, {code = "gpu.set(1,1,'x')"}) return "d28=" .. tostring(err)]])
+typeLine([[run local other for _, w in ipairs(gmuxapi.get_windows()) do if w.ownerJobId and w.ownerJobId ~= jobId then other = w.id end end local ok, err = gmuxapi.draw_window(other, {code = "gpu.set(1,1,'x')"}) return "d28=" .. tostring(err)]])
 emu:advance(2)
-assertScreenContains("d28=window 1 belongs to another process", "a process can't draw into a window it doesn't own")
+assertScreenContains("belongs to another process", "a process can't draw into a window it doesn't own")
 print("  OK -- drawing into another process's window is refused")
 
 print("test 29: the program launcher -- .mxe headers and libraries, legacy .lua programs, foreground/background")
@@ -2175,5 +2176,59 @@ do
   assert(c.text():find("on=" .. busy, 1, true), "by count: the worker with fewer processes:\n" .. c.text())
 end
 print("  OK -- load averages reported and shown; placement by load, or by count")
+
+print("test 56: a persistent program outlives its user's logout; the next login's taskbar brings its window back")
+do
+  local keeper = [==[--[[mxe
+name = "keeper"
+]]
+gmuxapi.set_persistent(true)
+local det, att = 0, 0
+local win = gmuxapi.create_window({title = "keeper", x = 3, y = 3, width = 24, height = 1,
+  code = "gpu.set(1, 1, 'KEEP det=0 att=0')"}).id
+while true do
+  local e = gmuxapi.pull_event(60)
+  if e and e[1] == "window_detached" then det = det + 1 end
+  if e and e[1] == "window_attached" then
+    att = att + 1
+    gmuxapi.draw_window(win, {code = "gpu.set(1, 1, args.t)", args = {t = "KEEP det=" .. det .. " att=" .. att}})
+  end
+end
+]==]
+  local plain = [==[--[[mxe
+name = "plain"
+]]
+gmuxapi.create_window({title = "plain", x = 3, y = 6, width = 10, height = 1, code = "gpu.set(1, 1, 'PLAIN')"})
+sleep(60)
+]==]
+  local c = newCluster(80, 25, {["/bin/keeper.mxe"] = keeper, ["/bin/plain.mxe"] = plain}, 2)
+  local function console() -- its taskbar button gives it the keyboard back
+    local bar = c.cells(1, 25, 80)
+    local bx = bar:find(" console ", 1, true)
+    if bx then c.touch(bx + 2, 25) end
+  end
+  local function run(line, wait) console() c.typeLine(line) c.emu:advance(wait or 1) end
+  run("keeper &", 2)
+  run("plain &", 2)
+  local text = c.text()
+  assert(text:find("KEEP det=0 att=0", 1, true) and text:find("PLAIN", 1, true), "both windows up:\n" .. text)
+  run("logout", 2)
+  c.typeLine("root")
+  c.emu:advance(2)
+  text = c.text()
+  assert(not text:find("KEEP", 1, true) and not text:find("PLAIN", 1, true), "neither shown after logging in again:\n" .. text)
+  local bar = c.cells(1, 25, 80)
+  local kx = bar:find("keeper", 1, true)
+  assert(kx and not bar:find("plain", 1, true), "the persistent program is on the new login's taskbar, the other ended:\n" .. bar)
+  assert(c.cell(kx, 25).fg == 0x88AAFF, "...marked as shown elsewhere")
+  c.touch(kx, 25)
+  c.emu:advance(2)
+  text = c.text()
+  assert(text:find("KEEP det=1 att=1", 1, true), "touching it brings the window here; the program heard it all:\n" .. text)
+  run("processes", 1)
+  text = c.text()
+  assert(text:find("killed (logged out)", 1, true), "the other program was ended by the logout:\n" .. text)
+end
+print("  OK -- set_persistent, detached on logout, listed on the next login's taskbar, reattached with its content")
 
 print("ALL OK")

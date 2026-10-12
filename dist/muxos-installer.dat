@@ -1,17 +1,18 @@
 --[[MUXOS-PAYLOAD 0.1.2
-@@MANIFEST 32
+@@MANIFEST 33
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-73333 /muxos.lua
-28806 /compositor.lua
+76049 /muxos.lua
+28834 /compositor.lua
 33883 /shell.lua
 2663 /bitmap.lua
 3046 /lineedit.lua
 5994 /system.lua
-36766 /session.lua
+37756 /session.lua
 5514 /vgpu.lua
 3384 /terminals.lua
-81126 /runtime.lua
+4025 /windows.lua
+83685 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 1682 /lib/bit32.lua
 3800 /lib/buffer.lua
@@ -226,7 +227,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 73333 /muxos.lua
+@@ 76049 /muxos.lua
 
 
 
@@ -736,10 +737,19 @@ return job and job.session and K.byId[job.session]
 end
 
 
+
 function K.windowOwner(id)
+local rec = K.win and K.win.get(id)
+local S = rec and rec.session and K.byId[rec.session]
+local win = S and S.compositor and S.compositor.getWindow(id)
+if win then return S, win, rec end
+end
+
+
+
+function K.windowsChanged(user)
 for _, S in ipairs(K.sessions) do
-local win = S.compositor.getWindow(id)
-if win then return S, win end
+if S.user == user and S.windowsChanged then S.windowsChanged() end
 end
 end
 
@@ -802,9 +812,19 @@ if parent and jobs[id].orphanPolicy == "orphan" then
 registerOrphanCandidate(appName, id)
 end
 
-if window then window.ownerJobId = id end
+
+
+local route
+if window then
+window.owner, window.user = id, jobs[id].user
+local address, key, port = K.win.hold(window, id)
+route = address and {address, key, port}
+local S = K.byId[window.session]
+if S and S.display.setOwner then S.display.setOwner(window.id, id, targetAddr) end
+end
 send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args, program = program,
-windowId = window and window.id, width = window and window.width, height = window and window.height})
+windowId = window and window.id, width = window and window.width, height = window and window.height,
+windowRoute = route})
 return id, targetAddr
 end
 
@@ -1297,11 +1317,7 @@ end
 end
 
 
-local windowStatus = (status == "done" or status == "killed") and "dead" or "error"
-local S = K.sessionOf(job)
-for _, winId in ipairs(S and S.compositor.windowsOwnedBy(id) or {}) do
-if job.loggedOut then S.compositor.close(winId) else S.compositor.setStatus(winId, windowStatus) end
-end
+K.win.jobEnded(id, (status == "done" or status == "killed") and "dead" or "error")
 
 
 applyOrphanPolicyForChildrenOf(id)
@@ -1773,7 +1789,7 @@ if not S then
 send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "its session has ended -- no screen to open a window on"})
 return
 end
-window, err = S.compositor.createWindow({title = tostring(g.title or "graphics"), x = g.x, y = g.y,
+window, err = K.win.open(S, {title = tostring(g.title or "graphics"), x = g.x, y = g.y,
 width = tonumber(g.width) or 40, height = tonumber(g.height) or 12,
 resizable = g.resizable, decorated = g.decorated,
 code = "gpu.setBackground(0x000000) gpu.fill(1, 1, " .. (tonumber(g.width) or 40) .. ", "
@@ -1786,12 +1802,12 @@ end
 local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node, msg.parent, msg.appName, msg.orphanPolicy,
 nil, window)
 if not jobId then
-if window then S.compositor.close(window.id) end
+if window then K.win.close(window) end
 send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = targetAddr})
 return
 end
 send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id,
-result = {id = jobId, node = targetAddr, window = window and S.compositor.describe(window)}})
+result = {id = jobId, node = targetAddr, window = window and K.win.describe(window)}})
 end
 
 
@@ -1984,14 +2000,17 @@ if not msg.ownerJobId then
 local caller = callerJob(msg)
 msg.ownerJobId = caller and caller.id
 end
-local S = K.sessionOf(jobs[msg.ownerJobId] or callerJob(msg))
-local win, err
-if S then win, err = S.compositor.createWindow(msg) else err = "its session has ended -- no screen to open a window on" end
-if not win then
+local caller = callerJob(msg)
+local S = K.sessionOf(jobs[msg.ownerJobId] or caller)
+local rec, err = K.win.open(S, msg, msg.ownerJobId)
+if not rec then
 send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
 return
 end
-send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S.compositor.describe(win)})
+
+local result = K.win.describe(rec)
+if caller then result.route, result.key, result.port = K.win.hold(rec, caller.id) end
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = result})
 end
 
 
@@ -2001,13 +2020,15 @@ end
 
 local function handleDrawWindow(msg)
 local caller = callerJob(msg)
-local S, win = K.windowOwner(msg.windowId)
+local S, win, rec = K.windowOwner(msg.windowId)
 local reply
 if not caller then
 reply = "not called from a running process"
 elseif not win then
-reply = "no such window: " .. tostring(msg.windowId)
-elseif win.ownerJobId ~= caller.id and not (win.ownerJobId and isDescendantOf(win.ownerJobId, caller.id)) then
+reply = K.win.get(msg.windowId) and "window " .. tostring(msg.windowId) .. " isn't shown on this screen"
+or "no such window: " .. tostring(msg.windowId)
+elseif msg.key ~= rec.key and win.ownerJobId ~= caller.id
+and not (win.ownerJobId and isDescendantOf(win.ownerJobId, caller.id)) then
 reply = "window " .. tostring(msg.windowId) .. " belongs to another process"
 end
 
@@ -2016,7 +2037,7 @@ end
 if not reply and not msg.pixels and type(msg.width) == "number" and type(msg.height) == "number"
 and (msg.width ~= win.width or msg.height ~= win.height) then
 local ok, err = S.compositor.setGeometry(win.id, win.x, win.y, msg.width, msg.height)
-if not ok then reply = err end
+if not ok then reply = err else K.win.moved(rec, win.x, win.y, win.width, win.height) end
 end
 if not reply then
 local ok, err = S.compositor.redrawWindow(msg.windowId, msg)
@@ -2100,6 +2121,10 @@ end
 local ok, err = S.compositor.share(win.id, child.id, msg.rect)
 if not ok then return reply(nil, err) end
 local rect = S.compositor.shares(win.id)[child.id]
+local rec = K.win.get(win.id)
+rec.shares = rec.shares or {}
+rec.shares[child.id] = rect
+if rect then K.win.hold(rec, child.id) end
 K.deliverEvent(child, rect and {"window_shared", win.id, rect.x, rect.y, rect.w, rect.h} or {"window_unshared", win.id})
 return reply(true)
 elseif msg.type == "RENDERCONFIG" then
@@ -2130,9 +2155,41 @@ if msg.close then K.deliverEvent(child, {"pipe_closed", "stdin"}) end
 send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
 end
 
+
 local function handleGetWindows(msg)
-local S = K.sessionOf(callerJob(msg))
-send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S and S.compositor.listWindows() or {}})
+local caller = callerJob(msg)
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = caller and K.win.ofUser(caller.user) or {}})
+end
+
+
+
+
+local function handleWindowRoute(msg)
+local caller = callerJob(msg)
+local rec = K.win.get(msg.windowId)
+local may = caller and rec and (rec.owner == caller.id or (rec.owner and isDescendantOf(rec.owner, caller.id))
+or (rec.shares and rec.shares[caller.id]))
+if not may then
+send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = rec and "window " .. rec.id
+.. " belongs to another process" or "no such window: " .. tostring(msg.windowId)})
+return
+end
+local address, key, port = K.win.hold(rec, caller.id)
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id,
+result = {address = address, key = key, port = port, width = rec.width, height = rec.height}})
+end
+
+
+
+
+local function handlePersist(msg)
+local caller = callerJob(msg)
+if not caller then
+send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "not called from a running process"})
+return
+end
+caller.persistent = msg.on ~= false or nil
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = caller.persistent == true})
 end
 
 
@@ -2213,6 +2270,10 @@ elseif msg.type == "SHAREWINDOW" or msg.type == "RENDERCONFIG" or msg.type == "D
 handleRender(msg)
 elseif msg.type == "PIPEWRITE" then
 handlePipeWrite(msg)
+elseif msg.type == "WINDOWROUTE" then
+handleWindowRoute(msg)
+elseif msg.type == "PERSIST" then
+handlePersist(msg)
 elseif msg.type == "ISFOREGROUND" then
 
 local caller = callerJob(msg)
@@ -2886,6 +2947,7 @@ K.resolveProgram, K.readManifest, K.launchProgram, K.PROGRAM_PATH = resolveProgr
 PROGRAM_PATH
 K.MUXOS_VERSION, K.selfAddr, K.fullscreen, K.controlJob = MUXOS_VERSION, selfAddr, fullscreen, controlJob
 K.lineedit = loadSibling("lineedit.lua")()
+K.win = loadSibling("windows.lua")(K)
 K.sessionChunk = loadSibling("session.lua")
 K.nextSession = 0
 
@@ -2897,6 +2959,46 @@ end
 function K.liveJob(id)
 local job = jobs[id]
 if job and job.status == "running" and nodes[job.node] and not nodes[job.node].down then return job end
+end
+
+
+
+function K.closeWindow(id)
+local rec = K.win.get(id)
+if not rec then return false end
+K.win.close(rec)
+local job = rec.owner and K.liveJob(rec.owner)
+if job then controlJob(job.id, "KILL", "killed (window closed)") end
+return true
+end
+
+function K.windowGeometry(id, x, y, width, height)
+local rec = K.win.get(id)
+if rec then K.win.moved(rec, x, y, width, height) end
+end
+
+function K.userWindows(user) return K.win.ofUser(user) end
+
+
+function K.attachWindow(id, S)
+local rec = K.win.get(id)
+if not rec or rec.user ~= S.user then return nil, "no such window of yours" end
+return K.win.attach(rec, S)
+end
+
+
+
+
+function K.endLogin(S)
+local ending = system.flag("logout_ends_jobs")
+for id in pairs(runningJobs) do
+local job = jobs[id]
+if job.login == S.login and ending and not job.persistent then
+job.loggedOut = true
+controlJob(id, "KILL", "killed (logged out)")
+end
+end
+K.win.sessionEnded(S)
 end
 
 
@@ -2999,7 +3101,7 @@ if not ok then print("session error (continuing): " .. tostring(err)) end
 end
 end
 
-@@ 28806 /compositor.lua
+@@ 28834 /compositor.lua
 
 
 
@@ -3604,7 +3706,7 @@ end
 
 if options.text then
 local x, y = options.x or 1, options.y or 1
-local id = nextId()
+local id = options.id or nextId()
 local win = {id = id, title = options.title or ("window " .. id), x = x, y = y,
 width = width, height = height, layer = options.layer or 0, dirty = true,
 textRows = {}, fg = options.fg or 0xFFFFFF, bg = options.bg or 0x000000,
@@ -3634,7 +3736,7 @@ end
 end
 
 local x, y = options.x or 1, options.y or 1
-local id = nextId()
+local id = options.id or nextId()
 
 
 
@@ -5973,7 +6075,7 @@ end
 
 return M
 
-@@ 36766 /session.lua
+@@ 37756 /session.lua
 
 
 
@@ -5997,6 +6099,23 @@ K.launchProgram, K.PROGRAM_PATH
 local gpu = opts.gpu
 local compositor = K.newCompositor(gpu)
 S.compositor, S.gpu = compositor, gpu
+
+
+
+S.display = {
+address = K.selfAddr,
+create = function(spec)
+local win, err = compositor.createWindow(spec)
+if not win then return nil, err end
+return {width = win.width, height = win.height}
+end,
+remove = function(id) compositor.close(id) end,
+status = function(id, status) compositor.setStatus(id, status) end,
+setOwner = function(id, jobId)
+local win = compositor.getWindow(id)
+if win then win.ownerJobId = jobId end
+end,
+}
 
 
 
@@ -6491,9 +6610,15 @@ end
 local function closeWindow(win)
 
 if consoleWin and win.id == consoleWin.id then compositor.minimize(win.id, true) return end
-local job = windowProcess(win)
+
+if win.ownerJobId and K.closeWindow(win.id) then return end
 compositor.close(win.id)
-if job then K.controlJob(job.id, "KILL", "killed (window closed)") end
+end
+
+
+
+local function noteGeometry(win)
+if win.ownerJobId then K.windowGeometry(win.id, win.x, win.y, win.width, win.height) end
 end
 
 
@@ -6799,16 +6924,36 @@ layer = 3000, text = true, decorated = false, bg = 0x222222, fg = 0xFFFFFF}) or 
 
 if consoleWin then compositor.setFocus(consoleWin.id) end
 
+
+
+
 function desktop.bar.windows()
-local list = {}
+local list, here = {}, {}
 for _, w in ipairs(compositor.listWindows()) do
 if w.id ~= (desktop.win and desktop.win.id) and w.id ~= (desktop.bar.win and desktop.bar.win.id)
 and w.id ~= (desktop.menu and desktop.menu.id) then
+list[#list + 1] = w
+here[w.id] = true
+end
+end
+for _, w in ipairs(S.user and K.userWindows(S.user) or {}) do
+if not here[w.id] and not w.status then
+w.away = true
 list[#list + 1] = w
 end
 end
 table.sort(list, function(a, b) return a.id < b.id end)
 return list
+end
+
+
+function S.windowsChanged() desktop.bar.nextCheck = 0 end
+
+
+local function fetchWindow(id)
+local ok, err = K.attachWindow(id, S)
+if not ok then print("can't bring window " .. id .. " here: " .. tostring(err)) return end
+desktop.bar.show(id)
 end
 
 function desktop.bar.render(list)
@@ -6839,14 +6984,16 @@ local w = list[i]
 local label = " " .. desktop.fit(w.title, math.min(title, utf8.len(w.title) or #w.title)) .. " "
 local width = utf8.len(label) or #label
 local fg, bg = 0xFFFFFF, 0x555555
-if w.minimized then
+if w.away then
+fg, bg = 0x88AAFF, 0x222244
+elseif w.minimized then
 fg, bg = 0x999999, 0x333333
 elseif focus and focus.id == w.id then
 fg, bg = 0x000000, 0xFFFFFF
 end
 if desktop.mono then fg, bg = 0xFFFFFF, 0x000000 end
 placed[#placed + 1] = {x, label, fg, bg}
-buttons[#buttons + 1] = {from = x, to = x + width - 1, window = w.id}
+buttons[#buttons + 1] = {from = x, to = x + width - 1, window = w.id, away = w.away}
 x = x + width + 1
 end
 if more then
@@ -6868,7 +7015,7 @@ desktop.bar.nextCheck = now + 0.5
 local list = desktop.bar.windows()
 local focus = compositor.getFocus()
 local parts = {focus and focus.id or 0, math.floor(now / 30)}
-for _, w in ipairs(list) do parts[#parts + 1] = w.id .. w.title .. tostring(w.minimized) end
+for _, w in ipairs(list) do parts[#parts + 1] = w.id .. w.title .. tostring(w.minimized) .. tostring(w.away) end
 local okClock, clock = pcall(os.date, "%H:%M")
 parts[#parts + 1] = okClock and tostring(clock) or ""
 local signature = table.concat(parts, "|")
@@ -6897,10 +7044,13 @@ elseif b.more then
 local items = {}
 for _, w in ipairs(desktop.bar.windows()) do
 local id = w.id
-items[#items + 1] = {label = w.title .. (w.minimized and " (minimized)" or ""),
-action = function() desktop.bar.show(id) end}
+items[#items + 1] = {label = w.title .. (w.minimized and " (minimized)" or "")
+.. (w.away and " (elsewhere)" or ""),
+action = function() if w.away then fetchWindow(id) else desktop.bar.show(id) end end}
 end
 desktop.toggleMenu(items, b.from)
+elseif b.away then
+fetchWindow(b.window)
 else
 local win = compositor.getWindow(b.window)
 local focus = compositor.getFocus()
@@ -6973,10 +7123,14 @@ if name == "drop" or not win then currentGrab = nil return end
 if name == "drag" then
 if grab.kind == "move" then
 compositor.move(win.id, x - grab.dx, y)
+noteGeometry(win)
 else
 local w = math.max(UI.MIN_WINDOW_WIDTH, x - win.x + 1)
 local h = math.max(1, y - compositor.bodyTop(win) + 1)
-if (w ~= win.width or h ~= win.height) and compositor.resize(win.id, w, h) then notifyResized(win) end
+if (w ~= win.width or h ~= win.height) and compositor.resize(win.id, w, h) then
+notifyResized(win)
+noteGeometry(win)
+end
 end
 return
 end
@@ -7007,7 +7161,10 @@ local w = win.width
 if lx == w - 5 or lx == w - 4 then
 compositor.minimize(win.id)
 elseif (lx == w - 3 or lx == w - 2) and win.resizable then
-if compositor.maximize(win.id) then notifyResized(win) end
+if compositor.maximize(win.id) then
+notifyResized(win)
+noteGeometry(win)
+end
 elseif lx == w - 1 or lx == w then
 closeWindow(win)
 else
@@ -7227,15 +7384,10 @@ end
 
 
 
+
+
 function S.logout()
-local ending = system.flag("logout_ends_jobs")
-for id in pairs(K.runningJobs) do
-local job = jobs[id]
-if job.login == S.login and ending then
-job.loggedOut = true
-K.controlJob(id, "KILL", "killed (logged out)")
-end
-end
+K.endLogin(S)
 for _, w in ipairs(compositor.listWindows()) do
 local own = w.id == (consoleWin and consoleWin.id) or w.id == (desktop.win and desktop.win.id)
 or w.id == (desktop.bar.win and desktop.bar.win.id)
@@ -7713,7 +7865,183 @@ end
 
 return T
 
-@@ 81126 /runtime.lua
+@@ 4025 /windows.lua
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local K = ...
+local W = {byId = {}}
+
+local function newKey()
+local parts = {}
+for i = 1, 4 do parts[i] = string.format("%04x", math.random(0, 0xFFFF)) end
+return table.concat(parts)
+end
+
+
+function W.describe(rec)
+local S = rec.session and K.byId[rec.session]
+return {id = rec.id, title = rec.title, x = rec.x, y = rec.y, width = rec.width, height = rec.height,
+ownerJobId = rec.owner, user = rec.user, resizable = rec.resizable, decorated = rec.decorated,
+attached = S ~= nil, session = S and S.id, status = rec.status}
+end
+
+function W.get(id) return W.byId[id] end
+
+
+function W.route(rec)
+local S = rec.session and K.byId[rec.session]
+if not S then return nil end
+return S.display.address, rec.key, S.display.port
+end
+
+
+local function announce(rec)
+local address, key, port = W.route(rec)
+for id in pairs(rec.holders) do
+local job = K.liveJob(id)
+if job then K.deliverEvent(job, {"window_route", rec.id, address or false, key or false, rec.width, rec.height, port}) end
+end
+end
+
+
+
+function W.open(S, spec, owner)
+if not S or not S.display then return nil, "its session has ended -- no screen to open a window on" end
+K.windowIds = K.windowIds + 1
+local id = K.windowIds
+local job = owner and K.jobs[owner]
+local shown = {}
+for k, v in pairs(spec) do shown[k] = v end
+shown.id, shown.ownerJobId, shown.text = id, owner, nil
+local size, err = S.display.create(shown)
+if not size then return nil, err end
+local rec = {id = id, owner = owner, user = job and job.user or S.user, session = S.id,
+title = tostring(spec.title or ("window " .. id)), x = spec.x or 1, y = spec.y or 1,
+width = size.width, height = size.height, resizable = spec.resizable == true,
+decorated = spec.decorated ~= false, key = newKey(), holders = {}}
+if owner then rec.holders[owner] = true end
+W.byId[id] = rec
+K.windowsChanged(rec.user)
+return rec
+end
+
+
+
+function W.hold(rec, jobId)
+rec.holders[jobId] = true
+return W.route(rec)
+end
+
+
+function W.detach(rec)
+local S = rec.session and K.byId[rec.session]
+rec.session = nil
+if S then pcall(S.display.remove, rec.id) end
+announce(rec)
+K.windowsChanged(rec.user)
+end
+
+
+
+function W.attach(rec, S)
+if rec.session == S.id then return true end
+local old = rec.session and K.byId[rec.session]
+if old then pcall(old.display.remove, rec.id) end
+rec.session = nil
+local size, err = S.display.create({id = rec.id, title = rec.title, x = rec.x, y = rec.y,
+width = rec.width, height = rec.height, resizable = rec.resizable, decorated = rec.decorated,
+ownerJobId = rec.owner, code = "gpu.setBackground(0x000000) gpu.fill(1, 1, " .. rec.width .. ", " .. rec.height .. ", ' ')"})
+if not size then
+K.windowsChanged(rec.user)
+return nil, err
+end
+rec.session, rec.key = S.id, newKey()
+if rec.status and S.display.status then S.display.status(rec.id, rec.status) end
+announce(rec)
+K.windowsChanged(rec.user)
+return true
+end
+
+
+function W.close(rec)
+local S = rec.session and K.byId[rec.session]
+W.byId[rec.id] = nil
+if S then pcall(S.display.remove, rec.id) end
+K.windowsChanged(rec.user)
+end
+
+
+function W.moved(rec, x, y, width, height)
+rec.x, rec.y = x or rec.x, y or rec.y
+rec.width, rec.height = width or rec.width, height or rec.height
+end
+
+function W.ownedBy(jobId)
+local list = {}
+for _, rec in pairs(W.byId) do
+if rec.owner == jobId then list[#list + 1] = rec end
+end
+return list
+end
+
+
+function W.ofUser(user)
+local list = {}
+for _, rec in pairs(W.byId) do
+if rec.user == user then list[#list + 1] = W.describe(rec) end
+end
+table.sort(list, function(a, b) return a.id < b.id end)
+return list
+end
+
+
+function W.jobEnded(jobId, status)
+for _, rec in ipairs(W.ownedBy(jobId)) do
+rec.status = status
+local S = rec.session and K.byId[rec.session]
+if S then
+if S.display.status then S.display.status(rec.id, status) end
+else
+W.close(rec)
+end
+K.windowsChanged(rec.user)
+end
+for _, rec in pairs(W.byId) do rec.holders[jobId] = nil end
+end
+
+
+
+function W.sessionEnded(S)
+for _, rec in pairs(W.byId) do
+if rec.session == S.id then
+if rec.status then W.close(rec) else W.detach(rec) end
+end
+end
+end
+
+return W
+
+@@ 83685 /runtime.lua
 
 
 
@@ -7871,7 +8199,10 @@ local nodeId = modemAddr
 local CHUNK_SIZE = 7000
 local nextMsgId = 1
 
-local function send(msg)
+
+
+local function send(msg, port)
+port = port or PORT
 local payload = serialize(msg)
 local id = nextMsgId
 nextMsgId = nextMsgId + 1
@@ -7881,9 +8212,9 @@ local chunk = payload:sub((i - 1) * CHUNK_SIZE + 1, i * CHUNK_SIZE)
 local frame = "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk
 
 if msg.to then
-component.invoke(modemAddr, "send", msg.to, PORT, frame)
+component.invoke(modemAddr, "send", msg.to, port, frame)
 else
-component.invoke(modemAddr, "broadcast", PORT, frame)
+component.invoke(modemAddr, "broadcast", port, frame)
 end
 end
 end
@@ -7956,8 +8287,11 @@ local migrationHandlers = {}
 local eventQueues = {}
 local MAX_QUEUED_EVENTS = 64
 
+local windowRouted
+
 local function queueEvent(id, event)
 if type(id) ~= "number" or type(event) ~= "table" then return end
+if event[1] == "window_route" then event = windowRouted(id, event) end
 local q = eventQueues[id]
 if not q then q = {}; eventQueues[id] = q end
 if #q < MAX_QUEUED_EVENTS then q[#q + 1] = event end
@@ -8174,6 +8508,79 @@ rpcReplies[id] = nil
 if not reply then return nil, "timed out waiting for kernal" end
 if reply.type == "RESULT" then return reply.result end
 return nil, reply.error
+end
+
+
+
+
+
+
+
+
+
+
+
+
+local winRoutes = {}
+local winDraws = {}
+local winRedraw = {}
+
+local function setRoute(id, address, key, port)
+winRoutes[id] = {address = address or false, key = key, port = port}
+end
+
+local function routeOf(id, caller)
+if winRoutes[id] then return winRoutes[id] end
+local r, err = remoteRequest("WINDOWROUTE", {windowId = id, caller = caller})
+if not r then return nil, err end
+setRoute(id, r.address, r.key, r.port)
+return winRoutes[id]
+end
+
+
+
+
+local function sendDraw(id, msgType, fields, caller, noReply)
+local r, err = routeOf(id, caller)
+if not r then return nil, err end
+if not r.address then return true end
+fields.windowId, fields.key, fields.caller = id, r.key, caller
+if r.address == kernalAddr and not noReply then return remoteRequest(msgType, fields) end
+fields.type, fields.from, fields.to, fields.id, fields.noReply = msgType, nodeId, r.address, nextId(), true
+send(fields, r.port)
+return true
+end
+
+
+local function rememberDraw(id, draw)
+if draw.clear ~= false then
+winDraws[id] = {draw}
+else
+local list = winDraws[id] or {}
+if #list < 16 then list[#list + 1] = draw end
+winDraws[id] = list
+end
+end
+
+
+
+windowRouted = function(jobId, e)
+local id = e[2]
+local old = winRoutes[id]
+setRoute(id, e[3], e[4], e[7])
+if not e[3] then return {"window_detached", id} end
+if not (old and old.key == e[4]) then
+if winRedraw[id] then
+winRedraw[id]()
+else
+for _, draw in ipairs(winDraws[id] or {}) do
+local fields = {}
+for k, v in pairs(draw) do fields[k] = v end
+sendDraw(id, "DRAWWINDOW", fields, jobId, true)
+end
+end
+end
+return {"window_attached", id, e[5], e[6]}
 end
 
 
@@ -8486,12 +8893,22 @@ options = options or {}
 
 
 
-return remoteRequest("CREATEWINDOW", {
+local win, err = remoteRequest("CREATEWINDOW", {
 title = options.title, x = options.x, y = options.y,
 width = options.width, height = options.height, code = options.code,
 pixels = options.pixels, mode = options.mode, bg = options.bg, args = options.args,
 resizable = options.resizable, decorated = options.title_bar, caller = currentJobId,
 })
+if win then
+setRoute(win.id, win.route, win.key, win.port)
+if options.code or options.pixels then
+rememberDraw(win.id, {code = options.code, args = options.args, pixels = options.pixels, mode = options.mode,
+width = options.pixels and options.width or nil, height = options.pixels and options.height or nil,
+bg = options.bg})
+end
+win.route, win.key, win.port = nil, nil, nil
+end
+return win, err
 end,
 
 
@@ -8501,9 +8918,19 @@ end,
 
 draw_window = function(id, options)
 options = options or {}
-return remoteRequest("DRAWWINDOW", {windowId = id, code = options.code, args = options.args,
-pixels = options.pixels, mode = options.mode, width = options.width, height = options.height,
-bg = options.bg, clear = options.clear, caller = currentJobId})
+local draw = {code = options.code, args = options.args, pixels = options.pixels, mode = options.mode,
+width = options.width, height = options.height, bg = options.bg, clear = options.clear}
+rememberDraw(id, draw)
+local fields = {}
+for k, v in pairs(draw) do fields[k] = v end
+return sendDraw(id, "DRAWWINDOW", fields, currentJobId)
+end,
+
+
+
+
+set_persistent = function(on)
+return remoteRequest("PERSIST", {on = on ~= false, caller = currentJobId})
 end,
 
 get_windows = function()
@@ -9389,6 +9816,13 @@ writeOutput(ctx.id, "no window for gpu output: " .. tostring(err) .. "\n")
 return
 end
 ctx.windowId = win.id
+setRoute(win.id, win.route, win.key, win.port)
+end
+
+winRedraw[ctx.windowId] = winRedraw[ctx.windowId] or function()
+for y = 1, v.grid().h do v.dirtyRows[y] = true end
+v.dirty = true
+flushVirtualGpu(ctx, true)
 end
 local rows = {}
 for y in pairs(v.dirtyRows) do
@@ -9410,9 +9844,8 @@ rows[#rows + 1] = row
 end
 end
 v.dirtyRows, v.dirty, v.lastFlush = {}, false, now
-send({type = "DRAWWINDOW", from = nodeId, to = kernalAddr, id = nextId(), windowId = ctx.windowId,
-code = WINDOW_DRAW_CODE, args = {rows = rows}, clear = false, width = g.w, height = g.h,
-caller = ctx.id, noReply = true})
+sendDraw(ctx.windowId, "DRAWWINDOW", {code = WINDOW_DRAW_CODE, args = {rows = rows}, clear = false,
+width = g.w, height = g.h}, ctx.id, true)
 end
 
 
@@ -10702,6 +11135,8 @@ if msg.windowId then
 
 local ctx = {id = msg.id, name = "graphics", windowId = msg.windowId,
 screenSize = {tonumber(msg.width) or 40, (tonumber(msg.height) or 12) + 1}}
+local route = type(msg.windowRoute) == "table" and msg.windowRoute or {}
+setRoute(msg.windowId, route[1], route[2], route[3])
 ctx.vgpu = newVirtualGpu(ctx, tonumber(msg.width) or 40, tonumber(msg.height) or 12)
 graphicsFlushers[msg.id] = function(force) flushVirtualGpu(ctx, force) end
 rawset(env, "gpu", ctx.vgpu.proxy)

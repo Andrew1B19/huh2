@@ -35,7 +35,7 @@ emu:addModem(kernal)
 local _, kscreen, kbufs = emu:addGpuScreen(kernal, 60, 20)
 local kfiles = {["/etc/kernal.cfg"] = "login_required = false\n", ["/runtime.lua"] = readFile(REPO_ROOT .. "/node/runtime.lua"),
   ["/bin/greet.lua"] = 'print("hello from " .. os.getenv("USER"))\nio.read()'}
-for _, f in ipairs({"muxos", "compositor", "shell", "bitmap", "lineedit", "system", "session", "vgpu", "terminals"}) do
+for _, f in ipairs({"muxos", "compositor", "shell", "bitmap", "lineedit", "system", "session", "vgpu", "terminals", "windows"}) do
   kfiles["/" .. f .. ".lua"] = readFile(REPO_ROOT .. "/kernal/" .. f .. ".lua")
 end
 emu:addEeprom(kernal, readFile(REPO_ROOT .. "/kernal/bios.lua"), emu:addFilesystem(kernal, kfiles))

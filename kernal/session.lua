@@ -22,6 +22,23 @@ local gpu = opts.gpu
 local compositor = K.newCompositor(gpu)
 S.compositor, S.gpu = compositor, gpu
 
+-- This screen as the window registry (kernal/windows.lua) sees it: where
+-- programs' windows are drawn, and how they're shown and taken away.
+S.display = {
+  address = K.selfAddr,
+  create = function(spec)
+    local win, err = compositor.createWindow(spec)
+    if not win then return nil, err end
+    return {width = win.width, height = win.height}
+  end,
+  remove = function(id) compositor.close(id) end,
+  status = function(id, status) compositor.setStatus(id, status) end,
+  setOwner = function(id, jobId)
+    local win = compositor.getWindow(id)
+    if win then win.ownerJobId = jobId end
+  end,
+}
+
 -- --- The console, replacing OpenOS's io/term ---
 --
 -- The console's text lives in regular memory (consoleLines) and never
@@ -515,9 +532,15 @@ end
 local function closeWindow(win)
   -- The console can't go away: closing it minimizes it.
   if consoleWin and win.id == consoleWin.id then compositor.minimize(win.id, true) return end
-  local job = windowProcess(win)
+  -- A program's window: gone everywhere, and its program with it.
+  if win.ownerJobId and K.closeWindow(win.id) then return end
   compositor.close(win.id)
-  if job then K.controlJob(job.id, "KILL", "killed (window closed)") end
+end
+
+-- A program window moved or changed size here: the registry keeps its
+-- place, for wherever it's shown next.
+local function noteGeometry(win)
+  if win.ownerJobId then K.windowGeometry(win.id, win.x, win.y, win.width, win.height) end
 end
 
 -- --- The desktop: gmux's -- a background and a column of app icons ---
@@ -823,16 +846,36 @@ desktop.bar.win = gpu and compositor.createWindow({title = "taskbar", x = 1, y =
 -- (A new window takes the focus: the console has it at boot.)
 if consoleWin then compositor.setFocus(consoleWin.id) end
 
+-- The taskbar's windows: this screen's, then the user's programs'
+-- windows shown elsewhere or nowhere (`away`; touching one brings it
+-- here) -- a user's running programs are on every one of their taskbars.
 function desktop.bar.windows()
-  local list = {}
+  local list, here = {}, {}
   for _, w in ipairs(compositor.listWindows()) do
     if w.id ~= (desktop.win and desktop.win.id) and w.id ~= (desktop.bar.win and desktop.bar.win.id)
         and w.id ~= (desktop.menu and desktop.menu.id) then
+      list[#list + 1] = w
+      here[w.id] = true
+    end
+  end
+  for _, w in ipairs(S.user and K.userWindows(S.user) or {}) do
+    if not here[w.id] and not w.status then
+      w.away = true
       list[#list + 1] = w
     end
   end
   table.sort(list, function(a, b) return a.id < b.id end)
   return list
+end
+
+-- The user's windows changed somewhere: redraw the taskbar soon.
+function S.windowsChanged() desktop.bar.nextCheck = 0 end
+
+-- Brings one of the user's windows here from wherever it is.
+local function fetchWindow(id)
+  local ok, err = K.attachWindow(id, S)
+  if not ok then print("can't bring window " .. id .. " here: " .. tostring(err)) return end
+  desktop.bar.show(id)
 end
 
 function desktop.bar.render(list)
@@ -863,14 +906,16 @@ function desktop.bar.render(list)
     local label = " " .. desktop.fit(w.title, math.min(title, utf8.len(w.title) or #w.title)) .. " "
     local width = utf8.len(label) or #label
     local fg, bg = 0xFFFFFF, 0x555555
-    if w.minimized then
+    if w.away then
+      fg, bg = 0x88AAFF, 0x222244 -- running, shown elsewhere or nowhere
+    elseif w.minimized then
       fg, bg = 0x999999, 0x333333
     elseif focus and focus.id == w.id then
       fg, bg = 0x000000, 0xFFFFFF
     end
     if desktop.mono then fg, bg = 0xFFFFFF, 0x000000 end
     placed[#placed + 1] = {x, label, fg, bg}
-    buttons[#buttons + 1] = {from = x, to = x + width - 1, window = w.id}
+    buttons[#buttons + 1] = {from = x, to = x + width - 1, window = w.id, away = w.away}
     x = x + width + 1
   end
   if more then
@@ -892,7 +937,7 @@ function desktop.bar.update(force)
   local list = desktop.bar.windows()
   local focus = compositor.getFocus()
   local parts = {focus and focus.id or 0, math.floor(now / 30)}
-  for _, w in ipairs(list) do parts[#parts + 1] = w.id .. w.title .. tostring(w.minimized) end
+  for _, w in ipairs(list) do parts[#parts + 1] = w.id .. w.title .. tostring(w.minimized) .. tostring(w.away) end
   local okClock, clock = pcall(os.date, "%H:%M")
   parts[#parts + 1] = okClock and tostring(clock) or ""
   local signature = table.concat(parts, "|")
@@ -921,10 +966,13 @@ function desktop.bar.touch(lx)
         local items = {}
         for _, w in ipairs(desktop.bar.windows()) do
           local id = w.id
-          items[#items + 1] = {label = w.title .. (w.minimized and " (minimized)" or ""),
-            action = function() desktop.bar.show(id) end}
+          items[#items + 1] = {label = w.title .. (w.minimized and " (minimized)" or "")
+            .. (w.away and " (elsewhere)" or ""),
+            action = function() if w.away then fetchWindow(id) else desktop.bar.show(id) end end}
         end
         desktop.toggleMenu(items, b.from)
+      elseif b.away then
+        fetchWindow(b.window)
       else
         local win = compositor.getWindow(b.window)
         local focus = compositor.getFocus()
@@ -997,10 +1045,14 @@ local function handleTouch(name, x, y, button)
     if name == "drag" then
       if grab.kind == "move" then
         compositor.move(win.id, x - grab.dx, y)
+        noteGeometry(win)
       else
         local w = math.max(UI.MIN_WINDOW_WIDTH, x - win.x + 1)
         local h = math.max(1, y - compositor.bodyTop(win) + 1)
-        if (w ~= win.width or h ~= win.height) and compositor.resize(win.id, w, h) then notifyResized(win) end
+        if (w ~= win.width or h ~= win.height) and compositor.resize(win.id, w, h) then
+          notifyResized(win)
+          noteGeometry(win)
+        end
       end
       return
     end
@@ -1031,7 +1083,10 @@ local function handleTouch(name, x, y, button)
     if lx == w - 5 or lx == w - 4 then
       compositor.minimize(win.id)
     elseif (lx == w - 3 or lx == w - 2) and win.resizable then
-      if compositor.maximize(win.id) then notifyResized(win) end
+      if compositor.maximize(win.id) then
+        notifyResized(win)
+        noteGeometry(win)
+      end
     elseif lx == w - 1 or lx == w then
       closeWindow(win)
     else
@@ -1249,17 +1304,12 @@ function S.loginLine(line)
   S.startSession(name)
 end
 
--- Ends the login: its processes (flag logout_ends_jobs), what's left of
--- its windows, the console's contents; back to login:.
+-- Ends the login: its processes (flag logout_ends_jobs; never a
+-- persistent one's), its programs' windows (detached: still running,
+-- they wait for the user's next session), the console's contents; back
+-- to login:.
 function S.logout()
-  local ending = system.flag("logout_ends_jobs")
-  for id in pairs(K.runningJobs) do
-    local job = jobs[id]
-    if job.login == S.login and ending then
-      job.loggedOut = true -- its windows close when it ends (finishJob)
-      K.controlJob(id, "KILL", "killed (logged out)")
-    end
-  end
+  K.endLogin(S)
   for _, w in ipairs(compositor.listWindows()) do
     local own = w.id == (consoleWin and consoleWin.id) or w.id == (desktop.win and desktop.win.id)
       or w.id == (desktop.bar.win and desktop.bar.win.id)

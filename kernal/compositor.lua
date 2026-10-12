@@ -602,7 +602,7 @@ function M.createWindow(options)
   -- own. Used for the kernal's console.
   if options.text then
     local x, y = options.x or 1, options.y or 1
-    local id = nextId()
+    local id = options.id or nextId()
     local win = {id = id, title = options.title or ("window " .. id), x = x, y = y,
       width = width, height = height, layer = options.layer or 0, dirty = true,
       textRows = {}, fg = options.fg or 0xFFFFFF, bg = options.bg or 0x000000,
@@ -632,7 +632,7 @@ function M.createWindow(options)
   end
 
   local x, y = options.x or 1, options.y or 1
-  local id = nextId()
+  local id = options.id or nextId()
   -- `ownerJobId` is OPTIONAL and purely informational to the
   -- compositor itself -- it's whatever node/runtime.lua's
   -- create_graphics_process passed through CREATEWINDOW's `ownerJobId`

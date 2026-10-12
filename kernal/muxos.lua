@@ -506,11 +506,20 @@ function K.sessionOf(job)
   return job and job.session and K.byId[job.session]
 end
 
--- The session showing window `id`, and the window.
+-- The session showing program window `id` with a compositor here (the
+-- kernal's own screen), and the compositor's window -- or nil.
 function K.windowOwner(id)
+  local rec = K.win and K.win.get(id)
+  local S = rec and rec.session and K.byId[rec.session]
+  local win = S and S.compositor and S.compositor.getWindow(id)
+  if win then return S, win, rec end
+end
+
+-- A user's windows changed (opened, closed, moved between sessions):
+-- their sessions' taskbars redraw.
+function K.windowsChanged(user)
   for _, S in ipairs(K.sessions) do
-    local win = S.compositor.getWindow(id)
-    if win then return S, win end
+    if S.user == user and S.windowsChanged then S.windowsChanged() end
   end
 end
 
@@ -573,9 +582,19 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
     registerOrphanCandidate(appName, id)
   end
   -- `window`: a graphics process's own window, which it draws into.
-  if window then window.ownerJobId = id end
+  -- `window`: a graphics process's own window (a registry record), which
+  -- it draws into.
+  local route
+  if window then
+    window.owner, window.user = id, jobs[id].user
+    local address, key, port = K.win.hold(window, id)
+    route = address and {address, key, port}
+    local S = K.byId[window.session]
+    if S and S.display.setOwner then S.display.setOwner(window.id, id, targetAddr) end
+  end
   send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args, program = program,
-    windowId = window and window.id, width = window and window.width, height = window and window.height})
+    windowId = window and window.id, width = window and window.width, height = window and window.height,
+    windowRoute = route})
   return id, targetAddr
 end
 
@@ -1068,11 +1087,7 @@ local function finishJob(id, status, result, err)
   end
   -- Its windows stay up, marked like gmux's: ended (done or killed) or
   -- failed (error, lost).
-  local windowStatus = (status == "done" or status == "killed") and "dead" or "error"
-  local S = K.sessionOf(job)
-  for _, winId in ipairs(S and S.compositor.windowsOwnedBy(id) or {}) do
-    if job.loggedOut then S.compositor.close(winId) else S.compositor.setStatus(winId, windowStatus) end
-  end
+  K.win.jobEnded(id, (status == "done" or status == "killed") and "dead" or "error")
   -- This job is no longer running -- apply whatever orphan policy ITS
   -- OWN children declared at spawn time.
   applyOrphanPolicyForChildrenOf(id)
@@ -1544,7 +1559,7 @@ local function handleSpawn(msg)
       send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "its session has ended -- no screen to open a window on"})
       return
     end
-    window, err = S.compositor.createWindow({title = tostring(g.title or "graphics"), x = g.x, y = g.y,
+    window, err = K.win.open(S, {title = tostring(g.title or "graphics"), x = g.x, y = g.y,
       width = tonumber(g.width) or 40, height = tonumber(g.height) or 12,
       resizable = g.resizable, decorated = g.decorated,
       code = "gpu.setBackground(0x000000) gpu.fill(1, 1, " .. (tonumber(g.width) or 40) .. ", "
@@ -1557,12 +1572,12 @@ local function handleSpawn(msg)
   local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node, msg.parent, msg.appName, msg.orphanPolicy,
     nil, window)
   if not jobId then
-    if window then S.compositor.close(window.id) end
+    if window then K.win.close(window) end
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = targetAddr})
     return
   end
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id,
-    result = {id = jobId, node = targetAddr, window = window and S.compositor.describe(window)}})
+    result = {id = jobId, node = targetAddr, window = window and K.win.describe(window)}})
 end
 
 -- gmuxapi.get_orphans(name): hands back the still-unclaimed orphan
@@ -1755,14 +1770,17 @@ local function handleCreateWindow(msg)
     local caller = callerJob(msg)
     msg.ownerJobId = caller and caller.id
   end
-  local S = K.sessionOf(jobs[msg.ownerJobId] or callerJob(msg))
-  local win, err
-  if S then win, err = S.compositor.createWindow(msg) else err = "its session has ended -- no screen to open a window on" end
-  if not win then
+  local caller = callerJob(msg)
+  local S = K.sessionOf(jobs[msg.ownerJobId] or caller)
+  local rec, err = K.win.open(S, msg, msg.ownerJobId)
+  if not rec then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
     return
   end
-  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S.compositor.describe(win)})
+  -- The window's description, and where the caller draws it.
+  local result = K.win.describe(rec)
+  if caller then result.route, result.key, result.port = K.win.hold(rec, caller.id) end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = result})
 end
 
 -- Redraw an existing window. Only its owner process (or an ancestor of
@@ -1772,13 +1790,15 @@ end
 -- flushes).
 local function handleDrawWindow(msg)
   local caller = callerJob(msg)
-  local S, win = K.windowOwner(msg.windowId)
+  local S, win, rec = K.windowOwner(msg.windowId)
   local reply
   if not caller then
     reply = "not called from a running process"
   elseif not win then
-    reply = "no such window: " .. tostring(msg.windowId)
-  elseif win.ownerJobId ~= caller.id and not (win.ownerJobId and isDescendantOf(win.ownerJobId, caller.id)) then
+    reply = K.win.get(msg.windowId) and "window " .. tostring(msg.windowId) .. " isn't shown on this screen"
+      or "no such window: " .. tostring(msg.windowId)
+  elseif msg.key ~= rec.key and win.ownerJobId ~= caller.id
+      and not (win.ownerJobId and isDescendantOf(win.ownerJobId, caller.id)) then
     reply = "window " .. tostring(msg.windowId) .. " belongs to another process"
   end
   -- width/height resize the window -- except with pixels, where they're
@@ -1787,7 +1807,7 @@ local function handleDrawWindow(msg)
   if not reply and not msg.pixels and type(msg.width) == "number" and type(msg.height) == "number"
       and (msg.width ~= win.width or msg.height ~= win.height) then
     local ok, err = S.compositor.setGeometry(win.id, win.x, win.y, msg.width, msg.height)
-    if not ok then reply = err end
+    if not ok then reply = err else K.win.moved(rec, win.x, win.y, win.width, win.height) end
   end
   if not reply then
     local ok, err = S.compositor.redrawWindow(msg.windowId, msg)
@@ -1871,6 +1891,10 @@ local function handleRender(msg)
     local ok, err = S.compositor.share(win.id, child.id, msg.rect)
     if not ok then return reply(nil, err) end
     local rect = S.compositor.shares(win.id)[child.id]
+    local rec = K.win.get(win.id)
+    rec.shares = rec.shares or {}
+    rec.shares[child.id] = rect
+    if rect then K.win.hold(rec, child.id) end
     K.deliverEvent(child, rect and {"window_shared", win.id, rect.x, rect.y, rect.w, rect.h} or {"window_unshared", win.id})
     return reply(true)
   elseif msg.type == "RENDERCONFIG" then
@@ -1901,9 +1925,41 @@ local function handlePipeWrite(msg)
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
 end
 
+-- The caller's user's windows, wherever they're shown (or not).
 local function handleGetWindows(msg)
-  local S = K.sessionOf(callerJob(msg))
-  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S and S.compositor.listWindows() or {}})
+  local caller = callerJob(msg)
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = caller and K.win.ofUser(caller.user) or {}})
+end
+
+-- Where a window is drawn now, for a process that may draw it (its
+-- owner, an ancestor of it, or one sharing part of it): {address, key,
+-- port}, or {} while it's detached.
+local function handleWindowRoute(msg)
+  local caller = callerJob(msg)
+  local rec = K.win.get(msg.windowId)
+  local may = caller and rec and (rec.owner == caller.id or (rec.owner and isDescendantOf(rec.owner, caller.id))
+    or (rec.shares and rec.shares[caller.id]))
+  if not may then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = rec and "window " .. rec.id
+      .. " belongs to another process" or "no such window: " .. tostring(msg.windowId)})
+    return
+  end
+  local address, key, port = K.win.hold(rec, caller.id)
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id,
+    result = {address = address, key = key, port = port, width = rec.width, height = rec.height}})
+end
+
+-- gmuxapi.set_persistent(on): the process keeps running when its user
+-- logs out (whatever flag logout_ends_jobs says); its windows wait,
+-- detached, for the user's next session.
+local function handlePersist(msg)
+  local caller = callerJob(msg)
+  if not caller then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "not called from a running process"})
+    return
+  end
+  caller.persistent = msg.on ~= false or nil
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = caller.persistent == true})
 end
 
 -- First real slice of the gmux application API, muxos-shaped:
@@ -1984,6 +2040,10 @@ local function handleModemMessage(from, port, data)
     handleRender(msg)
   elseif msg.type == "PIPEWRITE" then
     handlePipeWrite(msg)
+  elseif msg.type == "WINDOWROUTE" then
+    handleWindowRoute(msg)
+  elseif msg.type == "PERSIST" then
+    handlePersist(msg)
   elseif msg.type == "ISFOREGROUND" then
     -- readLine (docs/MXE.md): only the console's foreground program reads typed lines.
     local caller = callerJob(msg)
@@ -2657,6 +2717,7 @@ K.resolveProgram, K.readManifest, K.launchProgram, K.PROGRAM_PATH = resolveProgr
   PROGRAM_PATH
 K.MUXOS_VERSION, K.selfAddr, K.fullscreen, K.controlJob = MUXOS_VERSION, selfAddr, fullscreen, controlJob
 K.lineedit = loadSibling("lineedit.lua")()
+K.win = loadSibling("windows.lua")(K)
 K.sessionChunk = loadSibling("session.lua")
 K.nextSession = 0
 
@@ -2668,6 +2729,46 @@ end
 function K.liveJob(id)
   local job = jobs[id]
   if job and job.status == "running" and nodes[job.node] and not nodes[job.node].down then return job end
+end
+
+-- A program's window closed by its user: gone, and its program with it.
+-- False if `id` isn't a program window.
+function K.closeWindow(id)
+  local rec = K.win.get(id)
+  if not rec then return false end
+  K.win.close(rec)
+  local job = rec.owner and K.liveJob(rec.owner)
+  if job then controlJob(job.id, "KILL", "killed (window closed)") end
+  return true
+end
+
+function K.windowGeometry(id, x, y, width, height)
+  local rec = K.win.get(id)
+  if rec then K.win.moved(rec, x, y, width, height) end
+end
+
+function K.userWindows(user) return K.win.ofUser(user) end
+
+-- Brings one of the session's user's windows to its screen.
+function K.attachWindow(id, S)
+  local rec = K.win.get(id)
+  if not rec or rec.user ~= S.user then return nil, "no such window of yours" end
+  return K.win.attach(rec, S)
+end
+
+-- A login ends: its processes end (flag logout_ends_jobs) unless they
+-- asked to keep running (gmuxapi.set_persistent); windows of those that
+-- do are detached, to wait for the user's next session.
+function K.endLogin(S)
+  local ending = system.flag("logout_ends_jobs")
+  for id in pairs(runningJobs) do
+    local job = jobs[id]
+    if job.login == S.login and ending and not job.persistent then
+      job.loggedOut = true
+      controlJob(id, "KILL", "killed (logged out)")
+    end
+  end
+  K.win.sessionEnded(S)
 end
 
 -- A compositor for a session's gpu; window ids are unique across all.
