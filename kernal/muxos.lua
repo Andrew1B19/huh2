@@ -618,7 +618,7 @@ end
 -- the program. Either way, the scheduler places it.
 local PROGRAM_PATH = {"/bin", "/usr/bin"}
 -- Libraries built into the worker runtime rather than shipped from disk.
-local BUILTIN_MXE_LIBRARIES = {mux = true, http = true, thread = true, modem = true}
+local BUILTIN_MXE_LIBRARIES = {mux = true, http = true, thread = true, modem = true, bitmap = true}
 -- Searched in order (docs/MXE.md section 5).
 local MXE_LIBRARY_DIRS = {"/lib/mxe/", "/usr/lib/mxe/"}
 
@@ -1664,8 +1664,10 @@ local function handleGetModule(msg)
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "not called from a running process"})
     return
   end
-  local path = resolveModule(msg.name)
-  local source = path and readModuleFile(path)
+  -- "muxos:bitmap": the kernal's own pixel encoder, which the runtime
+  -- uses to encode pixels on the program's node (its `bitmap` library).
+  local path = msg.name == "muxos:bitmap" and "/bitmap.lua" or resolveModule(msg.name)
+  local source = path and (msg.name == "muxos:bitmap" and readFile(path) or readModuleFile(path))
   if source then
     send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {path = path, source = source}})
   else

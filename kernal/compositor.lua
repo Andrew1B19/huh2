@@ -536,6 +536,31 @@ local function registerWindow(win)
   return win
 end
 
+-- Paints cell runs, as a program's node encodes them (the runtime's
+-- `bitmap` library, or a legacy program's virtual gpu): rows of
+-- {y, x, fg, bg, text, x, fg, bg, text, ...}, in the coordinates of a
+-- box whose top-left cell is (ox, oy), clipped to `area` if given.
+-- Nothing is encoded here: the program's node did that.
+local function drawCells(gpu, rows, ox, oy, area)
+  if type(rows) ~= "table" then return end
+  for _, row in ipairs(rows) do
+    local y = oy + (math.tointeger(row[1]) or 1) - 1
+    if not area or (y >= area.y and y < area.y + area.h) then
+      for i = 2, #row, 4 do
+        local x, text = ox + (math.tointeger(row[i]) or 1) - 1, tostring(row[i + 3] or "")
+        local len = utf8.len(text) or #text
+        local from, to = x, x + len - 1
+        if area then from, to = math.max(from, area.x), math.min(to, area.x + area.w - 1) end
+        if to >= from then
+          gpu.setForeground(tonumber(row[i + 1]) or 0xFFFFFF)
+          gpu.setBackground(tonumber(row[i + 2]) or 0x000000)
+          gpu.set(from, y, from == x and to == x + len - 1 and text or textSlice(text, from - x + 1, to - from + 1))
+        end
+      end
+    end
+  end
+end
+
 -- Muxos-shaped create_window (also standing in for gmux's separate
 -- create_window_buffer -- see docs/PROTOCOL.md for why those two
 -- collapse into one call here). Allocates a GPU buffer, draws into it,
@@ -620,6 +645,16 @@ function M.createWindow(options)
     if not ok then
       gpu.freeBuffer(buffer)
       return nil, "bitmap draw failed: " .. tostring(drawErr)
+    end
+  end
+
+  if options.cells then
+    gpu.setActiveBuffer(buffer)
+    local ok, drawErr = pcall(drawCells, gpu, options.cells, 1, 1)
+    gpu.setActiveBuffer(0)
+    if not ok then
+      gpu.freeBuffer(buffer)
+      return nil, "drawing cells failed: " .. tostring(drawErr)
     end
   end
 
@@ -920,6 +955,12 @@ function M.redrawWindow(id, options)
     gpu.setActiveBuffer(0)
     if not ok then return nil, "bitmap draw failed: " .. tostring(err) end
   end
+  if options.cells then
+    gpu.setActiveBuffer(win.buffer)
+    local ok, err = pcall(drawCells, gpu, options.cells, 1, 1)
+    gpu.setActiveBuffer(0)
+    if not ok then return nil, "drawing cells failed: " .. tostring(err) end
+  end
   if options.code then
     local cached = win.drawCache[options.code]
     if not cached then
@@ -1170,6 +1211,11 @@ function M.drawRegion(id, key, frame, content, done)
       rows = math.min(rows, area.y + area.h - y)
       if x < area.x or y < area.y or cols < 1 or rows < 1 then error("the region is outside the share", 0) end
       bitmap.draw(gpu, cells, rows, cols, x, y)
+    elseif type(content.cells) == "table" then
+      if x < area.x or y < area.y or x > area.x + area.w - 1 or y > area.y + area.h - 1 then
+        error("the region is outside the share", 0)
+      end
+      drawCells(gpu, content.cells, x, y, area)
     elseif type(content.text) == "table" then
       for i, row in ipairs(content.text) do
         local yy = y + i - 1
@@ -1189,7 +1235,7 @@ function M.drawRegion(id, key, frame, content, done)
         end
       end
     else
-      error("a region needs pixels or text", 0)
+      error("a region needs cells, pixels or text", 0)
     end
   end)
   gpu.setActiveBuffer(0)

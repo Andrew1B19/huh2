@@ -2231,4 +2231,38 @@ sleep(60)
 end
 print("  OK -- set_persistent, detached on logout, listed on the next login's taskbar, reattached with its content")
 
+print("test 57: the bitmap library -- a program encodes pixels into cells itself and draws them")
+do
+  local program = [==[--[[mxe
+name = "bits57"
+libraries = {"bitmap"}
+]]
+local bitmap = require("bitmap")
+local win = gmuxapi.create_window({title = "bits57", x = 2, y = 2, width = 8, height = 2, code = "gpu.fill(1, 1, 8, 2, ' ')"}).id
+-- Red over blue, as half blocks: 4x2 pixels -> 4x1 cells.
+local pixels = {{0xFF0000, 0xFF0000, 0xFF0000, 0xFF0000}, {0x0000FF, 0x0000FF, 0x0000FF, 0x0000FF}}
+local cells, cols, rows = bitmap.cells("halfblock", pixels, 4, 2, 0x000000)
+gmuxapi.draw_window(win, {cells = cells, clear = false})
+-- The cells themselves, changed before drawing: a green one on row 2.
+local grid, gcols, grows = bitmap.encode("halfblock", {{0x00FF00}, {0x00FF00}}, 1, 2, 0x000000)
+local runs = bitmap.runs(grid, gcols, grows)
+runs[1][1] = 2 -- row 2
+local ok, err = gmuxapi.draw_window(win, {cells = runs, clear = false})
+print("bits57 " .. cols .. "x" .. rows .. " " .. tostring(ok) .. " " .. tostring(err))
+]==]
+  local c = newCluster(80, 25, {["/bin/bits57.mxe"] = program}, 1)
+  c.typeLine("bits57")
+  for _ = 1, 20 do
+    if c.text():find("bits57 4x1", 1, true) then break end
+    c.emu:advance(0.5)
+  end
+  assert(c.text():find("bits57 4x1 true nil", 1, true), "bitmap.cells encodes 4x2 pixels as 4x1 cells:\n" .. c.text())
+  local top = c.cell(2, 3)
+  assert(top and top.char == "\u{2580}" and top.fg == 0xFF0000 and top.bg == 0x0000FF,
+    "a half block, red over blue: " .. tostring(top and top.char) .. " " .. tostring(top and top.fg))
+  local green = c.cell(2, 4)
+  assert(green and ((green.char == " " and green.bg == 0x00FF00) or green.fg == 0x00FF00), "the changed cell on row 2 is green")
+end
+print("  OK -- bitmap.cells, bitmap.encode + runs, drawn as cells")
+
 print("ALL OK")

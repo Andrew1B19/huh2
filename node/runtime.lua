@@ -507,6 +507,48 @@ local function sendDraw(id, msgType, fields, caller, noReply)
   return true
 end
 
+-- --- Pixels to cells, on this node ---
+--
+-- OC's GPUs have no pixels: an image is encoded into character cells
+-- (half blocks or braille; kernal/bitmap.lua). That's done here, on the
+-- program's node, not by whichever screen shows the window: a draw goes
+-- out as ready cell runs -- rows of {y, x, fg, bg, text, ...} -- that
+-- the screen only paints. The encoder is the kernal's own bitmap.lua,
+-- fetched once.
+local bitmapModule
+local function bitmapLib(caller)
+  if not bitmapModule then
+    local r, err = remoteRequest("GETMODULE", {name = "muxos:bitmap", caller = caller})
+    if not r then error("the bitmap encoder: " .. tostring(err), 0) end
+    bitmapModule = assert(load(r.source, "=bitmap.lua"))()
+  end
+  return bitmapModule
+end
+
+-- An encoded cell grid (cells[row][col] = {char, fg, bg}) as runs.
+local function cellRuns(cells, cols, rows)
+  local out = {}
+  for y = 1, rows do
+    local row, r, x = cells[y], {y}, 1
+    while x <= cols do
+      local fg, bg, start, chars = row[x].fg, row[x].bg, x, {}
+      while x <= cols and row[x].fg == fg and row[x].bg == bg do
+        chars[#chars + 1] = row[x].char
+        x = x + 1
+      end
+      r[#r + 1], r[#r + 2], r[#r + 3], r[#r + 4] = start, fg, bg, table.concat(chars)
+    end
+    out[#out + 1] = r
+  end
+  return out
+end
+
+-- {pixels, width, height, mode, bg} as cell runs, and their size in cells.
+local function pixelsToCells(o, caller)
+  local cells, cols, rows = bitmapLib(caller).encode(o.mode, o.pixels, o.width, o.height, o.bg)
+  return cellRuns(cells, cols, rows), cols, rows
+end
+
 -- Keeps a window's draws since its last full one (clear ~= false).
 local function rememberDraw(id, draw)
   if draw.clear ~= false then
@@ -849,18 +891,24 @@ gmuxapi = {
     -- a 2D pixel grid encoded into half-block or braille sub-cell
     -- characters instead of running `code` -- OC's GPUs have no pixel
     -- API, so this is the only way to get anything bitmap-like.
+    -- A bit window's pixels go as cells, encoded here; width/height
+    -- then mean the window's size in cells.
+    local width, height, cells = options.width, options.height, options.cells
+    if options.pixels then
+      if not width or not height then
+        return nil, "options.pixels needs options.width/options.height (the pixel grid's own dimensions)"
+      end
+      cells, width, height = pixelsToCells(options, currentJobId)
+    end
     local win, err = remoteRequest("CREATEWINDOW", {
       title = options.title, x = options.x, y = options.y,
-      width = options.width, height = options.height, code = options.code,
-      pixels = options.pixels, mode = options.mode, bg = options.bg, args = options.args,
+      width = width, height = height, code = options.code, cells = cells, bg = options.bg, args = options.args,
       resizable = options.resizable, decorated = options.title_bar, caller = currentJobId,
     })
     if win then
       setRoute(win.id, win.route, win.key, win.port)
-      if options.code or options.pixels then
-        rememberDraw(win.id, {code = options.code, args = options.args, pixels = options.pixels, mode = options.mode,
-          width = options.pixels and options.width or nil, height = options.pixels and options.height or nil,
-          bg = options.bg})
+      if options.code or cells then
+        rememberDraw(win.id, {code = options.code, args = options.args, cells = cells, bg = options.bg})
       end
       win.route, win.key, win.port = nil, nil, nil
     end
@@ -874,8 +922,15 @@ gmuxapi = {
   -- blanking it first. Same sandbox as create_window.
   draw_window = function(id, options)
     options = options or {}
-    local draw = {code = options.code, args = options.args, pixels = options.pixels, mode = options.mode,
+    local draw = {code = options.code, args = options.args, cells = options.cells,
       width = options.width, height = options.height, bg = options.bg, clear = options.clear}
+    if options.pixels then
+      if not options.width or not options.height then
+        return nil, "options.pixels needs options.width/options.height"
+      end
+      draw.cells, draw.width, draw.height = pixelsToCells(options, currentJobId)
+      draw.width, draw.height = nil, nil -- the window keeps its size
+    end
     rememberDraw(id, draw)
     local fields = {}
     for k, v in pairs(draw) do fields[k] = v end
@@ -926,39 +981,46 @@ gmuxapi = {
       renderChunks[id] = config and config.chunk or false
     end
     local chunk = renderChunks[id] or 4096
-    local bands = {}
-    if content.pixels and content.width and content.height then
-      local perCell = content.mode == "braille" and 4 or 2
-      local rows = math.max(perCell, (chunk // math.max(1, content.width * 9)) // perCell * perCell)
-      for top = 1, content.height, rows do
-        local band = {}
-        for y = top, math.min(content.height, top + rows - 1) do band[#band + 1] = content.pixels[y] or {} end
-        bands[#bands + 1] = {pixels = band, width = content.width, height = #band, mode = content.mode,
-          bg = content.bg, x = content.x, y = (content.y or nil) and content.y + (top - 1) // perCell,
-          offset = (top - 1) // perCell}
-      end
-    elseif type(content.text) == "table" then
-      local size, start = 0, 1
-      for i, row in ipairs(content.text) do
-        size = size + (type(row) == "string" and #row or 40 * #row) + 8
-        if size > chunk or i == #content.text then
-          local part = {}
-          for j = start, i do part[#part + 1] = content.text[j] end
-          bands[#bands + 1] = {text = part, x = content.x, y = content.y and content.y + start - 1, offset = start - 1}
-          start, size = i + 1, 0
-        end
-      end
+    -- Pixels are encoded here, into cell runs; a region bigger than
+    -- `chunk` goes in bands of rows, all at the same corner.
+    local cells = content.cells
+    if content.pixels then
+      if not content.width or not content.height then return nil, "pixels need width and height" end
+      cells = pixelsToCells(content, currentJobId)
     end
-    if #bands == 0 then return nil, "a region needs pixels (with width and height) or text" end
-    for i, band in ipairs(bands) do
-      local msg = {windowId = id, frame = frame, pixels = band.pixels, width = band.width, height = band.height,
-        mode = band.mode, bg = band.bg, text = band.text, x = band.x, y = band.y, offset = band.offset,
-        done = i == #bands and content.done ~= false, caller = currentJobId}
-      if i < #bands then
-        msg.type, msg.from, msg.to, msg.id, msg.noReply = "DRAWREGION", nodeId, kernalAddr, nextId(), true
-        send(msg)
+    local bands = {}
+    local function band(rowsOrText, isText)
+      bands[#bands + 1] = isText and {text = rowsOrText} or {cells = rowsOrText}
+    end
+    local list = cells or (type(content.text) == "table" and content.text)
+    if not list then return nil, "a region needs cells, pixels (with width and height) or text" end
+    local part, size = {}, 0
+    for i, row in ipairs(list) do
+      local cost = 8
+      if type(row) == "string" then
+        cost = cost + #row
       else
-        return remoteRequest("DRAWREGION", msg)
+        for j = 1, #row do cost = cost + (type(row[j]) == "string" and #row[j] or 12) end
+      end
+      if size + cost > chunk and #part > 0 then
+        band(part, not cells)
+        part, size = {}, 0
+      end
+      part[#part + 1] = row
+      size = size + cost
+      -- Text rows keep their place: a band of them starts lower down.
+      -- (Cell rows carry their own row numbers.)
+      if not cells and #part == 1 then part.offset = i - 1 end
+    end
+    if #part > 0 then band(part, not cells) end
+    for i, b in ipairs(bands) do
+      local offset = b.text and b.text.offset or 0
+      local fields = {frame = frame, cells = b.cells, text = b.text, x = content.x,
+        y = content.y and content.y + offset, offset = offset, done = i == #bands and content.done ~= false}
+      if i < #bands then
+        sendDraw(id, "DRAWREGION", fields, currentJobId, true)
+      else
+        return sendDraw(id, "DRAWREGION", fields, currentJobId)
       end
     end
   end,
@@ -1175,6 +1237,26 @@ local BUILTIN_LIBRARIES = {
   --   t:kill()                          end it
   --   thread.yield()                    let the others run
   -- An error in a thread nobody joins is printed to the console.
+  -- Pixels to cells on this node (kernal/bitmap.lua's encoder), for
+  -- drawing bit graphics yourself:
+  --   cells, cols, rows = bitmap.cells(mode, pixels, width, height, bg)
+  --                         -- "halfblock" or "braille"; cell runs, ready
+  --                         -- for draw_window{cells} / draw_region{cells}
+  --   grid, cols, rows = bitmap.encode(mode, pixels, width, height, bg)
+  --                         -- the cells themselves: grid[row][col] =
+  --                         -- {char, fg, bg}, to change before drawing
+  --   cells = bitmap.runs(grid, cols, rows)
+  -- (draw_window and draw_region also take pixels, and encode them here.)
+  bitmap = function(id)
+    local encoder = bitmapLib(id)
+    return {
+      encode = encoder.encode,
+      runs = cellRuns,
+      cells = function(mode, pixels, width, height, bg)
+        return pixelsToCells({mode = mode, pixels = pixels, width = width, height = height, bg = bg}, id)
+      end,
+    }
+  end,
   thread = function(id)
     local count = 0
     local lib = {}
@@ -1506,9 +1588,7 @@ local hostUnicode = unicode
 local VGPU_MAX_W, VGPU_MAX_H = 160, 50
 local VGPU_MEMORY = VGPU_MAX_W * VGPU_MAX_H * 2 -- cells, for allocateBuffer
 local GRAPHICS_FLUSH_INTERVAL = 0.05
--- Rows arrive as {y, x, fg, bg, text, x, fg, bg, text, ...}.
-local WINDOW_DRAW_CODE = "for _, row in ipairs(args.rows) do local y = row[1] for i = 2, #row, 4 do " ..
-  "gpu.setForeground(row[i + 1]) gpu.setBackground(row[i + 2]) gpu.set(row[i], y, row[i + 3]) end end"
+-- A flush sends changed rows as cell runs: {y, x, fg, bg, text, x, fg, bg, text, ...}.
 
 local function newGrid(w, h, fg, bg)
   local g = {w = w, h = h, chars = {}, fgs = {}, bgs = {}}
@@ -1800,8 +1880,7 @@ local function flushVirtualGpu(ctx, force)
     end
   end
   v.dirtyRows, v.dirty, v.lastFlush = {}, false, now
-  sendDraw(ctx.windowId, "DRAWWINDOW", {code = WINDOW_DRAW_CODE, args = {rows = rows}, clear = false,
-    width = g.w, height = g.h}, ctx.id, true)
+  sendDraw(ctx.windowId, "DRAWWINDOW", {cells = rows, clear = false, width = g.w, height = g.h}, ctx.id, true)
 end
 
 -- The process's virtual gpu, screen and keyboard: address -> proxy.
