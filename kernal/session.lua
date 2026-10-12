@@ -26,7 +26,7 @@ S.compositor, S.gpu = compositor, gpu
 --
 -- The console's text lives in regular memory (consoleLines) and never
 -- has a video buffer of its own. Normally it's a compositor text
--- window on the bottom layer, painted from its rows straight into the
+-- window like any other, painted from its rows straight into the
 -- frame buffer. Its size isn't fixed: it starts as the bottom half of
 -- the screen and the `console <width> <height> [x y]` command changes
 -- it at any time (cheap, since there's no buffer to reallocate). In

@@ -372,19 +372,36 @@ local function liveNodeCount()
   return n
 end
 
--- Round-robin with a simple multi-core balancer on top: the live node
--- with the fewest running jobs wins, and round-robin order breaks ties
--- (so an idle rack still rotates instead of piling onto node 1).
+-- Where new work goes (flag `scheduler`): "load" -- the live worker
+-- with the lowest load average (processes ready to run, about the last
+-- 10 seconds, reported by each worker every 2 s), counting work sent
+-- there since its last report, among those with at least
+-- MIN_FREE_MEMORY free (all of them, if none has), then the one running
+-- the fewest processes (sleeping ones don't add to a load average);
+-- "count" -- just the fewest processes. Round-robin among equals.
+local MIN_FREE_MEMORY = 64 * 1024
 local function nextLiveNode(avoid)
-  local best, bestLoad
+  local byLoad = system.flag("scheduler") == "load"
+  local roomy = false
+  for _, addr in ipairs(nodeOrder) do
+    local node = nodes[addr]
+    if not node.down and not node.draining and addr ~= avoid and (node.free or math.huge) >= MIN_FREE_MEMORY then
+      roomy = true
+    end
+  end
+  local best, bestLoad, bestCount
   for _ = 1, #nodeOrder do
     local addr = nodeOrder[nextNode]
     nextNode = (nextNode % #nodeOrder) + 1
     local node = nodes[addr]
-    if not node.down and not node.draining and addr ~= avoid then
-      local load = node.running or 0
-      if not best or load < bestLoad then best, bestLoad = addr, load end
-      if load == 0 then break end
+    if not node.down and not node.draining and addr ~= avoid
+        and (not byLoad or not roomy or (node.free or math.huge) >= MIN_FREE_MEMORY) then
+      local load = byLoad and math.floor(((node.load or 0) + (node.recent or 0)) * 10 + 0.5) or 0
+      local count = node.running or 0
+      if not best or load < bestLoad or (load == bestLoad and count < bestCount) then
+        best, bestLoad, bestCount = addr, load, count
+      end
+      if load == 0 and count == 0 then break end
     end
   end
   if best then
@@ -546,6 +563,7 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
   runningJobs[id] = true
   runningCount = runningCount + 1
   nodes[targetAddr].running = (nodes[targetAddr].running or 0) + 1
+  nodes[targetAddr].recent = (nodes[targetAddr].recent or 0) + 1
   if parent then
     childrenOf[parent] = childrenOf[parent] or {}
     local siblings = childrenOf[parent]
@@ -1976,6 +1994,13 @@ local function handleModemMessage(from, port, data)
       send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
         error = "not in the foreground at the console"})
     end
+  elseif msg.type == "LOAD" then
+    -- A worker's load average and free memory (see nextLiveNode).
+    local node = nodes[msg.from]
+    if node and type(msg.load) == "number" then
+      node.load, node.load60, node.free, node.total = msg.load, tonumber(msg.load60), tonumber(msg.free), tonumber(msg.total)
+      node.recent = 0
+    end
   elseif msg.type == "COMPONENTS" then
     bus.setNodeComponents(msg.from, msg.components)
   elseif msg.type == "BUSLIST" or msg.type == "BUSINVOKE" or msg.type == "VALUECALL" then
@@ -2258,8 +2283,11 @@ local function listNodes()
     return
   end
   for i, addr in ipairs(nodeOrder) do
-    print(string.format("[%d] %s  (last seen %.1fs ago)%s", i, addr, computer.uptime() - nodes[addr].lastSeen,
-      nodes[addr].down and " DOWN" or (nodes[addr].draining and " DRAINING" or "")))
+    local node = nodes[addr]
+    local load = node.load and string.format("  load %.2f %.2f  %dK free", node.load, node.load60 or 0,
+      (node.free or 0) // 1024) or ""
+    print(string.format("[%d] %s  (last seen %.1fs ago)%s%s", i, addr, computer.uptime() - node.lastSeen,
+      node.down and " DOWN" or (node.draining and " DRAINING" or ""), load))
   end
 end
 

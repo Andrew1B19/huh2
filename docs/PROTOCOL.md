@@ -229,6 +229,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `HELLO`   | `from`                                                    | worker  | "I just booted, here's my address"                |
 | `PING`    | `from`                                                    | kernal  | "who's out there"                                  |
 | `PONG`    | `from`, `to`                                              | worker  | reply to `PING`                                    |
+| `LOAD`    | `from`, `to`, `load`, `load60`, `free`, `total`          | worker  | every 2 s: its load average (processes ready to run, ~10 s and ~60 s) and memory |
 | `JOB`     | `from`, `to`, `id`, `code`, `args`, `program`, `restore`  | kernal  | run `code` (a Lua chunk) with `args`; `program` (path, kind, `.mxe` launch response and libraries, and the `user`, `home` and `cwd` it runs as) when it's a launched program; `restore` is a migrated process's saved state (`mux.restored()`) |
 | `LIST`    | `from`, `to`, `id`                                        | either  | "list the components attached to you"             |
 | `INVOKE`  | `from`, `to`, `id`, `address`, `method`, `args`           | either  | call `component.invoke(address, method, args...)` on the receiver's own component (also the bus's relayed call; results that can't cross the wire come back as value references) |
@@ -446,9 +447,14 @@ README.md.
 
 ## Scheduler
 
-**BUILT**: round-robin job dispatch across the live worker nodes, with
-a simple multi-core balancer on top -- the live node with the fewest
-running jobs wins, and round-robin order breaks ties (test 27). Beyond that assignment policy, job
+**BUILT**: job dispatch across the live worker nodes by load average
+(flag `scheduler`, default `load`): each worker reports a Unix-style
+load average (processes ready to run, averaged over ~10 s and ~60 s)
+and its free memory every 2 s (`LOAD`); new work goes to the lowest
+~10 s average, counting work sent since that worker's last report,
+skipping workers under 64 KB free while another has room; then the
+fewest running jobs, then round-robin (tests 27, 55). `scheduler count`
+is the fewest running jobs alone. Beyond that assignment policy, job
 handling otherwise follows the same shape gmux already uses (a process
 table, `SPAWN`/`JOB` dispatch-and-record as already implemented --
 see "The gmux application API, translated" above) for now; this may get

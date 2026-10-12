@@ -2,16 +2,16 @@
 @@MANIFEST 32
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-72323 /muxos.lua
+73333 /muxos.lua
 28806 /compositor.lua
 33883 /shell.lua
 2663 /bitmap.lua
 3046 /lineedit.lua
-5812 /system.lua
+5994 /system.lua
 36766 /session.lua
 5514 /vgpu.lua
 3384 /terminals.lua
-80409 /runtime.lua
+81126 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 1682 /lib/bit32.lua
 3800 /lib/buffer.lua
@@ -226,7 +226,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 72323 /muxos.lua
+@@ 73333 /muxos.lua
 
 
 
@@ -604,16 +604,33 @@ end
 
 
 
+
+
+
+
+local MIN_FREE_MEMORY = 64 * 1024
 local function nextLiveNode(avoid)
-local best, bestLoad
+local byLoad = system.flag("scheduler") == "load"
+local roomy = false
+for _, addr in ipairs(nodeOrder) do
+local node = nodes[addr]
+if not node.down and not node.draining and addr ~= avoid and (node.free or math.huge) >= MIN_FREE_MEMORY then
+roomy = true
+end
+end
+local best, bestLoad, bestCount
 for _ = 1, #nodeOrder do
 local addr = nodeOrder[nextNode]
 nextNode = (nextNode % #nodeOrder) + 1
 local node = nodes[addr]
-if not node.down and not node.draining and addr ~= avoid then
-local load = node.running or 0
-if not best or load < bestLoad then best, bestLoad = addr, load end
-if load == 0 then break end
+if not node.down and not node.draining and addr ~= avoid
+and (not byLoad or not roomy or (node.free or math.huge) >= MIN_FREE_MEMORY) then
+local load = byLoad and math.floor(((node.load or 0) + (node.recent or 0)) * 10 + 0.5) or 0
+local count = node.running or 0
+if not best or load < bestLoad or (load == bestLoad and count < bestCount) then
+best, bestLoad, bestCount = addr, load, count
+end
+if load == 0 and count == 0 then break end
 end
 end
 if best then
@@ -775,6 +792,7 @@ program = program, args = args}
 runningJobs[id] = true
 runningCount = runningCount + 1
 nodes[targetAddr].running = (nodes[targetAddr].running or 0) + 1
+nodes[targetAddr].recent = (nodes[targetAddr].recent or 0) + 1
 if parent then
 childrenOf[parent] = childrenOf[parent] or {}
 local siblings = childrenOf[parent]
@@ -2205,6 +2223,13 @@ else
 send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
 error = "not in the foreground at the console"})
 end
+elseif msg.type == "LOAD" then
+
+local node = nodes[msg.from]
+if node and type(msg.load) == "number" then
+node.load, node.load60, node.free, node.total = msg.load, tonumber(msg.load60), tonumber(msg.free), tonumber(msg.total)
+node.recent = 0
+end
 elseif msg.type == "COMPONENTS" then
 bus.setNodeComponents(msg.from, msg.components)
 elseif msg.type == "BUSLIST" or msg.type == "BUSINVOKE" or msg.type == "VALUECALL" then
@@ -2487,8 +2512,11 @@ print("no worker nodes known -- try 'discover'")
 return
 end
 for i, addr in ipairs(nodeOrder) do
-print(string.format("[%d] %s  (last seen %.1fs ago)%s", i, addr, computer.uptime() - nodes[addr].lastSeen,
-nodes[addr].down and " DOWN" or (nodes[addr].draining and " DRAINING" or "")))
+local node = nodes[addr]
+local load = node.load and string.format("  load %.2f %.2f  %dK free", node.load, node.load60 or 0,
+(node.free or 0) // 1024) or ""
+print(string.format("[%d] %s  (last seen %.1fs ago)%s%s", i, addr, computer.uptime() - node.lastSeen,
+node.down and " DOWN" or (node.draining and " DRAINING" or ""), load))
 end
 end
 
@@ -5753,7 +5781,7 @@ end,
 KEY = KEY,
 }
 
-@@ 5812 /system.lua
+@@ 5994 /system.lua
 
 
 
@@ -5791,6 +5819,8 @@ help = "only root can add or remove users"},
 help = "only a process's own user (or root) can pause, resume or kill it"},
 {name = "logout_ends_jobs", type = "boolean", default = true,
 help = "logging out ends the processes started from that login"},
+{name = "scheduler", type = "choice", choices = {"load", "count"}, default = "load",
+help = "where new work goes: the worker with the lowest load average, or the fewest processes"},
 {name = "remote_terminals", type = "boolean", default = true, reboot = true,
 help = "network terminals (muxterm) can log in"},
 {name = "terminal_port", type = "number", default = 4478, min = 1, max = 65535, reboot = true,
@@ -7683,7 +7713,7 @@ end
 
 return T
 
-@@ 80409 /runtime.lua
+@@ 81126 /runtime.lua
 
 
 
@@ -10718,12 +10748,41 @@ end
 local SWEEP_EVERY = 10
 local MAX_SIGNALS_PER_ROUND = 32
 local lastSweep = computer.uptime()
+
+
+
+
+
+
+local LOAD_EVERY = 2
+local load = {fast = 0, slow = 0, last = computer.uptime(), sent = -math.huge}
+local function sampleLoad(ready)
+local now = computer.uptime()
+local dt = now - load.last
+if dt >= 0.2 then
+load.last = now
+local a, b = math.exp(-dt / 10), math.exp(-dt / 60)
+load.fast = load.fast * a + ready * (1 - a)
+load.slow = load.slow * b + ready * (1 - b)
+end
+if now - load.sent >= LOAD_EVERY and kernalAddr then
+load.sent = now
+send({type = "LOAD", from = nodeId, to = kernalAddr, load = math.floor(load.fast * 100 + 0.5) / 100,
+load60 = math.floor(load.slow * 100 + 0.5) / 100, free = computer.freeMemory(), total = computer.totalMemory()})
+end
+end
+
 while true do
+local ready = 0
 for _, id in ipairs({table.unpack(procOrder)}) do
 local p = procs[id]
-if p and runnable(p) then stepProc(p) end
+if p and runnable(p) then
+ready = ready + 1
+stepProc(p)
 end
-local timeout = SWEEP_EVERY
+end
+sampleLoad(ready)
+local timeout = LOAD_EVERY
 for _, id in ipairs(procOrder) do
 local p = procs[id]
 if runnable(p) then

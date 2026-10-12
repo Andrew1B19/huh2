@@ -3032,12 +3032,41 @@ end
 local SWEEP_EVERY = 10
 local MAX_SIGNALS_PER_ROUND = 32
 local lastSweep = computer.uptime()
+
+-- The node's load average, Unix style: how many processes are ready to
+-- run (not sleeping or waiting), averaged over about 10 seconds (what
+-- the kernal places work by) and a minute (for people), with free
+-- memory, sent to the kernal every LOAD_EVERY seconds. Costs a few
+-- multiplications a round and one small message.
+local LOAD_EVERY = 2
+local load = {fast = 0, slow = 0, last = computer.uptime(), sent = -math.huge}
+local function sampleLoad(ready)
+  local now = computer.uptime()
+  local dt = now - load.last
+  if dt >= 0.2 then
+    load.last = now
+    local a, b = math.exp(-dt / 10), math.exp(-dt / 60)
+    load.fast = load.fast * a + ready * (1 - a)
+    load.slow = load.slow * b + ready * (1 - b)
+  end
+  if now - load.sent >= LOAD_EVERY and kernalAddr then
+    load.sent = now
+    send({type = "LOAD", from = nodeId, to = kernalAddr, load = math.floor(load.fast * 100 + 0.5) / 100,
+      load60 = math.floor(load.slow * 100 + 0.5) / 100, free = computer.freeMemory(), total = computer.totalMemory()})
+  end
+end
+
 while true do
+  local ready = 0
   for _, id in ipairs({table.unpack(procOrder)}) do
     local p = procs[id]
-    if p and runnable(p) then stepProc(p) end
+    if p and runnable(p) then
+      ready = ready + 1
+      stepProc(p)
+    end
   end
-  local timeout = SWEEP_EVERY
+  sampleLoad(ready)
+  local timeout = LOAD_EVERY
   for _, id in ipairs(procOrder) do
     local p = procs[id]
     if runnable(p) then

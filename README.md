@@ -72,8 +72,8 @@ and what isn't yet.
 kernal/bios.lua       the kernal's own EEPROM image: mirrors the mod's stock bios.lua, loads
                        and runs /muxos.lua directly off the boot filesystem -- muxos REPLACES
                        OpenOS on the kernal, there's no OpenOS /init.lua in this picture.
-kernal/muxos.lua      kernal "init": boot-serving + discovery + round-robin job dispatch +
-                       job registry (jobs) + a minimal built-in REPL/text console, all built
+kernal/muxos.lua      kernal "init": boot-serving + discovery + load-balanced job dispatch +
+                       job registry (jobs) + the kernal's commands and sessions, all built
                        on the sandbox's component/computer APIs, no OpenOS libraries.
 kernal/compositor.lua  the only file that touches the real gpu for window content: window
                        registry, Z-order, occlusion culling, dirty tracking, a persistent
@@ -550,9 +550,10 @@ against the code (not just this document):
 
 - **GERTi** networking for programs (the raw modem API is built: the
   `modem` library and legacy programs' `modem` component).
-- **The scheduler:** places work on the live worker with the fewest
-  running jobs (round-robin among equals); nothing load-aware beyond
-  that.
+- **A rendering library** for `.mxe` programs, on top of render targets
+  (the pipework -- shares, frames, presentation modes -- is built).
+- **The `promote` orphan policy's** requirement that a promoted child
+  can run on its own isn't checked; the kernal takes it on trust.
 - **Deferred or undecided by design:** multi-monitor support, a kernal
   system bus (dbus-like) for `.mxe` programs, and OPM's interface to the
   kernal (OPM will update the kernal and its modules through it).
@@ -666,6 +667,7 @@ its default; a bad value from `flags` is refused.
 | `useradd_requires_root` | true | only root can `useradd` or `userdel` |
 | `kill_requires_owner` | false | only a process's own user (or root) can `pause`, `resume` or `kill` it |
 | `logout_ends_jobs` | true | logging out ends the processes started from that login |
+| `scheduler` | load | where new work goes: `load` (lowest load average) or `count` (fewest processes) -- see "The scheduler" |
 | `remote_terminals` | true | network terminals can log in (takes effect at the next boot) |
 | `terminal_port` | 4478 | the network port terminals use, not 4477 (the cluster's) (next boot) |
 
@@ -706,6 +708,23 @@ holds up another.
 
 Tested in `test/emu/muxterm_test.lua` (real OpenOS running muxterm) and
 `test/emu/vgpu_test.lua`.
+
+### The scheduler
+
+New work goes to the live worker with the lowest **load average**,
+Unix style: each worker counts, every round of its scheduler, how many
+of its processes are ready to run (not sleeping, not waiting on a
+reply), averages that over about 10 seconds (placement) and a minute
+(for people), and reports both with its free memory every 2 seconds.
+Work sent to a worker since its last report counts too, so a burst of
+new processes spreads out instead of piling onto whichever worker
+looked idlest. Ties go to the worker running the fewest processes
+(sleeping ones don't add to a load average), then round-robin. A worker
+with under 64 KB free gets nothing new while another has room.
+`nodes` shows each worker's two averages and free memory. Flag
+`scheduler count` goes back to counting processes alone. It costs a few
+multiplications a round and one small message per worker every 2
+seconds. Tested in test 55.
 
 ### Render targets: drawing one window from several nodes
 

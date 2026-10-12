@@ -515,7 +515,9 @@ print("test 12: parent/child jobs -- orphan/promote/kill policies, applied for r
 -- applyOrphanPolicyForChildrenOf fires for real -- this is the actual
 -- mechanism from docs/PROTOCOL.md's ".mxe process model", not a mock
 -- of it.
-typeLine('run local a=gmuxapi.create_headless_process({code="local t=0 for i=1,2000 do t=t+1 if i%50==0 then yield() end end return t", name="testapp", orphan_policy="orphan"}); local b=gmuxapi.create_headless_process({code="return 123", name="testapp", orphan_policy="promote"}); local c=gmuxapi.create_headless_process({code="for i=1,400 do sleep(0.05) end return 1", name="testapp", orphan_policy="kill"}); return tostring(a.process.id) .. "," .. tostring(b.process.id) .. "," .. tostring(c.process.id)')
+-- (The first two finish at once: the fan-out cap -- as many running as
+-- there are workers, 3 -- leaves room for the third only then.)
+typeLine('run local a=gmuxapi.create_headless_process({code="local t=0 for i=1,2000 do t=t+1 end return t", name="testapp", orphan_policy="orphan"}); local b=gmuxapi.create_headless_process({code="return 123", name="testapp", orphan_policy="promote"}); local c=gmuxapi.create_headless_process({code="for i=1,400 do sleep(0.05) end return 1", name="testapp", orphan_policy="kill"}); return tostring(a.process.id) .. "," .. tostring(b.process.id) .. "," .. tostring(c.process.id)')
 emu:advance(3)
 
 local childIds
@@ -1928,7 +1930,9 @@ do
   run("useradd alice")
   assert(has("added alice (home /home/alice)") and c.files["/etc/users"] == "alice\n", "useradd adds a user")
   run("flags")
-  assert(has("useradd_requires_root  = true") and has("reboot_requires_root   = false"), "flags lists them:\n" .. c.text())
+  assert(has("scheduler              = load") and has("terminal_port          = 4478"), "flags lists them:\n" .. c.text())
+  run("flags reboot_requires_root")
+  assert(has("reboot_requires_root = false -- only root"), "flags <name> shows one:\n" .. c.text())
   run("flags nosuch 1")
   assert(has("flags: no flag called nosuch"), "an unknown flag is refused")
   run("flags login_required maybe")
@@ -2140,5 +2144,36 @@ io.read()
   assert(c.files["/home/sink.txt"] == "ALPHA\nBETA\n", "io.popen(..., \"w\") feeds a program's input: " .. tostring(c.files["/home/sink.txt"]))
 end
 print("  OK -- colors, reverse, cursor moves, erasing, split sequences; popen for reading and writing")
+
+print("test 55: the scheduler places work by load average (flag scheduler), and nodes shows it")
+do
+  local c = newCluster(100, 30, {}, 2)
+  local function run(line, wait) c.typeLine(line) c.emu:advance(wait or 1) end
+  run("spawn 1 local t = computer.uptime() while computer.uptime() - t < 40 do yield() end")
+  local busy = c.text():match("spawned job %[%d+%] on (modem%-%x+)")
+  run("spawn 2 sleep(60)")
+  run("spawn 2 sleep(60)")
+  local sleepy
+  for addr in c.text():gmatch("spawned job %[%d+%] on (modem%-%x+)") do if addr ~= busy then sleepy = addr end end
+  assert(busy and sleepy and busy ~= sleepy, "two workers")
+  c.emu:advance(8)
+  run("nodes")
+  local function loadOf(addr) -- from the last `nodes` listing on screen
+    local last
+    for v in c.text():gmatch(addr:gsub("%-", "%%-") .. "  %(last seen [%d.]+s ago%)  load ([%d.]+)") do last = v end
+    return tonumber(last)
+  end
+  local busyLoad, sleepyLoad = loadOf(busy), loadOf(sleepy)
+  assert(busyLoad and sleepyLoad and busyLoad > 0.3 and sleepyLoad < busyLoad / 3,
+    "nodes shows each one's load: busy " .. tostring(busyLoad) .. ", sleepy " .. tostring(sleepyLoad) .. "\n" .. c.text())
+  run('run return "on=" .. gmuxapi.get_process(jobId).node', 2)
+  assert(c.text():match("on=(modem%-%x+)%s*\n[^\n]*$") == sleepy or c.text():find("on=" .. sleepy, 1, true),
+    "by load: the worker with two sleeping processes, not the busy one:\n" .. c.text())
+  run("clear")
+  run("flags scheduler count")
+  run('run return "on=" .. gmuxapi.get_process(jobId).node', 2)
+  assert(c.text():find("on=" .. busy, 1, true), "by count: the worker with fewer processes:\n" .. c.text())
+end
+print("  OK -- load averages reported and shown; placement by load, or by count")
 
 print("ALL OK")
