@@ -46,6 +46,8 @@ local kernalFiles = {
   ["/shell.lua"] = readFile(REPO_ROOT .. "/kernal/shell.lua"),
   ["/bitmap.lua"] = bitmapSrc,
   ["/lineedit.lua"] = readFile(REPO_ROOT .. "/kernal/lineedit.lua"),
+  ["/system.lua"] = readFile(REPO_ROOT .. "/kernal/system.lua"),
+  ["/etc/kernal.cfg"] = "login_required = false\n",
   ["/runtime.lua"] = runtimeSrc,
   -- Sample programs for the launcher (test 29).
   ["/bin/hello.mxe"] = [==[--[[mxe
@@ -316,7 +318,7 @@ local function typeLine(text)
 end
 
 print("test 1: kernal booted and discovered all 3 workers")
-assertScreenContains("muxos:/home>", "prompt visible")
+assertScreenContains("root@muxos:~>", "prompt visible")
 -- The startup banner itself may have already scrolled off a short
 -- console by now -- that's correct behavior (confirmed: this is a real
 -- fixed-height scrolling console, see kernal/muxos.lua's termWrite),
@@ -861,7 +863,7 @@ for _ = 1, 15 do
   emu:injectSignal(kernal, "key_down", screenAddr, 8, KEY_BACK_CODE, "tester"); emu:step()
 end
 emu:advance(0.2)
-if not screenHas("muxos:/home> " .. ("x"):rep(45) .. "_") or screenHas(("x"):rep(46)) then
+if not screenHas("root@muxos:~> " .. ("x"):rep(45) .. "_") or screenHas(("x"):rep(46)) then
   dumpScreenOnFailure("wrapped backspace")
   error("the wrapped input line did not shrink to 45 characters")
 end
@@ -984,7 +986,7 @@ typeLine("kill " .. kid)
 emu:advance(2)
 typeLine('run local p = gmuxapi.get_process(' .. kid .. ') return "k27=" .. p.status .. "/" .. p.error')
 emu:advance(2)
-assertScreenContains("k27=killed/killed by user", "the user can end a process")
+assertScreenContains("k27=killed/killed by root", "the user can end a process")
 print("  OK -- kill ends a process, recorded as killed by user")
 
 typeLine('run local c = gmuxapi.create_headless_process({code = "sleep(30) return 1"}) local ok, err = gmuxapi.kill_process(c.process.id) local ok2, err2 = gmuxapi.kill_process(' .. pid .. ') return "c27=" .. tostring(ok) .. "/" .. tostring(err2)')
@@ -1017,7 +1019,7 @@ do
   -- so it's marked ended, and the title is cut short of the buttons),
   -- row 2 its body.
   local titleRow, bodyRow = renderScreen():match("^([^\n]*)\n([^\n]*)")
-  if titleRow:sub(1, #"\u{23F9} - kb") ~= "\u{23F9} - kb" or not titleRow:find("\u{2716}", 1, true) or bodyRow:sub(1, 4) ~= "hi28" or screenHas("muxos:/home> hi28") then
+  if titleRow:sub(1, #"\u{23F9} - kb") ~= "\u{23F9} - kb" or not titleRow:find("\u{2716}", 1, true) or bodyRow:sub(1, 4) ~= "hi28" or screenHas("root@muxos:~> hi28") then
     dumpScreenOnFailure("keyboard delivery")
     error("typed keys didn't reach the focused process and its window")
   end
@@ -1247,7 +1249,7 @@ emu:advance(1)
 assertScreenContains(string.format("%-14s %s  on kernal", "internet", internetAddr), "the kernal's internet card is on the bus")
 assertScreenContains(string.format("%-14s %s  on %s", "redstone", redstoneAddr, w1), "worker 1's redstone card is on the bus")
 do
-  local after = screenAfter("muxos:/home> bus")
+  local after = screenAfter("root@muxos:~> bus")
   assert(not after:find("gpu ", 1, true) and not after:find("modem ", 1, true) and not after:find("eeprom ", 1, true),
     "the display, network cards and firmware stay off the bus")
 end
@@ -1387,10 +1389,10 @@ do
   dtouch(80 - 1, 1) -- close the program's window
   local cx, cy = iconOf("console")
   dtouch(cx, cy)
-  assert(text():find("muxos:/home> _", 1, true), "the console icon brings the console back:\n" .. text())
+  assert(text():find("root@muxos:~> _", 1, true), "the console icon brings the console back:\n" .. text())
   -- Its close button minimizes it rather than losing it.
   dtouch(80 - 1, 12)
-  assert(not text():find("muxos:/home> _", 1, true) and text():find("console", 1, true), "closing the console minimizes it:\n" .. text())
+  assert(not text():find("root@muxos:~> _", 1, true) and text():find("console", 1, true), "closing the console minimizes it:\n" .. text())
 end
 print("  OK -- icons for the console and every program; touching one starts it; the console minimizes")
 
@@ -1407,7 +1409,7 @@ do
   sh("cd /home && mkdir -p t41/sub && cd t41")
   sh("pwd > where.txt")
   assert(file("/home/t41/where.txt") == "/home/t41\n", "cd, mkdir -p, && and pwd: " .. tostring(file("/home/t41/where.txt")))
-  assertScreenContains("muxos:/home/t41> ", "the prompt shows the working directory")
+  assertScreenContains("root@muxos:/home/t41> ", "the prompt shows the working directory")
   sh("echo one > a.txt; echo two >> a.txt; echo 'three  spaced' >> a.txt")
   assert(file("/home/t41/a.txt") == "one\ntwo\nthree  spaced\n", "> and >> and quoting: " .. tostring(file("/home/t41/a.txt")))
   sh("cat a.txt | grep t | sort -r | tee sorted.txt | wc -l > count.txt")
@@ -1439,7 +1441,7 @@ do
   assertScreenContains("out.txt     readme.txt", "ls in aligned columns")
   sh("nodes; echo after-nodes")
   assertScreenContains("after-nodes", "a muxos command inside a shell line")
-  sh("cd ~ && rm -r t41")
+  sh("cd /home && rm -r t41 && cd ~")
   assert(not file("/home/t41/where.txt"), "rm -r cleaned up")
 end
 print("  OK -- the core utilities, pipes, redirection, variables, globs, &&/||, /mnt, and muxos commands mixed in")
@@ -1542,7 +1544,7 @@ do
   -- Minimize the console from its taskbar button (it's focused and on
   -- top), uncovering the icons; then bring it back the same way.
   c.touch(bx + 2, 25)
-  assert(not c.text():find("muxos:/home> _", 1, true), "the console's button minimized it:\n" .. c.text())
+  assert(not c.text():find("root@muxos:~> _", 1, true), "the console's button minimized it:\n" .. c.text())
   local fx, fy = c.find("( o.o )")
   assert(fx, "an .mxe header's icon is drawn:\n" .. c.text())
   assert(c.cell(fx, fy).fg == 0xFFFF44, "...in its icon_color")
@@ -1551,7 +1553,7 @@ do
   local dx, dy = c.find("/-------\\")
   assert(dx and c.cell(dx, dy).fg == 0xFF8844, "programs without one get gmux's icon, in gmux's colors")
   c.touch(bx + 2, 25)
-  assert(c.text():find("muxos:/home> _", 1, true), "...and the button restored it:\n" .. c.text())
+  assert(c.text():find("root@muxos:~> _", 1, true), "...and the button restored it:\n" .. c.text())
   -- The start menu lists the apps; touching one starts it.
   c.touch(3, 25)
   local mx, my = c.find("sidecar")
@@ -1799,17 +1801,17 @@ do
     ["/home/bad.ppm"] = "P6 4 4 255\nxx",
   }, 1)
   local function bg(x, y) local cell = c.cell(x, y) return cell and cell.bg end
-  c.typeLine("wallpaper two.ppm")
+  c.typeLine("wallpaper /home/two.ppm")
   c.emu:advance(1)
   assert(bg(10, 1) == 0xFF0000 and bg(70, 1) == 0x0000FF,
     string.format("a P6 image stretched over the screen (got %06x, %06x)", bg(10, 1) or 0, bg(70, 1) or 0))
   assert(c.files["/etc/wallpaper"] == "/home/two.ppm\n", "remembered in /etc/wallpaper")
   local ix, iy = c.find("/-------\\")
   assert(ix and bg(ix, iy) == 0x444444, "icons sit on tiles of the desktop's color")
-  c.typeLine("wallpaper green.ppm")
+  c.typeLine("wallpaper /home/green.ppm")
   c.emu:advance(1)
   assert(bg(10, 1) == 0x00FF00 and bg(70, 1) == 0x00FF00, "a P3 image")
-  c.typeLine("wallpaper bad.ppm")
+  c.typeLine("wallpaper /home/bad.ppm")
   c.emu:advance(1)
   assert(c.text():find("wallpaper: /home/bad.ppm: the image is cut short", 1, true), "a bad image is refused:\n" .. c.text())
   assert(bg(10, 1) == 0x00FF00, "...and the wallpaper stays")
@@ -1831,10 +1833,10 @@ do
   local function prompt() -- the last prompt on screen: the live line
     for y = 25, 1, -1 do
       local row = c.cells(1, y, 80)
-      local at = row:find("muxos:/home> ", 1, true)
+      local at = row:find("root@muxos:~> ", 1, true)
       if at then
         local x = utf8.len(row:sub(1, at - 1)) + 1
-        return (c.cells(x + 13, y, 40):gsub("%s+$", "")), x, y
+        return (c.cells(x + 14, y, 40):gsub("%s+$", "")), x, y
       end
     end
     error("no prompt:\n" .. c.text())
@@ -1857,7 +1859,7 @@ do
   c.key(("X"):byte())
   local text, x, y = prompt()
   assert(text == "Xdraft", "Home, then typing inserts at the start (got " .. text .. ")")
-  local under = c.cell(x + 14, y)
+  local under = c.cell(x + 15, y)
   assert(under.char == "d" and under.bg == 0xFFFFFF and under.fg == 0x000000, "the cursor is the inverted 'd'")
   c.key(0, RIGHT) c.key(0, RIGHT)
   c.key(0, DEL)
@@ -1893,14 +1895,90 @@ do
   -- It draws over the whole screen, then ends without releasing.
   c.typeLine('spawn 1 gmuxapi.request_fullscreen() gpu.fill(1, 1, 80, 25, " ") gpu.set(1, 1, "GRABBED") sleep(2)')
   c.emu:advance(1)
-  assert(c.text():find("GRABBED", 1, true) and not c.text():find("muxos:/home>", 1, true),
+  assert(c.text():find("GRABBED", 1, true) and not c.text():find("root@muxos:~>", 1, true),
     "while it holds the grant, the screen is its:\n" .. c.text())
   c.emu:advance(3)
-  assert(c.text():find("muxos:/home>", 1, true), "it ended without releasing: the desktop and console are back:\n" .. c.text())
+  assert(c.text():find("root@muxos:~>", 1, true), "it ended without releasing: the desktop and console are back:\n" .. c.text())
   c.typeLine('run local g, e = gmuxapi.request_fullscreen() local r = gmuxapi.release_fullscreen() return tostring(g ~= nil) .. "/" .. tostring(r ~= nil)')
   c.emu:advance(2)
   assert(c.text():find("true/true", 1, true), "and the grant is free for the next program:\n" .. c.text())
 end
 print("  OK -- a program that ends holding fullscreen gives the screen back")
+
+print("test 52: users and login, root-only actions, and kernal flags")
+do
+  local c = newCluster(80, 25, {
+    ["/etc/kernal.cfg"] = "# test flags\nlogin_required = true\nbogus = 1\nreboot_requires_root = maybe\n",
+    ["/bin/whereami.lua"] = 'print("env " .. os.getenv("USER") .. " " .. os.getenv("HOME") .. " " .. os.getenv("PWD"))',
+  }, 1)
+  local function has(str) return c.text():find(str, 1, true) end
+  local function run(line, wait) c.typeLine(line) c.emu:advance(wait or 0.5) end
+  assert(has("login: _"), "login_required: the console asks who you are:\n" .. c.text())
+  assert(has("no flag called bogus") and has("reboot_requires_root is true or false"),
+    "bad lines in /etc/kernal.cfg are reported:\n" .. c.text())
+  run("alice")
+  assert(has("no such user: alice") and has("login: _"), "an unknown name doesn't log in, or create a user")
+  run("root")
+  assert(has("root@muxos:~> _"), "root logs in, at home:\n" .. c.text())
+  run("useradd Bad!")
+  assert(has("useradd: a user name is lowercase"), "a bad user name is refused")
+  run("useradd alice")
+  assert(has("added alice (home /home/alice)") and c.files["/etc/users"] == "alice\n", "useradd adds a user")
+  run("flags")
+  assert(has("update_requires_root   = true") and has("reboot_requires_root   = false"), "flags lists them:\n" .. c.text())
+  run("flags nosuch 1")
+  assert(has("flags: no flag called nosuch"), "an unknown flag is refused")
+  run("flags login_required maybe")
+  assert(has("flags: login_required is true or false"), "a bad value is refused")
+  run("flags reboot_requires_root true")
+  assert(has("reboot_requires_root = true"), "root sets a flag")
+  assert(c.files["/etc/kernal.cfg"]:find("reboot_requires_root = true\n", 1, true)
+    and c.files["/etc/kernal.cfg"]:find("# test flags", 1, true), "...saved, keeping the file's other lines")
+  run("spawn 1 sleep(60)")
+  local rootJob = c.text():match("spawned job %[(%d+)%]")
+  run("logout")
+  assert(has("login: _") and not has("useradd"), "logout: back to login, the console cleared:\n" .. c.text())
+  run("alice")
+  assert(has("alice@muxos:~> _"), "alice logs in:\n" .. c.text())
+  run("pwd; whoami")
+  assert(has("/home/alice") and has("\nalice"), "her home and name:\n" .. c.text())
+  run("whereami", 2)
+  assert(has("env alice /home/alice /home/alice"), "legacy programs see USER, HOME and PWD:\n" .. c.text())
+  local bx = c.cells(1, 25, 80):find(" console ", 1, true)
+  c.touch(bx + 2, 25) -- the console's taskbar button: it's back on top
+  run("update")
+  assert(has("update: only root can do that (flag update_requires_root)"), "update is root's:\n" .. c.text())
+  run("reboot")
+  assert(has("reboot: only root can do that") and c.emu.nodes, "reboot too, now that the flag says so")
+  run("flags reboot_requires_root false")
+  assert(has("flags: only root can change flags"), "flags are root's")
+  run("spawn 1 sleep(60)")
+  local aliceJob = c.text():match("spawned job %[(%d+)%]")
+  run("processes")
+  assert(has("[" .. rootJob .. "] killed on") and has("as root -- killed (logged out)")
+    and has("[" .. aliceJob .. "] running on") and has("as alice"),
+    "processes shows whose each one is; root's logout ended root's:\n" .. c.text())
+  run("logout", 1)
+  run("root")
+  run("processes")
+  assert(has("[" .. aliceJob .. "] killed") and has("killed (logged out)"), "logging out ended alice's process:\n" .. c.text())
+  run("userdel alice")
+  assert(has("removed alice (their home /home/alice is kept)") and c.files["/etc/users"] == "", "userdel removes her")
+  run("logout")
+  run("alice")
+  assert(has("no such user: alice"), "and she can't log in any more")
+  -- The other two flags: processes outlive a logout; only their owner kills them.
+  run("root")
+  run("flags logout_ends_jobs false; flags kill_requires_owner true; useradd bob")
+  run("spawn 1 sleep(60)")
+  local kept = c.text():match("spawned job %[(%d+)%]")
+  run("logout", 1)
+  run("bob")
+  run("kill " .. kept)
+  assert(has("error: job [" .. kept .. "] is root's (flag kill_requires_owner)"), "bob can't kill root's:\n" .. c.text())
+  run("processes")
+  assert(has("[" .. kept .. "] running on"), "root's process outlived the logout:\n" .. c.text())
+end
+print("  OK -- login by name only, useradd/userdel, root-only update/reboot/flags, logout ends that login's processes")
 
 print("ALL OK")

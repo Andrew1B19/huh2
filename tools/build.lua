@@ -50,6 +50,7 @@ local FILES = {
   {"/shell.lua", "kernal/shell.lua"},
   {"/bitmap.lua", "kernal/bitmap.lua"},
   {"/lineedit.lua", "kernal/lineedit.lua"},
+  {"/system.lua", "kernal/system.lua"},
   {"/runtime.lua", "node/runtime.lua"},
 }
 for _, rel in ipairs(listDir("kernal/lib")) do

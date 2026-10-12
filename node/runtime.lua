@@ -2331,7 +2331,8 @@ local function newLegacyEnv(id, program)
   local ctx = {id = id, env = env, loaded = loaded, pushed = {}, listeners = {}, path = path,
     name = path and path:match("([^/]+)$") or "legacy", screenSize = program and program.screen,
     fsAddress = program and program.fsAddress,
-    osEnv = {PWD = "/", HOME = "/home", PATH = "/bin:/usr/bin:/home/bin:.", TERM = "term", SHELL = "/bin/sh"}}
+    osEnv = {PWD = program and program.cwd or "/", HOME = program and program.home or "/home",
+      USER = program and program.user or "root", PATH = "/bin:/usr/bin:/home/bin:.", TERM = "term", SHELL = "/bin/sh"}}
   function ctx.fsCall(op, ...)
     local result, err = remoteRequest("FS", {op = op, args = table.pack(...), caller = id})
     if not result then return nil, err end

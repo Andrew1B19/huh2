@@ -246,6 +246,22 @@ local fullscreen = {node = nil, job = nil}
 -- load bitmap.lua the same way this file loaded it.
 local compositor = loadSibling("compositor.lua")(loadSibling)
 
+-- Kernal flags (/etc/kernal.cfg) and users (/etc/users): kernal/system.lua.
+local system = loadSibling("system.lua")({
+  read = readFile,
+  write = function(path, data)
+    local h, err = tryInvoke(fsAddr, "open", path, "w")
+    if not h then return nil, err end
+    local ok, werr = tryInvoke(fsAddr, "write", h, data)
+    tryInvoke(fsAddr, "close", h)
+    return ok, werr
+  end,
+  mkdir = function(path) tryInvoke(fsAddr, "makeDirectory", path) end,
+})
+-- Who's logged in at the console: `user` (nil at the login: prompt) and
+-- `login`, counting logins, which marks the processes each one started.
+system.console = {user = nil, login = 0}
+
 -- The kernal's own gpu/screen, cached once -- used for
 -- isDisplayComponent (below) and to size the console window.
 local gpu, gpuAddr = primaryComponent("gpu")
@@ -277,14 +293,15 @@ if gpu then
   termW, termH = gpu.getResolution()
 end
 
-local CONSOLE_LAYER = -1000
+local CONSOLE_LAYER = 0
 local CONSOLE_MIN_W, CONSOLE_MIN_H = 10, 3
 -- Scrollback, in lines of output (oldest dropped first).
 local SCROLLBACK_LINES = 500
 local consoleLines = {}      -- committed logical lines, oldest first
 local consoleDirty = true
 local scrollOffset = 0       -- wrapped rows scrolled back from the bottom
-local editor = loadSibling("lineedit.lua")().new() -- the REPL's line being typed (kernal/lineedit.lua)
+system.lineedit = loadSibling("lineedit.lua")()
+local editor = system.lineedit.new() -- the REPL's line being typed (kernal/lineedit.lua); one per login
 local consolePartial = ""    -- program output not yet ended by a newline
 local commandBusy = false    -- a command is running; see handleKeyDown
 
@@ -333,6 +350,20 @@ local function wrapLine(line, width)
   return rows
 end
 
+-- The console's prompt: `login: ` while nobody is logged in, otherwise
+-- user@muxos:<working directory, ~ for home>.
+function system.prompt()
+  local user = system.console.user
+  if not user then return "login: " end
+  local cwd, home = shell and shell.cwd() or "/", system.home(user)
+  if cwd == home then
+    cwd = "~"
+  elseif cwd:sub(1, #home + 1) == home .. "/" then
+    cwd = "~" .. cwd:sub(#home + 1)
+  end
+  return user .. "@muxos:" .. cwd .. "> "
+end
+
 -- The line being typed, and where its cursor is: a character index into
 -- it, for a cursor within the line (drawn inverted), or nil when the
 -- cursor is at the end (drawn as a trailing "_").
@@ -344,7 +375,7 @@ local function liveLine()
     if consolePartial ~= "" then return consolePartial .. "_" end
     return nil
   end
-  local prompt = "muxos:" .. (shell and shell.cwd() or "/") .. "> "
+  local prompt = system.prompt()
   local text = editor:text()
   if editor:cursor() < (utf8.len(text) or #text) then
     return prompt .. text, (utf8.len(prompt) or #prompt) + editor:cursor() + 1
@@ -735,8 +766,15 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
   -- now," not a global count, so one tree hitting its cap doesn't
   -- block unrelated top-level work.
   local rootId = parent and jobs[parent] and jobs[parent].rootId or id
+  -- Whose it is: the parent's user and login, or the console's.
+  local owner = parent and jobs[parent] or system.console
+  local user = owner.user or "root"
+  if program then
+    program.user, program.home = user, system.home(user)
+    program.cwd = program.cwd or (not parent and shell and shell.cwd()) or program.home
+  end
   jobs[id] = {id = id, node = targetAddr, status = "running", code = code, codePreview = codePreview(code),
-    startedAt = computer.uptime(),
+    startedAt = computer.uptime(), user = user, login = owner.login,
     parent = parent, appName = appName, orphanPolicy = parent and (orphanPolicy or "orphan") or nil,
     rootId = rootId, path = program and program.path, kind = program and program.kind,
     program = program, args = args}
@@ -1217,7 +1255,7 @@ local function finishJob(id, status, result, err)
   net.release(id)
   if fullscreen.job == id then
     fullscreen.node, fullscreen.job = nil, nil
-    compositor.setExclusive(nil)
+    compositor.setExclusive(not system.console.user and "console" or nil)
     consoleDirty = true
   end
   runningJobs[id] = nil
@@ -1242,7 +1280,7 @@ local function finishJob(id, status, result, err)
   -- failed (error, lost).
   local windowStatus = (status == "done" or status == "killed") and "dead" or "error"
   for _, winId in ipairs(compositor.windowsOwnedBy(id)) do
-    compositor.setStatus(winId, windowStatus)
+    if job.loggedOut then compositor.close(winId) else compositor.setStatus(winId, windowStatus) end
   end
   -- This job is no longer running -- apply whatever orphan policy ITS
   -- OWN children declared at spawn time.
@@ -1255,9 +1293,7 @@ end
 -- quiet. Only nodes with running jobs are watched -- an idle node that
 -- died is found out the first time a job is sent its way and goes
 -- unacknowledged.
-local PROBE_AFTER = 3
-local DOWN_AFTER = 10
-local lastLivenessCheck = -math.huge
+local LIVENESS = {PROBE_AFTER = 3, DOWN_AFTER = 10, lastCheck = -math.huge}
 
 local function markNodeDown(addr)
   nodes[addr].down = true
@@ -1265,7 +1301,7 @@ local function markNodeDown(addr)
   if fullscreen.node == addr then
     fullscreen.node = nil
     fullscreen.job = nil
-    compositor.setExclusive(nil)
+    compositor.setExclusive(not system.console.user and "console" or nil)
     consoleDirty = true
   end
   local lost = {}
@@ -1280,17 +1316,17 @@ end
 
 local function checkLiveness()
   local now = computer.uptime()
-  if now - lastLivenessCheck < 1 then return end
-  lastLivenessCheck = now
+  if now - LIVENESS.lastCheck < 1 then return end
+  LIVENESS.lastCheck = now
   local watched = {}
   for id in pairs(runningJobs) do watched[jobs[id].node] = true end
   for addr in pairs(watched) do
     local node = nodes[addr]
     if node and not node.down then
       local silent = now - math.max(node.lastSeen or 0, node.lastDispatch or 0)
-      if silent > DOWN_AFTER then
+      if silent > LIVENESS.DOWN_AFTER then
         markNodeDown(addr)
-      elseif silent > PROBE_AFTER and (not node.probedAt or now - node.probedAt > PROBE_AFTER) then
+      elseif silent > LIVENESS.PROBE_AFTER and (not node.probedAt or now - node.probedAt > LIVENESS.PROBE_AFTER) then
         node.probedAt = now
         send({type = "PING", from = selfAddr, to = addr})
       end
@@ -1665,7 +1701,7 @@ local function handleReleaseFullscreen(msg)
   end
   fullscreen.node = nil
   fullscreen.job = nil
-  compositor.setExclusive(nil)
+  compositor.setExclusive(not system.console.user and "console" or nil)
   consoleDirty = true
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {released = true}})
 end
@@ -1965,7 +2001,7 @@ end
 -- GETPROCESS message) returns one job in full.
 local SUMMARY_FIELDS = {"id", "node", "status", "startedAt", "finishedAt", "parent", "appName",
   "orphanPolicy", "rootId", "codePreview", "error", "paused", "kind", "path", "migratable", "migrations",
-  "programName", "programVersion"}
+  "programName", "programVersion", "user"}
 
 local function handleGetProcesses(msg)
   local list = {}
@@ -2153,7 +2189,8 @@ local function exitFullscreen()
     fullscreen.node = nil
     fullscreen.job = nil
   end
-  compositor.setExclusive(nil)
+  -- Logged out, the screen is the login prompt's alone.
+  compositor.setExclusive(not system.console.user and "console" or nil)
   consoleDirty = true
 end
 
@@ -2250,7 +2287,7 @@ local function handleKeyDown(char, code)
   end
   local line = editor:key(char, code)
   if type(line) == "string" then
-    consoleAppend("muxos:" .. (shell and shell.cwd() or "/") .. "> " .. line)
+    consoleAppend(system.prompt() .. line)
     scrollOffset = 0
     commandBusy = true
     consoleDirty = true
@@ -3095,8 +3132,8 @@ local function printProcesses()
       parentInfo = string.format(" (parent=%s app=%s policy=%s)",
         job.parent and tostring(job.parent) or "none", tostring(job.appName), tostring(job.orphanPolicy))
     end
-    print(string.format("[%d] %s on %s%s%s", job.id, job.paused and "paused" or job.status, job.node,
-      job.error and (" -- " .. job.error) or "", parentInfo))
+    print(string.format("[%d] %s on %s as %s%s%s", job.id, job.paused and "paused" or job.status, job.node,
+      job.user or "root", job.error and (" -- " .. job.error) or "", parentInfo))
   end
 end
 
@@ -3279,14 +3316,15 @@ end
 do
 local KERNAL_COMMANDS = {}
 for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
-    .. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper"):gmatch("%S+") do
+    .. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
+    .. "shutdown logout flags users useradd userdel"):gmatch("%S+") do
   KERNAL_COMMANDS[name] = true
 end
 -- A disk without shell.lua (upgraded by hand) still boots; `update`
 -- from the installer floppy brings it.
 local shellOk, shellFactory = pcall(loadSibling, "shell.lua")
 if not shellOk then print("no shell (" .. tostring(shellFactory) .. ") -- run `update` with the installer floppy in") end
-shell = shellOk and shellFactory({
+local shellCtx = {
   invoke = tryInvoke, root = fsAddr, tmp = computer.tmpAddress(), list = component.list,
   write = consoleWrite,
   width = function() return (viewSize()) end,
@@ -3298,6 +3336,7 @@ shell = shellOk and shellFactory({
     local deadline = computer.uptime() + seconds
     while computer.uptime() < deadline do tick(deadline - computer.uptime()) end
   end,
+  help = function() system.help() end,
   info = {version = MUXOS_VERSION, address = selfAddr or computer.address(), uptime = computer.uptime,
     memory = function() return computer.freeMemory(), computer.totalMemory() end},
   -- Not built in: a muxos command, or a program OpenOS-shell style (a
@@ -3324,16 +3363,153 @@ shell = shellOk and shellFactory({
     runForeground(id)
     return jobs[id] and jobs[id].status == "done" and 0 or 1
   end,
-}) or nil
+}
+system.shellOk = shellOk
+-- A fresh shell per login: its own variables and working directory.
+function system.newShell(user)
+  if not shellOk then return nil end
+  shellCtx.user, shellCtx.home = user, system.home(user)
+  return shellFactory(shellCtx)
+end
+end
+
+-- --- Logging in and out ---
+
+-- Says why the console's user may not do something a flag reserves for
+-- root, and returns true; nothing (nil) if they may.
+function system.deny(flagName, doing)
+  local ok, why = system.allowed(system.console.user, flagName, doing)
+  if not ok then print(why) return true end
+end
+
+-- The login screen: the console alone, asking for a user name.
+function system.showLogin()
+  if fullscreen.node then fullscreen.node, fullscreen.job = nil, nil end
+  compositor.setExclusive("console")
+  if consoleWin then compositor.setFocus(consoleWin.id) end
+  print("muxos " .. MUXOS_VERSION .. " -- " .. selfAddr)
+  print("Log in with your user name (no password).")
+  scrollOffset, consoleDirty = 0, true
+end
+
+function system.startSession(name)
+  local c = system.console
+  c.user, c.login = name, c.login + 1
+  tryInvoke(fsAddr, "makeDirectory", system.home(name))
+  shell = system.newShell(name)
+  editor = system.lineedit.new()
+  if compositor.exclusiveOwner() == "console" then compositor.setExclusive(nil) end
+  desktop.refresh()
+  desktop.showConsole()
+  print("logged in as " .. name .. " (home " .. system.home(name) .. ") -- type 'help' for commands")
+  consoleDirty = true
+end
+
+-- At the login: prompt, a typed line is a user name.
+function system.login(line)
+  local name = (line or ""):match("^%s*(.-)%s*$")
+  if name == "" then return end
+  if not system.userExists(name) then
+    print("no such user: " .. name)
+    return
+  end
+  system.startSession(name)
+end
+
+function system.logout()
+  local c = system.console
+  local ending = system.flag("logout_ends_jobs")
+  for id in pairs(runningJobs) do
+    local job = jobs[id]
+    if job.login == c.login and ending then
+      job.loggedOut = true -- its windows close when it ends (finishJob)
+      controlJob(id, "KILL", "killed (logged out)")
+    end
+  end
+  -- Windows no running process owns go: what's left of this login.
+  for _, w in ipairs(compositor.listWindows()) do
+    local system_ = w.id == (consoleWin and consoleWin.id) or w.id == (desktop.win and desktop.win.id)
+      or w.id == (desktop.bar.win and desktop.bar.win.id)
+    local job = w.ownerJobId and jobs[w.ownerJobId]
+    if not system_ and not (job and job.status == "running" and not job.loggedOut) then compositor.close(w.id) end
+  end
+  if desktop.menu then desktop.toggleMenu() end
+  c.user = nil
+  editor = system.lineedit.new()
+  for i = #consoleLines, 1, -1 do consoleLines[i] = nil end
+  system.showLogin()
+end
+
+-- `flags`: lists them; `flags <name>` shows one; `flags <name> <value>`
+-- sets one (root only).
+function system.flagsCommand(args)
+  local name, value = args:match("^%s*(%S*)%s*(.-)%s*$")
+  if name == "" then
+    for _, f in ipairs(system.FLAGS) do
+      local v = system.flag(f.name)
+      print(string.format("%-22s = %-5s %s%s", f.name, tostring(v),
+        v == f.default and "" or "(default " .. tostring(f.default) .. ") ", "-- " .. f.help))
+    end
+    print("flags <name> <value> sets one (root only); kept in /etc/kernal.cfg")
+    return
+  end
+  if value == "" then
+    local known = false
+    for _, f in ipairs(system.FLAGS) do
+      if f.name == name then
+        known = true
+        print(f.name .. " = " .. tostring(system.flag(f.name)) .. " -- " .. f.help)
+      end
+    end
+    if not known then print("flags: no flag called " .. name) end
+    return
+  end
+  if system.console.user ~= "root" then print("flags: only root can change flags; log in as root") return end
+  local flag, err = system.setFlag(name, value)
+  if not flag then print("flags: " .. err) return end
+  print(name .. " = " .. tostring(system.flag(name)) .. (flag.reboot and "  (takes effect at the next boot)" or ""))
 end
 
 runCommand = function(line)
-  if not line or line == "quit" or line == "exit" then
-    shutdown(false)
-  elseif line == "reboot" then
-    shutdown(true)
+  if not system.console.user then return system.login(line) end
+  local word = line and line:match("^%s*(%S+)")
+  -- A line with more than one command in it is the shell's, which hands
+  -- each muxos command back here on its own.
+  if line and line:find("[;|&<>]") and (word == "flags" or word == "useradd" or word == "userdel") then word = nil end
+  if not line or line == "exit" or line == "logout" then
+    system.logout()
+  elseif line == "quit" or line == "shutdown" or line == "reboot" then
+    if not system.deny("reboot_requires_root", line) then shutdown(line == "reboot") end
   elseif line == "update" then
-    updates.run()
+    if not system.deny("update_requires_root", "update") then updates.run() end
+  elseif word == "flags" then
+    system.flagsCommand(line:sub(6))
+  elseif line == "users" then
+    for _, name in ipairs(system.users()) do
+      print(name .. (name == system.console.user and "  (logged in)" or "") .. "  " .. system.home(name))
+    end
+  elseif word == "useradd" or word == "userdel" then
+    local name = line:match("^%S+%s+(%S+)%s*$")
+    if not name then
+      print("usage: " .. word .. " <name>")
+    elseif not system.deny("useradd_requires_root", word) then
+      local ok, err
+      if word == "useradd" then
+        ok, err = system.addUser(name)
+      elseif name == system.console.user then
+        err = "you can't remove the user you're logged in as"
+      else
+        ok, err = system.removeUser(name)
+      end
+      if ok then
+        print(word == "useradd" and ("added " .. name .. " (home " .. system.home(name) .. ")")
+          or ("removed " .. name .. " (their home " .. system.home(name) .. " is kept)"))
+      else
+        print(word .. ": " .. err)
+      end
+    end
+  elseif (word == "drain" or word == "undrain" or word == "migrate") and system.deny("drain_requires_root", word) then
+    return
   elseif line == "wallpaper" or line:match("^wallpaper%s") then
     desktop.setWallpaper(line:match("^wallpaper%s+(.-)%s*$"))
   elseif line == "discover" then
@@ -3406,7 +3582,13 @@ runCommand = function(line)
     if not verb then
       print("usage: pause|resume|kill <job id>")
     else
-      local ok, err = controlJob(tonumber(idStr), verb:upper(), "killed by user")
+      local job, user = jobs[tonumber(idStr)], system.console.user
+      local ok, err
+      if job and job.user ~= user and user ~= "root" and system.flag("kill_requires_owner") then
+        err = "job [" .. idStr .. "] is " .. tostring(job.user) .. "'s (flag kill_requires_owner)"
+      else
+        ok, err = controlJob(tonumber(idStr), verb:upper(), "killed by " .. user)
+      end
       if ok then print(verb .. " sent to job [" .. idStr .. "]") else print("error: " .. err) end
     end
   elseif line:match("^migrate%s") then
@@ -3507,24 +3689,31 @@ runCommand = function(line)
 end
 
 print("muxos kernal -- " .. selfAddr)
-print("commands:")
-print("  discover | nodes | ping <node> [count] | quit | reboot")
-print("  update -- install a new muxos from the installer floppy's muxos-installer.dat")
-print("  wallpaper <file.ppm> | wallpaper none -- the desktop's background image")
-print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job id>")
-print("  migrate <job id> [node] | drain|undrain <node>")
-print("  spawn <node> <lua code>")
-print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
-print("  console <width> <height> [x y] -- resize/move the console window")
-print("  comp -- back to the desktop from console mode (hold Ctrl+Alt+C to enter it; a press exits fullscreen); PgUp/PgDn or the wheel scroll")
-print("  focus <window id> -- moves keyboard focus (manual stand-in -- no mouse/click gesture exists yet)")
-print("  bitdemo <halfblock|braille> <x> <y> -- draws a test pattern as a bit window")
-print("  bus (every component in the cluster) | components <node> | call <node> <component addr> <method> [args table]")
-print("(<node> is either a [n] index from 'nodes' or a full node address)")
-if shell then print("shell: ls cd cat cp mv rm mkdir grep ... with | > >> < ; && || -- type 'help'") end
+-- The muxos commands (`help` lists them too, after the shell's).
+function system.help()
+  print("muxos commands:")
+  print("  discover | nodes | ping <node> [count] | logout | shutdown | reboot")
+  print("  users | useradd <name> | userdel <name> | flags [<name> [<value>]] -- users and kernal flags")
+  print("  update -- install a new muxos from the installer floppy's muxos-installer.dat")
+  print("  wallpaper <file.ppm> | wallpaper none -- the desktop's background image")
+  print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job id>")
+  print("  migrate <job id> [node] | drain|undrain <node>")
+  print("  spawn <node> <lua code>")
+  print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
+  print("  console <width> <height> [x y] -- resize/move the console window")
+  print("  comp -- back to the desktop from console mode (hold Ctrl+Alt+C to enter it; a press exits fullscreen); PgUp/PgDn or the wheel scroll")
+  print("  focus <window id> -- gives a window the keyboard (touching it does too)")
+  print("  bitdemo <halfblock|braille> <x> <y> -- draws a test pattern as a bit window")
+  print("  bus (every component in the cluster) | components <node> | call <node> <component addr> <method> [args table]")
+  print("(<node> is either a [n] index from 'nodes' or a full node address)")
+end
+system.help()
+if system.shellOk then print("shell: ls cd cat cp mv rm mkdir grep ... with | > >> < ; && || -- type 'help'") end
+for _, problem in ipairs(system.loadFlags()) do print("flags: " .. problem) end
 desktop.refresh()
 discover(1)
 listNodes()
+if system.flag("login_required") then system.showLogin() else system.startSession("root") end
 
 while true do
   tick(0.05) -- ~1 tick between idle maintenance passes (sweepStaleChunks/compositor.flush)
