@@ -1,15 +1,16 @@
 --[[MUXOS-PAYLOAD 0.1.2
-@@MANIFEST 29
+@@MANIFEST 30
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-105924 /muxos.lua
+106298 /muxos.lua
 39456 /compositor.lua
 42271 /shell.lua
 6492 /bitmap.lua
 4518 /lineedit.lua
-7100 /system.lua
+7510 /system.lua
 52063 /session.lua
 7590 /vgpu.lua
+5262 /terminals.lua
 104783 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 2088 /lib/bit32.lua
@@ -223,7 +224,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 105924 /muxos.lua
+@@ 106298 /muxos.lua
 -- muxos kernal "init" for huh2. This REPLACES OpenOS on the kernal --
 -- it is the entire resident environment, not a program that runs under
 -- one. kernal/bios.lua (this node's own tiny EEPROM image, mirroring
@@ -1183,6 +1184,7 @@ function net.handle(job, msg)
   if op ~= "send" or port ~= nil then
     if math.type(port) ~= "integer" or port < 1 or port > 65535 then return nil, "bad port: " .. tostring(port) end
     if port == PORT then return nil, "port " .. PORT .. " is the cluster's own" end
+    if K.terminals and port == K.terminals.PORT then return nil, "port " .. port .. " is muxos's terminal port" end
   end
   if op == "open" then
     local owners = net.ports[port] or {}
@@ -2781,6 +2783,7 @@ end
 
 -- A session ends (a terminal hung up): as if it logged out, then gone.
 function K.endSession(S)
+  if not K.byId[S.id] then return end
   if S.user then K.inSession(S, S.logout) end
   for i, other in ipairs(K.sessions) do
     if other == S then table.remove(K.sessions, i) break end
@@ -2809,8 +2812,11 @@ function K.help()
 end
 
 
--- The kernal's own screen is the local session's.
+-- The kernal's own screen is the local session's; network terminals get
+-- sessions of their own (kernal/terminals.lua).
 if gpu and screenAddr then K.console = K.newSession({gpu = gpu, kind = "local"}) end
+K.terminals = loadSibling("terminals.lua")(K, {modem = modem, serialize = serialize, deserialize = deserialize,
+  vgpu = loadSibling("vgpu.lua")()})
 print("muxos kernal -- " .. selfAddr)
 K.help()
 if K.shellFactory then
@@ -5324,7 +5330,7 @@ return {
   KEY = KEY,
 }
 
-@@ 7100 /system.lua
+@@ 7510 /system.lua
 -- muxos system settings: kernal flags (/etc/kernal.cfg) and users
 -- (/etc/users). Loaded by the kernal with its disk helpers:
 --   loadSibling("system.lua")({read = readFile, write = writeFile, mkdir = makeDirectory})
@@ -5362,6 +5368,10 @@ local FLAGS = {
     help = "only a process's own user (or root) can pause, resume or kill it"},
   {name = "logout_ends_jobs", type = "boolean", default = true,
     help = "logging out ends the processes started from that login"},
+  {name = "remote_terminals", type = "boolean", default = true, reboot = true,
+    help = "network terminals (muxterm) can log in"},
+  {name = "terminal_port", type = "number", default = 4478, min = 1, max = 65535, reboot = true,
+    not_ = 4477, help = "the network port terminals use (not 4477, the cluster's)"},
 }
 local byName = {}
 for _, f in ipairs(FLAGS) do byName[f.name] = f end
@@ -5377,10 +5387,10 @@ local function parse(flag, text)
     if text == "false" or text == "no" or text == "off" then return false end
     return nil, flag.name .. " is true or false, not \"" .. text .. "\""
   elseif flag.type == "number" then
-    local n = tonumber(text)
-    if not n or (flag.min and n < flag.min) or (flag.max and n > flag.max) then
-      return nil, flag.name .. " is a number" .. (flag.min and (" from " .. flag.min .. " to " .. flag.max) or "")
-        .. ", not \"" .. text .. "\""
+    local n = math.tointeger(tonumber(text))
+    if not n or (flag.min and n < flag.min) or (flag.max and n > flag.max) or n == flag.not_ then
+      return nil, flag.name .. " is a whole number" .. (flag.min and (" from " .. flag.min .. " to " .. flag.max) or "")
+        .. (flag.not_ and (" other than " .. flag.not_) or "") .. ", not \"" .. text .. "\""
     end
     return n
   elseif flag.choices then
@@ -7105,6 +7115,150 @@ function M.new(width, height, depth)
 end
 
 return M
+
+@@ 5262 /terminals.lua
+-- muxos terminal server: network terminals (muxterm, an OpenOS program)
+-- log in to muxos over the network, each in a session of its own -- the
+-- same kind of session as the kernal's own screen, drawn with a
+-- kernal/vgpu.lua GPU instead of the real one.
+--
+-- Loaded by kernal/muxos.lua:
+--   loadSibling("terminals.lua")(K, {modem, serialize, deserialize, vgpu})
+--
+-- The protocol: raw modem messages on the terminal port (flag
+-- terminal_port, 4478 by default; not the cluster's 4477), each one
+-- serialized table with a type `t`:
+--   terminal -> kernal
+--     {t = "hello", w, h, depth}   start a session (broadcast, or sent to
+--                                  a kernal's address); again restarts it
+--     {t = "in", e = {name, ...}}  input: an OpenComputers signal name and
+--                                  its arguments after the address
+--                                  (key_down/key_up char code, touch/drag/
+--                                  drop x y button, scroll x y direction,
+--                                  clipboard text)
+--     {t = "ping"}                 I'm still here (every 2 s)
+--     {t = "bye"}                  hanging up
+--   kernal -> terminal
+--     {t = "welcome", kernal, session, w, h}
+--     {t = "draw", r = {{x, y, text, fg, bg}, ...}}  screen changes
+--     {t = "ping"}                 when there's been nothing else for 2 s
+--     {t = "bye", why}             the session is over
+-- A terminal that says nothing for 10 s is hung up on: its session ends
+-- as a logout does.
+local K, deps = ...
+local system, modem, serialize, deserialize, vgpu = K.system, deps.modem, deps.serialize, deps.deserialize, deps.vgpu
+
+local T = {byAddress = {}}
+local PORT = system.flag("terminal_port")
+local QUIET, SILENT = 2, 10
+local INPUT = {key_down = true, key_up = true, scroll = true, clipboard = true, touch = true, drag = true, drop = true}
+local MAX_MESSAGE = math.min(6000, ((modem.maxPacketSize and modem.maxPacketSize()) or 8192) - 512)
+
+T.PORT = PORT
+if system.flag("remote_terminals") then modem.open(PORT) end
+
+local function send(address, msg)
+  modem.send(address, PORT, serialize(msg))
+end
+
+-- A terminal's screen changes, after its session drew: as few messages
+-- as fit them.
+local function flushed(S)
+  local term = S.terminal
+  if not term then return end
+  local now = computer.uptime()
+  local runs = term.gpu.takeDamage(term.full)
+  term.full = false
+  local batch, size = {}, 0
+  local function ship()
+    if #batch == 0 then return end
+    send(term.address, {t = "draw", r = batch})
+    batch, size, term.lastSent = {}, 0, now
+  end
+  for _, run in ipairs(runs) do
+    local cost = #run[3] + 40
+    if size + cost > MAX_MESSAGE then ship() end
+    batch[#batch + 1] = run
+    size = size + cost
+  end
+  ship()
+  if now - term.lastSent > QUIET then
+    send(term.address, {t = "ping"})
+    term.lastSent = now
+  end
+end
+
+local function hangUp(term, why)
+  T.byAddress[term.address] = nil
+  K.endSession(term.session)
+  send(term.address, {t = "bye", why = why})
+end
+
+local function clamp(n, lo, hi, default)
+  n = math.tointeger(tonumber(n))
+  if not n then return default end
+  return math.max(lo, math.min(hi, n))
+end
+
+local function hello(address, msg)
+  if not system.flag("remote_terminals") then
+    send(address, {t = "bye", why = "this muxos doesn't take terminals (flag remote_terminals)"})
+    return
+  end
+  local old = T.byAddress[address]
+  if old then hangUp(old, "restarted") end
+  local w, h = clamp(msg.w, 20, 160, 80), clamp(msg.h, 8, 50, 25)
+  local depth = ({[1] = 1, [4] = 4, [8] = 8})[tonumber(msg.depth)] or 8
+  local gpu = vgpu.new(w, h, depth)
+  local S = K.newSession({gpu = gpu, kind = "terminal", address = address, flushed = flushed})
+  local now = computer.uptime()
+  local term = {address = address, session = S, gpu = gpu, lastSeen = now, lastSent = now, full = true}
+  S.terminal = term
+  T.byAddress[address] = term
+  send(address, {t = "welcome", kernal = K.selfAddr, session = S.id, w = w, h = h})
+  K.inSession(S, S.showLogin)
+end
+
+-- A message on the terminal port.
+function T.message(from, port, data)
+  if port ~= PORT or type(data) ~= "string" then return end
+  local msg = deserialize(data)
+  if type(msg) ~= "table" then return end
+  local term = T.byAddress[from]
+  if msg.t == "hello" then
+    hello(from, msg)
+  elseif not term then
+    if msg.t ~= "bye" then send(from, {t = "bye", why = "no session here -- start one with hello"}) end
+  elseif msg.t == "bye" then
+    T.byAddress[from] = nil
+    K.endSession(term.session)
+  else
+    term.lastSeen = computer.uptime()
+    local e = msg.e
+    if msg.t == "in" and type(e) == "table" and INPUT[e[1]] then
+      for i = 2, 4 do
+        if e[i] ~= nil and type(e[i]) ~= "number" and type(e[i]) ~= "string" then return end
+      end
+      K.inSession(term.session, term.session.input, e[1], e[2], e[3], e[4])
+    end
+  end
+end
+
+-- Hangs up on terminals that have gone quiet.
+function T.sweep()
+  local now = computer.uptime()
+  for _, term in pairs(T.byAddress) do
+    if now - term.lastSeen > SILENT then hangUp(term, "the terminal stopped answering") end
+  end
+end
+
+function T.list()
+  local list = {}
+  for _, term in pairs(T.byAddress) do list[#list + 1] = term end
+  return list
+end
+
+return T
 
 @@ 104783 /runtime.lua
 -- Worker runtime for huh2. NOT flashed anywhere -- this lives on the

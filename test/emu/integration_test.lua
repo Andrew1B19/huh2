@@ -49,6 +49,7 @@ local kernalFiles = {
   ["/system.lua"] = readFile(REPO_ROOT .. "/kernal/system.lua"),
   ["/session.lua"] = readFile(REPO_ROOT .. "/kernal/session.lua"),
   ["/vgpu.lua"] = readFile(REPO_ROOT .. "/kernal/vgpu.lua"),
+  ["/terminals.lua"] = readFile(REPO_ROOT .. "/kernal/terminals.lua"),
   ["/etc/kernal.cfg"] = "login_required = false\n",
   ["/runtime.lua"] = runtimeSrc,
   -- Sample programs for the launcher (test 29).
@@ -1927,7 +1928,7 @@ do
   run("useradd alice")
   assert(has("added alice (home /home/alice)") and c.files["/etc/users"] == "alice\n", "useradd adds a user")
   run("flags")
-  assert(has("update_requires_root   = true") and has("reboot_requires_root   = false"), "flags lists them:\n" .. c.text())
+  assert(has("useradd_requires_root  = true") and has("reboot_requires_root   = false"), "flags lists them:\n" .. c.text())
   run("flags nosuch 1")
   assert(has("flags: no flag called nosuch"), "an unknown flag is refused")
   run("flags login_required maybe")

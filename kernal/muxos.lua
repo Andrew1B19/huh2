@@ -957,6 +957,7 @@ function net.handle(job, msg)
   if op ~= "send" or port ~= nil then
     if math.type(port) ~= "integer" or port < 1 or port > 65535 then return nil, "bad port: " .. tostring(port) end
     if port == PORT then return nil, "port " .. PORT .. " is the cluster's own" end
+    if K.terminals and port == K.terminals.PORT then return nil, "port " .. port .. " is muxos's terminal port" end
   end
   if op == "open" then
     local owners = net.ports[port] or {}
@@ -2555,6 +2556,7 @@ end
 
 -- A session ends (a terminal hung up): as if it logged out, then gone.
 function K.endSession(S)
+  if not K.byId[S.id] then return end
   if S.user then K.inSession(S, S.logout) end
   for i, other in ipairs(K.sessions) do
     if other == S then table.remove(K.sessions, i) break end
@@ -2583,8 +2585,11 @@ function K.help()
 end
 
 
--- The kernal's own screen is the local session's.
+-- The kernal's own screen is the local session's; network terminals get
+-- sessions of their own (kernal/terminals.lua).
 if gpu and screenAddr then K.console = K.newSession({gpu = gpu, kind = "local"}) end
+K.terminals = loadSibling("terminals.lua")(K, {modem = modem, serialize = serialize, deserialize = deserialize,
+  vgpu = loadSibling("vgpu.lua")()})
 print("muxos kernal -- " .. selfAddr)
 K.help()
 if K.shellFactory then

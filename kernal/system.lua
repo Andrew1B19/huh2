@@ -35,6 +35,10 @@ local FLAGS = {
     help = "only a process's own user (or root) can pause, resume or kill it"},
   {name = "logout_ends_jobs", type = "boolean", default = true,
     help = "logging out ends the processes started from that login"},
+  {name = "remote_terminals", type = "boolean", default = true, reboot = true,
+    help = "network terminals (muxterm) can log in"},
+  {name = "terminal_port", type = "number", default = 4478, min = 1, max = 65535, reboot = true,
+    not_ = 4477, help = "the network port terminals use (not 4477, the cluster's)"},
 }
 local byName = {}
 for _, f in ipairs(FLAGS) do byName[f.name] = f end
@@ -50,10 +54,10 @@ local function parse(flag, text)
     if text == "false" or text == "no" or text == "off" then return false end
     return nil, flag.name .. " is true or false, not \"" .. text .. "\""
   elseif flag.type == "number" then
-    local n = tonumber(text)
-    if not n or (flag.min and n < flag.min) or (flag.max and n > flag.max) then
-      return nil, flag.name .. " is a number" .. (flag.min and (" from " .. flag.min .. " to " .. flag.max) or "")
-        .. ", not \"" .. text .. "\""
+    local n = math.tointeger(tonumber(text))
+    if not n or (flag.min and n < flag.min) or (flag.max and n > flag.max) or n == flag.not_ then
+      return nil, flag.name .. " is a whole number" .. (flag.min and (" from " .. flag.min .. " to " .. flag.max) or "")
+        .. (flag.not_ and (" other than " .. flag.not_) or "") .. ", not \"" .. text .. "\""
     end
     return n
   elseif flag.choices then

@@ -323,6 +323,9 @@ do
   local demoPlan = core.file_plan(cfg, core.order(cfg, "muxos-demo"), core.resolve_target(nil), concat)
   assert(#demoPlan == 1 and demoPlan[1].file == "/usr/bin/demo.mxe" and demoPlan[1].path == "muxos/apps/demo.mxe",
     "the demo is its own package, installed on muxos's PATH")
+  local termPlan = core.file_plan(cfg, core.order(cfg, "muxterm"), core.resolve_target(nil), concat)
+  assert(#termPlan == 1 and termPlan[1].file == "/usr/bin/muxterm.lua" and termPlan[1].path == "muxos/apps/muxterm.lua",
+    "muxterm is a package for OpenOS, on its PATH")
   local selfPlan = core.file_plan(cfg, core.order(cfg, "opm-mxe"), "/", concat)
   local dests = {}
   for _, p in ipairs(selfPlan) do dests[p.file] = p.path end

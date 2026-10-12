@@ -160,12 +160,15 @@ Every `.mxe` sees these globals, read-only. Its own globals are its own.
   - **windows:** `create_window{title, x, y, width, height, code |
     pixels, mode, bg, args, resizable, title_bar}`,
     `draw_window(id, {code, args, pixels, clear, bg})`,
-    `get_windows()`;
+    `get_windows()` (the windows of the program's session -- the screen
+    it was started from: the kernal's own, or a network terminal's);
   - **input:** `pull_event(timeout)` returns `{name, ...}`:
     `{"key_down", char, code}`, `{"key_up", ...}`,
     `{"touch"|"drag"|"drop", x, y, button}`, `{"scroll", x, y, dir}`,
-    `{"window_resized", id, w, h}`;
-  - **display:** `request_fullscreen()`, `release_fullscreen()`.
+    `{"window_resized", id, w, h}`, `{"clipboard", text}`;
+  - **display:** `request_fullscreen()`, `release_fullscreen()` (the
+    kernal's own screen only; a program in a terminal's session is
+    refused).
 - `component`: every component in the cluster over the bus, with
   OpenOS's API (`list`, `proxy`, `invoke`, `type`, `methods`,
   `isAvailable`, `getPrimary`, `component.<type>`). Primary prefers the
