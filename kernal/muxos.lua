@@ -282,7 +282,7 @@ local SCROLLBACK_LINES = 500
 local consoleLines = {}      -- committed logical lines, oldest first
 local consoleDirty = true
 local scrollOffset = 0       -- wrapped rows scrolled back from the bottom
-local inputBuffer = ""       -- the REPL's line being typed
+local editor = loadSibling("lineedit.lua")().new() -- the REPL's line being typed (kernal/lineedit.lua)
 local consolePartial = ""    -- program output not yet ended by a newline
 local commandBusy = false    -- a command is running; see handleKeyDown
 
@@ -331,6 +331,9 @@ local function wrapLine(line, width)
   return rows
 end
 
+-- The line being typed, and where its cursor is: a character index into
+-- it, for a cursor within the line (drawn inverted), or nil when the
+-- cursor is at the end (drawn as a trailing "_").
 local function liveLine()
   if commandBusy then
     -- A foreground program is running: show its unfinished output line
@@ -339,7 +342,12 @@ local function liveLine()
     if consolePartial ~= "" then return consolePartial .. "_" end
     return nil
   end
-  return "muxos:" .. (shell and shell.cwd() or "/") .. "> " .. inputBuffer .. "_"
+  local prompt = "muxos:" .. (shell and shell.cwd() or "/") .. "> "
+  local text = editor:text()
+  if editor:cursor() < (utf8.len(text) or #text) then
+    return prompt .. text, (utf8.len(prompt) or #prompt) + editor:cursor() + 1
+  end
+  return prompt .. text .. "_"
 end
 
 local function totalRows(width)
@@ -356,8 +364,10 @@ local function setScroll(rows)
   consoleDirty = true
 end
 
--- The h rows currently in view, top to bottom. Content shorter than the
--- view starts at the top, like a fresh terminal.
+-- The h rows currently in view, top to bottom, and the cursor's row and
+-- column within them when it's inside the line being typed (see
+-- liveLine). Content shorter than the view starts at the top, like a
+-- fresh terminal.
 local function visibleRows(w, h)
   local needed = h + scrollOffset
   local rows = {}            -- collected bottom-up
@@ -369,20 +379,28 @@ local function visibleRows(w, h)
       if #rows >= needed then return true end
     end
   end
-  local live = liveLine()
+  local live, cursorAt = liveLine()
+  local cursorUp, cursorCol -- rows up from the bottom (1 = the last one), column
+  if live and cursorAt then
+    local wrapped = #wrapLine(live, w)
+    cursorUp, cursorCol = wrapped - (cursorAt - 1) // w, (cursorAt - 1) % w + 1
+  end
   if live and addLine(live) then exhausted = false end
   if exhausted then
     for i = #consoleLines, 1, -1 do
       if addLine(consoleLines[i]) then exhausted = false break end
     end
   end
-  local out = {}
+  local out, cursorRow = {}, nil
   if exhausted and #rows < h then
     for i = 1, #rows do out[i] = rows[#rows - i + 1] end
+    cursorRow = cursorUp and #rows - cursorUp + 1
   else
     for r = 1, h do out[h - r + 1] = rows[scrollOffset + r] end
+    cursorRow = cursorUp and h - (cursorUp - scrollOffset) + 1
   end
-  return out
+  if cursorRow and (cursorRow < 1 or cursorRow > h) then cursorRow = nil end
+  return out, cursorRow, cursorCol
 end
 
 local function renderConsole()
@@ -392,7 +410,7 @@ local function renderConsole()
   if owner and owner ~= "console" then return end
   consoleDirty = false
   local w, h = viewSize()
-  local rows = visibleRows(w, h)
+  local rows, cursorRow, cursorCol = visibleRows(w, h)
   if scrollOffset > 0 then
     local tag = "[scrolled " .. scrollOffset .. " -- PgDn]"
     local first = rows[1] or ""
@@ -405,13 +423,33 @@ local function renderConsole()
     end
     rows[1] = first .. tag
   end
+  -- A cursor inside the line: that character, inverted.
+  local cursorCell
+  if cursorRow and rows[cursorRow] then
+    local row = rows[cursorRow]
+    local from = utf8.offset(row, cursorCol) or (#row + 1)
+    local to = utf8.offset(row, cursorCol + 1) or (#row + 1)
+    local under = row:sub(from, to - 1)
+    cursorCell = under ~= "" and under or " "
+    rows[cursorRow] = {{row:sub(1, from - 1)}, {cursorCell, 0x000000, 0xFFFFFF}, {row:sub(to)}}
+  end
   if owner == "console" then
     compositor.drawDirect(function(g)
       g.setForeground(0xFFFFFF)
       g.setBackground(0x000000)
       g.fill(1, 1, w, h, " ")
       for y = 1, h do
-        if rows[y] and rows[y] ~= "" then g.set(1, y, rows[y]) end
+        local row = rows[y]
+        if type(row) == "table" then
+          g.set(1, y, row[1][1] .. cursorCell .. row[3][1])
+          g.setForeground(0x000000)
+          g.setBackground(0xFFFFFF)
+          g.set(1 + (cursorCol - 1), y, cursorCell)
+          g.setForeground(0xFFFFFF)
+          g.setBackground(0x000000)
+        elseif row and row ~= "" then
+          g.set(1, y, row)
+        end
       end
     end)
   else
@@ -2198,9 +2236,8 @@ local function handleKeyDown(char, code)
     queuedKeys[#queuedKeys + 1] = {char, code}
     return
   end
-  if code == KEYS.ENTER then
-    local line = inputBuffer
-    inputBuffer = ""
+  local line = editor:key(char, code)
+  if type(line) == "string" then
     consoleAppend("muxos:" .. (shell and shell.cwd() or "/") .. "> " .. line)
     scrollOffset = 0
     commandBusy = true
@@ -2213,24 +2250,32 @@ local function handleKeyDown(char, code)
       local key = table.remove(queuedKeys, 1)
       handleKeyDown(key[1], key[2])
     end
-  elseif code == KEYS.BACK then
-    local len = utf8.len(inputBuffer)
-    if len and len > 0 then
-      inputBuffer = inputBuffer:sub(1, utf8.offset(inputBuffer, -1) - 1)
-    elseif #inputBuffer > 0 then
-      inputBuffer = inputBuffer:sub(1, -2)
-    end
+  elseif line then
+    scrollOffset = 0
     consoleDirty = true
-  elseif char and char >= 32 then
-    local ok, ch = pcall(utf8.char, char)
-    if ok then
-      inputBuffer = inputBuffer .. ch
-      scrollOffset = 0
-      consoleDirty = true
-    end
   end
-  -- No arrow-key history, no cursor movement within the line, no paste
-  -- handling -- a flat append/backspace-only line editor.
+end
+
+-- A paste (OpenComputers' "clipboard" signal): the focused program gets
+-- it as the signal; the console takes it as typing, each newline an
+-- Enter -- so a pasted script runs line by line, like in a terminal.
+function UI.paste(text) -- in UI: the main chunk is at its 200-local limit
+  local target = focusedProcess()
+  if target then
+    deliverEvent(target, {"clipboard", text})
+    return
+  end
+  text = text:gsub("\r\n?", "\n")
+  local held = {heldKeys[0], heldKeys[KEYS.ENTER]}
+  local function feed(c)
+    if c == 10 then handleKeyDown(13, KEYS.ENTER) elseif c >= 32 then handleKeyDown(c, 0) end
+  end
+  if utf8.len(text) then
+    for _, c in utf8.codes(text) do feed(c) end
+  else
+    for i = 1, #text do feed(text:byte(i)) end
+  end
+  heldKeys[0], heldKeys[KEYS.ENTER] = held[1], held[2]
 end
 
 local function handleKeyUp(char, code)
@@ -2795,6 +2840,8 @@ local function tick(timeout)
       handleKeyUp(a3, a4)
     elseif name == "scroll" then
       handleScroll(a3, a4, a5)
+    elseif name == "clipboard" and type(a3) == "string" then
+      UI.paste(a3)
     elseif name == "touch" or name == "drag" or name == "drop" then
       handleTouch(name, a3, a4, a5)
     elseif name == "component_added" or name == "component_removed" then

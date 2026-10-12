@@ -45,6 +45,7 @@ local kernalFiles = {
   ["/compositor.lua"] = compositorSrc,
   ["/shell.lua"] = readFile(REPO_ROOT .. "/kernal/shell.lua"),
   ["/bitmap.lua"] = bitmapSrc,
+  ["/lineedit.lua"] = readFile(REPO_ROOT .. "/kernal/lineedit.lua"),
   ["/runtime.lua"] = runtimeSrc,
   -- Sample programs for the launcher (test 29).
   ["/bin/hello.mxe"] = [==[--[[mxe
@@ -1812,5 +1813,68 @@ do
   assert(bg(10, 1) == 0x444444 and not c.files["/etc/wallpaper"], "wallpaper none: the plain desktop again")
 end
 print("  OK -- P6 and P3 wallpapers, stretched behind the icons, remembered across reboots, cleared")
+
+print("test 50: the console's line editor -- history, cursor movement, editing keys, paste")
+do
+  local c = newCluster(80, 25, {}, 1)
+  local LEFT, RIGHT, UP, DOWN, HOME, END_, DEL = 0xCB, 0xCD, 0xC8, 0xD0, 0xC7, 0xCF, 0xD3
+  local function prompt() -- the last prompt on screen: the live line
+    for y = 25, 1, -1 do
+      local row = c.cells(1, y, 80)
+      local at = row:find("muxos:/home> ", 1, true)
+      if at then
+        local x = utf8.len(row:sub(1, at - 1)) + 1
+        return (c.cells(x + 13, y, 40):gsub("%s+$", "")), x, y
+      end
+    end
+    error("no prompt:\n" .. c.text())
+  end
+  c.typeLine("echo one")
+  c.typeLine("echo two")
+  -- Up recalls the newest first; Down goes back toward the line being typed.
+  for _, ch in ipairs({"d", "r", "a", "f", "t"}) do c.key(ch:byte()) end
+  c.key(0, UP)
+  assert(prompt() == "echo two_", "Up: the last command (got " .. prompt() .. ")")
+  c.key(0, UP)
+  assert(prompt() == "echo one_", "Up again: the one before")
+  c.key(0, UP)
+  assert(prompt() == "echo one_", "...and no further")
+  c.key(0, DOWN)
+  c.key(0, DOWN)
+  assert(prompt() == "draft_", "Down past the newest: the line being typed comes back (got " .. prompt() .. ")")
+  -- Cursor movement: the cursor's character is drawn inverted.
+  c.key(0, HOME)
+  c.key(("X"):byte())
+  local text, x, y = prompt()
+  assert(text == "Xdraft", "Home, then typing inserts at the start (got " .. text .. ")")
+  local under = c.cell(x + 14, y)
+  assert(under.char == "d" and under.bg == 0xFFFFFF and under.fg == 0x000000, "the cursor is the inverted 'd'")
+  c.key(0, RIGHT) c.key(0, RIGHT)
+  c.key(0, DEL)
+  assert(prompt() == "Xdrft", "Delete removes the character under the cursor (got " .. prompt() .. ")")
+  c.key(0, LEFT)
+  c.key(8, 0x0E)
+  assert(prompt() == "Xrft", "Backspace removes the one before it (got " .. prompt() .. ")")
+  c.key(11) -- ^K
+  assert(prompt() == "X_", "^K cuts to the end (got " .. prompt() .. ")")
+  c.key(0, END_)
+  c.key(21) -- ^U
+  assert(prompt() == "_", "^U cuts to the start")
+  for ch in ("echo alpha beta"):gmatch(".") do c.key(ch:byte()) end
+  c.key(23) -- ^W
+  assert(prompt() == "echo alpha _", "^W cuts the last word (got " .. prompt() .. ")")
+  c.key(21)
+  -- Paste: each newline is an Enter, so a pasted script runs line by line.
+  c.emu:injectSignal(c.kernal, "clipboard", "kbd", "echo pasted1\necho pasted2\necho half", "tester")
+  c.emu:advance(1)
+  local screen = c.text()
+  assert(screen:find("\npasted1", 1, true) and screen:find("\npasted2", 1, true), "both pasted lines ran:\n" .. screen)
+  assert(prompt() == "echo half_", "the unfinished last line waits at the prompt (got " .. prompt() .. ")")
+  c.key(13, 0x1C)
+  c.emu:advance(0.5)
+  c.key(0, UP)
+  assert(prompt() == "echo half_", "pasted lines go into the history too")
+end
+print("  OK -- history, Home/End/arrows, Delete/Backspace, ^U ^K ^W, an inverted cursor, multi-line paste")
 
 print("ALL OK")
