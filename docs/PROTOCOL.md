@@ -1345,7 +1345,21 @@ The difference is what each sees:
   is read-only, and it has no `debug` and no raw `component` (test 27).
 
 The legacy environment is built too (gmux-style virtual components,
-OpenOS libraries, the OS filesystem; tests 33-35).
+OpenOS libraries, the OS filesystem; tests 33-35). A legacy program's
+terminal understands OpenOS's VT100 escape sequences (colors, reverse,
+cursor movement, erasing, save/restore, wrap on/off; test 54).
+
+**Pipes (`io.popen`, `pipe.popen`) -- BUILT.** OpenOS runs a popen'd
+program as a coroutine of its caller; muxos runs it as a process of its
+own, launched with a pipe (`LAUNCH`'s `pipe` = `"r"`/`"w"`): for `"r"`,
+its output reaches the opener as `{"pipe_data", child, text}` events
+instead of a window; for `"w"`, `PIPEWRITE {child, text, close}` from the
+opener becomes the child's input (`{"pipe_data", "stdin", text}`,
+`{"pipe_closed", "stdin"}`), and its own output goes onto the opener's
+terminal (`{"pipe_output", child, text}`), as in OpenOS. When the child
+ends, the opener hears `{"pipe_closed", child, status, error}`; `close()`
+waits for that. OpenOS's `pipe.buildPipeChain` (its shell's in-process
+pipelines) has no equivalent and says so (test 54).
 
 A kernal system bus (a dbus-like named-service/signal bus) is a
 possible later addition for `.mxe` programs to talk to kernal services

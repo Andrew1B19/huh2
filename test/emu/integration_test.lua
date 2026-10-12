@@ -184,8 +184,8 @@ print("missing=" .. tostring(ok) .. " " .. (tostring(err):match("module 'nosuchm
 }
 -- The vendored OpenOS libraries, installed as /lib on the kernal's disk.
 for _, rel in ipairs({"serialization", "text", "sides", "colors", "keyboard", "transforms", "internet",
-    "buffer", "uuid", "bit32", "note",
-    "core/full_keyboard", "core/full_text", "core/full_transforms", "core/full_buffer"}) do
+    "buffer", "uuid", "bit32", "note", "vt100",
+    "core/full_keyboard", "core/full_text", "core/full_transforms", "core/full_buffer", "core/full_vt"}) do
   kernalFiles["/lib/" .. rel .. ".lua"] = readFile(REPO_ROOT .. "/kernal/lib/" .. rel .. ".lua")
 end
 emu:addFilesystem(kernal, kernalFiles)
@@ -2071,5 +2071,74 @@ print("results " .. tostring(gmuxapi.get_process(a.process.id).result))
     .. tostring(color(c.cell(49, 13))) .. ")")
 end
 print("  OK -- shares, split frames (complete and at the deadline), alternate order, tearing, refusals")
+
+print("test 54: legacy programs -- ANSI escape sequences in their terminal; io.popen and pipe.popen")
+do
+  local libs = {}
+  for _, rel in ipairs({"text", "vt100", "core/full_text", "core/full_vt", "transforms", "core/full_transforms"}) do
+    libs["/lib/" .. rel .. ".lua"] = readFile(REPO_ROOT .. "/kernal/lib/" .. rel .. ".lua")
+  end
+  libs["/bin/ansi.lua"] = [==[
+io.write("\27[31mred\27[0m plain\n")
+io.write("\27[2;5Hpos")
+io.write("\27[1")
+io.write("0;1Hsplit")
+io.write("\27[4;1H\27[7mrev\27[27m back")
+io.write("\27[6;1Hxxxxxxxxxx\27[6;3H\27[K")
+print("\27[8;1Hvt100=" .. type(require("vt100").parse))
+io.read()
+]==]
+  libs["/bin/count.lua"] = 'local n = tonumber((...)) or 3 for i = 1, n do print("line " .. i) end'
+  libs["/bin/sink.lua"] = 'local f = io.open("/home/sink.txt", "w") for l in io.lines() do f:write(l:upper() .. "\\n") end f:close()'
+  libs["/bin/popen.lua"] = [==[
+local h = io.popen("count 3")
+local lines = {}
+for l in h:lines() do lines[#lines + 1] = l end
+local ok, how, code = h:close()
+local w = io.popen("sink", "w")
+w:write("alpha\n")
+w:write("beta\n")
+local wok = w:close()
+local pipe = require("pipe")
+local h2 = pipe.popen("count 2")
+local all = h2:read("a")
+h2:close()
+local _, chain = pcall(pipe.buildPipeChain, {})
+print("popen " .. table.concat(lines, ",") .. " " .. tostring(ok) .. " " .. tostring(how) .. " " .. tostring(code)
+  .. " w=" .. tostring(wok) .. " pipe=" .. all:gsub("\n", "/") .. " chain=" .. tostring(chain):match("muxos runs every program") )
+io.read()
+]==]
+  local c = newCluster(80, 25, libs, 3)
+  c.typeLine("ansi")
+  for _ = 1, 20 do
+    if c.text():find("vt100=function", 1, true) then break end
+    c.emu:advance(0.5)
+  end
+  local ax, ay = c.find("red plain")
+  assert(ax, "the escapes aren't printed:\n" .. c.text())
+  assert(c.cell(ax, ay).fg == 0xFF0000 and c.cell(ax + 4, ay).fg == 0xFFFFFF, "31m is red, 0m resets")
+  local px, py = c.find("pos")
+  assert(py == ay + 1 and px == ax + 4, "ESC[2;5H moves to row 2, column 5")
+  local sx, sy = c.find("split")
+  assert(sy == ay + 9 and sx == ax, "a sequence split across writes still works")
+  local rx, ry = c.find("rev back")
+  assert(c.cell(rx, ry).bg == 0xFFFFFF and c.cell(rx, ry).fg == 0x000000 and c.cell(rx + 4, ry).bg == 0x000000,
+    "7m reverses, 27m undoes it")
+  assert(c.find("xx ") or c.cells(ax, ay + 5, 10) == "xx        ", "ESC[K clears to the end of the line: " .. c.cells(ax, ay + 5, 10))
+  assert(c.text():find("vt100=function", 1, true), "OpenOS's vt100 library loads")
+  c.key(13, 0x1C)
+  c.emu:advance(1)
+  local bx = c.cells(1, 25, 80):find(" console ", 1, true)
+  c.touch(bx + 2, 25)
+  c.typeLine("popen")
+  for _ = 1, 40 do
+    if c.text():find("popen line", 1, true) then break end
+    c.emu:advance(0.5)
+  end
+  assert(c.text():gsub("\n", ""):find("popen line 1,line 2,line 3 true exit 0 w=true pipe=line 1/line 2/ chain=muxos runs every program", 1, true),
+    "io.popen reads a program's output; pipe.popen too; buildPipeChain says why not:\n" .. c.text())
+  assert(c.files["/home/sink.txt"] == "ALPHA\nBETA\n", "io.popen(..., \"w\") feeds a program's input: " .. tostring(c.files["/home/sink.txt"]))
+end
+print("  OK -- colors, reverse, cursor moves, erasing, split sequences; popen for reading and writing")
 
 print("ALL OK")

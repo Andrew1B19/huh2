@@ -550,9 +550,6 @@ against the code (not just this document):
 
 - **GERTi** networking for programs (the raw modem API is built: the
   `modem` library and legacy programs' `modem` component).
-- **OpenOS's `vt100`** escape-sequence library and `pipe` for legacy
-  programs (`shell`, `process`, `thread`, `tty`, `buffer`, `uuid` and
-  `note` are built).
 - **The scheduler:** places work on the live worker with the fewest
   running jobs (round-robin among equals); nothing load-aware beyond
   that.

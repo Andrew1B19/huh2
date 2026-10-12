@@ -1304,17 +1304,46 @@ end
 -- The next signal for a legacy process (its own pushed ones first), or
 -- nil after `timeout`. Keeps OpenOS's keyboard library's pressed-key
 -- tables current and runs event.listen handlers, as OpenOS does.
+-- A pipe's event (see legacyPopen): its data goes into the pipe's
+-- buffer, never to the program as a signal. True if `e` was one.
+local function pipeEvent(ctx, e)
+  if e[1] == "pipe_output" then
+    -- A program this one opened for writing printed: onto our terminal.
+    if ctx.term then ctx.term.write(tostring(e[3])) end
+    return true
+  end
+  if e[1] ~= "pipe_data" and e[1] ~= "pipe_closed" then return false end
+  local p = e[2] == "stdin" and ctx.pipeIn or ctx.pipes[e[2]]
+  if p then
+    if e[1] == "pipe_data" then
+      p.buffer = p.buffer .. tostring(e[3])
+    else
+      p.closed, p.status, p.error = true, e[3], e[4]
+    end
+  end
+  return true
+end
+
+-- Waits (up to `timeout`) for a pipe's next event; anything else that
+-- arrives meanwhile is kept for the program, in order.
+local function pipeWait(ctx, timeout)
+  local e = gmuxapi.pull_event(timeout)
+  if e and not pipeEvent(ctx, e) then ctx.deferred[#ctx.deferred + 1] = e end
+end
+
 local function legacyPull(ctx, timeout)
   local sig = table.remove(ctx.pushed, 1)
-  if not sig then
-    local e = gmuxapi.pull_event(timeout)
+  local deadline = timeout and computer.uptime() + timeout
+  while not sig do
+    local e = table.remove(ctx.deferred, 1)
+      or gmuxapi.pull_event(deadline and math.max(0, deadline - computer.uptime()) or nil)
     if not e then return nil end
-    sig = toSignal(e)
-    -- A user resize of its window is a resolution change, as in gmux.
-    if sig[1] == "window_resized" and ctx.vgpu and sig[2] == ctx.windowId then
-      ctx.vgpu.resize(sig[3], sig[4])
-      sig = table.pack("screen_resized", VSCREEN_ADDRESS, sig[3], sig[4])
-    end
+    if not pipeEvent(ctx, e) then sig = toSignal(e) end
+  end
+  -- A user resize of its window is a resolution change, as in gmux.
+  if sig[1] == "window_resized" and ctx.vgpu and sig[2] == ctx.windowId then
+    ctx.vgpu.resize(sig[3], sig[4])
+    sig = table.pack("screen_resized", VSCREEN_ADDRESS, sig[3], sig[4])
   end
   local kb = ctx.loaded.keyboard
   if type(kb) == "table" and type(kb.pressedCodes) == "table" then
@@ -1749,15 +1778,19 @@ local function newTerminal(ctx)
       g.fill(1, h, w, 1, " ")
     end
   end
-  function t.write(value)
+  -- Plain text (no escape sequences): wraps, scrolls, \n \r \t.
+  local function plain(text)
     local g = gpu()
     local w, h = g.getResolution()
     t.y = math.min(t.y, h)
-    for piece, ctl in tostring(value):gmatch("([^\n\r\t]*)([\n\r\t]?)") do
+    for piece, ctl in text:gmatch("([^\n\r\t]*)([\n\r\t]?)") do
       local chars = splitChars(piece)
       local i = 1
       while i <= #chars do
-        if t.x > w then newline() end
+        if t.x > w then
+          if t.nowrap then break end -- ESC[?7l: past the edge is cut off
+          newline()
+        end
         local n = math.min(#chars - i + 1, w - t.x + 1)
         g.set(t.x, t.y, table.concat(chars, "", i, i + n - 1))
         t.x, i = t.x + n, i + n
@@ -1767,7 +1800,119 @@ local function newTerminal(ctx)
       elseif ctl == "\r" then
         t.x = 1
       elseif ctl == "\t" then
-        t.write(string.rep(" ", 8 - (t.x - 1) % 8))
+        plain(string.rep(" ", 8 - (t.x - 1) % 8))
+      end
+    end
+  end
+
+  -- VT100/ANSI escape sequences, as OpenOS's tty (lib/vt100.lua and
+  -- core/full_vt.lua) understands them: SGR colors (30-37, 40-47, 90-97,
+  -- 100-107, 39, 49, 0) and reverse (7, 27); cursor movement (A B C D, H
+  -- and f to a row;column); erasing (J: 0 below, 1 above, 2 all; K: 0
+  -- right, 1 left, 2 the line); saving and restoring the cursor (ESC 7/8,
+  -- ESC[s/u); and wrapping on/off (ESC[?7h/l). Anything else is dropped.
+  local COLORS = {[0] = 0x000000, 0xFF0000, 0x00FF00, 0xFFFF00, 0x0000FF, 0xFF00FF, 0x00B6FF, 0xFFFFFF}
+  local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
+  local function sgr(params)
+    local g = gpu()
+    if params == "" then params = "0" end
+    for n in (params .. ";"):gmatch("(%d*);") do
+      n = tonumber(n) or 0
+      if n == 0 then
+        g.setForeground(0xFFFFFF) g.setBackground(0x000000) t.reversed = nil
+      elseif n == 7 or n == 27 then
+        if (n == 7) ~= (t.reversed == true) then
+          local f, b = g.getForeground(), g.getBackground()
+          g.setForeground(b) g.setBackground(f)
+          t.reversed = n == 7 or nil
+        end
+      elseif n >= 30 and n <= 37 or n >= 90 and n <= 97 then
+        g.setForeground(COLORS[n % 10])
+      elseif n >= 40 and n <= 47 or n >= 100 and n <= 107 then
+        g.setBackground(COLORS[n % 10])
+      elseif n == 39 then
+        g.setForeground(0xFFFFFF)
+      elseif n == 49 then
+        g.setBackground(0x000000)
+      end
+    end
+  end
+  -- Runs one complete sequence (ESC already stripped); `final` is its
+  -- last character, `params` what's between "[" and it.
+  local function csi(params, final)
+    local g = gpu()
+    local w, h = g.getResolution()
+    local n = tonumber(params:match("^(%d+)")) or 1
+    if final == "m" then
+      sgr(params)
+    elseif final == "A" then t.y = clamp(t.y - n, 1, h)
+    elseif final == "B" then t.y = clamp(t.y + n, 1, h)
+    elseif final == "C" then t.x = clamp(t.x + n, 1, w)
+    elseif final == "D" then t.x = clamp(t.x - n, 1, w)
+    elseif final == "H" or final == "f" then
+      local row, col = params:match("^(%d*);?(%d*)$")
+      t.y, t.x = clamp(tonumber(row) or 1, 1, h), clamp(tonumber(col) or 1, 1, w)
+    elseif final == "J" then
+      local mode = tonumber(params) or 0
+      if mode == 2 then
+        g.fill(1, 1, w, h, " ")
+      elseif mode == 1 then
+        if t.y > 1 then g.fill(1, 1, w, t.y - 1, " ") end
+        g.fill(1, t.y, t.x, 1, " ")
+      else
+        g.fill(t.x, t.y, w - t.x + 1, 1, " ")
+        if t.y < h then g.fill(1, t.y + 1, w, h - t.y, " ") end
+      end
+    elseif final == "K" then
+      local mode = tonumber(params) or 0
+      if mode == 2 then g.fill(1, t.y, w, 1, " ")
+      elseif mode == 1 then g.fill(1, t.y, t.x, 1, " ")
+      else g.fill(t.x, t.y, w - t.x + 1, 1, " ") end
+    elseif final == "s" then
+      t.saved = {t.x, t.y}
+    elseif final == "u" then
+      if t.saved then t.x, t.y = t.saved[1], t.saved[2] end
+    end
+  end
+
+  function t.write(value)
+    local text = (t.pending or "") .. tostring(value)
+    t.pending = nil
+    local i = 1
+    while i <= #text do
+      local esc = text:find("\27", i, true)
+      if not esc then plain(text:sub(i)) break end
+      if esc > i then plain(text:sub(i, esc - 1)) end
+      local second = text:sub(esc + 1, esc + 1)
+      if second == "" then
+        t.pending = text:sub(esc) -- the rest comes in the next write
+        break
+      elseif second == "7" then
+        t.saved = {t.x, t.y, gpu().getForeground(), gpu().getBackground()}
+        i = esc + 2
+      elseif second == "8" then
+        if t.saved then
+          t.x, t.y = t.saved[1], t.saved[2]
+          if t.saved[3] then gpu().setForeground(t.saved[3]) gpu().setBackground(t.saved[4]) end
+        end
+        i = esc + 2
+      elseif second == "[" then
+        local params, final, stop = text:match("^([%d;?]*)([%a@])()", esc + 2)
+        if params then
+          if params == "?7" and (final == "h" or final == "l") then
+            t.nowrap = final == "l" or nil
+          else
+            csi(params, final)
+          end
+          i = stop
+        elseif text:sub(esc + 2):match("^[%d;?]*$") then
+          t.pending = text:sub(esc) -- unfinished
+          break
+        else
+          i = esc + 1 -- malformed: drop the ESC
+        end
+      else
+        i = esc + 1
       end
     end
   end
@@ -2129,7 +2274,23 @@ local function unavailable(name)
   end})
 end
 
+local legacyPopen -- below, with the legacy environment
+
 local LEGACY_FACES = {
+  -- OpenOS's pipe library runs programs as coroutines of the caller;
+  -- here each is a process of its own, so only popen carries over.
+  pipe = function(ctx)
+    local function unsupported(name)
+      return function()
+        error("pipe." .. name .. ": muxos runs every program as a process of its own; use pipe.popen or io.popen", 2)
+      end
+    end
+    return {
+      popen = function(command, mode) return legacyPopen(ctx, command, mode) end,
+      buildPipeChain = unsupported("buildPipeChain"),
+      createCoroutineStack = unsupported("createCoroutineStack"),
+    }
+  end,
   computer = function(ctx)
     return {
       uptime = computer.uptime, address = computer.address,
@@ -2390,6 +2551,129 @@ local LEGACY_FACES = {
   end,
 }
 
+-- --- Pipes: io.popen / pipe.popen for legacy programs ---
+--
+-- OpenOS runs a popen'd program as a coroutine of the caller; muxos runs
+-- it as a process of its own (anywhere in the cluster), launched with a
+-- pipe: for "r", its output comes to the opener as {"pipe_data", id,
+-- text} events instead of going to a window; for "w", what the opener
+-- writes reaches it as its input. {"pipe_closed", id, status, error}
+-- marks the end. pipeEvent (above) keeps these out of the program's own
+-- signals.
+
+-- Reads from a pipe's buffer like a file: "l", "L", "n", "a" or a byte
+-- count; waits for more while the other end is open.
+local function pipeRead(ctx, p, format)
+  if type(format) == "string" then format = format:gsub("^%*", "") end
+  format = format or "l"
+  while true do
+    if type(format) == "number" then
+      if #p.buffer >= format or (p.closed and p.buffer ~= "") then
+        local piece = p.buffer:sub(1, format)
+        p.buffer = p.buffer:sub(format + 1)
+        return piece
+      end
+      if p.closed then return nil end
+    elseif format == "a" then
+      if p.closed then
+        local all = p.buffer
+        p.buffer = ""
+        return all
+      end
+    elseif format == "n" then
+      if p.buffer:find("\n", 1, true) or p.closed then
+        local space, word = p.buffer:match("^(%s*)(%S*)")
+        p.buffer = p.buffer:sub(#space + #word + 1)
+        return tonumber(word)
+      end
+    else
+      local nl = p.buffer:find("\n", 1, true)
+      if nl then
+        local line = p.buffer:sub(1, format == "L" and nl or nl - 1)
+        p.buffer = p.buffer:sub(nl + 1)
+        return line
+      end
+      if p.closed then
+        if p.buffer == "" then return nil end
+        local line = p.buffer
+        p.buffer = ""
+        return line
+      end
+    end
+    pipeWait(ctx, 1)
+  end
+end
+
+-- A command line's words, with '...' and "..." quoting.
+local function splitWords(command)
+  local words, word, quote, any = {}, {}, nil, false
+  for c in tostring(command):gmatch(".") do
+    if quote then
+      if c == quote then quote = nil else word[#word + 1] = c end
+    elseif c == "'" or c == '"' then
+      quote, any = c, true
+    elseif c:match("%s") then
+      if #word > 0 or any then words[#words + 1] = table.concat(word) end
+      word, any = {}, false
+    else
+      word[#word + 1] = c
+    end
+  end
+  if #word > 0 or any then words[#words + 1] = table.concat(word) end
+  return words
+end
+
+legacyPopen = function(ctx, command, mode)
+  mode = mode or "r"
+  if mode ~= "r" and mode ~= "w" then return nil, "popen's mode is \"r\" or \"w\"" end
+  local words = splitWords(command)
+  if #words == 0 then return nil, "no command" end
+  local launched, err = remoteRequest("LAUNCH", {path = words[1], args = {table.unpack(words, 2)}, caller = ctx.id,
+    pipe = mode})
+  if not launched then return nil, err end
+  local child = launched.id
+  local p = {buffer = ""}
+  ctx.pipes[child] = p
+  local h = {}
+  if mode == "r" then
+    function h:read(...)
+      local n = select("#", ...)
+      if n == 0 then return pipeRead(ctx, p, "l") end
+      local values = {}
+      for i = 1, n do
+        values[i] = pipeRead(ctx, p, (select(i, ...)))
+        if values[i] == nil then return table.unpack(values, 1, i) end
+      end
+      return table.unpack(values, 1, n)
+    end
+    function h:lines(format) return function() return pipeRead(ctx, p, format or "l") end end
+    function h:write() return nil, "this pipe was opened for reading" end
+  else
+    function h:write(...)
+      local parts = {}
+      for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+      local ok, writeErr = remoteRequest("PIPEWRITE", {child = child, text = table.concat(parts), caller = ctx.id})
+      if not ok then return nil, writeErr end
+      return self
+    end
+    function h:read() return nil, "this pipe was opened for writing" end
+    function h:lines() error("this pipe was opened for writing", 2) end
+  end
+  -- Like Lua's: waits for the program to end; true, "exit", 0 if it ran
+  -- to completion.
+  function h:close()
+    if mode == "w" then remoteRequest("PIPEWRITE", {child = child, close = true, caller = ctx.id}) end
+    while not p.closed do pipeWait(ctx, 1) end
+    ctx.pipes[child] = nil
+    if p.status == "done" then return true, "exit", 0 end
+    return nil, "exit", 1
+  end
+  function h:flush() return self end
+  function h:setvbuf() return true end
+  function h:seek() return nil, "can't seek on a pipe" end
+  return h
+end
+
 local function newLegacyEnv(id, program)
   local env = {}
   for _, k in ipairs({"assert", "error", "ipairs", "next", "pairs", "pcall", "rawequal", "rawget",
@@ -2402,6 +2686,7 @@ local function newLegacyEnv(id, program)
   local loaded = {}
   local path = program and program.path
   local ctx = {id = id, env = env, loaded = loaded, pushed = {}, listeners = {}, path = path,
+    deferred = {}, pipes = {}, pipeIn = program and program.pipe and program.pipe:find("w") and {buffer = ""} or nil,
     name = path and path:match("([^/]+)$") or "legacy", screenSize = program and program.screen,
     fsAddress = program and program.fsAddress,
     osEnv = {PWD = program and program.cwd or "/", HOME = program and program.home or "/home",
@@ -2416,7 +2701,11 @@ local function newLegacyEnv(id, program)
   local devices = virtualDevices(ctx)
   local term = newTerminal(ctx)
   ctx.term = term
-  term.clear()
+  -- Opened by popen: its output goes to the process that opened it (as
+  -- data to read, or onto its terminal), and it has no window unless it
+  -- draws (or errs).
+  local piped = program and program.pipe
+  if not piped then term.clear() end
   local vgpu = devices[VGPU_ADDRESS]
   local function errorWrite(text)
     local old = vgpu.setForeground(0xFF0000)
@@ -2426,11 +2715,12 @@ local function newLegacyEnv(id, program)
   jobEndHooks[id] = function(ok, result)
     if not ok and result ~= EXIT and result ~= KILLED then errorWrite(tostring(result) .. "\n") end
   end
+  local out = piped and function(text) writeOutput(id, text) end or term.write
   env.print = function(...)
     local n = select("#", ...)
     local parts = {}
     for i = 1, n do parts[i] = tostring((select(i, ...))) end
-    term.write(table.concat(parts, "\t") .. "\n")
+    out(table.concat(parts, "\t") .. "\n")
   end
   local function resolve(p)
     p = tostring(p)
@@ -2438,7 +2728,7 @@ local function newLegacyEnv(id, program)
     return rootPath(p)
   end
   local function write(...)
-    for i = 1, select("#", ...) do term.write(tostring((select(i, ...)))) end
+    for i = 1, select("#", ...) do out(tostring((select(i, ...)))) end
   end
   local stdout = {write = function(self, ...) write(...) return self end, flush = function(self) return self end,
     setvbuf = function() return true end}
@@ -2447,6 +2737,8 @@ local function newLegacyEnv(id, program)
     return self
   end, flush = function(self) return self end, setvbuf = function() return true end}
   local function readTerminal(format)
+    -- Opened by popen for writing: input is what the opener writes.
+    if ctx.pipeIn then return pipeRead(ctx, ctx.pipeIn, format) end
     local line = legacyReadLine(ctx)
     if format == "n" or format == "*n" then return tonumber(line) end
     if format == "L" or format == "*L" then return line .. "\n" end
@@ -2461,6 +2753,7 @@ local function newLegacyEnv(id, program)
     stdout = stdout,
     stderr = stderr,
     open = function(p, mode) return openFile(ctx, resolve(p), mode) end,
+    popen = function(command, mode) return legacyPopen(ctx, command, mode) end,
     lines = function(p, fmt)
       if p == nil then return stdin:lines() end
       local f, err = openFile(ctx, resolve(p), "r")

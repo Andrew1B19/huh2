@@ -1,8 +1,8 @@
 --[[MUXOS-PAYLOAD 0.1.2
-@@MANIFEST 30
+@@MANIFEST 32
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-71173 /muxos.lua
+72323 /muxos.lua
 28806 /compositor.lua
 33883 /shell.lua
 2663 /bitmap.lua
@@ -11,7 +11,7 @@
 36766 /session.lua
 5514 /vgpu.lua
 3384 /terminals.lua
-72546 /runtime.lua
+80409 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 1682 /lib/bit32.lua
 3800 /lib/buffer.lua
@@ -20,6 +20,7 @@
 4615 /lib/core/full_keyboard.lua
 6534 /lib/core/full_text.lua
 2033 /lib/core/full_transforms.lua
+1681 /lib/core/full_vt.lua
 2458 /lib/internet.lua
 1553 /lib/keyboard.lua
 2300 /lib/note.lua
@@ -28,6 +29,7 @@
 2439 /lib/text.lua
 1517 /lib/transforms.lua
 501 /lib/uuid.lua
+2417 /lib/vt100.lua
 6034 /bin/opm.mxe
 4098 /lib/mxe/opm_core.lua
 @@ 3862 /eeprom/kernal.lua
@@ -224,7 +226,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 71173 /muxos.lua
+@@ 72323 /muxos.lua
 
 
 
@@ -880,7 +882,7 @@ end
 
 
 local LEGACY_PACKAGE_PATH = {"/lib/?.lua", "/usr/lib/?.lua", "/lib/?/init.lua", "/usr/lib/?/init.lua"}
-local LEGACY_FACES = {component = true, computer = true, event = true, term = true, unicode = true,
+local LEGACY_FACES = {component = true, computer = true, event = true, term = true, unicode = true, pipe = true,
 process = true, package = true, filesystem = true, shell = true, thread = true, tty = true}
 local MAX_PREFETCH = 32
 local moduleCache = {}
@@ -995,10 +997,12 @@ end
 return false
 end
 
-launchProgram = function(path, args, parent)
+
+
+launchProgram = function(path, args, parent, pipe)
 local source, err = readFile(path)
 if not source then return nil, "can't read " .. path .. ": " .. tostring(err) end
-local program = {path = path, kind = path:match("%.mxe$") and "mxe" or "legacy"}
+local program = {path = path, kind = path:match("%.mxe$") and "mxe" or "legacy", pipe = pipe}
 if program.kind == "mxe" then
 local manifest, manifestErr = readManifest(source)
 if not manifest then return nil, manifestErr end
@@ -1248,6 +1252,9 @@ local job = jobs[id]
 closeJobFiles(id)
 net.release(id)
 K.dropShares(id)
+
+local reader = job.pipeTo and K.liveJob(job.pipeTo)
+if reader then K.deliverEvent(reader, {"pipe_closed", id, status, err}) end
 if fullscreen.job == id then
 fullscreen.node, fullscreen.job = nil, nil
 K.releaseScreen()
@@ -1810,8 +1817,18 @@ end
 
 local function handleOutput(msg)
 local job = jobs[msg.jobId]
-local S = job and K.sessionOf(job)
-if S and job.node == msg.from and type(msg.text) == "string" then S.write(msg.text) end
+if not job or job.node ~= msg.from or type(msg.text) ~= "string" then return end
+
+
+if job.pipeTo then
+local reader = K.liveJob(job.pipeTo)
+if reader then
+K.deliverEvent(reader, {job.pipeMode:find("r") and "pipe_data" or "pipe_output", job.id, msg.text})
+end
+return
+end
+local S = K.sessionOf(job)
+if S then S.write(msg.text) end
 end
 
 
@@ -1824,7 +1841,9 @@ reply = "not called from a running process"
 elseif not path then
 reply = "program not found: " .. tostring(msg.path)
 else
-local id, addrOrErr = launchProgram(path, type(msg.args) == "table" and msg.args or {}, caller.id)
+local pipe = (msg.pipe == "r" or msg.pipe == "w" or msg.pipe == "rw") and msg.pipe or nil
+local id, addrOrErr = launchProgram(path, type(msg.args) == "table" and msg.args or {}, caller.id, pipe)
+if id and pipe then jobs[id].pipeTo, jobs[id].pipeMode = caller.id, pipe end
 if id then
 send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {id = id, node = addrOrErr, path = path}})
 return
@@ -2078,6 +2097,21 @@ K.framesPresented(S, presented)
 reply(true)
 end
 
+
+
+
+local function handlePipeWrite(msg)
+local caller = callerJob(msg)
+local child = K.liveJob(msg.child)
+if not caller or not child or child.pipeTo ~= caller.id then
+send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "no pipe to process " .. tostring(msg.child)})
+return
+end
+if type(msg.text) == "string" then K.deliverEvent(child, {"pipe_data", "stdin", msg.text}) end
+if msg.close then K.deliverEvent(child, {"pipe_closed", "stdin"}) end
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
+end
+
 local function handleGetWindows(msg)
 local S = K.sessionOf(callerJob(msg))
 send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S and S.compositor.listWindows() or {}})
@@ -2159,6 +2193,8 @@ elseif msg.type == "INVOKE" then
 handleInvoke(msg)
 elseif msg.type == "SHAREWINDOW" or msg.type == "RENDERCONFIG" or msg.type == "DRAWREGION" then
 handleRender(msg)
+elseif msg.type == "PIPEWRITE" then
+handlePipeWrite(msg)
 elseif msg.type == "ISFOREGROUND" then
 
 local caller = callerJob(msg)
@@ -7647,7 +7683,7 @@ end
 
 return T
 
-@@ 72546 /runtime.lua
+@@ 80409 /runtime.lua
 
 
 
@@ -8954,17 +8990,46 @@ end
 
 
 
+
+
+local function pipeEvent(ctx, e)
+if e[1] == "pipe_output" then
+
+if ctx.term then ctx.term.write(tostring(e[3])) end
+return true
+end
+if e[1] ~= "pipe_data" and e[1] ~= "pipe_closed" then return false end
+local p = e[2] == "stdin" and ctx.pipeIn or ctx.pipes[e[2]]
+if p then
+if e[1] == "pipe_data" then
+p.buffer = p.buffer .. tostring(e[3])
+else
+p.closed, p.status, p.error = true, e[3], e[4]
+end
+end
+return true
+end
+
+
+
+local function pipeWait(ctx, timeout)
+local e = gmuxapi.pull_event(timeout)
+if e and not pipeEvent(ctx, e) then ctx.deferred[#ctx.deferred + 1] = e end
+end
+
 local function legacyPull(ctx, timeout)
 local sig = table.remove(ctx.pushed, 1)
-if not sig then
-local e = gmuxapi.pull_event(timeout)
+local deadline = timeout and computer.uptime() + timeout
+while not sig do
+local e = table.remove(ctx.deferred, 1)
+or gmuxapi.pull_event(deadline and math.max(0, deadline - computer.uptime()) or nil)
 if not e then return nil end
-sig = toSignal(e)
+if not pipeEvent(ctx, e) then sig = toSignal(e) end
+end
 
 if sig[1] == "window_resized" and ctx.vgpu and sig[2] == ctx.windowId then
 ctx.vgpu.resize(sig[3], sig[4])
 sig = table.pack("screen_resized", VSCREEN_ADDRESS, sig[3], sig[4])
-end
 end
 local kb = ctx.loaded.keyboard
 if type(kb) == "table" and type(kb.pressedCodes) == "table" then
@@ -9399,15 +9464,19 @@ g.copy(1, 2, w, h - 1, 0, -1)
 g.fill(1, h, w, 1, " ")
 end
 end
-function t.write(value)
+
+local function plain(text)
 local g = gpu()
 local w, h = g.getResolution()
 t.y = math.min(t.y, h)
-for piece, ctl in tostring(value):gmatch("([^\n\r\t]*)([\n\r\t]?)") do
+for piece, ctl in text:gmatch("([^\n\r\t]*)([\n\r\t]?)") do
 local chars = splitChars(piece)
 local i = 1
 while i <= #chars do
-if t.x > w then newline() end
+if t.x > w then
+if t.nowrap then break end
+newline()
+end
 local n = math.min(#chars - i + 1, w - t.x + 1)
 g.set(t.x, t.y, table.concat(chars, "", i, i + n - 1))
 t.x, i = t.x + n, i + n
@@ -9417,7 +9486,119 @@ newline()
 elseif ctl == "\r" then
 t.x = 1
 elseif ctl == "\t" then
-t.write(string.rep(" ", 8 - (t.x - 1) % 8))
+plain(string.rep(" ", 8 - (t.x - 1) % 8))
+end
+end
+end
+
+
+
+
+
+
+
+local COLORS = {[0] = 0x000000, 0xFF0000, 0x00FF00, 0xFFFF00, 0x0000FF, 0xFF00FF, 0x00B6FF, 0xFFFFFF}
+local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
+local function sgr(params)
+local g = gpu()
+if params == "" then params = "0" end
+for n in (params .. ";"):gmatch("(%d*);") do
+n = tonumber(n) or 0
+if n == 0 then
+g.setForeground(0xFFFFFF) g.setBackground(0x000000) t.reversed = nil
+elseif n == 7 or n == 27 then
+if (n == 7) ~= (t.reversed == true) then
+local f, b = g.getForeground(), g.getBackground()
+g.setForeground(b) g.setBackground(f)
+t.reversed = n == 7 or nil
+end
+elseif n >= 30 and n <= 37 or n >= 90 and n <= 97 then
+g.setForeground(COLORS[n % 10])
+elseif n >= 40 and n <= 47 or n >= 100 and n <= 107 then
+g.setBackground(COLORS[n % 10])
+elseif n == 39 then
+g.setForeground(0xFFFFFF)
+elseif n == 49 then
+g.setBackground(0x000000)
+end
+end
+end
+
+
+local function csi(params, final)
+local g = gpu()
+local w, h = g.getResolution()
+local n = tonumber(params:match("^(%d+)")) or 1
+if final == "m" then
+sgr(params)
+elseif final == "A" then t.y = clamp(t.y - n, 1, h)
+elseif final == "B" then t.y = clamp(t.y + n, 1, h)
+elseif final == "C" then t.x = clamp(t.x + n, 1, w)
+elseif final == "D" then t.x = clamp(t.x - n, 1, w)
+elseif final == "H" or final == "f" then
+local row, col = params:match("^(%d*);?(%d*)$")
+t.y, t.x = clamp(tonumber(row) or 1, 1, h), clamp(tonumber(col) or 1, 1, w)
+elseif final == "J" then
+local mode = tonumber(params) or 0
+if mode == 2 then
+g.fill(1, 1, w, h, " ")
+elseif mode == 1 then
+if t.y > 1 then g.fill(1, 1, w, t.y - 1, " ") end
+g.fill(1, t.y, t.x, 1, " ")
+else
+g.fill(t.x, t.y, w - t.x + 1, 1, " ")
+if t.y < h then g.fill(1, t.y + 1, w, h - t.y, " ") end
+end
+elseif final == "K" then
+local mode = tonumber(params) or 0
+if mode == 2 then g.fill(1, t.y, w, 1, " ")
+elseif mode == 1 then g.fill(1, t.y, t.x, 1, " ")
+else g.fill(t.x, t.y, w - t.x + 1, 1, " ") end
+elseif final == "s" then
+t.saved = {t.x, t.y}
+elseif final == "u" then
+if t.saved then t.x, t.y = t.saved[1], t.saved[2] end
+end
+end
+
+function t.write(value)
+local text = (t.pending or "") .. tostring(value)
+t.pending = nil
+local i = 1
+while i <= #text do
+local esc = text:find("\27", i, true)
+if not esc then plain(text:sub(i)) break end
+if esc > i then plain(text:sub(i, esc - 1)) end
+local second = text:sub(esc + 1, esc + 1)
+if second == "" then
+t.pending = text:sub(esc)
+break
+elseif second == "7" then
+t.saved = {t.x, t.y, gpu().getForeground(), gpu().getBackground()}
+i = esc + 2
+elseif second == "8" then
+if t.saved then
+t.x, t.y = t.saved[1], t.saved[2]
+if t.saved[3] then gpu().setForeground(t.saved[3]) gpu().setBackground(t.saved[4]) end
+end
+i = esc + 2
+elseif second == "[" then
+local params, final, stop = text:match("^([%d;?]*)([%a@])()", esc + 2)
+if params then
+if params == "?7" and (final == "h" or final == "l") then
+t.nowrap = final == "l" or nil
+else
+csi(params, final)
+end
+i = stop
+elseif text:sub(esc + 2):match("^[%d;?]*$") then
+t.pending = text:sub(esc)
+break
+else
+i = esc + 1
+end
+else
+i = esc + 1
 end
 end
 end
@@ -9779,7 +9960,23 @@ error(name .. "." .. tostring(k) .. " isn't available to legacy programs yet", 2
 end})
 end
 
+local legacyPopen
+
 local LEGACY_FACES = {
+
+
+pipe = function(ctx)
+local function unsupported(name)
+return function()
+error("pipe." .. name .. ": muxos runs every program as a process of its own; use pipe.popen or io.popen", 2)
+end
+end
+return {
+popen = function(command, mode) return legacyPopen(ctx, command, mode) end,
+buildPipeChain = unsupported("buildPipeChain"),
+createCoroutineStack = unsupported("createCoroutineStack"),
+}
+end,
 computer = function(ctx)
 return {
 uptime = computer.uptime, address = computer.address,
@@ -10040,6 +10237,129 @@ end,
 end,
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+local function pipeRead(ctx, p, format)
+if type(format) == "string" then format = format:gsub("^%*", "") end
+format = format or "l"
+while true do
+if type(format) == "number" then
+if #p.buffer >= format or (p.closed and p.buffer ~= "") then
+local piece = p.buffer:sub(1, format)
+p.buffer = p.buffer:sub(format + 1)
+return piece
+end
+if p.closed then return nil end
+elseif format == "a" then
+if p.closed then
+local all = p.buffer
+p.buffer = ""
+return all
+end
+elseif format == "n" then
+if p.buffer:find("\n", 1, true) or p.closed then
+local space, word = p.buffer:match("^(%s*)(%S*)")
+p.buffer = p.buffer:sub(#space + #word + 1)
+return tonumber(word)
+end
+else
+local nl = p.buffer:find("\n", 1, true)
+if nl then
+local line = p.buffer:sub(1, format == "L" and nl or nl - 1)
+p.buffer = p.buffer:sub(nl + 1)
+return line
+end
+if p.closed then
+if p.buffer == "" then return nil end
+local line = p.buffer
+p.buffer = ""
+return line
+end
+end
+pipeWait(ctx, 1)
+end
+end
+
+
+local function splitWords(command)
+local words, word, quote, any = {}, {}, nil, false
+for c in tostring(command):gmatch(".") do
+if quote then
+if c == quote then quote = nil else word[#word + 1] = c end
+elseif c == "'" or c == '"' then
+quote, any = c, true
+elseif c:match("%s") then
+if #word > 0 or any then words[#words + 1] = table.concat(word) end
+word, any = {}, false
+else
+word[#word + 1] = c
+end
+end
+if #word > 0 or any then words[#words + 1] = table.concat(word) end
+return words
+end
+
+legacyPopen = function(ctx, command, mode)
+mode = mode or "r"
+if mode ~= "r" and mode ~= "w" then return nil, "popen's mode is \"r\" or \"w\"" end
+local words = splitWords(command)
+if #words == 0 then return nil, "no command" end
+local launched, err = remoteRequest("LAUNCH", {path = words[1], args = {table.unpack(words, 2)}, caller = ctx.id,
+pipe = mode})
+if not launched then return nil, err end
+local child = launched.id
+local p = {buffer = ""}
+ctx.pipes[child] = p
+local h = {}
+if mode == "r" then
+function h:read(...)
+local n = select("#", ...)
+if n == 0 then return pipeRead(ctx, p, "l") end
+local values = {}
+for i = 1, n do
+values[i] = pipeRead(ctx, p, (select(i, ...)))
+if values[i] == nil then return table.unpack(values, 1, i) end
+end
+return table.unpack(values, 1, n)
+end
+function h:lines(format) return function() return pipeRead(ctx, p, format or "l") end end
+function h:write() return nil, "this pipe was opened for reading" end
+else
+function h:write(...)
+local parts = {}
+for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+local ok, writeErr = remoteRequest("PIPEWRITE", {child = child, text = table.concat(parts), caller = ctx.id})
+if not ok then return nil, writeErr end
+return self
+end
+function h:read() return nil, "this pipe was opened for writing" end
+function h:lines() error("this pipe was opened for writing", 2) end
+end
+
+
+function h:close()
+if mode == "w" then remoteRequest("PIPEWRITE", {child = child, close = true, caller = ctx.id}) end
+while not p.closed do pipeWait(ctx, 1) end
+ctx.pipes[child] = nil
+if p.status == "done" then return true, "exit", 0 end
+return nil, "exit", 1
+end
+function h:flush() return self end
+function h:setvbuf() return true end
+function h:seek() return nil, "can't seek on a pipe" end
+return h
+end
+
 local function newLegacyEnv(id, program)
 local env = {}
 for _, k in ipairs({"assert", "error", "ipairs", "next", "pairs", "pcall", "rawequal", "rawget",
@@ -10052,6 +10372,7 @@ env.computer = NATIVE.computer
 local loaded = {}
 local path = program and program.path
 local ctx = {id = id, env = env, loaded = loaded, pushed = {}, listeners = {}, path = path,
+deferred = {}, pipes = {}, pipeIn = program and program.pipe and program.pipe:find("w") and {buffer = ""} or nil,
 name = path and path:match("([^/]+)$") or "legacy", screenSize = program and program.screen,
 fsAddress = program and program.fsAddress,
 osEnv = {PWD = program and program.cwd or "/", HOME = program and program.home or "/home",
@@ -10066,7 +10387,11 @@ end
 local devices = virtualDevices(ctx)
 local term = newTerminal(ctx)
 ctx.term = term
-term.clear()
+
+
+
+local piped = program and program.pipe
+if not piped then term.clear() end
 local vgpu = devices[VGPU_ADDRESS]
 local function errorWrite(text)
 local old = vgpu.setForeground(0xFF0000)
@@ -10076,11 +10401,12 @@ end
 jobEndHooks[id] = function(ok, result)
 if not ok and result ~= EXIT and result ~= KILLED then errorWrite(tostring(result) .. "\n") end
 end
+local out = piped and function(text) writeOutput(id, text) end or term.write
 env.print = function(...)
 local n = select("#", ...)
 local parts = {}
 for i = 1, n do parts[i] = tostring((select(i, ...))) end
-term.write(table.concat(parts, "\t") .. "\n")
+out(table.concat(parts, "\t") .. "\n")
 end
 local function resolve(p)
 p = tostring(p)
@@ -10088,7 +10414,7 @@ if p:sub(1, 1) ~= "/" then p = (ctx.osEnv.PWD or "/") .. "/" .. p end
 return rootPath(p)
 end
 local function write(...)
-for i = 1, select("#", ...) do term.write(tostring((select(i, ...)))) end
+for i = 1, select("#", ...) do out(tostring((select(i, ...)))) end
 end
 local stdout = {write = function(self, ...) write(...) return self end, flush = function(self) return self end,
 setvbuf = function() return true end}
@@ -10097,6 +10423,8 @@ for i = 1, select("#", ...) do errorWrite(tostring((select(i, ...)))) end
 return self
 end, flush = function(self) return self end, setvbuf = function() return true end}
 local function readTerminal(format)
+
+if ctx.pipeIn then return pipeRead(ctx, ctx.pipeIn, format) end
 local line = legacyReadLine(ctx)
 if format == "n" or format == "*n" then return tonumber(line) end
 if format == "L" or format == "*L" then return line .. "\n" end
@@ -10111,6 +10439,7 @@ stdin = stdin,
 stdout = stdout,
 stderr = stderr,
 open = function(p, mode) return openFile(ctx, resolve(p), mode) end,
+popen = function(command, mode) return legacyPopen(ctx, command, mode) end,
 lines = function(p, fmt)
 if p == nil then return stdin:lines() end
 local f, err = openFile(ctx, resolve(p), "r")
@@ -11568,6 +11897,101 @@ end
 return nil, current_index - 1
 end
 
+@@ 1681 /lib/core/full_vt.lua
+local vt100 = require("vt100")
+
+local rules = vt100.rules
+
+
+rules[{"%[", "%?", "7", "[hl]"}] = function(window, _, _, _, nowrap)
+window.nowrap = nowrap == "l"
+end
+
+
+local function set_cursor(window, x, y)
+window.x = math.min(math.max(x, 1), window.width)
+window.y = math.min(math.max(y, 1), window.height)
+end
+
+
+
+
+
+
+rules[{"%[", "%d*", "[ABCD]"}] = function(window, _, n, dir)
+local dx, dy = 0, 0
+n = tonumber(n) or 1
+if dir == "A" then
+dy = -n
+elseif dir == "B" then
+dy = n
+elseif dir == "C" then
+dx = n
+else
+dx = -n
+end
+set_cursor(window, window.x + dx, window.y + dy)
+end
+
+
+
+
+
+rules[{"%[", "%d*", ";", "%d*", "[Hf]"}] = function(window, _, y, _, x)
+set_cursor(window, tonumber(x) or 1, tonumber(y) or 1)
+end
+
+
+
+rules[{"%[[Hf]"}] = function(window)
+set_cursor(window, 1, 1)
+end
+
+
+
+
+
+local function clear_line(window, _, n)
+n = tonumber(n) or 0
+local x = (n == 0 and window.x or 1)
+local rep = n == 1 and window.x or (window.width - x + 1)
+window.gpu.fill(x + window.dx, window.y + window.dy, rep, 1, " ")
+end
+rules[{"%[", "[012]?", "K"}] = clear_line
+
+
+
+
+
+rules[{"%[", "[012]?", "J"}] = function(window, _, n)
+clear_line(window, _, n)
+n = tonumber(n) or 0
+local y = n == 0 and (window.y + 1) or 1
+local rep = n == 1 and (window.y - 1) or (window.height)
+window.gpu.fill(1 + window.dx, y + window.dy, window.width, rep, " ")
+end
+
+
+rules[{"%[", "6", "n"}] = function(window)
+
+
+io.stdin.bufferRead = string.format("%s%s[%d;%dR", io.stdin.bufferRead, string.char(0x1b), window.y, window.x)
+end
+
+
+
+
+rules[{"[DEM]"}] = function(window, _, dir)
+if dir == "D" then
+window.y = window.y + 1
+elseif dir == "E" then
+window.y = window.y + 1
+window.x = 1
+else
+window.y = window.y -  1
+end
+end
+
 @@ 2458 /lib/internet.lua
 local buffer = require("buffer")
 local component = require("component")
@@ -12326,6 +12750,137 @@ return result
 end
 
 return uuid
+
+@@ 2417 /lib/vt100.lua
+local text = require("text")
+
+local rules = {}
+local vt100 = {rules=rules}
+local full
+
+
+
+
+rules[{"%[", "[%d;]*", "m"}] = function(window, _, number_text)
+
+
+local colors = {0x0,0xff0000,0x00ff00,0xffff00,0x0000ff,0xff00ff,0x00B6ff,0xffffff}
+local fg, bg = window.gpu.setForeground, window.gpu.setBackground
+if window.flip then
+fg, bg = bg, fg
+end
+number_text = " _ " .. number_text:gsub("^;$", ""):gsub(";", " _ ") .. " _ "
+local parts = text.internal.tokenize(number_text)
+local last_was_break
+for _,part in ipairs(parts) do
+local num = tonumber(part[1].txt)
+last_was_break, num = not num, num or last_was_break and 0
+
+local flip = num == 7
+if flip then
+if not window.flip then
+local rgb, pal = bg(window.gpu.getForeground())
+fg(pal or rgb, not not pal)
+fg, bg = bg, fg
+end
+elseif num == 5 then
+window.blink = true
+elseif num == 0 then
+bg(colors[1])
+fg(colors[8])
+elseif num then
+num = num - 29
+local set = fg
+if num > 10 then
+num = num - 10
+set = bg
+end
+local color = colors[num]
+if color then
+set(color)
+end
+end
+window.flip = flip
+end
+end
+
+local function save_attributes(window, seven, s)
+if seven == "7" or s == "s" then
+window.saved =
+{
+window.x,
+window.y,
+{window.gpu.getBackground()},
+{window.gpu.getForeground()},
+window.flip,
+window.blink
+}
+else
+local data = window.saved or {1, 1, {0x0}, {0xffffff}, window.flip, window.blink}
+window.x = data[1]
+window.y = data[2]
+window.gpu.setBackground(table.unpack(data[3]))
+window.gpu.setForeground(table.unpack(data[4]))
+window.flip = data[5]
+window.blink = data[6]
+end
+end
+
+
+
+rules[{"[78]"}] = save_attributes
+
+
+
+rules[{"%[", "[su]"}] = save_attributes
+
+
+function vt100.parse(window)
+if window.output_buffer:sub(1, 1) ~= "\27" then
+return ""
+end
+local any_valid
+
+for rule,action in pairs(rules) do
+local last_index = 1
+local captures = {}
+for _,pattern in ipairs(rule) do
+if last_index >= #window.output_buffer then
+any_valid = true
+break
+end
+local si, ei, capture = window.output_buffer:find("^(" .. pattern .. ")", last_index + 1)
+if not si then
+break
+end
+captures[#captures + 1] = capture
+last_index = ei
+end
+
+if #captures == #rule then
+action(window, table.unpack(captures))
+window.output_buffer = window.output_buffer:sub(last_index + 1)
+return ""
+end
+end
+
+if not full then
+
+full = true
+dofile("/lib/core/full_vt.lua")
+return vt100.parse(window)
+end
+
+if not any_valid then
+
+window.output_buffer = window.output_buffer:sub(2)
+return "\27"
+end
+
+
+end
+
+return vt100
 
 @@ 6034 /bin/opm.mxe
 --[[mxe

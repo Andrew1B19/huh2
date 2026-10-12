@@ -653,7 +653,7 @@ end
 -- GETMODULE request. Machine-level modules are faces built into the
 -- worker runtime and never looked up here.
 local LEGACY_PACKAGE_PATH = {"/lib/?.lua", "/usr/lib/?.lua", "/lib/?/init.lua", "/usr/lib/?/init.lua"}
-local LEGACY_FACES = {component = true, computer = true, event = true, term = true, unicode = true,
+local LEGACY_FACES = {component = true, computer = true, event = true, term = true, unicode = true, pipe = true,
   process = true, package = true, filesystem = true, shell = true, thread = true, tty = true}
 local MAX_PREFETCH = 32
 local moduleCache = {} -- path -> {source, modified}
@@ -768,10 +768,12 @@ do
     return false
   end
 
-  launchProgram = function(path, args, parent)
+  -- `pipe` ("r", "w" or "rw"): the program's output goes to its parent
+  -- instead of a window, and/or its input comes from the parent (popen).
+  launchProgram = function(path, args, parent, pipe)
     local source, err = readFile(path)
     if not source then return nil, "can't read " .. path .. ": " .. tostring(err) end
-    local program = {path = path, kind = path:match("%.mxe$") and "mxe" or "legacy"}
+    local program = {path = path, kind = path:match("%.mxe$") and "mxe" or "legacy", pipe = pipe}
     if program.kind == "mxe" then
       local manifest, manifestErr = readManifest(source)
       if not manifest then return nil, manifestErr end
@@ -1021,6 +1023,9 @@ local function finishJob(id, status, result, err)
   closeJobFiles(id)
   net.release(id)
   K.dropShares(id)
+  -- The end of a pipe: its reader hears it.
+  local reader = job.pipeTo and K.liveJob(job.pipeTo)
+  if reader then K.deliverEvent(reader, {"pipe_closed", id, status, err}) end
   if fullscreen.job == id then
     fullscreen.node, fullscreen.job = nil, nil
     K.releaseScreen()
@@ -1583,8 +1588,18 @@ end
 
 local function handleOutput(msg)
   local job = jobs[msg.jobId]
-  local S = job and K.sessionOf(job)
-  if S and job.node == msg.from and type(msg.text) == "string" then S.write(msg.text) end
+  if not job or job.node ~= msg.from or type(msg.text) ~= "string" then return end
+  -- A piped program's output goes to the process that opened the pipe:
+  -- as data to read ("r"), or onto its terminal ("w"), as in OpenOS.
+  if job.pipeTo then
+    local reader = K.liveJob(job.pipeTo)
+    if reader then
+      K.deliverEvent(reader, {job.pipeMode:find("r") and "pipe_data" or "pipe_output", job.id, msg.text})
+    end
+    return
+  end
+  local S = K.sessionOf(job)
+  if S then S.write(msg.text) end
 end
 
 -- gmuxapi.launch: a process launching a program becomes its parent.
@@ -1597,7 +1612,9 @@ local function handleLaunch(msg)
   elseif not path then
     reply = "program not found: " .. tostring(msg.path)
   else
-    local id, addrOrErr = launchProgram(path, type(msg.args) == "table" and msg.args or {}, caller.id)
+    local pipe = (msg.pipe == "r" or msg.pipe == "w" or msg.pipe == "rw") and msg.pipe or nil
+    local id, addrOrErr = launchProgram(path, type(msg.args) == "table" and msg.args or {}, caller.id, pipe)
+    if id and pipe then jobs[id].pipeTo, jobs[id].pipeMode = caller.id, pipe end
     if id then
       send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {id = id, node = addrOrErr, path = path}})
       return
@@ -1851,6 +1868,21 @@ local function handleRender(msg)
   reply(true)
 end
 
+-- A process writing into a program it opened with a pipe (popen "w"):
+-- the program gets {"pipe_data", "stdin", text}, or {"pipe_closed",
+-- "stdin"} once the writer closes its end.
+local function handlePipeWrite(msg)
+  local caller = callerJob(msg)
+  local child = K.liveJob(msg.child)
+  if not caller or not child or child.pipeTo ~= caller.id then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "no pipe to process " .. tostring(msg.child)})
+    return
+  end
+  if type(msg.text) == "string" then K.deliverEvent(child, {"pipe_data", "stdin", msg.text}) end
+  if msg.close then K.deliverEvent(child, {"pipe_closed", "stdin"}) end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
+end
+
 local function handleGetWindows(msg)
   local S = K.sessionOf(callerJob(msg))
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S and S.compositor.listWindows() or {}})
@@ -1932,6 +1964,8 @@ local function handleModemMessage(from, port, data)
     handleInvoke(msg)
   elseif msg.type == "SHAREWINDOW" or msg.type == "RENDERCONFIG" or msg.type == "DRAWREGION" then
     handleRender(msg)
+  elseif msg.type == "PIPEWRITE" then
+    handlePipeWrite(msg)
   elseif msg.type == "ISFOREGROUND" then
     -- readLine (docs/MXE.md): only the console's foreground program reads typed lines.
     local caller = callerJob(msg)

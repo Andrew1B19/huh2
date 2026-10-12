@@ -9,11 +9,14 @@ Vendored unchanged from OpenOS (MightyPirates/OpenComputers,
 `OPENOS_LICENSE`:
 
 - `serialization.lua`, `text.lua`, `sides.lua`, `colors.lua`, `keyboard.lua`, `internet.lua`,
-  `transforms.lua`, `buffer.lua`, `uuid.lua`, `bit32.lua`, `note.lua`
+  `transforms.lua`, `buffer.lua`, `uuid.lua`, `bit32.lua`, `note.lua`, `vt100.lua`
 - `core/full_keyboard.lua`, `core/full_text.lua`, `core/full_transforms.lua`,
-  `core/full_buffer.lua` (loaded lazily by the above through `package.delay`)
+  `core/full_buffer.lua`, `core/full_vt.lua` (loaded lazily by the above)
 
 To add a library, drop it in `/lib` (or `/usr/lib`) on the kernal's disk.
 Machine-level modules (`component`, `computer`, `event`, `term`, `unicode`,
-`process`, `package`, `filesystem`, `shell`, `thread`, `tty`) are provided by
-the worker runtime itself, not by files here.
+`process`, `package`, `filesystem`, `shell`, `thread`, `tty`, `pipe`) are
+provided by the worker runtime itself, not by files here. A program's
+terminal interprets VT100 escape sequences itself, as OpenOS's tty does
+(`vt100.lua` is here for programs that `require` it directly); `pipe` is
+`popen` only -- each program is a process of its own.
