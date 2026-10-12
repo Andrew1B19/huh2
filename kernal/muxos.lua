@@ -220,8 +220,6 @@ local bus = {
   components = {}, -- address -> {type, node, methods}
   relays = {},     -- our request id -> {to, id, node, expires}
 }
--- The program running in the foreground at the console (runForeground).
-local foregroundJob = nil
 local nodeOrder = {}  -- address list, stable iteration/round-robin order
 local nextJobId = 1
 local nextNode = 1
@@ -239,13 +237,6 @@ local nextNode = 1
 -- grant goes when that process ends even if its node stays up.
 local fullscreen = {node = nil, job = nil}
 
--- The compositor is the only code in this whole project that makes a
--- real gpu.* call for WINDOW content -- see compositor.lua's own header
--- for why that's worth enforcing structurally, not just by convention.
--- It's loaded with loadSibling itself as its chunk argument, so it can
--- load bitmap.lua the same way this file loaded it.
-local compositor = loadSibling("compositor.lua")(loadSibling)
-
 -- Kernal flags (/etc/kernal.cfg) and users (/etc/users): kernal/system.lua.
 local system = loadSibling("system.lua")({
   read = readFile,
@@ -258,9 +249,6 @@ local system = loadSibling("system.lua")({
   end,
   mkdir = function(path) tryInvoke(fsAddr, "makeDirectory", path) end,
 })
--- Who's logged in at the console: `user` (nil at the login: prompt) and
--- `login`, counting logins, which marks the processes each one started.
-system.console = {user = nil, login = 0}
 
 -- The kernal's own gpu/screen, cached once -- used for
 -- isDisplayComponent (below) and to size the console window.
@@ -270,276 +258,27 @@ if gpu and screenAddr then
   tryInvoke(gpuAddr, "bind", screenAddr)
 end
 
--- --- The console, replacing OpenOS's io/term ---
+-- --- Sessions ---
 --
--- The console's text lives in regular memory (consoleLines) and never
--- has a video buffer of its own. Normally it's a compositor text
--- window on the bottom layer, painted from its rows straight into the
--- frame buffer. Its size isn't fixed: it starts as the bottom half of
--- the screen and the `console <width> <height> [x y]` command changes
--- it at any time (cheap, since there's no buffer to reallocate). In
--- console mode (hold Ctrl+Alt+C) it's the compositor's
--- exclusive owner instead and draws straight onto the real screen at
--- full resolution.
+-- A session is one person at one screen: the kernal's own (the local
+-- console) or a network terminal's. Each is a kernal/session.lua
+-- instance with its own console, login, shell, compositor, desktop and
+-- input; the kernal keeps them in K.sessions and gives them, through
+-- `K`, what they need of its own (jobs, the launcher, commands).
 --
--- Output is kept as logical (unwrapped) lines and wrapped only when
--- rendered, at whatever width the console currently has -- which is
--- what makes scrollback, switching between the two sizes, and
--- backspacing across a wrapped input line simple. Rendering happens at
--- most once per tick (renderConsole, from tick()).
+-- Commands run in a coroutine per session (see session.lua): one that
+-- waits yields back here (K.wait), so a slow command at one terminal
+-- never holds up another. K.current is the session whose command or
+-- input is being handled -- where `print` goes, and who owns a process
+-- started from it.
+local K = {sessions = {}, byId = {}, current = nil, console = nil, commands = setmetatable({}, {__mode = "k"}),
+  logins = 0, windowIds = 0}
 
-local termW, termH = 1, 1
-if gpu then
-  termW, termH = gpu.getResolution()
-end
-
-local CONSOLE_LAYER = 0
-local CONSOLE_MIN_W, CONSOLE_MIN_H = 10, 3
--- Scrollback, in lines of output (oldest dropped first).
-local SCROLLBACK_LINES = 500
-local consoleLines = {}      -- committed logical lines, oldest first
-local consoleDirty = true
-local scrollOffset = 0       -- wrapped rows scrolled back from the bottom
-system.lineedit = loadSibling("lineedit.lua")()
-local editor = system.lineedit.new() -- the REPL's line being typed (kernal/lineedit.lua); one per login
-local consolePartial = ""    -- program output not yet ended by a newline
-local commandBusy = false    -- a command is running; see handleKeyDown
-
--- A window like any other, with a title bar (gmux-style): it can be
--- minimized, moved and resized. Its close button minimizes it instead.
--- The POSIX-style shell (kernal/shell.lua), loaded once the program
--- launcher it hands programs to exists (below); declared here for the
--- prompt, which shows its working directory.
-local shell = nil
-
-local consoleW, consoleH = termW, math.max(CONSOLE_MIN_H, math.floor(termH / 2))
-local consoleWin = gpu and compositor.createWindow({title = "console", x = 1, y = termH - consoleH - 1,
-  width = consoleW, height = consoleH, layer = CONSOLE_LAYER, text = true}) or nil
-
-local function consoleOwnsScreen()
-  return compositor.exclusiveOwner() == "console"
-end
-
--- The console's current size: the whole screen in console mode, its
--- window otherwise.
-local function viewSize()
-  if consoleOwnsScreen() then return termW, termH end
-  local win = consoleWin and compositor.getWindow(consoleWin.id)
-  if win then return win.width, win.height end -- resized by hand too
-  return consoleW, consoleH
-end
-
--- Splits one logical line into rows of at most `width` characters
--- (UTF-8 aware; falls back to bytes for invalid UTF-8).
-local function wrapLine(line, width)
-  local len = utf8.len(line)
-  if not len then
-    local rows = {}
-    for i = 1, math.max(#line, 1), width do rows[#rows + 1] = line:sub(i, i + width - 1) end
-    return rows
-  end
-  if len <= width then return {line} end
-  local rows = {}
-  local startChar = 1
-  while startChar <= len do
-    local from = utf8.offset(line, startChar)
-    local to = utf8.offset(line, startChar + width)
-    rows[#rows + 1] = to and line:sub(from, to - 1) or line:sub(from)
-    startChar = startChar + width
-  end
-  return rows
-end
-
--- The console's prompt: `login: ` while nobody is logged in, otherwise
--- user@muxos:<working directory, ~ for home>.
-function system.prompt()
-  local user = system.console.user
-  if not user then return "login: " end
-  local cwd, home = shell and shell.cwd() or "/", system.home(user)
-  if cwd == home then
-    cwd = "~"
-  elseif cwd:sub(1, #home + 1) == home .. "/" then
-    cwd = "~" .. cwd:sub(#home + 1)
-  end
-  return user .. "@muxos:" .. cwd .. "> "
-end
-
--- The line being typed, and where its cursor is: a character index into
--- it, for a cursor within the line (drawn inverted), or nil when the
--- cursor is at the end (drawn as a trailing "_").
-local function liveLine()
-  if commandBusy then
-    -- A foreground program is running: show its unfinished output line
-    -- (e.g. a prompt it wrote with io.write, plus the echo of what's
-    -- being typed into it).
-    if consolePartial ~= "" then return consolePartial .. "_" end
-    return nil
-  end
-  local prompt = system.prompt()
-  local text = editor:text()
-  if editor:cursor() < (utf8.len(text) or #text) then
-    return prompt .. text, (utf8.len(prompt) or #prompt) + editor:cursor() + 1
-  end
-  return prompt .. text .. "_"
-end
-
-local function totalRows(width)
-  local n = 0
-  for _, line in ipairs(consoleLines) do n = n + #wrapLine(line, width) end
-  local live = liveLine()
-  if live then n = n + #wrapLine(live, width) end
-  return n
-end
-
-local function setScroll(rows)
-  local w, h = viewSize()
-  scrollOffset = math.max(0, math.min(rows, totalRows(w) - h))
-  consoleDirty = true
-end
-
--- The h rows currently in view, top to bottom, and the cursor's row and
--- column within them when it's inside the line being typed (see
--- liveLine). Content shorter than the view starts at the top, like a
--- fresh terminal.
-local function visibleRows(w, h)
-  local needed = h + scrollOffset
-  local rows = {}            -- collected bottom-up
-  local exhausted = true
-  local function addLine(line)
-    local wrapped = wrapLine(line, w)
-    for i = #wrapped, 1, -1 do
-      rows[#rows + 1] = wrapped[i]
-      if #rows >= needed then return true end
-    end
-  end
-  local live, cursorAt = liveLine()
-  local cursorUp, cursorCol -- rows up from the bottom (1 = the last one), column
-  if live and cursorAt then
-    local wrapped = #wrapLine(live, w)
-    cursorUp, cursorCol = wrapped - (cursorAt - 1) // w, (cursorAt - 1) % w + 1
-  end
-  if live and addLine(live) then exhausted = false end
-  if exhausted then
-    for i = #consoleLines, 1, -1 do
-      if addLine(consoleLines[i]) then exhausted = false break end
-    end
-  end
-  local out, cursorRow = {}, nil
-  if exhausted and #rows < h then
-    for i = 1, #rows do out[i] = rows[#rows - i + 1] end
-    cursorRow = cursorUp and #rows - cursorUp + 1
-  else
-    for r = 1, h do out[h - r + 1] = rows[scrollOffset + r] end
-    cursorRow = cursorUp and h - (cursorUp - scrollOffset) + 1
-  end
-  if cursorRow and (cursorRow < 1 or cursorRow > h) then cursorRow = nil end
-  return out, cursorRow, cursorCol
-end
-
-local function renderConsole()
-  if not consoleDirty or not consoleWin then return end
-  -- Another owner (a fullscreen node) has the screen: leave it alone.
-  local owner = compositor.exclusiveOwner()
-  if owner and owner ~= "console" then return end
-  consoleDirty = false
-  local w, h = viewSize()
-  local rows, cursorRow, cursorCol = visibleRows(w, h)
-  if scrollOffset > 0 then
-    local tag = "[scrolled " .. scrollOffset .. " -- PgDn]"
-    local first = rows[1] or ""
-    local keep = math.max(0, w - #tag)
-    local len = utf8.len(first) or #first
-    if len < keep then
-      first = first .. (" "):rep(keep - len)
-    else
-      first = first:sub(1, (utf8.offset(first, keep + 1) or (keep + 1)) - 1)
-    end
-    rows[1] = first .. tag
-  end
-  -- A cursor inside the line: that character, inverted.
-  local cursorCell
-  if cursorRow and rows[cursorRow] then
-    local row = rows[cursorRow]
-    local from = utf8.offset(row, cursorCol) or (#row + 1)
-    local to = utf8.offset(row, cursorCol + 1) or (#row + 1)
-    local under = row:sub(from, to - 1)
-    cursorCell = under ~= "" and under or " "
-    rows[cursorRow] = {{row:sub(1, from - 1)}, {cursorCell, 0x000000, 0xFFFFFF}, {row:sub(to)}}
-  end
-  if owner == "console" then
-    compositor.drawDirect(function(g)
-      g.setForeground(0xFFFFFF)
-      g.setBackground(0x000000)
-      g.fill(1, 1, w, h, " ")
-      for y = 1, h do
-        local row = rows[y]
-        if type(row) == "table" then
-          g.set(1, y, row[1][1] .. cursorCell .. row[3][1])
-          g.setForeground(0x000000)
-          g.setBackground(0xFFFFFF)
-          g.set(1 + (cursorCol - 1), y, cursorCell)
-          g.setForeground(0xFFFFFF)
-          g.setBackground(0x000000)
-        elseif row and row ~= "" then
-          g.set(1, y, row)
-        end
-      end
-    end)
-  else
-    compositor.setText(consoleWin.id, rows)
-  end
-end
-
-local function consoleAppend(line)
-  consoleLines[#consoleLines + 1] = line
-  if #consoleLines > SCROLLBACK_LINES then table.remove(consoleLines, 1) end
-  -- Keep a scrolled-back view still while new output arrives below it.
-  if scrollOffset > 0 then scrollOffset = scrollOffset + #wrapLine(line, (viewSize())) end
-  consoleDirty = true
-end
-
--- Shadows the native `print` (which only logs to the Java server
--- console, not the in-game screen -- see this file's header) for every
--- call below this point in the same chunk.
+-- Kernal output: to the session being served, else the local console.
 local function print(...)
-  local n = select("#", ...)
-  local parts = {}
-  for i = 1, n do parts[i] = tostring((select(i, ...))) end
-  local text = table.concat(parts, "\t")
-  if consolePartial ~= "" then
-    consoleAppend(consolePartial)
-    consolePartial = ""
-  end
-  for line in (text .. "\n"):gmatch("(.-)\n") do consoleAppend(line) end
+  local S = K.current or K.console
+  if S then S.print(...) end
 end
-
--- Program output (OUTPUT messages): may end mid-line, so the unfinished
--- part is held in consolePartial until its newline arrives.
-local function consoleWrite(text)
-  local start = 1
-  while true do
-    local nl = text:find("\n", start, true)
-    if not nl then
-      consolePartial = consolePartial .. text:sub(start)
-      break
-    end
-    consoleAppend(consolePartial .. text:sub(start, nl - 1))
-    consolePartial = ""
-    start = nl + 1
-  end
-  consoleDirty = true
-end
-
--- --- Minimal keyboard modifier tracking, replacing OpenOS's keyboard library ---
-
--- Same key-code constants OpenOS's own lib/keyboard.lua uses internally
--- (verified against its source) -- just tracked by hand here since
--- there's no keyboard.pressedCodes table to read without it.
--- Key codes, in one table (the main chunk is near Lua's 200-local limit).
-local KEYS = {BACK = 0x0E, ENTER = 0x1C, LCONTROL = 0x1D, RCONTROL = 0x9D, LMENU = 0x38, RMENU = 0xB8, C = 0x2E}
-local heldKeys = {}
-local function isControlDown() return heldKeys[KEYS.LCONTROL] or heldKeys[KEYS.RCONTROL] end
-local function isAltDown() return heldKeys[KEYS.LMENU] or heldKeys[KEYS.RMENU] end
 
 -- Every message over the modem is chunked, not just boot's CODE --
 -- even a tiny PING gets wrapped as one chunk, uniformly, rather than
@@ -744,6 +483,30 @@ local awaiting = {}
 -- SPAWN carrying an explicit `parent` (its own job id, which
 -- node/runtime.lua now exposes to running job code as the global
 -- `jobId`) sets these.
+-- The session a process belongs to -- where its windows and output go --
+-- if it's still on.
+function K.sessionOf(job)
+  return job and job.session and K.byId[job.session]
+end
+
+-- The session showing window `id`, and the window.
+function K.windowOwner(id)
+  for _, S in ipairs(K.sessions) do
+    local win = S.compositor.getWindow(id)
+    if win then return S, win end
+  end
+end
+
+-- The fullscreen grant ended: the kernal's screen goes back to its own
+-- session (the login screen, if nobody's logged in there).
+function K.releaseScreen()
+  local S = K.console
+  if S then
+    S.compositor.setExclusive(not S.user and "console" or nil)
+    S.redraw()
+  end
+end
+
 local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy, program, window)
   if targetAddr then
     if not nodes[targetAddr] then return nil, "unknown node: " .. tostring(targetAddr) end
@@ -766,15 +529,17 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
   -- now," not a global count, so one tree hitting its cap doesn't
   -- block unrelated top-level work.
   local rootId = parent and jobs[parent] and jobs[parent].rootId or id
-  -- Whose it is: the parent's user and login, or the console's.
-  local owner = parent and jobs[parent] or system.console
+  -- Whose it is: the parent's session, user and login, or those of the
+  -- session it was started from.
+  local S = K.current
+  local owner = parent and jobs[parent] or {session = S and S.id, user = S and S.user, login = S and S.login}
   local user = owner.user or "root"
   if program then
     program.user, program.home = user, system.home(user)
-    program.cwd = program.cwd or (not parent and shell and shell.cwd()) or program.home
+    program.cwd = program.cwd or (not parent and S and S.cwd()) or program.home
   end
   jobs[id] = {id = id, node = targetAddr, status = "running", code = code, codePreview = codePreview(code),
-    startedAt = computer.uptime(), user = user, login = owner.login,
+    startedAt = computer.uptime(), user = user, login = owner.login, session = owner.session,
     parent = parent, appName = appName, orphanPolicy = parent and (orphanPolicy or "orphan") or nil,
     rootId = rootId, path = program and program.path, kind = program and program.kind,
     program = program, args = args}
@@ -1025,7 +790,8 @@ do
     else
       program.modules = prefetchModules(source)
       -- Sizes the default resolution of its virtual gpu.
-      program.screen = {termW, termH}
+      local S = parent and K.sessionOf(jobs[parent]) or K.current or K.console
+      program.screen = {S and S.width or 80, S and S.height or 25}
       program.fsAddress = fsAddr
     end
     local appName = path:match("([^/]+)%.%w+$")
@@ -1191,6 +957,7 @@ function net.handle(job, msg)
   if op ~= "send" or port ~= nil then
     if math.type(port) ~= "integer" or port < 1 or port > 65535 then return nil, "bad port: " .. tostring(port) end
     if port == PORT then return nil, "port " .. PORT .. " is the cluster's own" end
+    if K.terminals and port == K.terminals.PORT then return nil, "port " .. port .. " is muxos's terminal port" end
   end
   if op == "open" then
     local owners = net.ports[port] or {}
@@ -1255,8 +1022,7 @@ local function finishJob(id, status, result, err)
   net.release(id)
   if fullscreen.job == id then
     fullscreen.node, fullscreen.job = nil, nil
-    compositor.setExclusive(not system.console.user and "console" or nil)
-    consoleDirty = true
+    K.releaseScreen()
   end
   runningJobs[id] = nil
   runningCount = runningCount - 1
@@ -1279,8 +1045,9 @@ local function finishJob(id, status, result, err)
   -- Its windows stay up, marked like gmux's: ended (done or killed) or
   -- failed (error, lost).
   local windowStatus = (status == "done" or status == "killed") and "dead" or "error"
-  for _, winId in ipairs(compositor.windowsOwnedBy(id)) do
-    if job.loggedOut then compositor.close(winId) else compositor.setStatus(winId, windowStatus) end
+  local S = K.sessionOf(job)
+  for _, winId in ipairs(S and S.compositor.windowsOwnedBy(id) or {}) do
+    if job.loggedOut then S.compositor.close(winId) else S.compositor.setStatus(winId, windowStatus) end
   end
   -- This job is no longer running -- apply whatever orphan policy ITS
   -- OWN children declared at spawn time.
@@ -1301,8 +1068,7 @@ local function markNodeDown(addr)
   if fullscreen.node == addr then
     fullscreen.node = nil
     fullscreen.job = nil
-    compositor.setExclusive(not system.console.user and "console" or nil)
-    consoleDirty = true
+    K.releaseScreen()
   end
   local lost = {}
   for id in pairs(runningJobs) do
@@ -1686,10 +1452,16 @@ local function handleRequestFullscreen(msg)
       error = "fullscreen already held by " .. fullscreen.node})
     return
   end
-  fullscreen.node = msg.from
   local job = jobs[msg.caller]
-  fullscreen.job = job and job.status == "running" and job.node == msg.from and job.id or nil
-  compositor.setExclusive(msg.from)
+  job = job and job.status == "running" and job.node == msg.from and job or nil
+  -- The grant is the kernal's own screen: for its own session's programs.
+  if not K.console or (job and K.sessionOf(job) ~= K.console) then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
+      error = "fullscreen is for programs on the kernal's own screen, not a terminal's"})
+    return
+  end
+  fullscreen.node, fullscreen.job = msg.from, job and job.id
+  K.console.compositor.setExclusive(msg.from)
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {granted = true}})
 end
 
@@ -1701,8 +1473,7 @@ local function handleReleaseFullscreen(msg)
   end
   fullscreen.node = nil
   fullscreen.job = nil
-  compositor.setExclusive(not system.console.user and "console" or nil)
-  consoleDirty = true
+  K.releaseScreen()
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {released = true}})
 end
 
@@ -1741,10 +1512,15 @@ local function handleSpawn(msg)
   -- create_graphics_process: the window first, so its id goes with the
   -- job; the job becomes its owner.
   local window
+  local S = K.sessionOf(jobs[msg.parent])
   if type(msg.graphics) == "table" then
     local g = msg.graphics
     local err
-    window, err = compositor.createWindow({title = tostring(g.title or "graphics"), x = g.x, y = g.y,
+    if not S then
+      send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "its session has ended -- no screen to open a window on"})
+      return
+    end
+    window, err = S.compositor.createWindow({title = tostring(g.title or "graphics"), x = g.x, y = g.y,
       width = tonumber(g.width) or 40, height = tonumber(g.height) or 12,
       resizable = g.resizable, decorated = g.decorated,
       code = "gpu.setBackground(0x000000) gpu.fill(1, 1, " .. (tonumber(g.width) or 40) .. ", "
@@ -1757,12 +1533,12 @@ local function handleSpawn(msg)
   local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node, msg.parent, msg.appName, msg.orphanPolicy,
     nil, window)
   if not jobId then
-    if window then compositor.close(window.id) end
+    if window then S.compositor.close(window.id) end
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = targetAddr})
     return
   end
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id,
-    result = {id = jobId, node = targetAddr, window = window and compositor.describe(window)}})
+    result = {id = jobId, node = targetAddr, window = window and S.compositor.describe(window)}})
 end
 
 -- gmuxapi.get_orphans(name): hands back the still-unclaimed orphan
@@ -1806,9 +1582,8 @@ end
 
 local function handleOutput(msg)
   local job = jobs[msg.jobId]
-  if job and job.node == msg.from and type(msg.text) == "string" then
-    consoleWrite(msg.text)
-  end
+  local S = job and K.sessionOf(job)
+  if S and job.node == msg.from and type(msg.text) == "string" then S.write(msg.text) end
 end
 
 -- gmuxapi.launch: a process launching a program becomes its parent.
@@ -1944,12 +1719,14 @@ local function handleCreateWindow(msg)
     local caller = callerJob(msg)
     msg.ownerJobId = caller and caller.id
   end
-  local win, err = compositor.createWindow(msg)
+  local S = K.sessionOf(jobs[msg.ownerJobId] or callerJob(msg))
+  local win, err
+  if S then win, err = S.compositor.createWindow(msg) else err = "its session has ended -- no screen to open a window on" end
   if not win then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
     return
   end
-  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = compositor.describe(win)})
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S.compositor.describe(win)})
 end
 
 -- Redraw an existing window. Only its owner process (or an ancestor of
@@ -1959,7 +1736,7 @@ end
 -- flushes).
 local function handleDrawWindow(msg)
   local caller = callerJob(msg)
-  local win = compositor.getWindow(msg.windowId)
+  local S, win = K.windowOwner(msg.windowId)
   local reply
   if not caller then
     reply = "not called from a running process"
@@ -1973,11 +1750,11 @@ local function handleDrawWindow(msg)
   -- drawn within the window as it is.
   if not reply and not msg.pixels and type(msg.width) == "number" and type(msg.height) == "number"
       and (msg.width ~= win.width or msg.height ~= win.height) then
-    local ok, err = compositor.setGeometry(win.id, win.x, win.y, msg.width, msg.height)
+    local ok, err = S.compositor.setGeometry(win.id, win.x, win.y, msg.width, msg.height)
     if not ok then reply = err end
   end
   if not reply then
-    local ok, err = compositor.redrawWindow(msg.windowId, msg)
+    local ok, err = S.compositor.redrawWindow(msg.windowId, msg)
     if ok then
       if not msg.noReply then send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true}) end
       return
@@ -1988,7 +1765,8 @@ local function handleDrawWindow(msg)
 end
 
 local function handleGetWindows(msg)
-  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = compositor.listWindows()})
+  local S = K.sessionOf(callerJob(msg))
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S and S.compositor.listWindows() or {}})
 end
 
 -- First real slice of the gmux application API, muxos-shaped:
@@ -2068,7 +1846,8 @@ local function handleModemMessage(from, port, data)
   elseif msg.type == "ISFOREGROUND" then
     -- readLine (docs/MXE.md): only the console's foreground program reads typed lines.
     local caller = callerJob(msg)
-    if caller and foregroundJob == caller.id then
+    local S = caller and K.sessionOf(caller)
+    if S and S.foregroundJob == caller.id then
       send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
     else
       send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
@@ -2162,809 +1941,81 @@ local function handleModemMessage(from, port, data)
   end
 end
 
--- Runs the command the REPL's line editor (below) just collected.
--- Forward-declared; assigned once everything it calls exists.
-local runCommand
-
--- UI constants, in one table (the main chunk is near Lua's 200-local
--- limit): PgUp/PgDn key codes, how long Ctrl+Alt+C is held for console
--- mode, and the narrowest a window can be resized to (room for the
--- title bar's buttons).
-local UI = {KEY_PAGEUP = 0xC9, KEY_PAGEDOWN = 0xD1, CONSOLE_HOLD_SECONDS = 1, MIN_WINDOW_WIDTH = 8}
-
--- Keys typed while a command is still running. Handling them inline
--- used to run a second command NESTED inside the first one's wait;
--- now they're replayed, in order, once the running command returns.
-local queuedKeys = {}
-
--- The kernal-level interrupt: bring the console up and show it alone,
--- whatever else is going on (a stuck fullscreen app, a window covering
--- everything). `comp` returns to normal compositing.
--- Ctrl+Alt+C, pressed: exit whatever is fullscreen -- a node's
--- fullscreen grant (force-released, so a crashed holder can't trap the
--- screen), or console mode.
-local function exitFullscreen()
-  if fullscreen.node then
-    print("Ctrl+Alt+C: force-releasing fullscreen grant held by " .. fullscreen.node)
-    fullscreen.node = nil
-    fullscreen.job = nil
-  end
-  -- Logged out, the screen is the login prompt's alone.
-  compositor.setExclusive(not system.console.user and "console" or nil)
-  consoleDirty = true
+-- Runs fn(...) as session S: its output and the processes it starts are
+-- S's.
+function K.inSession(S, fn, ...)
+  local prev = K.current
+  K.current = S
+  local ok, err = pcall(fn, ...)
+  K.current = prev
+  if not ok then error(err, 0) end
 end
 
--- Ctrl+Alt+C, held for UI.CONSOLE_HOLD_SECONDS: the kernal-level
--- interrupt that drops into the full-screen kernal console.
-local comboPressedAt, comboHoldFired = nil, false
+local INPUT = {key_down = true, key_up = true, scroll = true, clipboard = true, touch = true, drag = true, drop = true}
 
-local function consoleInterrupt()
-  exitFullscreen()
-  compositor.setExclusive("console")
-  if consoleWin then compositor.setFocus(consoleWin.id) end
-  scrollOffset = 0
-  consoleDirty = true
-  print("console only -- type 'comp' to show windows again")
-end
-
-local function scrollConsole(rows)
-  setScroll(scrollOffset + rows)
-end
-
--- The process that gets keyboard/scroll input right now: the owner of
--- the focused window, if it's a live process. Otherwise (console mode,
--- the console focused, or a window whose process has ended) the console
--- gets it. Ctrl+Alt+C always reaches the kernal.
-local function focusedProcess()
-  if consoleOwnsScreen() then return nil end
-  local win = compositor.getFocus()
-  if not win or (consoleWin and win.id == consoleWin.id) or not win.ownerJobId then return nil end
-  local job = jobs[win.ownerJobId]
-  if job and job.status == "running" and nodes[job.node] and not nodes[job.node].down then return job end
-end
-
-local function deliverEvent(job, event)
-  send({type = "EVENT", from = selfAddr, to = job.node, jobId = job.id, event = event})
-end
-
--- The program running in the foreground from the console (see
--- runForeground), which gets the console's typed input. The kernal
--- echoes it like a terminal: printable characters, backspace (only over
--- what was typed since the last Enter), and Enter.
-local foregroundTyped = ""
-
-local function feedForeground(char, code)
-  local job = jobs[foregroundJob]
-  if not job or job.status ~= "running" then return false end
-  deliverEvent(job, {"key_down", char, code})
-  if code == KEYS.ENTER then
-    consoleAppend(consolePartial)
-    consolePartial, foregroundTyped = "", ""
-  elseif code == KEYS.BACK then
-    local len = utf8.len(foregroundTyped)
-    if len and len > 0 then
-      local cut = utf8.offset(foregroundTyped, -1)
-      local removed = #foregroundTyped - cut + 1
-      foregroundTyped = foregroundTyped:sub(1, cut - 1)
-      consolePartial = consolePartial:sub(1, #consolePartial - removed)
-    end
-  elseif char and char >= 32 then
-    local ok, ch = pcall(utf8.char, char)
-    if ok then
-      foregroundTyped = foregroundTyped .. ch
-      consolePartial = consolePartial .. ch
-    end
-  end
-  consoleDirty = true
-  return true
-end
-
-local function handleKeyDown(char, code)
-  heldKeys[code] = true
-  -- Ctrl+Alt+C was OpenOS's own interrupt shortcut; muxos has no OpenOS
-  -- underneath, so it's reclaimed as the kernal's console interrupt.
-  if code == KEYS.C and isControlDown() and isAltDown() then
-    -- Key repeat sends more key_downs while it's held; only the first
-    -- one is a press.
-    if not comboPressedAt then
-      comboPressedAt, comboHoldFired = computer.uptime(), false
-      exitFullscreen()
-    end
-    return
-  end
-  local target = focusedProcess()
-  if target then
-    deliverEvent(target, {"key_down", char, code})
-    return
-  end
-  -- Scrolling never waits behind a running command.
-  if code == UI.KEY_PAGEUP then scrollConsole(select(2, viewSize()) - 1) return end
-  if code == UI.KEY_PAGEDOWN then scrollConsole(-(select(2, viewSize()) - 1)) return end
-  if commandBusy and foregroundJob and feedForeground(char, code) then return end
-  if commandBusy then
-    queuedKeys[#queuedKeys + 1] = {char, code}
-    return
-  end
-  local line = editor:key(char, code)
-  if type(line) == "string" then
-    consoleAppend(system.prompt() .. line)
-    scrollOffset = 0
-    commandBusy = true
-    consoleDirty = true
-    local ok, err = pcall(runCommand, line)
-    commandBusy = false
-    consoleDirty = true
-    if not ok then print("command error: " .. tostring(err)) end
-    while #queuedKeys > 0 and not commandBusy do
-      local key = table.remove(queuedKeys, 1)
-      handleKeyDown(key[1], key[2])
-    end
-  elseif line then
-    scrollOffset = 0
-    consoleDirty = true
-  end
-end
-
--- A paste (OpenComputers' "clipboard" signal): the focused program gets
--- it as the signal; the console takes it as typing, each newline an
--- Enter -- so a pasted script runs line by line, like in a terminal.
-function UI.paste(text) -- in UI: the main chunk is at its 200-local limit
-  local target = focusedProcess()
-  if target then
-    deliverEvent(target, {"clipboard", text})
-    return
-  end
-  text = text:gsub("\r\n?", "\n")
-  local held = {heldKeys[0], heldKeys[KEYS.ENTER]}
-  local function feed(c)
-    if c == 10 then handleKeyDown(13, KEYS.ENTER) elseif c >= 32 then handleKeyDown(c, 0) end
-  end
-  if utf8.len(text) then
-    for _, c in utf8.codes(text) do feed(c) end
-  else
-    for i = 1, #text do feed(text:byte(i)) end
-  end
-  heldKeys[0], heldKeys[KEYS.ENTER] = held[1], held[2]
-end
-
-local function handleKeyUp(char, code)
-  heldKeys[code] = nil
-  if code == KEYS.C or not (isControlDown() and isAltDown()) then
-    comboPressedAt = nil
-  end
-  local target = focusedProcess()
-  if target then deliverEvent(target, {"key_up", char, code}) end
-end
-
-local function handleScroll(x, y, direction)
-  local target = focusedProcess()
-  if target then
-    deliverEvent(target, {"scroll", x, y, direction})
-  else
-    -- Mouse wheel over the screen: positive direction is up.
-    scrollConsole((direction or 0) > 0 and 3 or -3)
-  end
-end
-
--- --- Touch: window decorations and pointer input (gmux's touch_event) ---
+-- Pulls and fully handles exactly one signal, or times out, then does
+-- the regular upkeep: stale message chunks, the bus, orphans, node
+-- liveness, and every session's drawing. Only the kernal's main loop
+-- (and waits outside any command, at boot) call it; a command waits
+-- through K.wait, which yields to the main loop instead.
 --
--- A touch focuses and raises the window under it. On the title bar it
--- hits a button (minimize, maximize, close -- close also kills the
--- owner process, as in gmux) or starts a move that following drags
--- carry out; on a resizable window's bottom-right body cell it starts a
--- resize. Anything else reaches the window's owner process as
--- {"touch"/"drag"/"drop", x, y, button} in the body's own coordinates.
--- A resized window's owner gets {"window_resized", id, width, height}.
--- Nothing here while one owner has the whole screen.
-local currentGrab = nil
-
-local function windowProcess(win)
-  local job = win.ownerJobId and jobs[win.ownerJobId]
-  if job and job.status == "running" and nodes[job.node] and not nodes[job.node].down then return job end
-end
-
-local function notifyResized(win)
-  local job = windowProcess(win)
-  if job then deliverEvent(job, {"window_resized", win.id, win.width, win.height}) end
-end
-
-local function closeWindow(win)
-  -- The console can't go away: closing it minimizes it.
-  if consoleWin and win.id == consoleWin.id then compositor.minimize(win.id, true) return end
-  local job = windowProcess(win)
-  compositor.close(win.id)
-  if job then controlJob(job.id, "KILL", "killed (window closed)") end
-end
-
--- --- The desktop: gmux's -- a background and a column of app icons ---
---
--- A full-screen text window on the lowest layer, under the console and
--- every other window. Its icons are the console and every program in
--- /bin and /usr/bin (.mxe preferred over .lua, like the launcher);
--- touching one starts it, as if typed at the console with a trailing
--- "&" (a legacy program gets its own terminal window). Rebuilt at boot
--- and on `comp`, so newly installed programs appear.
--- One local (the kernal's main chunk is near Lua's 200-local limit).
-local desktop = {apps = {}, ICON_W = 9, ICON_H = 5, -- 4 rows of art, then the name
-  ART = {"/-------\\", "| -|... |", "|- | ...|", "\\-------/"}}
-do
-  local okDepth, depth = pcall(function() return gpu and gpu.getDepth() end)
-  desktop.mono = okDepth and depth == 1
-  -- gmux's colors: background, icon art (its "secondary"), text.
-  desktop.colors = desktop.mono and {bg = 0x000000, art = 0xFFFFFF, text = 0xFFFFFF, accent = 0xFFFFFF}
-    or {bg = 0x444444, art = 0xFF8844, text = 0xFFFFFF, accent = 0x44FFFF}
-  desktop.win = gpu and compositor.createWindow({title = "desktop", x = 1, y = 1, width = termW, height = termH,
-    layer = -2000, text = true, decorated = false, bg = desktop.colors.bg, fg = desktop.colors.text}) or nil
-end
-
-function desktop.perColumn()
-  return math.max(1, math.floor((termH - 3) / (desktop.ICON_H + 1))) -- above the taskbar
-end
-
--- A text cell-width-exact: cut or padded (centered) to `width` columns.
-function desktop.fit(text, width, center)
-  text = tostring(text or "")
-  local len = utf8.len(text) or #text
-  if len > width then
-    return text:sub(1, (utf8.offset(text, width + 1) or (width + 1)) - 1)
-  end
-  local pad = width - len
-  local left = center and pad // 2 or 0
-  return (" "):rep(left) .. text .. (" "):rep(pad - left)
-end
-
--- A program's own icon, if it has one: an .mxe header's
---   icon = {"row 1", "row 2", "row 3", "row 4"}  (9 columns each)
---   icon_color = 0xRRGGBB                        (or one per row)
--- or, for any program, a <name>.icon file next to it: up to 4 rows of
--- art, optionally after a first line "#RRGGBB" giving its color.
-function desktop.iconOf(path)
-  local art, color
-  local source = path:match("%.mxe$") and readFile(path)
-  if source then
-    local manifest = readManifest(source)
-    if manifest and type(manifest.icon) == "table" then art, color = manifest.icon, manifest.icon_color end
-  end
-  if not art then
-    local text = readFile((path:gsub("%.[^./]*$", "")) .. ".icon")
-    if text then
-      art = {}
-      for line in (text .. "\n"):gmatch("([^\n]*)\n") do
-        local hex = #art == 0 and not color and line:match("^#(%x%x%x%x%x%x)%s*$")
-        if hex then color = tonumber(hex, 16) elseif #art < 4 then art[#art + 1] = line end
-      end
-      while #art > 0 and art[#art] == "" do art[#art] = nil end
-    end
-  end
-  if not art or #art == 0 then return nil end
-  local rows, colors = {}, {}
-  for i = 1, 4 do
-    rows[i] = desktop.fit(art[i], desktop.ICON_W, true)
-    local c = type(color) == "table" and color[i] or color
-    colors[i] = (not desktop.mono and math.type(c) == "integer") and c or nil
-  end
-  return {rows = rows, colors = colors}
-end
-
-function desktop.scan()
-  local apps, seen = {{name = "console", console = true}}, {console = true}
-  for _, dir in ipairs(PROGRAM_PATH) do
-    local names = tryInvoke(fsAddr, "list", dir)
-    if type(names) == "table" then
-      table.sort(names)
-      for _, n in ipairs(names) do
-        local base = n:match("^(.-)%.mxe$") or n:match("^(.-)%.lua$")
-        if base and not seen[base] then
-          local path = resolveProgram(base) -- .mxe first, like typing it
-          if path then
-            seen[base] = true
-            local ok, icon = pcall(desktop.iconOf, path)
-            apps[#apps + 1] = {name = base, path = path, icon = ok and icon or nil}
-          end
-        end
-      end
-    end
-  end
-  desktop.apps = apps
-end
-
--- Rows of colored spans, from {x, text, fg} pieces placed on each row.
-function desktop.spans(width, placed)
-  table.sort(placed, function(a, b) return a[1] < b[1] end)
-  local row, col = {}, 1
-  for _, piece in ipairs(placed) do
-    if piece[1] > col then row[#row + 1] = {(" "):rep(piece[1] - col)} col = piece[1] end
-    row[#row + 1] = {piece[2], piece[3], piece[4]}
-    col = col + (utf8.len(piece[2]) or #piece[2])
-  end
-  if col <= width then row[#row + 1] = {(" "):rep(width - col + 1)} end
-  return row
-end
-
--- --- Wallpaper: a PPM image (P3 or P6), stretched over the screen in
--- half-block cells (kernal/bitmap.lua) behind the icons. `wallpaper
--- <file.ppm>` sets it (remembered in /etc/wallpaper), `wallpaper none`
--- clears it.
-desktop.bitmap = loadSibling("bitmap.lua")()
-desktop.WALLPAPER_CONFIG = "/etc/wallpaper"
-desktop.MAX_WALLPAPER = 1024 * 1024
-
--- A PPM image: width, height and pixel(x, y) -> 0xRRGGBB, or nil and why.
-function desktop.readPPM(data)
-  local pos, fields = 1, {}
-  while #fields < 4 do
-    local token, nextPos = data:match("^%s*([^%s#]+)()", pos)
-    if not token then
-      local comment = data:match("^%s*#[^\n]*\n()", pos)
-      if not comment then return nil, "not a PPM image (bad header)" end
-      pos = comment
-    else
-      fields[#fields + 1], pos = token, nextPos
-    end
-  end
-  local magic, w, h, maxval = fields[1], tonumber(fields[2]), tonumber(fields[3]), tonumber(fields[4])
-  if (magic ~= "P6" and magic ~= "P3") or not w or not h or not maxval or w < 1 or h < 1 or maxval < 1 or maxval > 255 then
-    return nil, "not a PPM image (only P3/P6 with 8-bit colors)"
-  end
-  local scale = 255 / maxval
-  local function rgb(r, g, b)
-    return (math.floor(r * scale) << 16) | (math.floor(g * scale) << 8) | math.floor(b * scale)
-  end
-  if magic == "P6" then
-    local start = pos + 1 -- one whitespace byte ends the header
-    if #data < start + w * h * 3 - 1 then return nil, "the image is cut short" end
-    return w, h, function(x, y)
-      local i = start + ((y - 1) * w + (x - 1)) * 3
-      return rgb(data:byte(i), data:byte(i + 1), data:byte(i + 2))
-    end
-  end
-  local values = {}
-  for n in data:sub(pos):gmatch("%d+") do values[#values + 1] = tonumber(n) end
-  if #values < w * h * 3 then return nil, "the image is cut short" end
-  return w, h, function(x, y)
-    local i = ((y - 1) * w + (x - 1)) * 3
-    return rgb(values[i + 1], values[i + 2], values[i + 3])
-  end
-end
-
--- The wallpaper's cells for this screen, or nil and why.
-function desktop.wallpaperCells(path)
-  local size = tryInvoke(fsAddr, "size", path)
-  if not tryInvoke(fsAddr, "exists", path) then return nil, path .. ": no such file" end
-  if (size or 0) > desktop.MAX_WALLPAPER then return nil, path .. ": too big (1 MB at most)" end
-  local data = readFile(path)
-  if not data then return nil, path .. ": can't read it" end
-  local w, h, pixel = desktop.readPPM(data)
-  if not w then return nil, path .. ": " .. tostring(h) end
-  local pw, ph = termW, termH * 2
-  local pixels = {}
-  for y = 1, ph do
-    local row, sy = {}, math.floor((y - 1) * h / ph) + 1
-    for x = 1, pw do row[x] = pixel(math.floor((x - 1) * w / pw) + 1, sy) end
-    pixels[y] = row
-  end
-  return (desktop.bitmap.encode("halfblock", pixels, pw, ph, desktop.colors.bg))
-end
-
-function desktop.loadWallpaper()
-  desktop.wall = nil
-  local config = readFile(desktop.WALLPAPER_CONFIG)
-  local path = config and config:match("^%s*(.-)%s*$")
-  if not path or path == "" then return end
-  local cells, err = desktop.wallpaperCells(path)
-  if cells then desktop.wall = cells else print("wallpaper: " .. tostring(err)) end
-end
-
-function desktop.render()
-  if not desktop.win then return end
-  local W, H, C = desktop.ICON_W, desktop.ICON_H, desktop.colors
-  -- The background: the wallpaper's cells, or the plain color.
-  local grid = {}
-  for y = 1, termH do
-    local row, wall = {}, desktop.wall and desktop.wall[y]
-    for x = 1, termW do
-      local cell = wall and wall[x]
-      row[x] = cell and {cell.char, cell.fg, cell.bg} or {" ", C.text, C.bg}
-    end
-    grid[y] = row
-  end
-  -- The icons, each on a tile of the desktop's color.
-  local per = desktop.perColumn()
-  local function put(x, y, text, fg)
-    if not grid[y] then return end
-    local i = 0
-    for _, code in utf8.codes(text) do
-      local cell = grid[y][x + i]
-      if cell then cell[1], cell[2], cell[3] = utf8.char(code), fg, C.bg end
-      i = i + 1
-    end
-  end
-  for i, app in ipairs(desktop.apps) do
-    local x, y = 2 + (i - 1) // per * (W + 1), 2 + (i - 1) % per * (H + 1)
-    if x + W - 1 <= termW then
-      for j = 1, 4 do
-        put(x, y + j - 1, app.icon and app.icon.rows[j] or desktop.ART[j], app.icon and app.icon.colors[j] or C.art)
-      end
-      put(x, y + 4, desktop.fit(app.name, W, true), C.text)
-    end
-  end
-  -- Rows of spans: runs of cells sharing their colors.
-  local rows = {}
-  for y = 1, termH do
-    local spans, row, x = {}, grid[y], 1
-    while x <= termW do
-      local fg, bg, chars = row[x][2], row[x][3], {}
-      while x <= termW and row[x][2] == fg and row[x][3] == bg do
-        chars[#chars + 1] = row[x][1]
-        x = x + 1
-      end
-      spans[#spans + 1] = {table.concat(chars), fg, bg}
-    end
-    rows[y] = spans
-  end
-  compositor.setText(desktop.win.id, rows)
-end
-
-function desktop.refresh()
-  desktop.scan()
-  desktop.loadWallpaper()
-  desktop.render()
-end
-
--- The `wallpaper` command: <file.ppm> sets it, `none` clears it.
-function desktop.setWallpaper(arg)
-  if not arg or arg == "" then
-    local config = readFile(desktop.WALLPAPER_CONFIG)
-    print("wallpaper: " .. (config and config:match("^%s*(.-)%s*$") or "none")
-      .. "  (wallpaper <file.ppm> | wallpaper none)")
-    return
-  end
-  if arg == "none" then
-    tryInvoke(fsAddr, "remove", desktop.WALLPAPER_CONFIG)
-    desktop.wall = nil
-    desktop.render()
-    print("wallpaper cleared")
-    return
-  end
-  local path = arg
-  if path:sub(1, 1) ~= "/" then path = (shell and shell.cwd() or "/") .. "/" .. path end
-  local cells, err = desktop.wallpaperCells(path)
-  if not cells then print("wallpaper: " .. tostring(err)) return end
-  tryInvoke(fsAddr, "makeDirectory", "/etc")
-  local h = tryInvoke(fsAddr, "open", desktop.WALLPAPER_CONFIG, "w")
-  if h then tryInvoke(fsAddr, "write", h, path .. "\n") tryInvoke(fsAddr, "close", h) end
-  desktop.wall = cells
-  desktop.render()
-  print("wallpaper: " .. path)
-end
-
-function desktop.showConsole()
-  if not consoleWin then return end
-  local win = compositor.getWindow(consoleWin.id)
-  if win and win.minimized then compositor.minimize(consoleWin.id, false) end
-  compositor.raise(consoleWin.id)
-  compositor.setFocus(consoleWin.id)
-  consoleDirty = true
-end
-
--- Starts an app from the desktop, the start menu or the taskbar.
-function desktop.launch(app)
-  if app.console then desktop.showConsole() return end
-  local id, addrOrErr = launchProgram(app.path, {})
-  if id then
-    print("[" .. id .. "] " .. app.path .. " started on " .. addrOrErr)
-  else
-    print("error: " .. tostring(addrOrErr))
-  end
-end
-
--- A touch on the desktop: the icon under it, if any, starts.
-function desktop.touch(lx, ly)
-  local W, H, per = desktop.ICON_W, desktop.ICON_H, desktop.perColumn()
-  local col, colOff = (lx - 2) // (W + 1), (lx - 2) % (W + 1)
-  local row, rowOff = (ly - 2) // (H + 1), (ly - 2) % (H + 1)
-  if lx < 2 or ly < 2 or colOff >= W or rowOff >= H or row >= per then return end
-  local app = desktop.apps[col * per + row + 1]
-  if app then desktop.launch(app) end
-end
-
--- --- The taskbar: a start button, a button per window, and a clock ---
---
--- The bottom row, above every window. Touching a window's button
--- restores and raises it -- or minimizes it, if it's already the
--- focused window on top. The start button opens a menu of every app
--- (the desktop's icons can be covered by windows).
-desktop.bar = {buttons = {}, signature = nil, nextCheck = 0}
-desktop.bar.win = gpu and compositor.createWindow({title = "taskbar", x = 1, y = termH, width = termW, height = 1,
-  layer = 3000, text = true, decorated = false, bg = 0x222222, fg = 0xFFFFFF}) or nil
--- (A new window takes the focus: the console has it at boot.)
-if consoleWin then compositor.setFocus(consoleWin.id) end
-
-function desktop.bar.windows()
-  local list = {}
-  for _, w in ipairs(compositor.listWindows()) do
-    if w.id ~= (desktop.win and desktop.win.id) and w.id ~= (desktop.bar.win and desktop.bar.win.id)
-        and w.id ~= (desktop.menu and desktop.menu.id) then
-      list[#list + 1] = w
-    end
-  end
-  table.sort(list, function(a, b) return a.id < b.id end)
-  return list
-end
-
-function desktop.bar.render(list)
-  local C, focus = desktop.colors, compositor.getFocus()
-  local okClock, clock = pcall(os.date, "%H:%M")
-  if not okClock or type(clock) ~= "string" then
-    local t = math.floor(computer.uptime())
-    clock = string.format("%d:%02d", t // 3600, t // 60 % 60)
-  end
-  clock = " " .. clock .. " "
-  local placed, buttons = {}, {}
-  local start = desktop.mono and "[muxos]" or " \u{2261} muxos "
-  placed[#placed + 1] = {1, start, desktop.mono and 0xFFFFFF or 0x000000, desktop.mono and 0x000000 or C.accent}
-  buttons[#buttons + 1] = {from = 1, to = utf8.len(start), start = true}
-  local x, limit = utf8.len(start) + 2, termW - #clock
-  -- Every window gets a button: titles shrink (14 characters down to 3)
-  -- until all fit; past that, a "+N" button lists the rest in a menu.
-  local room, title = limit - x + 2, 14 -- a button is title + 2 spaces + 1 gap
-  while title > 3 and #list * (title + 3) > room do title = title - 1 end
-  local shown, more = #list, nil
-  if #list * (title + 3) > room then
-    more = " +" .. #list .. " "
-    shown = math.max(0, (room - #more - 1) // (title + 3))
-    more = " +" .. (#list - shown) .. " "
-  end
-  for i = 1, shown do
-    local w = list[i]
-    local label = " " .. desktop.fit(w.title, math.min(title, utf8.len(w.title) or #w.title)) .. " "
-    local width = utf8.len(label) or #label
-    local fg, bg = 0xFFFFFF, 0x555555
-    if w.minimized then
-      fg, bg = 0x999999, 0x333333
-    elseif focus and focus.id == w.id then
-      fg, bg = 0x000000, 0xFFFFFF
-    end
-    if desktop.mono then fg, bg = 0xFFFFFF, 0x000000 end
-    placed[#placed + 1] = {x, label, fg, bg}
-    buttons[#buttons + 1] = {from = x, to = x + width - 1, window = w.id}
-    x = x + width + 1
-  end
-  if more then
-    placed[#placed + 1] = {x, more, 0x000000, desktop.mono and 0xFFFFFF or C.accent}
-    buttons[#buttons + 1] = {from = x, to = x + #more - 1, more = true}
-  end
-  placed[#placed + 1] = {termW - #clock + 1, clock, 0xFFFFFF, nil}
-  desktop.bar.buttons = buttons
-  compositor.setText(desktop.bar.win.id, {desktop.spans(termW, placed)})
-end
-
--- Redraws the bar when its windows, focus or the clock changed --
--- checked at most twice a second, from tick(), or at once when forced.
-function desktop.bar.update(force)
-  if not desktop.bar.win or compositor.exclusiveOwner() then return end
-  local now = computer.uptime()
-  if not force and now < desktop.bar.nextCheck then return end
-  desktop.bar.nextCheck = now + 0.5
-  local list = desktop.bar.windows()
-  local focus = compositor.getFocus()
-  local parts = {focus and focus.id or 0, math.floor(now / 30)}
-  for _, w in ipairs(list) do parts[#parts + 1] = w.id .. w.title .. tostring(w.minimized) end
-  local okClock, clock = pcall(os.date, "%H:%M")
-  parts[#parts + 1] = okClock and tostring(clock) or ""
-  local signature = table.concat(parts, "|")
-  if force or signature ~= desktop.bar.signature then
-    desktop.bar.signature = signature
-    desktop.bar.render(list)
-  end
-end
-
--- Shows a window: restored if minimized, raised, focused.
-function desktop.bar.show(id)
-  local win = compositor.getWindow(id)
-  if not win then return end
-  if win.minimized then compositor.minimize(id, false) end
-  compositor.raise(id)
-  compositor.setFocus(id)
-end
-
-function desktop.bar.touch(lx)
-  for _, b in ipairs(desktop.bar.buttons) do
-    if lx >= b.from and lx <= b.to then
-      if b.start then
-        desktop.toggleMenu()
-      elseif b.more then
-        -- Every window, by title; touching one shows it.
-        local items = {}
-        for _, w in ipairs(desktop.bar.windows()) do
-          local id = w.id
-          items[#items + 1] = {label = w.title .. (w.minimized and " (minimized)" or ""),
-            action = function() desktop.bar.show(id) end}
-        end
-        desktop.toggleMenu(items, b.from)
-      else
-        local win = compositor.getWindow(b.window)
-        local focus = compositor.getFocus()
-        local top -- the topmost ordinary window showing
-        for _, w in ipairs(compositor.listWindows()) do
-          if w.id ~= desktop.bar.win.id and w.id ~= (desktop.menu and desktop.menu.id) and not w.minimized then
-            top = w
-            break
-          end
-        end
-        if win then
-          if not win.minimized and focus and focus.id == win.id and top and top.id == win.id then
-            compositor.minimize(win.id, true)
-          else
-            desktop.bar.show(win.id)
-          end
-        end
-      end
-      break
-    end
-  end
-  desktop.bar.update(true)
-end
-
--- A menu above the taskbar, one item per row: the start menu (every
--- app) by default, or the given items ({label, action}) at column x.
--- Open already: closes it instead.
-function desktop.toggleMenu(items, x)
-  if desktop.menu then
-    compositor.close(desktop.menu.id)
-    desktop.menu, desktop.menuItems = nil, nil
-    return
-  end
-  if not items then
-    items = {}
-    for _, app in ipairs(desktop.apps) do
-      items[#items + 1] = {label = app.name, action = function() desktop.launch(app) end}
-    end
-  end
-  if #items == 0 then return end
-  local rows, width = {}, 8
-  for _, item in ipairs(items) do width = math.max(width, (utf8.len(item.label) or #item.label) + 2) end
-  width = math.min(width, termW)
-  local height = math.min(#items, termH - 2)
-  for i = 1, height do rows[i] = " " .. desktop.fit(items[i].label, width - 1) end
-  local focus = compositor.getFocus()
-  desktop.menu = compositor.createWindow({title = "menu", x = math.max(1, math.min(x or 1, termW - width + 1)),
-    y = termH - height, width = width, height = height,
-    layer = 2900, text = true, decorated = false, bg = 0xFFFFFF, fg = 0x000000})
-  if focus then compositor.setFocus(focus.id) end -- the menu doesn't take it
-  if desktop.menu then
-    desktop.menuItems = items
-    compositor.setText(desktop.menu.id, rows)
-  end
-end
-
-function desktop.menuTouch(ly)
-  local item = desktop.menuItems and desktop.menuItems[ly]
-  desktop.toggleMenu()
-  if item then item.action() end
-  desktop.bar.update(true)
-end
-
-local function handleTouch(name, x, y, button)
-  if compositor.exclusiveOwner() then currentGrab = nil return end
-  if currentGrab then
-    local grab = currentGrab
-    local win = compositor.getWindow(grab.id)
-    if name == "drop" or not win then currentGrab = nil return end
-    if name == "drag" then
-      if grab.kind == "move" then
-        compositor.move(win.id, x - grab.dx, y)
-      else
-        local w = math.max(UI.MIN_WINDOW_WIDTH, x - win.x + 1)
-        local h = math.max(1, y - compositor.bodyTop(win) + 1)
-        if (w ~= win.width or h ~= win.height) and compositor.resize(win.id, w, h) then notifyResized(win) end
-      end
-      return
-    end
-    currentGrab = nil -- a fresh touch ends the grab and is handled below
-  end
-  local win, part, lx, ly = compositor.hitTest(x, y)
-  if not win then return end
-  if desktop.menu and win.id ~= desktop.menu.id and name == "touch" then desktop.toggleMenu() end
-  if desktop.menu and win.id == desktop.menu.id then
-    if name == "touch" then desktop.menuTouch(ly) end
-    return
-  end
-  if desktop.bar.win and win.id == desktop.bar.win.id then
-    if name == "touch" then desktop.bar.touch(lx) end
-    return
-  end
-  if desktop.win and win.id == desktop.win.id then
-    if name == "touch" then desktop.touch(lx, ly) end
-    return
-  end
-  if name == "touch" then
-    compositor.setFocus(win.id)
-    compositor.raise(win.id)
-  end
-  if part == "title" then
-    if name ~= "touch" then return end
-    local w = win.width
-    if lx == w - 5 or lx == w - 4 then
-      compositor.minimize(win.id)
-    elseif (lx == w - 3 or lx == w - 2) and win.resizable then
-      if compositor.maximize(win.id) then notifyResized(win) end
-    elseif lx == w - 1 or lx == w then
-      closeWindow(win)
-    else
-      currentGrab = {id = win.id, kind = "move", dx = lx - 1}
-    end
-    return
-  end
-  if name == "touch" and win.resizable and win.decorated and lx == win.width and ly == win.height then
-    currentGrab = {id = win.id, kind = "resize"}
-    return
-  end
-  local job = windowProcess(win)
-  if job then deliverEvent(job, {name, lx, ly, button}) end
-end
-
--- Pulls and fully handles exactly one signal, or times out -- the ONE
--- place every wait in this program funnels through, whether that's the
--- REPL idling at its prompt or something deep in a submit()/awaitReply()
--- blocking on a specific network reply. This replaces BOTH the old
--- "separate background thread polling pump()" design AND the old
--- os.sleep(0.05)-paced maintenance loop: there is exactly one coroutine
--- here (no OpenOS thread library to fake concurrency with any more), so
--- servicing everything inline, on every signal, from wherever a wait
--- happens to be nested, is the only correct shape now -- not a
--- simplification taken for convenience, the actual consequence of there
--- being no OpenOS underneath to schedule a second thread with.
---
--- pcall-wrapped around the dispatch + maintenance work for the same
--- reason the old design's background thread was: without it, an
--- uncaught error in any single handler (a bad INVOKE, a window draw-
--- code bug, anything) would propagate all the way out of this, the
--- kernal's ONLY coroutine now -- not just killing a background thread
--- the REPL could still survive without, but the whole event loop.
+-- pcall-wrapped: an uncaught error in any single handler (a bad INVOKE,
+-- a window draw-code bug, anything) must not end the kernal's event
+-- loop.
 local function tick(timeout)
   local sig = table.pack(pullSignal(timeout))
   local name, a2, a3, a4, a5, a6 = table.unpack(sig, 1, 6)
   local ok, err = pcall(function()
     if name == "modem_message" and a4 ~= PORT then net.deliver(sig) end
     if type(a2) == "string" and bus.components[a2] then bus.forwardSignal(selfAddr, sig) end
-    if name == "key_down" then
-      handleKeyDown(a3, a4)
-    elseif name == "key_up" then
-      handleKeyUp(a3, a4)
-    elseif name == "scroll" then
-      handleScroll(a3, a4, a5)
-    elseif name == "clipboard" and type(a3) == "string" then
-      UI.paste(a3)
-    elseif name == "touch" or name == "drag" or name == "drop" then
-      handleTouch(name, a3, a4, a5)
+    if INPUT[name] then
+      -- The kernal's own keyboard and screen: the local session's.
+      if K.console then K.inSession(K.console, K.console.input, name, a3, a4, a5) end
     elseif name == "component_added" or name == "component_removed" then
       bus.refreshOwn()
     elseif name == "modem_message" then
-      handleModemMessage(a3, a4, a6)
-    end
-    if comboPressedAt and not comboHoldFired and heldKeys[KEYS.C] and isControlDown() and isAltDown()
-        and computer.uptime() - comboPressedAt >= UI.CONSOLE_HOLD_SECONDS then
-      comboHoldFired = true
-      consoleInterrupt()
+      if a4 == PORT then
+        handleModemMessage(a3, a4, a6)
+      elseif K.terminals then
+        K.terminals.message(a3, a4, a6)
+      end
     end
     sweepStaleChunks()
     bus.sweep()
     sweepStaleOrphans()
     checkLiveness()
-    renderConsole()
-    desktop.bar.update()
-    compositor.flush()
+    if K.terminals then K.terminals.sweep() end
+    for _, S in ipairs(K.sessions) do K.inSession(S, S.update) end
   end)
   if not ok then
     print("tick error (continuing): " .. tostring(err))
   end
 end
 
+-- Waits: inside a session's command, by yielding to the main loop (which
+-- resumes it each tick); anywhere else, by ticking.
+function K.wait(timeout)
+  if K.commands[coroutine.running()] then
+    coroutine.yield()
+  else
+    tick(timeout)
+  end
+end
+
+-- Runs a session's command coroutine until it waits or ends.
+function K.resumeCommand(S, co)
+  local prev = K.current
+  K.current = S
+  K.commands[co] = true
+  local ok, err = coroutine.resume(co)
+  K.current = prev
+  return ok, err
+end
+
 local function waitSeconds(duration)
   local deadline = computer.uptime() + duration
   while computer.uptime() < deadline do
-    tick(deadline - computer.uptime())
+    K.wait(deadline - computer.uptime())
   end
 end
 
@@ -2989,7 +2040,7 @@ local function waitForReply(id, addr, timeout)
       awaiting[id] = nil
       return msg
     end
-    tick(deadline - computer.uptime())
+    K.wait(deadline - computer.uptime())
   end
   awaiting[id] = nil
   return nil, "timed out waiting for " .. tostring(addr)
@@ -3005,25 +2056,6 @@ end
 -- Submit `code` (compiled as a chunk and called with `args` as its only
 -- argument) to one worker node and block for the result. Picks the next
 -- node round-robin unless targetAddr is given.
--- Runs a launched program in the foreground: the console waits until it
--- ends (any way: done, error, killed, lost), feeding it typed input
--- meanwhile, like an OpenOS shell.
-local function runForeground(id)
-  foregroundJob, foregroundTyped = id, ""
-  while jobs[id] and jobs[id].status == "running" do
-    tick(0.5)
-  end
-  foregroundJob = nil
-  if consolePartial ~= "" then
-    consoleAppend(consolePartial)
-    consolePartial = ""
-  end
-  local job = jobs[id]
-  if job and job.status ~= "done" then
-    print(job.status .. ": " .. tostring(job.error))
-  end
-end
-
 local function submit(code, args, targetAddr)
   local id, addrOrErr = dispatchJob(code, args, targetAddr)
   if not id then
@@ -3137,47 +2169,6 @@ local function printProcesses()
   end
 end
 
--- Generates a small test pattern (a filled diamond, red center ring,
--- blue outer ring, transparent corners) so `bitdemo` has something
--- visually meaningful to draw without requiring anyone to type a pixel
--- grid by hand at the REPL.
-local function demoPixels(size)
-  local pixels = {}
-  local center = (size + 1) / 2
-  for y = 1, size do
-    pixels[y] = {}
-    for x = 1, size do
-      local dist = math.abs(x - center) + math.abs(y - center)
-      if dist < size / 4 then
-        pixels[y][x] = 0xff0000 -- red center
-      elseif dist < size / 2 then
-        pixels[y][x] = 0x0000ff -- blue ring
-      else
-        pixels[y][x] = nil -- transparent corners
-      end
-    end
-  end
-  return pixels
-end
-
-local function printWindows()
-  local list = compositor.listWindows()
-  if #list == 0 then
-    print("no windows created yet")
-    return
-  end
-  local focus = compositor.getFocus()
-  for _, win in ipairs(list) do
-    local tags = ""
-    if focus and win.id == focus.id then tags = tags .. " (focused)" end
-    if win.ownerJobId then tags = tags .. " (owner job " .. win.ownerJobId .. ")" end
-    if win.minimized then tags = tags .. " (minimized)" end
-    if win.maximized then tags = tags .. " (maximized)" end
-    if win.status then tags = tags .. " (process " .. win.status .. ")" end
-    print(string.format("[%d] %q  %dx%d at (%d,%d)%s", win.id, win.title, win.width, win.height, win.x, win.y, tags))
-  end
-end
-
 -- --- `update`: a new muxos from the installer floppy ---
 --
 -- Reads the installer's data file (/muxos-installer.dat) from whichever
@@ -3205,7 +2196,7 @@ function updates.read(addr, path)
       return table.concat(parts)
     end
     parts[#parts + 1] = data
-    if #parts % 16 == 0 then tick(0) end
+    if #parts % 16 == 0 then K.wait(0) end
   end
 end
 
@@ -3284,7 +2275,7 @@ function updates.run()
       end
       tryInvoke(fsAddr, "close", h)
       if tryInvoke(fsAddr, "size", f.path .. ".new") ~= #f.data then return abandon("short write: " .. f.path) end
-      tick(0)
+      K.wait(0)
     end
   end
   -- Everything is written: swap the new files in.
@@ -3311,138 +2302,9 @@ function updates.run()
     version, #staged, biosNote))
 end
 
--- muxos's own console commands, by first word: inside a shell line
--- (`nodes; ls`) these still reach runCommand, not the program path.
-do
-local KERNAL_COMMANDS = {}
-for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
-    .. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
-    .. "shutdown logout flags users useradd userdel"):gmatch("%S+") do
-  KERNAL_COMMANDS[name] = true
-end
--- A disk without shell.lua (upgraded by hand) still boots; `update`
--- from the installer floppy brings it.
-local shellOk, shellFactory = pcall(loadSibling, "shell.lua")
-if not shellOk then print("no shell (" .. tostring(shellFactory) .. ") -- run `update` with the installer floppy in") end
-local shellCtx = {
-  invoke = tryInvoke, root = fsAddr, tmp = computer.tmpAddress(), list = component.list,
-  write = consoleWrite,
-  width = function() return (viewSize()) end,
-  clear = function()
-    for i = #consoleLines, 1, -1 do consoleLines[i] = nil end
-    scrollOffset, consoleDirty = 0, true
-  end,
-  sleep = function(seconds)
-    local deadline = computer.uptime() + seconds
-    while computer.uptime() < deadline do tick(deadline - computer.uptime()) end
-  end,
-  help = function() system.help() end,
-  info = {version = MUXOS_VERSION, address = selfAddr or computer.address(), uptime = computer.uptime,
-    memory = function() return computer.freeMemory(), computer.totalMemory() end},
-  -- Not built in: a muxos command, or a program OpenOS-shell style (a
-  -- legacy program has its own window, as in gmux, so the console
-  -- doesn't wait for it; & runs any program in the background).
-  external = function(argv, background)
-    if KERNAL_COMMANDS[argv[1]] then
-      runCommand(table.concat(argv, " "))
-      return 0
-    end
-    local path = resolveProgram(argv[1])
-    if not path then
-      print("sh: " .. argv[1] .. ": command not found")
-      return 127
-    end
-    local id, addrOrErr = launchProgram(path, {table.unpack(argv, 2)})
-    if not id then
-      print("error: " .. addrOrErr)
-      return 1
-    elseif background or path:match("%.lua$") then
-      print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
-      return 0
-    end
-    runForeground(id)
-    return jobs[id] and jobs[id].status == "done" and 0 or 1
-  end,
-}
-system.shellOk = shellOk
--- A fresh shell per login: its own variables and working directory.
-function system.newShell(user)
-  if not shellOk then return nil end
-  shellCtx.user, shellCtx.home = user, system.home(user)
-  return shellFactory(shellCtx)
-end
-end
-
--- --- Logging in and out ---
-
--- Says why the console's user may not do something a flag reserves for
--- root, and returns true; nothing (nil) if they may.
-function system.deny(flagName, doing)
-  local ok, why = system.allowed(system.console.user, flagName, doing)
-  if not ok then print(why) return true end
-end
-
--- The login screen: the console alone, asking for a user name.
-function system.showLogin()
-  if fullscreen.node then fullscreen.node, fullscreen.job = nil, nil end
-  compositor.setExclusive("console")
-  if consoleWin then compositor.setFocus(consoleWin.id) end
-  print("muxos " .. MUXOS_VERSION .. " -- " .. selfAddr)
-  print("Log in with your user name (no password).")
-  scrollOffset, consoleDirty = 0, true
-end
-
-function system.startSession(name)
-  local c = system.console
-  c.user, c.login = name, c.login + 1
-  tryInvoke(fsAddr, "makeDirectory", system.home(name))
-  shell = system.newShell(name)
-  editor = system.lineedit.new()
-  if compositor.exclusiveOwner() == "console" then compositor.setExclusive(nil) end
-  desktop.refresh()
-  desktop.showConsole()
-  print("logged in as " .. name .. " (home " .. system.home(name) .. ") -- type 'help' for commands")
-  consoleDirty = true
-end
-
--- At the login: prompt, a typed line is a user name.
-function system.login(line)
-  local name = (line or ""):match("^%s*(.-)%s*$")
-  if name == "" then return end
-  if not system.userExists(name) then
-    print("no such user: " .. name)
-    return
-  end
-  system.startSession(name)
-end
-
-function system.logout()
-  local c = system.console
-  local ending = system.flag("logout_ends_jobs")
-  for id in pairs(runningJobs) do
-    local job = jobs[id]
-    if job.login == c.login and ending then
-      job.loggedOut = true -- its windows close when it ends (finishJob)
-      controlJob(id, "KILL", "killed (logged out)")
-    end
-  end
-  -- Windows no running process owns go: what's left of this login.
-  for _, w in ipairs(compositor.listWindows()) do
-    local system_ = w.id == (consoleWin and consoleWin.id) or w.id == (desktop.win and desktop.win.id)
-      or w.id == (desktop.bar.win and desktop.bar.win.id)
-    local job = w.ownerJobId and jobs[w.ownerJobId]
-    if not system_ and not (job and job.status == "running" and not job.loggedOut) then compositor.close(w.id) end
-  end
-  if desktop.menu then desktop.toggleMenu() end
-  c.user = nil
-  editor = system.lineedit.new()
-  for i = #consoleLines, 1, -1 do consoleLines[i] = nil end
-  system.showLogin()
-end
-
 -- `flags`: lists them; `flags <name>` shows one; `flags <name> <value>`
 -- sets one (root only).
-function system.flagsCommand(args)
+function K.flagsCommand(S, args)
   local name, value = args:match("^%s*(%S*)%s*(.-)%s*$")
   if name == "" then
     for _, f in ipairs(system.FLAGS) do
@@ -3464,40 +2326,52 @@ function system.flagsCommand(args)
     if not known then print("flags: no flag called " .. name) end
     return
   end
-  if system.console.user ~= "root" then print("flags: only root can change flags; log in as root") return end
+  if S.user ~= "root" then print("flags: only root can change flags; log in as root") return end
   local flag, err = system.setFlag(name, value)
   if not flag then print("flags: " .. err) return end
   print(name .. " = " .. tostring(system.flag(name)) .. (flag.reboot and "  (takes effect at the next boot)" or ""))
 end
 
-runCommand = function(line)
-  if not system.console.user then return system.login(line) end
-  local word = line and line:match("^%s*(%S+)")
+
+-- A command typed at a session's console (in that session's command
+-- coroutine): the session's own commands first, then the kernal's, then
+-- the shell.
+function K.runCommand(S, line)
+  if not S.user then return S.loginLine(line) end
+  if S.command(line) then return end
+  local word = line:match("^%s*(%S+)")
   -- A line with more than one command in it is the shell's, which hands
   -- each muxos command back here on its own.
-  if line and line:find("[;|&<>]") and (word == "flags" or word == "useradd" or word == "userdel") then word = nil end
-  if not line or line == "exit" or line == "logout" then
-    system.logout()
-  elseif line == "quit" or line == "shutdown" or line == "reboot" then
-    if not system.deny("reboot_requires_root", line) then shutdown(line == "reboot") end
+  if line:find("[;|&<>]") and (word == "flags" or word == "useradd" or word == "userdel") then word = nil end
+  if line == "quit" or line == "shutdown" or line == "reboot" then
+    if not S.deny("reboot_requires_root", line) then shutdown(line == "reboot") end
   elseif line == "update" then
-    if not system.deny("update_requires_root", "update") then updates.run() end
+    if not S.deny("update_requires_root", "update") then updates.run() end
   elseif word == "flags" then
-    system.flagsCommand(line:sub(6))
-  elseif line == "users" then
+    K.flagsCommand(S, line:sub(6))
+  elseif line == "users" or line == "who" then
+    local on = {}
+    for _, other in ipairs(K.sessions) do
+      if other.user then
+        on[other.user] = (on[other.user] and on[other.user] .. ", " or "")
+          .. (other.kind == "local" and "console" or "terminal " .. tostring(other.address):sub(1, 8))
+      end
+    end
     for _, name in ipairs(system.users()) do
-      print(name .. (name == system.console.user and "  (logged in)" or "") .. "  " .. system.home(name))
+      if line == "users" or on[name] then
+        print(name .. "  " .. system.home(name) .. (on[name] and ("  (logged in: " .. on[name] .. ")") or ""))
+      end
     end
   elseif word == "useradd" or word == "userdel" then
     local name = line:match("^%S+%s+(%S+)%s*$")
     if not name then
       print("usage: " .. word .. " <name>")
-    elseif not system.deny("useradd_requires_root", word) then
+    elseif not S.deny("useradd_requires_root", word) then
       local ok, err
       if word == "useradd" then
         ok, err = system.addUser(name)
-      elseif name == system.console.user then
-        err = "you can't remove the user you're logged in as"
+      elseif K.loggedIn(name) then
+        err = name .. " is logged in"
       else
         ok, err = system.removeUser(name)
       end
@@ -3508,10 +2382,8 @@ runCommand = function(line)
         print(word .. ": " .. err)
       end
     end
-  elseif (word == "drain" or word == "undrain" or word == "migrate") and system.deny("drain_requires_root", word) then
+  elseif (word == "drain" or word == "undrain" or word == "migrate") and S.deny("drain_requires_root", word) then
     return
-  elseif line == "wallpaper" or line:match("^wallpaper%s") then
-    desktop.setWallpaper(line:match("^wallpaper%s+(.-)%s*$"))
   elseif line == "discover" then
     discover(1)
     listNodes()
@@ -3546,43 +2418,12 @@ runCommand = function(line)
       local id, addrOrErr = dispatchJob(code, nil, resolveNode(node))
       if not id then print("error: " .. addrOrErr) else print("spawned job [" .. id .. "] on " .. addrOrErr) end
     end
-  elseif line:match("^window%s") then
-    local title, x, y, w, h, code = line:match("^window%s+(%S+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(.*)$")
-    if not title then
-      print("usage: window <title> <x> <y> <width> <height> <lua code drawing into `gpu`>")
-    else
-      local win, err = compositor.createWindow({title = title, x = tonumber(x), y = tonumber(y),
-        width = tonumber(w), height = tonumber(h), code = code})
-      if err then print("error: " .. err) else print("created window [" .. win.id .. "]") end
-    end
-  elseif line == "windows" then
-    printWindows()
-  elseif line:match("^console%s") then
-    local w, h, x, y = line:match("^console%s+(%d+)%s+(%d+)%s*(%d*)%s*(%d*)$")
-    w, h, x, y = tonumber(w), tonumber(h), tonumber(x), tonumber(y)
-    if not w then
-      print("usage: console <width> <height> [x y]  (default: docked bottom-left)")
-    elseif w < CONSOLE_MIN_W or h < CONSOLE_MIN_H or w > termW or h > termH - 2 then
-      print(string.format("console size must be between %dx%d and %dx%d", CONSOLE_MIN_W, CONSOLE_MIN_H, termW, termH - 2))
-    else
-      -- y is the title bar's row; the text is below it, above the taskbar.
-      x, y = x or 1, y or (termH - h - 1)
-      if x + w - 1 > termW or y + h > termH - 1 then
-        print("that doesn't fit on the screen")
-      else
-        compositor.setGeometry(consoleWin.id, x, y, w, h)
-        consoleW, consoleH = w, h
-        setScroll(scrollOffset)
-        consoleDirty = true
-        print(string.format("console is now %dx%d at (%d,%d)", w, h, x, y))
-      end
-    end
   elseif line:match("^pause%s") or line:match("^resume%s") or line:match("^kill%s") then
     local verb, idStr = line:match("^(%a+)%s+(%d+)$")
     if not verb then
       print("usage: pause|resume|kill <job id>")
     else
-      local job, user = jobs[tonumber(idStr)], system.console.user
+      local job, user = jobs[tonumber(idStr)], S.user
       local ok, err
       if job and job.user ~= user and user ~= "root" and system.flag("kill_requires_owner") then
         err = "job [" .. idStr .. "] is " .. tostring(job.user) .. "'s (flag kill_requires_owner)"
@@ -3613,38 +2454,6 @@ runCommand = function(line)
       else
         print("error: " .. moved)
       end
-    end
-  elseif line == "comp" then
-    -- Back to normal compositing from console mode.
-    -- Only takes the screen back from the console, never from a node
-    -- holding the fullscreen grant.
-    if consoleOwnsScreen() then compositor.setExclusive(nil) end
-    scrollOffset = 0
-    consoleDirty = true
-    desktop.refresh()
-    print("desktop restored -- all windows shown")
-  elseif line:match("^focus%s") then
-    -- Manual stand-in for the gesture that will eventually move focus
-    -- for real (there's no mouse/click component anywhere in this
-    -- project) -- see kernal/compositor.lua's M.setFocus. Moving focus
-    -- doesn't yet DO anything beyond being observable via `windows`
-    -- (handleKeyDown below still only ever feeds the kernal's own REPL
-    -- input buffer) -- that's the next piece, not this one.
-    local idStr = line:match("^focus%s+(%d+)$")
-    if not idStr then
-      print("usage: focus <window id>")
-    else
-      local ok, err = compositor.setFocus(tonumber(idStr))
-      if ok then print("window [" .. idStr .. "] focused") else print("error: " .. err) end
-    end
-  elseif line:match("^bitdemo%s") then
-    local mode, x, y = line:match("^bitdemo%s+(%S+)%s+(%d+)%s+(%d+)$")
-    if not mode or (mode ~= "halfblock" and mode ~= "braille") then
-      print("usage: bitdemo <halfblock|braille> <x> <y>")
-    else
-      local win, err = compositor.createWindow({title = "bitdemo", x = tonumber(x), y = tonumber(y),
-        pixels = demoPixels(16), width = 16, height = 16, mode = mode, bg = 0x000000})
-      if err then print("error: " .. err) else print("created bit window [" .. win.id .. "] (" .. win.width .. "x" .. win.height .. " cells)") end
     end
   elseif line == "bus" then
     local addrs = {}
@@ -3682,18 +2491,85 @@ runCommand = function(line)
       end
     end
   elseif line:match("%S") then
-    -- Everything else is a shell line: POSIX-style commands, pipes and
-    -- redirection, programs (kernal/shell.lua).
-    if shell then shell.run(line) else print("no shell -- run `update` with the installer floppy in") end
+    S.shellRun(line)
   end
 end
 
-print("muxos kernal -- " .. selfAddr)
+
+-- What the sessions get of the kernal (see kernal/session.lua).
+K.system, K.jobs, K.runningJobs = system, jobs, runningJobs
+K.readFile, K.tryInvoke, K.fsAddr, K.loadSibling = readFile, tryInvoke, fsAddr, loadSibling
+K.resolveProgram, K.readManifest, K.launchProgram, K.PROGRAM_PATH = resolveProgram, readManifest, launchProgram,
+  PROGRAM_PATH
+K.MUXOS_VERSION, K.selfAddr, K.fullscreen, K.controlJob = MUXOS_VERSION, selfAddr, fullscreen, controlJob
+K.lineedit = loadSibling("lineedit.lua")()
+K.sessionChunk = loadSibling("session.lua")
+K.nextSession = 0
+
+function K.deliverEvent(job, event)
+  send({type = "EVENT", from = selfAddr, to = job.node, jobId = job.id, event = event})
+end
+
+-- A process that's running on a node that's up, or nil.
+function K.liveJob(id)
+  local job = jobs[id]
+  if job and job.status == "running" and nodes[job.node] and not nodes[job.node].down then return job end
+end
+
+-- A compositor for a session's gpu; window ids are unique across all.
+function K.newCompositor(g)
+  return loadSibling("compositor.lua")(loadSibling, {gpu = g, nextId = function()
+    K.windowIds = K.windowIds + 1
+    return K.windowIds
+  end})
+end
+
+function K.nextLogin()
+  K.logins = K.logins + 1
+  return K.logins
+end
+
+-- The session `name` is logged in at, if any.
+function K.loggedIn(name)
+  for _, S in ipairs(K.sessions) do
+    if S.user == name then return S end
+  end
+end
+
+-- A disk without shell.lua (upgraded by hand) still boots; `update`
+-- from the installer floppy brings it.
+do
+  local ok, factory = pcall(loadSibling, "shell.lua")
+  K.shellFactory = ok and factory or nil
+  K.shellError = not ok and tostring(factory) or nil
+end
+
+-- opts: {gpu, kind = "local" | "terminal", address}.
+function K.newSession(opts)
+  K.nextSession = K.nextSession + 1
+  opts.id = K.nextSession
+  local S = K.sessionChunk(K, opts)
+  K.sessions[#K.sessions + 1] = S
+  K.byId[S.id] = S
+  return S
+end
+
+-- A session ends (a terminal hung up): as if it logged out, then gone.
+function K.endSession(S)
+  if not K.byId[S.id] then return end
+  if S.user then K.inSession(S, S.logout) end
+  for i, other in ipairs(K.sessions) do
+    if other == S then table.remove(K.sessions, i) break end
+  end
+  K.byId[S.id] = nil
+  if K.console == S then K.console = nil end
+end
+
 -- The muxos commands (`help` lists them too, after the shell's).
-function system.help()
+function K.help()
   print("muxos commands:")
   print("  discover | nodes | ping <node> [count] | logout | shutdown | reboot")
-  print("  users | useradd <name> | userdel <name> | flags [<name> [<value>]] -- users and kernal flags")
+  print("  users | who | useradd <name> | userdel <name> | flags [<name> [<value>]] -- users and kernal flags")
   print("  update -- install a new muxos from the installer floppy's muxos-installer.dat")
   print("  wallpaper <file.ppm> | wallpaper none -- the desktop's background image")
   print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job id>")
@@ -3707,14 +2583,35 @@ function system.help()
   print("  bus (every component in the cluster) | components <node> | call <node> <component addr> <method> [args table]")
   print("(<node> is either a [n] index from 'nodes' or a full node address)")
 end
-system.help()
-if system.shellOk then print("shell: ls cd cat cp mv rm mkdir grep ... with | > >> < ; && || -- type 'help'") end
+
+
+-- The kernal's own screen is the local session's; network terminals get
+-- sessions of their own (kernal/terminals.lua).
+if gpu and screenAddr then K.console = K.newSession({gpu = gpu, kind = "local"}) end
+K.terminals = loadSibling("terminals.lua")(K, {modem = modem, serialize = serialize, deserialize = deserialize,
+  vgpu = loadSibling("vgpu.lua")()})
+print("muxos kernal -- " .. selfAddr)
+K.help()
+if K.shellFactory then
+  print("shell: ls cd cat cp mv rm mkdir grep ... with | > >> < ; && || -- type 'help'")
+else
+  print("no shell (" .. tostring(K.shellError) .. ") -- run `update` with the installer floppy in")
+end
 for _, problem in ipairs(system.loadFlags()) do print("flags: " .. problem) end
-desktop.refresh()
 discover(1)
 listNodes()
-if system.flag("login_required") then system.showLogin() else system.startSession("root") end
+if K.console then
+  if system.flag("login_required") then
+    K.inSession(K.console, K.console.showLogin)
+  else
+    K.inSession(K.console, K.console.startSession, "root")
+  end
+end
 
 while true do
-  tick(0.05) -- ~1 tick between idle maintenance passes (sweepStaleChunks/compositor.flush)
+  tick(0.05) -- ~1 tick between idle maintenance passes
+  for _, S in ipairs(K.sessions) do
+    local ok, err = pcall(S.resume)
+    if not ok then print("session error (continuing): " .. tostring(err)) end
+  end
 end

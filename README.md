@@ -86,6 +86,11 @@ kernal/bitmap.lua      half-block/braille pixel-grid encoder for "bit windows" -
                        same character grid. Loaded by compositor.lua via loadSibling().
 kernal/lineedit.lua    the console's line editor: history, cursor movement, paste.
 kernal/system.lua      kernal flags (/etc/kernal.cfg) and users (/etc/users).
+kernal/session.lua     a session: one screen's console, login, shell, compositor, desktop and
+                       input -- the kernal's own screen, or a network terminal's.
+kernal/vgpu.lua        a GPU in Lua memory, for a terminal's session to draw with.
+kernal/terminals.lua   the terminal server: network terminals' sessions (see "Network terminals").
+apps/muxterm.lua       muxterm, the network terminal: an OpenOS program (its own package).
 installer/install.lua  the installer (bare from the kernal BIOS, or on OpenOS): installs the
                        kernal, flashes EEPROMs.
 tools/build.lua        builds it, with everything it installs, into dist/ (see "Installing").
@@ -343,7 +348,8 @@ Errors the Analyzer can show:
 - Flash `node/bios.lua` onto each worker's EEPROM and `kernal/bios.lua`
   onto the kernal's (`flash -q <file>` in OpenOS).
 - Copy `kernal/muxos.lua`, `compositor.lua`, `shell.lua`, `bitmap.lua`,
-  `lineedit.lua` and `system.lua` (all in `kernal/`) and
+  `lineedit.lua`, `system.lua`, `session.lua`, `vgpu.lua` and
+  `terminals.lua` (all in `kernal/`) and
   `node/runtime.lua` to the root of the kernal's disk, and `kernal/lib`
   to `/lib`.
 
@@ -476,7 +482,7 @@ answer any of them from its own state alone:
   `create_window_buffer`: `options.code` (run ON the kernal, drawing
   into the allocated buffer) replaces gmux's `func(gpu)` callback, since
   a function value can't cross the network either.
-- `get_windows()` -- the kernal's window registry (`kernal/compositor.lua`).
+- `get_windows()` -- the windows of the caller's session (`kernal/compositor.lua`).
 - `request_fullscreen()` / `release_fullscreen()` -- not part of gmux's
   real API (it never needs this; its apps already share the host
   process's real gpu/screen directly). Added because direct gpu/screen
@@ -660,9 +666,46 @@ its default; a bad value from `flags` is refused.
 | `useradd_requires_root` | true | only root can `useradd` or `userdel` |
 | `kill_requires_owner` | false | only a process's own user (or root) can `pause`, `resume` or `kill` it |
 | `logout_ends_jobs` | true | logging out ends the processes started from that login |
+| `remote_terminals` | true | network terminals can log in (takes effect at the next boot) |
+| `terminal_port` | 4478 | the network port terminals use, not 4477 (the cluster's) (next boot) |
 
 The `*_requires_root` flags aren't security -- anyone can log in as root
 -- they make the important things deliberate. Tested in test 52.
+
+### Network terminals
+
+Any OpenOS computer with a screen, a keyboard and a network card on the
+cluster's network can be a muxos terminal: install **muxterm** (its own
+package: `oppm install muxterm`, or copy `apps/muxterm.lua` to
+`/usr/bin`) and run `muxterm` (`muxterm <kernal address> [port]` to name
+the kernal). It finds the kernal, and you get a muxos session of your
+own on that screen: `login:`, then a console, a desktop, a taskbar and
+windows, sized to that screen. Programs you start there show their
+windows and output there. **Ctrl+Alt+D** disconnects, which logs out;
+every other key, Ctrl+Alt+C included, goes to muxos.
+
+Internally the kernal's own screen and a terminal are the same thing --
+a *session* (`kernal/session.lua`), one per screen, each with its own
+console, line editor, shell, login, compositor, desktop and input. A
+terminal's session draws with a GPU kept in Lua memory
+(`kernal/vgpu.lua`); after each frame, the cells that changed go to the
+terminal as runs of same-colored text, which muxterm draws with its own
+GPU. Keys and touches come back the other way. Each session's commands
+run in a coroutine of their own, so a slow command at one screen never
+holds up another.
+
+- `who` lists who's logged in where; `users` lists every user.
+- The same user can be logged in at several screens at once.
+- A terminal that goes quiet for 10 seconds is hung up on (its session
+  logs out). The protocol is in `kernal/terminals.lua`.
+- The fullscreen grant is the kernal's own screen's: programs in a
+  terminal's session can't take it.
+- Memory: a terminal's screen and its windows live in the kernal's RAM
+  (roughly 50 bytes a cell) -- a few terminals are fine on a kernal with
+  tier 3 memory.
+
+Tested in `test/emu/muxterm_test.lua` (real OpenOS running muxterm) and
+`test/emu/vgpu_test.lua`.
 
 ### The desktop, the taskbar and the demo
 
