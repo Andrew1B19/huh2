@@ -5,7 +5,7 @@ running 4 Server blades on one shared component bus. It's a multi-core
 system OS: the 3 worker nodes' custom firmware are its cores/threads, and
 the kernal is the scheduler/front-end.
 
-- **Kernal (1 node)** -- `kernal/bios.lua` is its entire EEPROM image
+- **Kernal (main node)** -- `kernal/bios.lua` is its entire EEPROM image
   (mirroring the mod's own stock bios.lua, adapted to load `/muxos.lua`
   instead of OpenOS's `/init.lua`), and `kernal/muxos.lua` is its
   "init" -- not a program running under OpenOS, a REPLACEMENT for it.
@@ -33,7 +33,7 @@ the kernal is the scheduler/front-end.
   muxos.lua's own event loop. The kernal also holds `node/runtime.lua`
   on its own disk and serves it to workers at boot (see below) -- it's
   the authoritative source for what a worker runs.
-- **Workers (3 nodes)** -- no OS, no disk, on purpose. `node/bios.lua` is
+- **Workers (thread nodes)** -- no OS, no disk, on purpose. `node/bios.lua` is
   the only thing flashed onto each one's EEPROM, and it's tiny: open a
   Network Card, ask the kernal for `node/runtime.lua`'s source, `load()`
   and run it. No local fallback -- if the kernal isn't up yet, it just
