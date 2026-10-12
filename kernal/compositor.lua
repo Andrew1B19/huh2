@@ -749,6 +749,9 @@ function M.close(id)
   windows[id] = nil
   local gpu = kernalGpu()
   if win.buffer and gpu then gpu.freeBuffer(win.buffer) end
+  for _, f in pairs(win.render and win.render.frames or {}) do
+    if gpu then gpu.freeBuffer(f.buffer) end
+  end
   if focusedId == id then moveFocus(windowOrder[1]) end
   exposeRect(outerRect(win))
   return win
@@ -840,6 +843,11 @@ function M.setGeometry(id, x, y, width, height)
     gpu.bitblt(buffer, 1, 1, math.min(width, win.width), math.min(height, win.height), win.buffer, 1, 1)
     gpu.freeBuffer(win.buffer)
     win.buffer = buffer
+    -- Frames being drawn were for the old size.
+    if win.render then
+      for _, f in pairs(win.render.frames) do gpu.freeBuffer(f.buffer) end
+      win.render.frames = {}
+    end
   end
   local old = outerRect(win)
   win.x, win.y, win.width, win.height = x, y, width, height
@@ -958,6 +966,293 @@ function M.flush()
     frameDamage = nil
     if d.w > 0 and d.h > 0 then gpu.bitblt(0, d.x, d.y, d.w, d.h, frameBuffer, d.x, d.y) end
   end
+end
+
+-- --- Render targets: several processes drawing one window ---
+--
+-- A window's owner can share rectangles of it with its child processes
+-- (M.share), which then draw their parts straight into it, frame by
+-- frame (M.drawRegion), each from whatever node it runs on -- the
+-- pipework for rendering on several nodes at once, like SLI. Regions
+-- go into a back buffer per frame; nothing reaches the window until the
+-- frame is presented, by the window's mode (M.renderConfig):
+--   split      every share draws its own part of each frame; a frame is
+--              presented when all of them have, or at the deadline with
+--              what arrived (the missing parts keep the last frame's, or
+--              are cleared -- `stale`)
+--   alternate  the shares take turns drawing whole frames; frames are
+--              presented in order as each is complete, and one that
+--              misses its deadline is dropped, never shown late
+--   tearing    regions go straight into one buffer, presented as soon as
+--              the next frame starts (or at the deadline): the least
+--              latency, frames may mix
+-- Other settings: `deadline` (seconds a frame waits), `queue` (frames in
+-- flight at once), `chunk` (bytes per region message, for the runtime to
+-- split big regions by).
+local RENDER_DEFAULTS = {mode = "split", deadline = 0.25, stale = "keep", queue = 2, chunk = 4096}
+local RENDER_CHOICES = {mode = {split = true, alternate = true, tearing = true}, stale = {keep = true, clear = true}}
+local RENDER_RANGES = {deadline = {0.01, 10}, queue = {1, 8}, chunk = {512, 65536}}
+
+local function renderState(win)
+  if not win.render then
+    local config = {}
+    for k, v in pairs(RENDER_DEFAULTS) do config[k] = v end
+    win.render = {config = config, frames = {}, presented = 0, shares = {}}
+  end
+  return win.render
+end
+
+local function copyConfig(config)
+  local c = {}
+  for k, v in pairs(config) do c[k] = v end
+  return c
+end
+
+-- Sets (any of) a window's render settings; returns them all. Unknown
+-- settings and out-of-range values are refused, never adjusted.
+function M.renderConfig(id, options)
+  local win = windows[id]
+  if not win then return nil, "no such window: " .. tostring(id) end
+  if not win.buffer then return nil, "window " .. tostring(id) .. " has no drawable buffer" end
+  local r = renderState(win)
+  if type(options) == "table" then
+    for k, v in pairs(options) do
+      if RENDER_DEFAULTS[k] == nil then return nil, "no render setting called " .. tostring(k) end
+      if RENDER_CHOICES[k] and not RENDER_CHOICES[k][v] then
+        local names = {}
+        for name in pairs(RENDER_CHOICES[k]) do names[#names + 1] = name end
+        table.sort(names)
+        return nil, k .. " is one of " .. table.concat(names, ", ") .. ", not " .. tostring(v)
+      end
+      local range = RENDER_RANGES[k]
+      if range and (type(v) ~= "number" or v < range[1] or v > range[2]
+          or ((k == "queue" or k == "chunk") and math.type(v) ~= "integer")) then
+        return nil, k .. " is a number from " .. range[1] .. " to " .. range[2] .. ", not " .. tostring(v)
+      end
+    end
+    -- A new mode starts afresh.
+    if options.mode and options.mode ~= r.config.mode then
+      local gpu = kernalGpu()
+      for _, f in pairs(r.frames) do if f.buffer then gpu.freeBuffer(f.buffer) end end
+      r.frames = {}
+    end
+    for k, v in pairs(options) do r.config[k] = v end
+  end
+  return copyConfig(r.config)
+end
+
+-- Lets `key` (a process) draw the part `rect` ({x, y, w, h}, in the
+-- window's own cells) of a window; nil removes the share.
+function M.share(id, key, rect)
+  local win = windows[id]
+  if not win then return nil, "no such window: " .. tostring(id) end
+  if not win.buffer then return nil, "window " .. tostring(id) .. " has no drawable buffer" end
+  local r = renderState(win)
+  if rect == nil then
+    r.shares[key] = nil
+    return true
+  end
+  local x, y, w, h = math.tointeger(rect.x or rect[1]), math.tointeger(rect.y or rect[2]),
+    math.tointeger(rect.w or rect[3]), math.tointeger(rect.h or rect[4])
+  if not (x and y and w and h) or x < 1 or y < 1 or w < 1 or h < 1 or x + w - 1 > win.width or y + h - 1 > win.height then
+    return nil, "the rectangle must be whole cells within the window (" .. win.width .. "x" .. win.height .. ")"
+  end
+  r.shares[key] = {x = x, y = y, w = w, h = h}
+  return true
+end
+
+-- The windows `key` has a share of, and drops those shares.
+function M.unshareAll(key)
+  local ids = {}
+  for id, win in pairs(windows) do
+    if win.render and win.render.shares[key] then
+      win.render.shares[key] = nil
+      ids[#ids + 1] = id
+    end
+  end
+  return ids
+end
+
+function M.shares(id)
+  local win = windows[id]
+  local list = {}
+  for key, rect in pairs(win and win.render and win.render.shares or {}) do
+    list[key] = {x = rect.x, y = rect.y, w = rect.w, h = rect.h}
+  end
+  return list
+end
+
+-- The buffer frame `n` is drawn into, made on first use from what's
+-- shown now (stale = keep) or blank (stale = clear).
+local function frameFor(gpu, win, r, n)
+  local f = r.frames[n]
+  if f then return f end
+  local buffer = gpu.allocateBuffer(win.width, win.height)
+  if not buffer then return nil, "no video memory for another frame" end
+  if r.config.stale == "keep" then
+    gpu.bitblt(buffer, 1, 1, win.width, win.height, win.buffer, 1, 1)
+  else
+    gpu.setActiveBuffer(buffer)
+    gpu.setBackground(0x000000)
+    gpu.fill(1, 1, win.width, win.height, " ")
+    gpu.setActiveBuffer(0)
+  end
+  -- got: who has finished their part; partial: who has started it but
+  -- has more to come (a region sent in bands).
+  f = {buffer = buffer, got = {}, partial = {}, started = computer.uptime()}
+  r.frames[n] = f
+  return f
+end
+
+local function freeFrame(gpu, r, n)
+  local f = r.frames[n]
+  if f and f.buffer then gpu.freeBuffer(f.buffer) end
+  r.frames[n] = nil
+end
+
+-- Shows frame n: its buffer becomes the window's content.
+local function present(gpu, win, r, n, out, complete)
+  local f = r.frames[n]
+  gpu.bitblt(win.buffer, 1, 1, win.width, win.height, f.buffer, 1, 1)
+  for m in pairs(r.frames) do
+    if m <= n then freeFrame(gpu, r, m) end
+  end
+  r.presented = n
+  win.dirty = true
+  out[#out + 1] = {id = win.id, frame = n, complete = complete}
+end
+
+-- Draws one region of frame `frame` for `key`: content is {pixels,
+-- width, height, mode, bg} (bit graphics) or {text = rows (strings or
+-- {text, fg, bg} spans)}, at {x, y} within the window (default: the
+-- share's corner, `offset` rows down from it), clipped to `key`'s share (the owner, key = "owner",
+-- may draw anywhere). `done` (default true): this is `key`'s last
+-- region of the frame. Returns the frames this presented, if any (the
+-- tearing mode presents as the next frame starts).
+function M.drawRegion(id, key, frame, content, done)
+  local win = windows[id]
+  if not win then return nil, "no such window: " .. tostring(id) end
+  if not win.buffer then return nil, "window " .. tostring(id) .. " has no drawable buffer" end
+  local r = renderState(win)
+  local area = key == "owner" and {x = 1, y = 1, w = win.width, h = win.height} or r.shares[key]
+  if not area then return nil, "no share of window " .. tostring(id) .. " to draw in" end
+  frame = math.tointeger(frame)
+  if not frame or frame < 1 then return nil, "frames are numbered 1, 2, 3, ..." end
+  local gpu = kernalGpu()
+  local presented = {}
+  local mode = r.config.mode
+  if mode == "tearing" then
+    -- One working buffer; a newer frame presents the one before.
+    local current = r.current or 0
+    if frame < current then return nil, "frame " .. frame .. " is already past" end
+    if frame > current then
+      if r.frames[current] then present(gpu, win, r, current, presented, false) end
+      r.current = frame
+    end
+  else
+    if frame <= r.presented then return nil, "frame " .. frame .. " is already past" end
+    if frame > r.presented + r.config.queue then
+      return nil, "frame " .. frame .. " is too far ahead (" .. r.config.queue .. " in flight at most)"
+    end
+  end
+  local f, err = frameFor(gpu, win, r, frame)
+  if not f then return nil, err end
+  -- Where, clipped to the share.
+  local x = math.tointeger(content.x) or area.x
+  local y = math.tointeger(content.y) or (area.y + (math.tointeger(content.offset) or 0))
+  gpu.setActiveBuffer(f.buffer)
+  local ok, drawErr = pcall(function()
+    if content.pixels then
+      local w, h = math.tointeger(content.width), math.tointeger(content.height)
+      if not w or not h then error("pixels need width and height", 0) end
+      local cells, cols, rows = bitmap.encode(content.mode, content.pixels, w, h, content.bg)
+      cols = math.min(cols, area.x + area.w - x)
+      rows = math.min(rows, area.y + area.h - y)
+      if x < area.x or y < area.y or cols < 1 or rows < 1 then error("the region is outside the share", 0) end
+      bitmap.draw(gpu, cells, rows, cols, x, y)
+    elseif type(content.text) == "table" then
+      for i, row in ipairs(content.text) do
+        local yy = y + i - 1
+        if yy >= area.y and yy < area.y + area.h then
+          local spans = type(row) == "table" and row or {{tostring(row)}}
+          local xx = x
+          for _, span in ipairs(spans) do
+            local text = tostring(span[1] or "")
+            gpu.setForeground(span[2] or 0xFFFFFF)
+            gpu.setBackground(span[3] or 0x000000)
+            -- Only the part inside the share.
+            local len = utf8.len(text) or #text
+            local from, to = math.max(xx, area.x), math.min(xx + len - 1, area.x + area.w - 1)
+            if to >= from then gpu.set(from, yy, textSlice(text, from - xx + 1, to - from + 1)) end
+            xx = xx + len
+          end
+        end
+      end
+    else
+      error("a region needs pixels or text", 0)
+    end
+  end)
+  gpu.setActiveBuffer(0)
+  if not ok then return nil, drawErr end
+  if done ~= false then
+    f.got[key], f.partial[key] = true, nil
+  else
+    f.partial[key] = true
+  end
+  return true, presented
+end
+
+-- Presents what's due, by mode: called once per tick. `expected(id)`
+-- gives the shares a split frame waits for (the live ones). Returns
+-- {id, frame, complete} for each frame presented.
+function M.renderTick(expected)
+  local out = {}
+  local now = computer.uptime()
+  local gpu = kernalGpu()
+  for id, win in pairs(windows) do
+    local r = win.render
+    if r and next(r.frames) then
+      local mode = r.config.mode
+      if mode == "tearing" then
+        local f = r.current and r.frames[r.current]
+        if f and now - f.started >= r.config.deadline then
+          present(gpu, win, r, r.current, out, false)
+          r.current = r.current + 1
+        end
+      else
+        local waiting = expected(id)
+        while true do
+          local n
+          for m in pairs(r.frames) do if not n or m < n then n = m end end
+          if not n then break end
+          local f = r.frames[n]
+          local complete
+          if mode == "alternate" then
+            complete = next(f.got) ~= nil
+          else
+            complete = true
+            for _, key in ipairs(waiting) do
+              if not f.got[key] then complete = false break end
+            end
+          end
+          complete = complete and next(f.partial) == nil
+          local overdue = now - f.started >= r.config.deadline
+          if complete then
+            present(gpu, win, r, n, out, true)
+          elseif overdue and mode == "split" then
+            present(gpu, win, r, n, out, false)
+          elseif overdue then
+            -- alternate: a late frame is dropped, never shown out of order
+            freeFrame(gpu, r, n)
+            r.presented = math.max(r.presented, n)
+          else
+            break
+          end
+        end
+      end
+    end
+  end
+  return out
 end
 
 return M

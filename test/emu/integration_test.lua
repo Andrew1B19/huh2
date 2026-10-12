@@ -1984,4 +1984,92 @@ do
 end
 print("  OK -- login by name only, useradd/userdel, root-only update/reboot/flags, logout ends that login's processes")
 
+print("test 53: render targets -- children draw their parts of one window; split, alternate and tearing frames")
+do
+  local child = [==[
+local e
+repeat e = gmuxapi.pull_event(10) until not e or e[1] == "window_shared"
+if not e then return "no share" end
+for f = 1, args.frames do
+  local ok, err = gmuxapi.draw_region(args.win, f, {text = {args.text, args.text, args.text, args.text}})
+  if not ok then return "err " .. tostring(err) end
+  repeat e = gmuxapi.pull_event(10) until not e or (e[1] == "frame_presented" and e[3] == f)
+end
+local outside, why = gmuxapi.draw_region(args.win, args.frames + 1, {pixels = {{1}}, width = 1, height = 2, x = args.outside, y = 1})
+if args.linger then sleep(args.linger) end
+return "done " .. tostring(why)
+]==]
+  local program = [==[--[[mxe
+name = "render53"
+]]
+local CHILD = CHILD_SOURCE
+local win = gmuxapi.create_window({title = "render53", x = 2, y = 2, width = 20, height = 4, code = "gpu.fill(1, 1, 20, 4, '.')"}).id
+local config = gmuxapi.render_config(win, {mode = "split", deadline = 1})
+local _, bad = gmuxapi.render_config(win, {mode = "fast"})
+local _, bad2 = gmuxapi.render_config(win, {speed = 1})
+print("config " .. config.mode .. " " .. config.deadline .. " " .. config.stale .. " | " .. tostring(bad) .. " | " .. tostring(bad2))
+local a = gmuxapi.create_headless_process({code = CHILD, args = {win = win, frames = 2, text = "AAAAAAAAAA", outside = 15}})
+local b = gmuxapi.create_headless_process({code = CHILD, args = {win = win, frames = 1, text = "BBBBBBBBBB", linger = 4, outside = 1}})
+local _, notMine = gmuxapi.share_window(win, 999999, {1, 1, 5, 1})
+print("share " .. tostring(gmuxapi.share_window(win, a.process.id, {1, 1, 10, 4})) .. " "
+  .. tostring(gmuxapi.share_window(win, b.process.id, {x = 11, y = 1, w = 10, h = 4})) .. " | " .. tostring(notMine))
+local seen = {}
+local stop = computer.uptime() + 10
+while #seen < 2 and computer.uptime() < stop do
+  local e = gmuxapi.pull_event(1)
+  if e and e[1] == "frame_presented" then seen[#seen + 1] = e[3] .. ":" .. tostring(e[4]) end
+end
+print("presented " .. table.concat(seen, " "))
+-- Alternate: frame 2 shows at once; frame 1, late, never does.
+local w2 = gmuxapi.create_window({title = "alt53", x = 2, y = 9, width = 10, height = 1, code = "gpu.fill(1, 1, 10, 1, ' ')"}).id
+gmuxapi.render_config(w2, {mode = "alternate", queue = 3})
+gmuxapi.draw_region(w2, 2, {text = {"TWO"}})
+local _, late = gmuxapi.draw_region(w2, 1, {text = {"ONE"}})
+-- Tearing: frame 1 shows as soon as frame 2 starts.
+local w3 = gmuxapi.create_window({title = "tear53", x = 2, y = 7, width = 10, height = 1, code = "gpu.fill(1, 1, 10, 1, ' ')"}).id
+gmuxapi.render_config(w3, {mode = "tearing", deadline = 5})
+gmuxapi.draw_region(w3, 1, {text = {"first"}})
+gmuxapi.draw_region(w3, 2, {text = {"X"}})
+local e
+repeat e = gmuxapi.pull_event(3) until not e or (e[1] == "frame_presented" and e[2] == w3)
+print("late " .. tostring(late) .. " | tear " .. (e and (e[3] .. ":" .. tostring(e[4])) or "none"))
+-- A big region goes in bands of `chunk` bytes, all one frame.
+local w4 = gmuxapi.create_window({title = "big53", x = 30, y = 9, width = 20, height = 4, code = "gpu.fill(1, 1, 20, 4, ' ')"}).id
+gmuxapi.render_config(w4, {chunk = 512})
+local pixels = {}
+for y = 1, 8 do
+  pixels[y] = {}
+  for x = 1, 20 do pixels[y][x] = y <= 4 and 0xFF0000 or 0x00FF00 end
+end
+local okBig, bigErr = gmuxapi.draw_region(w4, 1, {pixels = pixels, width = 20, height = 8, mode = "halfblock"})
+print("big " .. tostring(okBig) .. " " .. tostring(bigErr))
+sleep(1)
+print("results " .. tostring(gmuxapi.get_process(a.process.id).result))
+]==]
+  program = program:gsub("CHILD_SOURCE", function() return string.format("%q", child) end)
+  local c = newCluster(80, 25, {["/bin/render53.mxe"] = program}, 3)
+  c.typeLine("render53")
+  for _ = 1, 30 do
+    if c.text():find("results", 1, true) then break end
+    c.emu:advance(0.5)
+  end
+  local text = c.text():gsub("\n", "")
+  assert(text:find("config split 1 keep | mode is one of alternate, split, tearing, not fast | no render setting called speed", 1, true),
+    "render_config sets and refuses:\n" .. text)
+  assert(text:find("share true true | process 999999 isn't a running descendant of yours", 1, true), "share_window:\n" .. text)
+  assert(text:find("presented 1:true 2:false", 1, true),
+    "frame 1 complete (both parts), frame 2 at its deadline without the second part:\n" .. text)
+  assert(text:find("late frame 1 is already past | tear 1:false", 1, true), "alternate and tearing:\n" .. text)
+  assert(text:find("results done the region is outside the share", 1, true), "drawing outside a share is refused:\n" .. text)
+  assert(text:find("AAAAAAAAAABBBBBBBBBB", 1, true), "both parts in the window, the second kept from frame 1:\n" .. text)
+  assert(text:find("TWO", 1, true) and not text:find("ONE", 1, true) and text:find("first", 1, true),
+    "what each mode put on screen:\n" .. text)
+  assert(text:find("big true nil", 1, true), "a big region in bands:\n" .. text)
+  local function color(cell) return cell and (cell.char == " " and cell.bg or cell.fg) end
+  assert(color(c.cell(30, 10)) == 0xFF0000 and color(c.cell(49, 13)) == 0x00FF00,
+    "every band landed: top red, bottom green (got " .. tostring(color(c.cell(30, 10))) .. ", "
+    .. tostring(color(c.cell(49, 13))) .. ")")
+end
+print("  OK -- shares, split frames (complete and at the deadline), alternate order, tearing, refusals")
+
 print("ALL OK")

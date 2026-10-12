@@ -162,6 +162,32 @@ Every `.mxe` sees these globals, read-only. Its own globals are its own.
     `draw_window(id, {code, args, pixels, clear, bg})`,
     `get_windows()` (the windows of the program's session -- the screen
     it was started from: the kernal's own, or a network terminal's);
+  - **render targets** -- several processes, on several nodes, drawing
+    one window frame by frame (the pipework for a rendering library):
+    - `share_window(window, child, {x, y, w, h})` -- the window's owner
+      lets a descendant draw that rectangle (window cells); the child
+      gets `{"window_shared", window, x, y, w, h}`.
+      `unshare_window(window, child)` takes it back.
+    - `render_config(window, options)` -- returns the window's settings,
+      after setting any given (owner only): `mode` = `"split"` (each
+      share draws its part of every frame; a frame shows when all have,
+      or at the deadline, the missing parts as they were -- or blank,
+      `stale = "clear"`), `"alternate"` (shares take turns drawing
+      whole frames, shown in order; a frame that misses its deadline is
+      dropped, never shown late) or `"tearing"` (no waiting: a frame
+      shows as soon as the next one starts); `deadline` (seconds,
+      0.25); `stale` (`"keep"`/`"clear"`); `queue` (frames in flight,
+      2); `chunk` (bytes per message for a big region, 4096). Unknown
+      settings and out-of-range values are refused.
+    - `draw_region(window, frame, content)` -- this process's part of
+      frame `frame` (1, 2, 3, ...): `{pixels, width, height, mode, bg}`
+      (bit graphics) or `{text = rows}` (strings or `{text, fg, bg}`
+      spans), at `content.x`/`y` (window cells; default the share's
+      corner), clipped to the share. `content.done = false`: more of
+      this frame is coming from this process.
+    - Events: `{"frame_presented", window, frame, complete}` to the owner
+      and every process drawing it; `{"region_lost", window, process}` to
+      the owner when a sharing process ends.
   - **input:** `pull_event(timeout)` returns `{name, ...}`:
     `{"key_down", char, code}`, `{"key_up", ...}`,
     `{"touch"|"drag"|"drop", x, y, button}`, `{"scroll", x, y, dir}`,

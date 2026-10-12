@@ -2,8 +2,8 @@
 @@MANIFEST 30
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-68182 /muxos.lua
-20692 /compositor.lua
+71173 /muxos.lua
+28806 /compositor.lua
 33883 /shell.lua
 2663 /bitmap.lua
 3046 /lineedit.lua
@@ -11,7 +11,7 @@
 36766 /session.lua
 5514 /vgpu.lua
 3384 /terminals.lua
-70102 /runtime.lua
+72546 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 1682 /lib/bit32.lua
 3800 /lib/buffer.lua
@@ -224,7 +224,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 68182 /muxos.lua
+@@ 71173 /muxos.lua
 
 
 
@@ -1247,6 +1247,7 @@ local function finishJob(id, status, result, err)
 local job = jobs[id]
 closeJobFiles(id)
 net.release(id)
+K.dropShares(id)
 if fullscreen.job == id then
 fullscreen.node, fullscreen.job = nil, nil
 K.releaseScreen()
@@ -1991,6 +1992,92 @@ end
 if not msg.noReply then send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = reply}) end
 end
 
+
+
+
+local function managesWindow(caller, win)
+return caller and win.ownerJobId and (win.ownerJobId == caller.id or isDescendantOf(win.ownerJobId, caller.id))
+end
+
+
+
+function K.framesPresented(S, list)
+for _, p in ipairs(list) do
+local win = S.compositor.getWindow(p.id)
+if win then
+local told = {}
+local function tell(id)
+local job = K.liveJob(id)
+if job and not told[id] then
+told[id] = true
+K.deliverEvent(job, {"frame_presented", p.id, p.frame, p.complete})
+end
+end
+if win.ownerJobId then tell(win.ownerJobId) end
+for key in pairs(S.compositor.shares(p.id)) do tell(key) end
+end
+end
+end
+
+
+function K.expectedRegions(S, id)
+local list = {}
+for key in pairs(S.compositor.shares(id)) do
+if K.liveJob(key) then list[#list + 1] = key end
+end
+return list
+end
+
+
+
+function K.dropShares(id)
+for _, S in ipairs(K.sessions) do
+for _, winId in ipairs(S.compositor.unshareAll(id)) do
+local win = S.compositor.getWindow(winId)
+local owner = win and win.ownerJobId and K.liveJob(win.ownerJobId)
+if owner then K.deliverEvent(owner, {"region_lost", winId, id}) end
+end
+end
+end
+
+local function handleRender(msg)
+local caller = callerJob(msg)
+local S, win = K.windowOwner(msg.windowId)
+local function reply(result, err)
+if msg.noReply then return end
+if result == nil then
+send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
+else
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = result})
+end
+end
+if not caller then return reply(nil, "not called from a running process") end
+if not win then return reply(nil, "no such window: " .. tostring(msg.windowId)) end
+local manager = managesWindow(caller, win)
+if msg.type == "SHAREWINDOW" then
+local child = K.liveJob(msg.child)
+if not manager then return reply(nil, "window " .. win.id .. " belongs to another process") end
+if not child or not isDescendantOf(child.id, caller.id) then
+return reply(nil, "process " .. tostring(msg.child) .. " isn't a running descendant of yours")
+end
+local ok, err = S.compositor.share(win.id, child.id, msg.rect)
+if not ok then return reply(nil, err) end
+local rect = S.compositor.shares(win.id)[child.id]
+K.deliverEvent(child, rect and {"window_shared", win.id, rect.x, rect.y, rect.w, rect.h} or {"window_unshared", win.id})
+return reply(true)
+elseif msg.type == "RENDERCONFIG" then
+if not manager and (msg.options ~= nil or not S.compositor.shares(win.id)[caller.id]) then
+return reply(nil, "window " .. win.id .. " belongs to another process")
+end
+return reply(S.compositor.renderConfig(win.id, manager and msg.options or nil))
+end
+
+local ok, presented = S.compositor.drawRegion(win.id, manager and "owner" or caller.id, msg.frame, msg, msg.done)
+if not ok then return reply(nil, presented) end
+K.framesPresented(S, presented)
+reply(true)
+end
+
 local function handleGetWindows(msg)
 local S = K.sessionOf(callerJob(msg))
 send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S and S.compositor.listWindows() or {}})
@@ -2070,6 +2157,8 @@ if msg.type == "LIST" then
 handleList(msg)
 elseif msg.type == "INVOKE" then
 handleInvoke(msg)
+elseif msg.type == "SHAREWINDOW" or msg.type == "RENDERCONFIG" or msg.type == "DRAWREGION" then
+handleRender(msg)
 elseif msg.type == "ISFOREGROUND" then
 
 local caller = callerJob(msg)
@@ -2212,7 +2301,10 @@ bus.sweep()
 sweepStaleOrphans()
 checkLiveness()
 if K.terminals then K.terminals.sweep() end
-for _, S in ipairs(K.sessions) do K.inSession(S, S.update) end
+for _, S in ipairs(K.sessions) do
+K.framesPresented(S, S.compositor.renderTick(function(id) return K.expectedRegions(S, id) end))
+K.inSession(S, S.update)
+end
 end)
 if not ok then
 print("tick error (continuing): " .. tostring(err))
@@ -2843,7 +2935,7 @@ if not ok then print("session error (continuing): " .. tostring(err)) end
 end
 end
 
-@@ 20692 /compositor.lua
+@@ 28806 /compositor.lua
 
 
 
@@ -3595,6 +3687,9 @@ removeFromOrder(id)
 windows[id] = nil
 local gpu = kernalGpu()
 if win.buffer and gpu then gpu.freeBuffer(win.buffer) end
+for _, f in pairs(win.render and win.render.frames or {}) do
+if gpu then gpu.freeBuffer(f.buffer) end
+end
 if focusedId == id then moveFocus(windowOrder[1]) end
 exposeRect(outerRect(win))
 return win
@@ -3686,6 +3781,11 @@ if not buffer then return false, "could not allocate a gpu buffer: " .. tostring
 gpu.bitblt(buffer, 1, 1, math.min(width, win.width), math.min(height, win.height), win.buffer, 1, 1)
 gpu.freeBuffer(win.buffer)
 win.buffer = buffer
+
+if win.render then
+for _, f in pairs(win.render.frames) do gpu.freeBuffer(f.buffer) end
+win.render.frames = {}
+end
 end
 local old = outerRect(win)
 win.x, win.y, win.width, win.height = x, y, width, height
@@ -3804,6 +3904,293 @@ local d = clipToScreen(frameDamage)
 frameDamage = nil
 if d.w > 0 and d.h > 0 then gpu.bitblt(0, d.x, d.y, d.w, d.h, frameBuffer, d.x, d.y) end
 end
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local RENDER_DEFAULTS = {mode = "split", deadline = 0.25, stale = "keep", queue = 2, chunk = 4096}
+local RENDER_CHOICES = {mode = {split = true, alternate = true, tearing = true}, stale = {keep = true, clear = true}}
+local RENDER_RANGES = {deadline = {0.01, 10}, queue = {1, 8}, chunk = {512, 65536}}
+
+local function renderState(win)
+if not win.render then
+local config = {}
+for k, v in pairs(RENDER_DEFAULTS) do config[k] = v end
+win.render = {config = config, frames = {}, presented = 0, shares = {}}
+end
+return win.render
+end
+
+local function copyConfig(config)
+local c = {}
+for k, v in pairs(config) do c[k] = v end
+return c
+end
+
+
+
+function M.renderConfig(id, options)
+local win = windows[id]
+if not win then return nil, "no such window: " .. tostring(id) end
+if not win.buffer then return nil, "window " .. tostring(id) .. " has no drawable buffer" end
+local r = renderState(win)
+if type(options) == "table" then
+for k, v in pairs(options) do
+if RENDER_DEFAULTS[k] == nil then return nil, "no render setting called " .. tostring(k) end
+if RENDER_CHOICES[k] and not RENDER_CHOICES[k][v] then
+local names = {}
+for name in pairs(RENDER_CHOICES[k]) do names[#names + 1] = name end
+table.sort(names)
+return nil, k .. " is one of " .. table.concat(names, ", ") .. ", not " .. tostring(v)
+end
+local range = RENDER_RANGES[k]
+if range and (type(v) ~= "number" or v < range[1] or v > range[2]
+or ((k == "queue" or k == "chunk") and math.type(v) ~= "integer")) then
+return nil, k .. " is a number from " .. range[1] .. " to " .. range[2] .. ", not " .. tostring(v)
+end
+end
+
+if options.mode and options.mode ~= r.config.mode then
+local gpu = kernalGpu()
+for _, f in pairs(r.frames) do if f.buffer then gpu.freeBuffer(f.buffer) end end
+r.frames = {}
+end
+for k, v in pairs(options) do r.config[k] = v end
+end
+return copyConfig(r.config)
+end
+
+
+
+function M.share(id, key, rect)
+local win = windows[id]
+if not win then return nil, "no such window: " .. tostring(id) end
+if not win.buffer then return nil, "window " .. tostring(id) .. " has no drawable buffer" end
+local r = renderState(win)
+if rect == nil then
+r.shares[key] = nil
+return true
+end
+local x, y, w, h = math.tointeger(rect.x or rect[1]), math.tointeger(rect.y or rect[2]),
+math.tointeger(rect.w or rect[3]), math.tointeger(rect.h or rect[4])
+if not (x and y and w and h) or x < 1 or y < 1 or w < 1 or h < 1 or x + w - 1 > win.width or y + h - 1 > win.height then
+return nil, "the rectangle must be whole cells within the window (" .. win.width .. "x" .. win.height .. ")"
+end
+r.shares[key] = {x = x, y = y, w = w, h = h}
+return true
+end
+
+
+function M.unshareAll(key)
+local ids = {}
+for id, win in pairs(windows) do
+if win.render and win.render.shares[key] then
+win.render.shares[key] = nil
+ids[#ids + 1] = id
+end
+end
+return ids
+end
+
+function M.shares(id)
+local win = windows[id]
+local list = {}
+for key, rect in pairs(win and win.render and win.render.shares or {}) do
+list[key] = {x = rect.x, y = rect.y, w = rect.w, h = rect.h}
+end
+return list
+end
+
+
+
+local function frameFor(gpu, win, r, n)
+local f = r.frames[n]
+if f then return f end
+local buffer = gpu.allocateBuffer(win.width, win.height)
+if not buffer then return nil, "no video memory for another frame" end
+if r.config.stale == "keep" then
+gpu.bitblt(buffer, 1, 1, win.width, win.height, win.buffer, 1, 1)
+else
+gpu.setActiveBuffer(buffer)
+gpu.setBackground(0x000000)
+gpu.fill(1, 1, win.width, win.height, " ")
+gpu.setActiveBuffer(0)
+end
+
+
+f = {buffer = buffer, got = {}, partial = {}, started = computer.uptime()}
+r.frames[n] = f
+return f
+end
+
+local function freeFrame(gpu, r, n)
+local f = r.frames[n]
+if f and f.buffer then gpu.freeBuffer(f.buffer) end
+r.frames[n] = nil
+end
+
+
+local function present(gpu, win, r, n, out, complete)
+local f = r.frames[n]
+gpu.bitblt(win.buffer, 1, 1, win.width, win.height, f.buffer, 1, 1)
+for m in pairs(r.frames) do
+if m <= n then freeFrame(gpu, r, m) end
+end
+r.presented = n
+win.dirty = true
+out[#out + 1] = {id = win.id, frame = n, complete = complete}
+end
+
+
+
+
+
+
+
+
+function M.drawRegion(id, key, frame, content, done)
+local win = windows[id]
+if not win then return nil, "no such window: " .. tostring(id) end
+if not win.buffer then return nil, "window " .. tostring(id) .. " has no drawable buffer" end
+local r = renderState(win)
+local area = key == "owner" and {x = 1, y = 1, w = win.width, h = win.height} or r.shares[key]
+if not area then return nil, "no share of window " .. tostring(id) .. " to draw in" end
+frame = math.tointeger(frame)
+if not frame or frame < 1 then return nil, "frames are numbered 1, 2, 3, ..." end
+local gpu = kernalGpu()
+local presented = {}
+local mode = r.config.mode
+if mode == "tearing" then
+
+local current = r.current or 0
+if frame < current then return nil, "frame " .. frame .. " is already past" end
+if frame > current then
+if r.frames[current] then present(gpu, win, r, current, presented, false) end
+r.current = frame
+end
+else
+if frame <= r.presented then return nil, "frame " .. frame .. " is already past" end
+if frame > r.presented + r.config.queue then
+return nil, "frame " .. frame .. " is too far ahead (" .. r.config.queue .. " in flight at most)"
+end
+end
+local f, err = frameFor(gpu, win, r, frame)
+if not f then return nil, err end
+
+local x = math.tointeger(content.x) or area.x
+local y = math.tointeger(content.y) or (area.y + (math.tointeger(content.offset) or 0))
+gpu.setActiveBuffer(f.buffer)
+local ok, drawErr = pcall(function()
+if content.pixels then
+local w, h = math.tointeger(content.width), math.tointeger(content.height)
+if not w or not h then error("pixels need width and height", 0) end
+local cells, cols, rows = bitmap.encode(content.mode, content.pixels, w, h, content.bg)
+cols = math.min(cols, area.x + area.w - x)
+rows = math.min(rows, area.y + area.h - y)
+if x < area.x or y < area.y or cols < 1 or rows < 1 then error("the region is outside the share", 0) end
+bitmap.draw(gpu, cells, rows, cols, x, y)
+elseif type(content.text) == "table" then
+for i, row in ipairs(content.text) do
+local yy = y + i - 1
+if yy >= area.y and yy < area.y + area.h then
+local spans = type(row) == "table" and row or {{tostring(row)}}
+local xx = x
+for _, span in ipairs(spans) do
+local text = tostring(span[1] or "")
+gpu.setForeground(span[2] or 0xFFFFFF)
+gpu.setBackground(span[3] or 0x000000)
+
+local len = utf8.len(text) or #text
+local from, to = math.max(xx, area.x), math.min(xx + len - 1, area.x + area.w - 1)
+if to >= from then gpu.set(from, yy, textSlice(text, from - xx + 1, to - from + 1)) end
+xx = xx + len
+end
+end
+end
+else
+error("a region needs pixels or text", 0)
+end
+end)
+gpu.setActiveBuffer(0)
+if not ok then return nil, drawErr end
+if done ~= false then
+f.got[key], f.partial[key] = true, nil
+else
+f.partial[key] = true
+end
+return true, presented
+end
+
+
+
+
+function M.renderTick(expected)
+local out = {}
+local now = computer.uptime()
+local gpu = kernalGpu()
+for id, win in pairs(windows) do
+local r = win.render
+if r and next(r.frames) then
+local mode = r.config.mode
+if mode == "tearing" then
+local f = r.current and r.frames[r.current]
+if f and now - f.started >= r.config.deadline then
+present(gpu, win, r, r.current, out, false)
+r.current = r.current + 1
+end
+else
+local waiting = expected(id)
+while true do
+local n
+for m in pairs(r.frames) do if not n or m < n then n = m end end
+if not n then break end
+local f = r.frames[n]
+local complete
+if mode == "alternate" then
+complete = next(f.got) ~= nil
+else
+complete = true
+for _, key in ipairs(waiting) do
+if not f.got[key] then complete = false break end
+end
+end
+complete = complete and next(f.partial) == nil
+local overdue = now - f.started >= r.config.deadline
+if complete then
+present(gpu, win, r, n, out, true)
+elseif overdue and mode == "split" then
+present(gpu, win, r, n, out, false)
+elseif overdue then
+
+freeFrame(gpu, r, n)
+r.presented = math.max(r.presented, n)
+else
+break
+end
+end
+end
+end
+end
+return out
 end
 
 return M
@@ -7260,7 +7647,7 @@ end
 
 return T
 
-@@ 70102 /runtime.lua
+@@ 72546 /runtime.lua
 
 
 
@@ -7730,6 +8117,9 @@ end
 local graphicsFlushers = {}
 
 
+local renderChunks = {}
+
+
 local jobEndHooks = {}
 
 local function flushOutput(id, force)
@@ -8052,6 +8442,76 @@ end,
 
 get_windows = function()
 return remoteRequest("GETWINDOWS", {caller = currentJobId})
+end,
+
+
+
+
+
+share_window = function(id, child, rect)
+return remoteRequest("SHAREWINDOW", {windowId = id, child = child, rect = rect, caller = currentJobId})
+end,
+unshare_window = function(id, child)
+return remoteRequest("SHAREWINDOW", {windowId = id, child = child, caller = currentJobId})
+end,
+
+
+
+
+render_config = function(id, options)
+local config, err = remoteRequest("RENDERCONFIG", {windowId = id, options = options, caller = currentJobId})
+if config then renderChunks[id] = config.chunk end
+return config, err
+end,
+
+
+
+
+
+
+
+draw_region = function(id, frame, content)
+content = content or {}
+if renderChunks[id] == nil then
+local config = remoteRequest("RENDERCONFIG", {windowId = id, caller = currentJobId})
+renderChunks[id] = config and config.chunk or false
+end
+local chunk = renderChunks[id] or 4096
+local bands = {}
+if content.pixels and content.width and content.height then
+local perCell = content.mode == "braille" and 4 or 2
+local rows = math.max(perCell, (chunk // math.max(1, content.width * 9)) // perCell * perCell)
+for top = 1, content.height, rows do
+local band = {}
+for y = top, math.min(content.height, top + rows - 1) do band[#band + 1] = content.pixels[y] or {} end
+bands[#bands + 1] = {pixels = band, width = content.width, height = #band, mode = content.mode,
+bg = content.bg, x = content.x, y = (content.y or nil) and content.y + (top - 1) // perCell,
+offset = (top - 1) // perCell}
+end
+elseif type(content.text) == "table" then
+local size, start = 0, 1
+for i, row in ipairs(content.text) do
+size = size + (type(row) == "string" and #row or 40 * #row) + 8
+if size > chunk or i == #content.text then
+local part = {}
+for j = start, i do part[#part + 1] = content.text[j] end
+bands[#bands + 1] = {text = part, x = content.x, y = content.y and content.y + start - 1, offset = start - 1}
+start, size = i + 1, 0
+end
+end
+end
+if #bands == 0 then return nil, "a region needs pixels (with width and height) or text" end
+for i, band in ipairs(bands) do
+local msg = {windowId = id, frame = frame, pixels = band.pixels, width = band.width, height = band.height,
+mode = band.mode, bg = band.bg, text = band.text, x = band.x, y = band.y, offset = band.offset,
+done = i == #bands and content.done ~= false, caller = currentJobId}
+if i < #bands then
+msg.type, msg.from, msg.to, msg.id, msg.noReply = "DRAWREGION", nodeId, kernalAddr, nextId(), true
+send(msg)
+else
+return remoteRequest("DRAWREGION", msg)
+end
+end
 end,
 
 
