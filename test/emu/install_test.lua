@@ -292,6 +292,8 @@ do
     emu:injectSignal(kernal, "key_down", screenAddr, 13, 0x1C, "tester")
     emu:step()
   end
+  typeLine("root")
+  emu:advance(1)
   typeLine("nodes")
   emu:advance(1)
   for _, w in ipairs(workers) do
@@ -398,7 +400,9 @@ do
   -- The floppy is still in: the installed system boots first.
   emu:boot(node)
   emu:advance(3)
-  assert(screenText():find("muxos:/home> _", 1, true), "muxos booted from the hard disk:\n" .. screenText())
+  assert(screenText():find("login: _", 1, true), "muxos booted from the hard disk, to its login:\n" .. screenText())
+  typeLine("root")
+  assert(screenText():find("root@muxos:~> _", 1, true), "logged in as root:\n" .. screenText())
 end
 print("  OK")
 
@@ -654,7 +658,8 @@ do
   end
   emu:boot(node)
   emu:advance(3)
-  assert(text():find("muxos:/> _", 1, true), "muxos booted without its shell:\n" .. text())
+  typeLine("root")
+  assert(text():find("root@muxos:/> _", 1, true), "muxos booted without its shell:\n" .. text())
   typeLine("ls")
   assert(text():find("no shell -- run `update` with the installer floppy in", 1, true),
     "without its shell it says how to get it:\n" .. text())
@@ -678,7 +683,8 @@ do
   assert(node.status == "dead", "reboot restarts the computer")
   emu:boot(node)
   emu:advance(3)
-  assert(text():find("muxos:/home> _", 1, true), "the new version boots:\n" .. text())
+  typeLine("root")
+  assert(text():find("root@muxos:~> _", 1, true), "the new version boots:\n" .. text())
   typeLine("echo shell works > /home/after.txt")
   assert(disk["/home/after.txt"] == "shell works\n", "update brought the shell")
 end

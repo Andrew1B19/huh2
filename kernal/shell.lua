@@ -34,11 +34,15 @@ local ctx = ...
 --   clear()                        clears the console
 --   sleep(seconds)                 waits, keeping the kernal responsive
 --   info                           {version, address, uptime(), memory()}
+--   user, home                     who is logged in, and their home folder
+--   help()                         prints the muxos commands (for `help`)
 -- }
+-- One shell per login: a new login gets a fresh one (its own variables
+-- and working directory).
 local M = {}
 
-local env = {HOME = "/home", PATH = "/bin:/usr/bin", PWD = "/", SHELL = "/bin/sh", USER = "root",
-  TERM = "muxos"}
+local env = {HOME = ctx.home or "/home", PATH = "/bin:/usr/bin", PWD = "/", SHELL = "/bin/sh",
+  USER = ctx.user or "root", TERM = "muxos"}
 local exported = {HOME = true, PATH = true, PWD = true, SHELL = true, USER = true, TERM = true}
 local lastStatus = 0
 
@@ -1099,7 +1103,8 @@ define("help", "help", function(_, io)
   for _, u in ipairs(help) do sorted[#sorted + 1] = u end
   table.sort(sorted)
   for _, u in ipairs(sorted) do io.out("  " .. u .. "\n") end
-  io.out("plus programs in $PATH and the muxos commands listed at boot (nodes, run, update, ...)\n")
+  io.out("plus programs in $PATH, and:\n")
+  if ctx.help then ctx.help() end
 end)
 
 -- --- Running a line ---

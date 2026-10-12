@@ -84,6 +84,8 @@ kernal/shell.lua       the console's POSIX-style shell: ls, cd, cat, cp, grep, .
 kernal/bitmap.lua      half-block/braille pixel-grid encoder for "bit windows" -- OC's gpu
                        hardware has no pixel API, so this is sub-cell encoding on top of the
                        same character grid. Loaded by compositor.lua via loadSibling().
+kernal/lineedit.lua    the console's line editor: history, cursor movement, paste.
+kernal/system.lua      kernal flags (/etc/kernal.cfg) and users (/etc/users).
 installer/install.lua  the installer (bare from the kernal BIOS, or on OpenOS): installs the
                        kernal, flashes EEPROMs.
 tools/build.lua        builds it, with everything it installs, into dist/ (see "Installing").
@@ -231,7 +233,9 @@ floppy and the installer starts; choose **1) install the kernal**. It:
 - flashes the muxos kernal BIOS onto this computer's EEPROM, pointed at
   that disk.
 
-Reboot and muxos starts.
+Reboot and muxos starts, at `login:`. Type `root` (there are no
+passwords); `useradd <name>` adds more users -- see "Users and kernal
+flags" below.
 
 ### Updating
 
@@ -239,9 +243,11 @@ Put the new installer files on the floppy (all three, as in step 1),
 put it in a drive the kernal can see, and at the muxos console type:
 
 ```
-muxos> update
-muxos> reboot
+root@muxos:~> update
+root@muxos:~> reboot
 ```
+
+Only root can update (the `update_requires_root` flag).
 
 `update` reads `muxos-installer.dat` from the floppy (a floppy is slow:
 about 10 seconds), checks it against its own manifest, and installs its
@@ -336,9 +342,10 @@ Errors the Analyzer can show:
 
 - Flash `node/bios.lua` onto each worker's EEPROM and `kernal/bios.lua`
   onto the kernal's (`flash -q <file>` in OpenOS).
-- Copy `kernal/muxos.lua`, `kernal/compositor.lua`, `kernal/bitmap.lua`
-  and `node/runtime.lua` to the root of the kernal's disk, and
-  `kernal/lib` to `/lib`.
+- Copy `kernal/muxos.lua`, `compositor.lua`, `shell.lua`, `bitmap.lua`,
+  `lineedit.lua` and `system.lua` (all in `kernal/`) and
+  `node/runtime.lua` to the root of the kernal's disk, and `kernal/lib`
+  to `/lib`.
 
 The kernal BIOS boots the first disk with `/muxos.lua` on it. Workers
 never need a disk: they fetch `runtime.lua` from the kernal at boot.
@@ -346,26 +353,26 @@ never need a disk: they fetch `runtime.lua` from the kernal at boot.
 It discovers workers automatically, then drops into a prompt:
 
 ```
-muxos> discover
-muxos> nodes
-muxos> ping 1
-muxos> ping 1 10
-muxos> run return 1 + 1
-muxos> runall return computer.address()
-muxos> processes
-muxos> spawn 1 return 42
-muxos> window hello 5 5 20 5 gpu.set(1,1,"hi from the kernal")
-muxos> windows
-muxos> comp                   (back to the desktop from console mode)
-muxos> console 80 20
-muxos> hello world            (runs /bin/hello.mxe or /bin/hello.lua)
-muxos> hello world &          (in the background)
-muxos> pause 12 / resume 12 / kill 12
-muxos> bitdemo halfblock 5 5
-muxos> bitdemo braille 30 5
-muxos> components 1
-muxos> call 1 <component addr> getResolution
-muxos> quit
+root@muxos:~> discover
+root@muxos:~> nodes
+root@muxos:~> ping 1
+root@muxos:~> ping 1 10
+root@muxos:~> run return 1 + 1
+root@muxos:~> runall return computer.address()
+root@muxos:~> processes
+root@muxos:~> spawn 1 return 42
+root@muxos:~> window hello 5 5 20 5 gpu.set(1,1,"hi from the kernal")
+root@muxos:~> windows
+root@muxos:~> comp                   (back to the desktop from console mode)
+root@muxos:~> console 80 20
+root@muxos:~> hello world            (runs /bin/hello.mxe or /bin/hello.lua)
+root@muxos:~> hello world &          (in the background)
+root@muxos:~> pause 12 / resume 12 / kill 12
+root@muxos:~> bitdemo halfblock 5 5
+root@muxos:~> bitdemo braille 30 5
+root@muxos:~> components 1
+root@muxos:~> call 1 <component addr> getResolution
+root@muxos:~> quit
 ```
 
 `processes` shows the kernal's own job registry (`jobs`) -- every job
@@ -585,8 +592,9 @@ too. Keys, wheel and touch input go to the focused window's process
 ### The shell
 
 The console is a POSIX-style shell (`kernal/shell.lua`), to a
-reasonable degree of `sh`. The prompt shows the working directory
-(`muxos:/home> `; home is `/home`).
+reasonable degree of `sh`. The prompt shows who's logged in and the
+working directory, `~` for home (`root@muxos:~> `). Each login gets a
+fresh shell: its own variables, starting in its home folder.
 
 - **Syntax:** `'...'` and `"..."` quoting and `\` escapes; `$VAR`,
   `${VAR}`, `$?`, `VAR=value`, `export`, `unset`; `~`; globs (`*`, `?`,
@@ -614,6 +622,47 @@ reasonable degree of `sh`. The prompt shows the working directory
   than POSIX regular expressions (`grep -F` matches plain text).
 
 Tested in `test/emu/integration_test.lua`, test 41.
+
+### Users and kernal flags
+
+muxos is multi-user the way a small Unix machine is: you log in at the
+console with a user name, and that's all -- **no passwords, no file
+ownership, no permission system**. What a user name gives you:
+
+- **A home folder:** `/home/<name>`; root's is `/root`. It's the
+  shell's `~` and `$HOME`, where a login starts, and what legacy
+  programs see as `HOME` (with `USER`, and `PWD` the folder they were
+  started from).
+- **Your own processes:** `processes` shows whose each one is.
+  `logout` (or `exit`) ends the processes started from that login
+  (flag `logout_ends_jobs`), closes what's left of its windows, clears
+  the console, and goes back to `login:`.
+
+Users are created explicitly: a name typed at `login:` that isn't a
+user just says `no such user` and asks again -- a typo never makes an
+account. `users` lists them; `useradd <name>` adds one (and its home
+folder); `userdel <name>` removes one and keeps its home folder. They're
+kept in `/etc/users`, one per line; `root` always exists.
+
+**Kernal flags** are the system's policy, kept in `/etc/kernal.cfg` as
+`name = value` lines (comments with `#`). `flags` lists them with their
+values and defaults, `flags <name>` shows one, and `flags <name>
+<value>` sets one -- root only, and the file's other lines and comments
+are kept. A bad line in the file is reported at boot and that flag keeps
+its default; a bad value from `flags` is refused.
+
+| flag | default | |
+|---|---|---|
+| `login_required` | true | the console asks for a user name at boot; false logs in as root (takes effect at the next boot) |
+| `update_requires_root` | true | only root can `update` the kernal and its modules |
+| `reboot_requires_root` | false | only root can `reboot`, `shutdown` or `quit` |
+| `drain_requires_root` | false | only root can `drain`, `undrain` or `migrate` |
+| `useradd_requires_root` | true | only root can `useradd` or `userdel` |
+| `kill_requires_owner` | false | only a process's own user (or root) can `pause`, `resume` or `kill` it |
+| `logout_ends_jobs` | true | logging out ends the processes started from that login |
+
+The `*_requires_root` flags aren't security -- anyone can log in as root
+-- they make the important things deliberate. Tested in test 52.
 
 ### The desktop, the taskbar and the demo
 
