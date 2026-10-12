@@ -94,6 +94,9 @@ apps/muxterm.lua       muxterm, the network terminal: an OpenOS program (its own
 installer/install.lua  the installer (bare from the kernal BIOS, or on OpenOS): installs the
                        kernal, flashes EEPROMs.
 tools/build.lua        builds it, with everything it installs, into dist/ (see "Installing").
+tools/strip.lua        strips comments and indentation from the files the installer ships,
+                       keeping every line break (line numbers in errors stay the repo's);
+                       the build checks each stripped file compiles to the same code.
 dist/muxos-installer.lua  the built installer program, and
 dist/muxos-installer.dat  its data file (everything it installs); the two go together.
 test/emu/install_test.lua runs that installer on emulated hardware and boots the result.
@@ -341,7 +344,7 @@ Errors the Analyzer can show:
 - **"failed loading bios: ..."**: the EEPROM holds code that doesn't
   compile; re-flash it.
 - **"not enough memory"**: add RAM (two tier 3 sticks is comfortable for
-  a worker, which compiles a roughly 90 KB runtime when it boots).
+  a worker, which compiles a roughly 70 KB runtime when it boots).
 
 ### Installing by hand
 
@@ -707,6 +710,23 @@ holds up another.
 Tested in `test/emu/muxterm_test.lua` (real OpenOS running muxterm) and
 `test/emu/vgpu_test.lua`.
 
+### Render targets: drawing one window from several nodes
+
+A window's owner can share parts of it with its child processes, which
+then draw their parts straight into it, each from whatever worker it
+runs on -- frame by frame, like SLI. Regions go into a back buffer per
+frame; a frame reaches the screen only when it's presented, by the
+window's mode: **split** (each share draws its part of every frame; a
+frame shows once all have, or at its deadline with what arrived),
+**alternate** (shares take turns drawing whole frames, shown in order,
+late frames dropped), or **tearing** (a frame shows as soon as the next
+starts). Deadline, stale handling, frames in flight and message size are
+settings too. The API (`share_window`, `render_config`, `draw_region`,
+and `frame_presented`/`region_lost` events) is in docs/MXE.md; a
+higher-level rendering library for `.mxe` programs will sit on it. The
+demo draws its Mandelbrot this way: each strip's process draws its own
+strip. Tested in test 53.
+
 ### The desktop, the taskbar and the demo
 
 - **Icons:** a program can have its own icon: an `.mxe` sets `icon` (4
@@ -732,8 +752,10 @@ Tested in `test/emu/muxterm_test.lua` (real OpenOS running muxterm) and
   - Four threads run at once: an image thread, a braille-graphics thread,
     a status thread, and the main thread waiting for `q`.
   - It computes a Mandelbrot image in strips, each in a child process
-    that the scheduler places on the workers. It queues strips beyond
-    what the fan-out cap allows.
+    that the scheduler places on the workers and that draws its strip
+    straight into the shared image window (render targets, split
+    frames). Strips beyond what the fan-out cap allows go in the next
+    wave, the next frame.
   - It draws the image as colour half-block graphics, then cycles its
     colours; it animates braille graphics; and a text window shows which
     worker computed each strip.

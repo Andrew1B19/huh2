@@ -18,7 +18,9 @@ icon_color = {0xFF44FF, 0x44FFFF, 0x44FF44, 0xFFFF44}
 --   * threads within one process (the `thread` library): four run at
 --     once, each waiting on its own timers and kernal calls;
 --   * child processes the scheduler spreads over the workers: a
---     Mandelbrot image is split into strips, each computed by a child;
+--     Mandelbrot image is split into strips, each computed by a child
+--     that draws its strip straight into the shared window (render
+--     targets: gmuxapi.share_window / draw_region, split frames);
 --   * windows of colored half-block "bit" graphics and braille graphics
 --     (kernal/bitmap.lua), redrawn live, and a text status window.
 -- Usage: demo [strips]   (default 4).  Press q in one of its windows to end.
@@ -32,11 +34,14 @@ local ITERATIONS = 40
 local running = true
 local state = {phase = "starting", frames = 0, strips = {}, workers = {}, started = computer.uptime()}
 
--- Each strip's child process: the escape-time counts for its rows. It
--- runs on whichever worker the scheduler picks, with the native API, so
--- it reports which node it ran on.
+-- Each strip's child process: the escape-time counts for its rows,
+-- drawn into its share of the image window as frame `a.frame`, then
+-- returned. It runs on whichever worker the scheduler picks, with the
+-- native API, so it reports which node it ran on.
 local STRIP_CODE = [[
 local a = args
+local e
+repeat e = gmuxapi.pull_event(10) until not e or e[1] == "window_shared"
 local rows = {}
 for py = a.y0, a.y1 do
   local row = {}
@@ -52,6 +57,23 @@ for py = a.y0, a.y1 do
   end
   rows[#rows + 1] = row
   yield()
+end
+if e then
+  local function hue(h)
+    h = (h % 1) * 6
+    local i = math.floor(h)
+    local f = h - i
+    local q, t = math.floor(255 * (1 - f)), math.floor(255 * f)
+    local rgb = ({{255, t, 0}, {q, 255, 0}, {0, 255, t}, {0, q, 255}, {t, 0, 255}, {255, 0, q}})[i + 1]
+    return (rgb[1] << 16) | (rgb[2] << 8) | rgb[3]
+  end
+  local pixels = {}
+  for r, row in ipairs(rows) do
+    pixels[r] = {}
+    for x, n in ipairs(row) do if n < a.iter then pixels[r][x] = hue(n / 16) end end
+  end
+  gmuxapi.draw_region(a.win, a.frame, {pixels = pixels, width = a.w, height = #rows, mode = "halfblock", bg = 0x000000})
+  repeat e = gmuxapi.pull_event(10) until not e or (e[1] == "frame_presented" and e[3] == a.frame)
 end
 return {y0 = a.y0, rows = rows, node = computer.address()}
 ]]
@@ -104,10 +126,12 @@ local function drawImage(shift)
 end
 
 local imageThread = thread.create(function()
-  -- The strips, queued: a job tree may run as many children at once as
-  -- there are live workers (muxos's fan-out cap), so the next strip
-  -- starts whenever one finishes.
-  local per = math.ceil(IMG_H / STRIPS)
+  -- The strips, in waves: a job tree may run as many children at once as
+  -- there are live workers (muxos's fan-out cap). Each wave is one frame
+  -- of the image window, split between its strips' processes: each gets
+  -- a share of the window and draws its strip there itself.
+  gmuxapi.render_config(imageWin, {mode = "split", deadline = 5})
+  local per = math.ceil(IMG_H / STRIPS / 2) * 2 -- whole cells: 2 pixel rows each
   local queue, children = {}, {}
   for i = 1, STRIPS do
     local y0, y1 = (i - 1) * per + 1, math.min(IMG_H, i * per)
@@ -116,21 +140,26 @@ local imageThread = thread.create(function()
       state.strips[i] = {rows = y0 .. "-" .. y1, status = "queued", node = "", y0 = y0, y1 = y1}
     end
   end
-  local total, finished = #queue, 0
+  local total, finished, frame = #queue, 0, 0
   state.phase = "computing on the workers"
   while finished < total and running do
-    -- Start what the cap allows.
-    while #queue > 0 do
-      local s = state.strips[queue[1]]
-      local child, err = gmuxapi.create_headless_process({code = STRIP_CODE, name = "demo-strip",
-        orphan_policy = "kill", args = {y0 = s.y0, y1 = s.y1, w = IMG_W, h = IMG_H, iter = ITERATIONS}})
-      if not child then
-        if not tostring(err):find("fan-out cap", 1, true) then error(err) end
-        break -- wait for one to finish
+    -- A new wave, once the last one is drawn: as many as the cap allows.
+    if #children == 0 then
+      frame = frame + 1
+      while #queue > 0 do
+        local s = state.strips[queue[1]]
+        local child, err = gmuxapi.create_headless_process({code = STRIP_CODE, name = "demo-strip",
+          orphan_policy = "kill", args = {y0 = s.y0, y1 = s.y1, w = IMG_W, h = IMG_H, iter = ITERATIONS,
+            win = imageWin, frame = frame}})
+        if not child then
+          if not tostring(err):find("fan-out cap", 1, true) then error(err) end
+          break -- the rest wait for the next wave
+        end
+        s.status, s.node, s.id = "running", child.process.node, child.process.id
+        gmuxapi.share_window(imageWin, child.process.id, {1, (s.y0 - 1) // 2 + 1, IMG_W, (s.y1 - s.y0 + 1) // 2})
+        children[#children + 1] = queue[1]
+        table.remove(queue, 1)
       end
-      s.status, s.node, s.id = "running", child.process.node, child.process.id
-      children[#children + 1] = queue[1]
-      table.remove(queue, 1)
     end
     sleep(0.2)
     for k = #children, 1, -1 do
@@ -143,7 +172,6 @@ local imageThread = thread.create(function()
           s.status, s.node = "done", job.result.node
           state.workers[job.result.node] = true
           for r, row in ipairs(job.result.rows) do counts[job.result.y0 + r - 1] = row end
-          drawImage(0) -- each strip shows as it arrives
         else
           s.status = tostring(job.status)
         end

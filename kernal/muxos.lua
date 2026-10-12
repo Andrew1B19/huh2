@@ -1020,6 +1020,7 @@ local function finishJob(id, status, result, err)
   local job = jobs[id]
   closeJobFiles(id)
   net.release(id)
+  K.dropShares(id)
   if fullscreen.job == id then
     fullscreen.node, fullscreen.job = nil, nil
     K.releaseScreen()
@@ -1764,6 +1765,92 @@ local function handleDrawWindow(msg)
   if not msg.noReply then send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = reply}) end
 end
 
+-- --- Render targets (kernal/compositor.lua's "Render targets") ---
+
+-- May `caller` manage window `win`: its owner, or an ancestor of it?
+local function managesWindow(caller, win)
+  return caller and win.ownerJobId and (win.ownerJobId == caller.id or isDescendantOf(win.ownerJobId, caller.id))
+end
+
+-- Frames presented: the window's owner and every process drawing into
+-- it hear {"frame_presented", window, frame, complete}.
+function K.framesPresented(S, list)
+  for _, p in ipairs(list) do
+    local win = S.compositor.getWindow(p.id)
+    if win then
+      local told = {}
+      local function tell(id)
+        local job = K.liveJob(id)
+        if job and not told[id] then
+          told[id] = true
+          K.deliverEvent(job, {"frame_presented", p.id, p.frame, p.complete})
+        end
+      end
+      if win.ownerJobId then tell(win.ownerJobId) end
+      for key in pairs(S.compositor.shares(p.id)) do tell(key) end
+    end
+  end
+end
+
+-- The live processes a split frame of window `id` waits for.
+function K.expectedRegions(S, id)
+  local list = {}
+  for key in pairs(S.compositor.shares(id)) do
+    if K.liveJob(key) then list[#list + 1] = key end
+  end
+  return list
+end
+
+-- A process ended: its shares go, and each window's owner hears
+-- {"region_lost", window, process}.
+function K.dropShares(id)
+  for _, S in ipairs(K.sessions) do
+    for _, winId in ipairs(S.compositor.unshareAll(id)) do
+      local win = S.compositor.getWindow(winId)
+      local owner = win and win.ownerJobId and K.liveJob(win.ownerJobId)
+      if owner then K.deliverEvent(owner, {"region_lost", winId, id}) end
+    end
+  end
+end
+
+local function handleRender(msg)
+  local caller = callerJob(msg)
+  local S, win = K.windowOwner(msg.windowId)
+  local function reply(result, err)
+    if msg.noReply then return end
+    if result == nil then
+      send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
+    else
+      send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = result})
+    end
+  end
+  if not caller then return reply(nil, "not called from a running process") end
+  if not win then return reply(nil, "no such window: " .. tostring(msg.windowId)) end
+  local manager = managesWindow(caller, win)
+  if msg.type == "SHAREWINDOW" then
+    local child = K.liveJob(msg.child)
+    if not manager then return reply(nil, "window " .. win.id .. " belongs to another process") end
+    if not child or not isDescendantOf(child.id, caller.id) then
+      return reply(nil, "process " .. tostring(msg.child) .. " isn't a running descendant of yours")
+    end
+    local ok, err = S.compositor.share(win.id, child.id, msg.rect)
+    if not ok then return reply(nil, err) end
+    local rect = S.compositor.shares(win.id)[child.id]
+    K.deliverEvent(child, rect and {"window_shared", win.id, rect.x, rect.y, rect.w, rect.h} or {"window_unshared", win.id})
+    return reply(true)
+  elseif msg.type == "RENDERCONFIG" then
+    if not manager and (msg.options ~= nil or not S.compositor.shares(win.id)[caller.id]) then
+      return reply(nil, "window " .. win.id .. " belongs to another process")
+    end
+    return reply(S.compositor.renderConfig(win.id, manager and msg.options or nil))
+  end
+  -- DRAWREGION
+  local ok, presented = S.compositor.drawRegion(win.id, manager and "owner" or caller.id, msg.frame, msg, msg.done)
+  if not ok then return reply(nil, presented) end
+  K.framesPresented(S, presented)
+  reply(true)
+end
+
 local function handleGetWindows(msg)
   local S = K.sessionOf(callerJob(msg))
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S and S.compositor.listWindows() or {}})
@@ -1843,6 +1930,8 @@ local function handleModemMessage(from, port, data)
     handleList(msg)
   elseif msg.type == "INVOKE" then
     handleInvoke(msg)
+  elseif msg.type == "SHAREWINDOW" or msg.type == "RENDERCONFIG" or msg.type == "DRAWREGION" then
+    handleRender(msg)
   elseif msg.type == "ISFOREGROUND" then
     -- readLine (docs/MXE.md): only the console's foreground program reads typed lines.
     local caller = callerJob(msg)
@@ -1985,7 +2074,10 @@ local function tick(timeout)
     sweepStaleOrphans()
     checkLiveness()
     if K.terminals then K.terminals.sweep() end
-    for _, S in ipairs(K.sessions) do K.inSession(S, S.update) end
+    for _, S in ipairs(K.sessions) do
+      K.framesPresented(S, S.compositor.renderTick(function(id) return K.expectedRegions(S, id) end))
+      K.inSession(S, S.update)
+    end
   end)
   if not ok then
     print("tick error (continuing): " .. tostring(err))

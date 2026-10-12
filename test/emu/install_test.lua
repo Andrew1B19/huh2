@@ -8,6 +8,8 @@
 --   lua5.3 test/emu/install_test.lua
 local REPO_ROOT = (arg and arg[0] and arg[0]:match("^(.*)/test/emu/install_test%.lua$")) or "."
 local Emulator = dofile(REPO_ROOT .. "/test/emu/emulator.lua")
+-- Disk files ship stripped of comments (tools/strip.lua).
+local strip = dofile(REPO_ROOT .. "/tools/strip.lua")
 
 local function readFile(path)
   local f = assert(io.open(path, "rb"))
@@ -153,13 +155,13 @@ do
   assert(code == 0, "kernal install failed:\n" .. out)
   assert(out:find("Upgrading muxos 0.0.9 to 0.1.2", 1, true), "it noticed the old version:\n" .. out)
   assert(out:find("warning", 1, true) == nil, "no hardware warnings on a complete kernal:\n" .. out)
-  assert(disk["/muxos.lua"] == readFile(REPO_ROOT .. "/kernal/muxos.lua"), "muxos.lua installed")
-  assert(disk["/runtime.lua"] == readFile(REPO_ROOT .. "/node/runtime.lua"), "runtime.lua installed")
-  assert(disk["/lib/core/full_text.lua"] == readFile(REPO_ROOT .. "/kernal/lib/core/full_text.lua"), "libraries installed")
+  assert(disk["/muxos.lua"] == strip(readFile(REPO_ROOT .. "/kernal/muxos.lua")), "muxos.lua installed")
+  assert(disk["/runtime.lua"] == strip(readFile(REPO_ROOT .. "/node/runtime.lua")), "runtime.lua installed")
+  assert(disk["/lib/core/full_text.lua"] == strip(readFile(REPO_ROOT .. "/kernal/lib/core/full_text.lua")), "libraries installed")
   assert(disk["/.muxos-version"] == "0.1.2\n" and disk["/home/keep.txt"] == "mine", "version recorded, user files kept")
   assert(not disk["/eeprom/kernal.lua"], "BIOS images aren't disk files")
-  assert(disk["/bin/opm.mxe"] == readFile(REPO_ROOT .. "/opm/opm.mxe")
-    and disk["/lib/mxe/opm_core.lua"] == readFile(REPO_ROOT .. "/opm/opm_core.lua"), "opm ships with muxos")
+  assert(disk["/bin/opm.mxe"] == strip(readFile(REPO_ROOT .. "/opm/opm.mxe"))
+    and disk["/lib/mxe/opm_core.lua"] == strip(readFile(REPO_ROOT .. "/opm/opm_core.lua")), "opm ships with muxos")
   for path in pairs(disk) do assert(not path:match("%.new$"), "left a staged file behind: " .. path) end
   local eeprom = kernal.components[kernalEeprom].methods
   assert(eeprom.get() == readFile(REPO_ROOT .. "/kernal/bios.lua") and eeprom.getData() == diskAddr,
@@ -395,7 +397,7 @@ do
   typeLine("y")
   emu:advance(5)
   assert(screenText():find("muxos 0.1.2 is installed.", 1, true), "it installed:\n" .. screenText())
-  assert(hdd["/muxos.lua"] == readFile(REPO_ROOT .. "/kernal/muxos.lua") and hdd["/bin/opm.mxe"], "the files are on the hard disk")
+  assert(hdd["/muxos.lua"] == strip(readFile(REPO_ROOT .. "/kernal/muxos.lua")) and hdd["/bin/opm.mxe"], "the files are on the hard disk")
   assert(node.components[eeprom].methods.getData() == hddAddr, "the EEPROM boots the hard disk now")
   typeLine("y")
   assert(node.status == "dead", "it rebooted")

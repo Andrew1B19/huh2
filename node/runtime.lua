@@ -465,6 +465,9 @@ end
 -- output is flushed; `force` before the process blocks, otherwise it's
 -- rate-limited.
 local graphicsFlushers = {}
+
+-- window id -> its render `chunk` (gmuxapi.draw_region), once asked.
+local renderChunks = {}
 -- id -> function(ok, result), run when the job ends (a legacy program
 -- writes its error into its own window).
 local jobEndHooks = {}
@@ -789,6 +792,76 @@ gmuxapi = {
 
   get_windows = function()
     return remoteRequest("GETWINDOWS", {caller = currentJobId})
+  end,
+
+  -- Render targets: several processes drawing one window, frame by
+  -- frame, each from its own node (see kernal/compositor.lua's "Render
+  -- targets"). The window's owner shares rectangles of it with its
+  -- descendants; each gets {"window_shared", window, x, y, w, h}.
+  share_window = function(id, child, rect)
+    return remoteRequest("SHAREWINDOW", {windowId = id, child = child, rect = rect, caller = currentJobId})
+  end,
+  unshare_window = function(id, child)
+    return remoteRequest("SHAREWINDOW", {windowId = id, child = child, caller = currentJobId})
+  end,
+
+  -- The window's render settings, after setting any in `options` (the
+  -- owner only): mode (split | alternate | tearing), deadline, stale
+  -- (keep | clear), queue, chunk.
+  render_config = function(id, options)
+    local config, err = remoteRequest("RENDERCONFIG", {windowId = id, options = options, caller = currentJobId})
+    if config then renderChunks[id] = config.chunk end
+    return config, err
+  end,
+
+  -- Draws this process's part of frame `frame`: `content` is {pixels,
+  -- width, height, mode, bg} or {text = rows}, at content.x/y (window
+  -- cells; default: the share's corner). A region bigger than the
+  -- window's `chunk` goes as several messages, in bands; only the last
+  -- waits for the kernal's answer. `content.done = false`: more of
+  -- this frame is still to come from this process.
+  draw_region = function(id, frame, content)
+    content = content or {}
+    if renderChunks[id] == nil then
+      local config = remoteRequest("RENDERCONFIG", {windowId = id, caller = currentJobId})
+      renderChunks[id] = config and config.chunk or false
+    end
+    local chunk = renderChunks[id] or 4096
+    local bands = {}
+    if content.pixels and content.width and content.height then
+      local perCell = content.mode == "braille" and 4 or 2
+      local rows = math.max(perCell, (chunk // math.max(1, content.width * 9)) // perCell * perCell)
+      for top = 1, content.height, rows do
+        local band = {}
+        for y = top, math.min(content.height, top + rows - 1) do band[#band + 1] = content.pixels[y] or {} end
+        bands[#bands + 1] = {pixels = band, width = content.width, height = #band, mode = content.mode,
+          bg = content.bg, x = content.x, y = (content.y or nil) and content.y + (top - 1) // perCell,
+          offset = (top - 1) // perCell}
+      end
+    elseif type(content.text) == "table" then
+      local size, start = 0, 1
+      for i, row in ipairs(content.text) do
+        size = size + (type(row) == "string" and #row or 40 * #row) + 8
+        if size > chunk or i == #content.text then
+          local part = {}
+          for j = start, i do part[#part + 1] = content.text[j] end
+          bands[#bands + 1] = {text = part, x = content.x, y = content.y and content.y + start - 1, offset = start - 1}
+          start, size = i + 1, 0
+        end
+      end
+    end
+    if #bands == 0 then return nil, "a region needs pixels (with width and height) or text" end
+    for i, band in ipairs(bands) do
+      local msg = {windowId = id, frame = frame, pixels = band.pixels, width = band.width, height = band.height,
+        mode = band.mode, bg = band.bg, text = band.text, x = band.x, y = band.y, offset = band.offset,
+        done = i == #bands and content.done ~= false, caller = currentJobId}
+      if i < #bands then
+        msg.type, msg.from, msg.to, msg.id, msg.noReply = "DRAWREGION", nodeId, kernalAddr, nextId(), true
+        send(msg)
+      else
+        return remoteRequest("DRAWREGION", msg)
+      end
+    end
   end,
 
   -- Not part of gmux's real API at all -- gmux never needs this,
