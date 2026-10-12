@@ -94,6 +94,9 @@ apps/muxterm.lua       muxterm, the network terminal: an OpenOS program (its own
 installer/install.lua  the installer (bare from the kernal BIOS, or on OpenOS): installs the
                        kernal, flashes EEPROMs.
 tools/build.lua        builds it, with everything it installs, into dist/ (see "Installing").
+tools/strip.lua        strips comments and indentation from the files the installer ships,
+                       keeping every line break (line numbers in errors stay the repo's);
+                       the build checks each stripped file compiles to the same code.
 dist/muxos-installer.lua  the built installer program, and
 dist/muxos-installer.dat  its data file (everything it installs); the two go together.
 test/emu/install_test.lua runs that installer on emulated hardware and boots the result.
@@ -341,7 +344,7 @@ Errors the Analyzer can show:
 - **"failed loading bios: ..."**: the EEPROM holds code that doesn't
   compile; re-flash it.
 - **"not enough memory"**: add RAM (two tier 3 sticks is comfortable for
-  a worker, which compiles a roughly 90 KB runtime when it boots).
+  a worker, which compiles a roughly 70 KB runtime when it boots).
 
 ### Installing by hand
 

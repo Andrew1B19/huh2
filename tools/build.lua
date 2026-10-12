@@ -14,6 +14,9 @@
 
 local ROOT = (arg[0]:match("^(.*)/tools/build%.lua$")) or "."
 local EEPROM_SIZE = 4096
+-- Disk files ship without comments or indentation (tools/strip.lua), so
+-- the installer fits on a floppy; line numbers stay the repo's.
+local strip = dofile(ROOT .. "/tools/strip.lua")
 
 -- Line endings are normalized to LF: a checkout converted to CRLF (git's
 -- core.autocrlf on Windows) builds the same installer, byte for byte.
@@ -71,7 +74,18 @@ local function build()
     contents[i] = data
     if entry[2]:match("%.lua$") or entry[2]:match("%.mxe$") then
       local ok, err = load(data, "=" .. entry[2], "t")
-      if not ok then errors[#errors + 1] = err end
+      if not ok then
+        errors[#errors + 1] = err
+      elseif not entry[1]:match("^/eeprom/") then
+        -- Stripped, it must compile to exactly the same code.
+        local shipped = strip(data)
+        local same, sameErr = load(shipped, "=" .. entry[2], "t")
+        if not same or string.dump(same, true) ~= string.dump(ok, true) then
+          errors[#errors + 1] = entry[2] .. ": stripping it changed its code (" .. tostring(sameErr) .. ")"
+        else
+          contents[i] = shipped
+        end
+      end
     end
     if entry[1]:match("^/eeprom/") and #data > EEPROM_SIZE then
       errors[#errors + 1] = entry[2] .. " is " .. #data .. " bytes; an EEPROM holds " .. EEPROM_SIZE
@@ -99,7 +113,18 @@ local function build()
   installer, n = installer:gsub('local VERSION = "dev"', 'local VERSION = "' .. tostring(version) .. '"', 1)
   if n ~= 1 then errors[#errors + 1] = "installer/install.lua has no VERSION line to fill in" end
   local ok, err = load(installer, "=installer/install.lua", "t")
-  if not ok then errors[#errors + 1] = err end
+  if not ok then
+    errors[#errors + 1] = err
+  else
+    -- Shipped stripped as well: it loads at floppy speed.
+    local shipped = strip(installer)
+    local same = load(shipped, "=installer/install.lua", "t")
+    if not same or string.dump(same, true) ~= string.dump(ok, true) then
+      errors[#errors + 1] = "installer/install.lua: stripping it changed its code"
+    else
+      installer = shipped
+    end
+  end
   local init = readFile("installer/init.lua")
   ok, err = load(init, "=installer/init.lua", "t")
   if not ok then errors[#errors + 1] = err end
