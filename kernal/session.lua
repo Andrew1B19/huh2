@@ -15,12 +15,27 @@
 local K, opts = ...
 local S = {id = opts.id, kind = opts.kind, address = opts.address, user = nil, login = 0}
 local system, jobs = K.system, K.jobs
-local readFile, tryInvoke, fsAddr, loadSibling = K.readFile, K.tryInvoke, K.fsAddr, K.loadSibling
-local resolveProgram, readManifest, launchProgram, PROGRAM_PATH = K.resolveProgram, K.readManifest,
-  K.launchProgram, K.PROGRAM_PATH
+local loadSibling, launchProgram = K.loadSibling, K.launchProgram
 local gpu = opts.gpu
 local compositor = K.newCompositor(gpu)
 S.compositor, S.gpu = compositor, gpu
+
+-- This screen as the window registry (kernal/windows.lua) sees it: where
+-- programs' windows are drawn, and how they're shown and taken away.
+S.display = {
+  address = K.selfAddr,
+  create = function(spec)
+    local win, err = compositor.createWindow(spec)
+    if not win then return nil, err end
+    return {width = win.width, height = win.height}
+  end,
+  remove = function(id) compositor.close(id) end,
+  status = function(id, status) compositor.setStatus(id, status) end,
+  setOwner = function(id, jobId)
+    local win = compositor.getWindow(id)
+    if win then win.ownerJobId = jobId end
+  end,
+}
 
 -- --- The console, replacing OpenOS's io/term ---
 --
@@ -107,7 +122,7 @@ end
 function S.prompt()
   local user = S.user
   if not user then return "login: " end
-  local cwd, home = shell and shell.cwd() or "/", system.home(user)
+  local cwd, home = S.cwd(), system.home(user)
   if cwd == home then
     cwd = "~"
   elseif cwd:sub(1, #home + 1) == home .. "/" then
@@ -515,9 +530,15 @@ end
 local function closeWindow(win)
   -- The console can't go away: closing it minimizes it.
   if consoleWin and win.id == consoleWin.id then compositor.minimize(win.id, true) return end
-  local job = windowProcess(win)
+  -- A program's window: gone everywhere, and its program with it.
+  if win.ownerJobId and K.closeWindow(win.id) then return end
   compositor.close(win.id)
-  if job then K.controlJob(job.id, "KILL", "killed (window closed)") end
+end
+
+-- A program window moved or changed size here: the registry keeps its
+-- place, for wherever it's shown next.
+local function noteGeometry(win)
+  if win.ownerJobId then K.windowGeometry(win.id, win.x, win.y, win.width, win.height) end
 end
 
 -- --- The desktop: gmux's -- a background and a column of app icons ---
@@ -556,57 +577,22 @@ function desktop.fit(text, width, center)
   return (" "):rep(left) .. text .. (" "):rep(pad - left)
 end
 
--- A program's own icon, if it has one: an .mxe header's
---   icon = {"row 1", "row 2", "row 3", "row 4"}  (9 columns each)
---   icon_color = 0xRRGGBB                        (or one per row)
--- or, for any program, a <name>.icon file next to it: up to 4 rows of
--- art, optionally after a first line "#RRGGBB" giving its color.
-function desktop.iconOf(path)
-  local art, color
-  local source = path:match("%.mxe$") and readFile(path)
-  if source then
-    local manifest = readManifest(source)
-    if manifest and type(manifest.icon) == "table" then art, color = manifest.icon, manifest.icon_color end
-  end
-  if not art then
-    local text = readFile((path:gsub("%.[^./]*$", "")) .. ".icon")
-    if text then
-      art = {}
-      for line in (text .. "\n"):gmatch("([^\n]*)\n") do
-        local hex = #art == 0 and not color and line:match("^#(%x%x%x%x%x%x)%s*$")
-        if hex then color = tonumber(hex, 16) elseif #art < 4 then art[#art + 1] = line end
-      end
-      while #art > 0 and art[#art] == "" do art[#art] = nil end
-    end
-  end
-  if not art or #art == 0 then return nil end
-  local rows, colors = {}, {}
-  for i = 1, 4 do
-    rows[i] = desktop.fit(art[i], desktop.ICON_W, true)
-    local c = type(color) == "table" and color[i] or color
-    colors[i] = (not desktop.mono and math.type(c) == "integer") and c or nil
-  end
-  return {rows = rows, colors = colors}
-end
-
+-- The apps: the console, and every program in /bin and /usr/bin, with
+-- its icon if it has one (K.apps: an .mxe header's `icon`/`icon_color`,
+-- or a <name>.icon file), fitted to the desktop's icon size.
 function desktop.scan()
-  local apps, seen = {{name = "console", console = true}}, {console = true}
-  for _, dir in ipairs(PROGRAM_PATH) do
-    local names = tryInvoke(fsAddr, "list", dir)
-    if type(names) == "table" then
-      table.sort(names)
-      for _, n in ipairs(names) do
-        local base = n:match("^(.-)%.mxe$") or n:match("^(.-)%.lua$")
-        if base and not seen[base] then
-          local path = resolveProgram(base) -- .mxe first, like typing it
-          if path then
-            seen[base] = true
-            local ok, icon = pcall(desktop.iconOf, path)
-            apps[#apps + 1] = {name = base, path = path, icon = ok and icon or nil}
-          end
-        end
+  local apps = {{name = "console", console = true}}
+  for _, app in ipairs(K.apps()) do
+    local icon
+    if type(app.art) == "table" and #app.art > 0 then
+      icon = {rows = {}, colors = {}}
+      for i = 1, 4 do
+        icon.rows[i] = desktop.fit(app.art[i], desktop.ICON_W, true)
+        local c = type(app.color) == "table" and app.color[i] or app.color
+        icon.colors[i] = (not desktop.mono and math.type(c) == "integer") and c or nil
       end
     end
+    apps[#apps + 1] = {name = app.name, path = app.path, icon = icon}
   end
   desktop.apps = apps
 end
@@ -672,10 +658,10 @@ end
 
 -- The wallpaper's cells for this screen, or nil and why.
 function desktop.wallpaperCells(path)
-  local size = tryInvoke(fsAddr, "size", path)
-  if not tryInvoke(fsAddr, "exists", path) then return nil, path .. ": no such file" end
-  if (size or 0) > desktop.MAX_WALLPAPER then return nil, path .. ": too big (1 MB at most)" end
-  local data = readFile(path)
+  local size = K.fileSize(path)
+  if not size then return nil, path .. ": no such file" end
+  if size > desktop.MAX_WALLPAPER then return nil, path .. ": too big (1 MB at most)" end
+  local data = K.readFile(path)
   if not data then return nil, path .. ": can't read it" end
   local w, h, pixel = desktop.readPPM(data)
   if not w then return nil, path .. ": " .. tostring(h) end
@@ -691,7 +677,7 @@ end
 
 function desktop.loadWallpaper()
   desktop.wall = nil
-  local config = readFile(desktop.WALLPAPER_CONFIG)
+  local config = K.readFile(desktop.WALLPAPER_CONFIG)
   local path = config and config:match("^%s*(.-)%s*$")
   if not path or path == "" then return end
   local cells, err = desktop.wallpaperCells(path)
@@ -757,25 +743,23 @@ end
 -- The `wallpaper` command: <file.ppm> sets it, `none` clears it.
 function desktop.setWallpaper(arg)
   if not arg or arg == "" then
-    local config = readFile(desktop.WALLPAPER_CONFIG)
+    local config = K.readFile(desktop.WALLPAPER_CONFIG)
     print("wallpaper: " .. (config and config:match("^%s*(.-)%s*$") or "none")
       .. "  (wallpaper <file.ppm> | wallpaper none)")
     return
   end
   if arg == "none" then
-    tryInvoke(fsAddr, "remove", desktop.WALLPAPER_CONFIG)
+    K.writeFile(desktop.WALLPAPER_CONFIG, nil)
     desktop.wall = nil
     desktop.render()
     print("wallpaper cleared")
     return
   end
   local path = arg
-  if path:sub(1, 1) ~= "/" then path = (shell and shell.cwd() or "/") .. "/" .. path end
+  if path:sub(1, 1) ~= "/" then path = S.cwd() .. "/" .. path end
   local cells, err = desktop.wallpaperCells(path)
   if not cells then print("wallpaper: " .. tostring(err)) return end
-  tryInvoke(fsAddr, "makeDirectory", "/etc")
-  local h = tryInvoke(fsAddr, "open", desktop.WALLPAPER_CONFIG, "w")
-  if h then tryInvoke(fsAddr, "write", h, path .. "\n") tryInvoke(fsAddr, "close", h) end
+  K.writeFile(desktop.WALLPAPER_CONFIG, path .. "\n")
   desktop.wall = cells
   desktop.render()
   print("wallpaper: " .. path)
@@ -794,6 +778,7 @@ end
 function desktop.launch(app)
   if app.console then desktop.showConsole() return end
   local id, addrOrErr = launchProgram(app.path, {})
+  if id == true then return end -- asked; the kernal reports how it went
   if id then
     print("[" .. id .. "] " .. app.path .. " started on " .. addrOrErr)
   else
@@ -823,16 +808,36 @@ desktop.bar.win = gpu and compositor.createWindow({title = "taskbar", x = 1, y =
 -- (A new window takes the focus: the console has it at boot.)
 if consoleWin then compositor.setFocus(consoleWin.id) end
 
+-- The taskbar's windows: this screen's, then the user's programs'
+-- windows shown elsewhere or nowhere (`away`; touching one brings it
+-- here) -- a user's running programs are on every one of their taskbars.
 function desktop.bar.windows()
-  local list = {}
+  local list, here = {}, {}
   for _, w in ipairs(compositor.listWindows()) do
     if w.id ~= (desktop.win and desktop.win.id) and w.id ~= (desktop.bar.win and desktop.bar.win.id)
         and w.id ~= (desktop.menu and desktop.menu.id) then
+      list[#list + 1] = w
+      here[w.id] = true
+    end
+  end
+  for _, w in ipairs(S.user and K.userWindows(S.user) or {}) do
+    if not here[w.id] and not w.status then
+      w.away = true
       list[#list + 1] = w
     end
   end
   table.sort(list, function(a, b) return a.id < b.id end)
   return list
+end
+
+-- The user's windows changed somewhere: redraw the taskbar soon.
+function S.windowsChanged() desktop.bar.nextCheck = 0 end
+
+-- Brings one of the user's windows here from wherever it is.
+local function fetchWindow(id)
+  local ok, err = K.attachWindow(id, S)
+  if not ok then print("can't bring window " .. id .. " here: " .. tostring(err)) return end
+  desktop.bar.show(id)
 end
 
 function desktop.bar.render(list)
@@ -863,14 +868,16 @@ function desktop.bar.render(list)
     local label = " " .. desktop.fit(w.title, math.min(title, utf8.len(w.title) or #w.title)) .. " "
     local width = utf8.len(label) or #label
     local fg, bg = 0xFFFFFF, 0x555555
-    if w.minimized then
+    if w.away then
+      fg, bg = 0x88AAFF, 0x222244 -- running, shown elsewhere or nowhere
+    elseif w.minimized then
       fg, bg = 0x999999, 0x333333
     elseif focus and focus.id == w.id then
       fg, bg = 0x000000, 0xFFFFFF
     end
     if desktop.mono then fg, bg = 0xFFFFFF, 0x000000 end
     placed[#placed + 1] = {x, label, fg, bg}
-    buttons[#buttons + 1] = {from = x, to = x + width - 1, window = w.id}
+    buttons[#buttons + 1] = {from = x, to = x + width - 1, window = w.id, away = w.away}
     x = x + width + 1
   end
   if more then
@@ -892,7 +899,7 @@ function desktop.bar.update(force)
   local list = desktop.bar.windows()
   local focus = compositor.getFocus()
   local parts = {focus and focus.id or 0, math.floor(now / 30)}
-  for _, w in ipairs(list) do parts[#parts + 1] = w.id .. w.title .. tostring(w.minimized) end
+  for _, w in ipairs(list) do parts[#parts + 1] = w.id .. w.title .. tostring(w.minimized) .. tostring(w.away) end
   local okClock, clock = pcall(os.date, "%H:%M")
   parts[#parts + 1] = okClock and tostring(clock) or ""
   local signature = table.concat(parts, "|")
@@ -921,10 +928,13 @@ function desktop.bar.touch(lx)
         local items = {}
         for _, w in ipairs(desktop.bar.windows()) do
           local id = w.id
-          items[#items + 1] = {label = w.title .. (w.minimized and " (minimized)" or ""),
-            action = function() desktop.bar.show(id) end}
+          items[#items + 1] = {label = w.title .. (w.minimized and " (minimized)" or "")
+            .. (w.away and " (elsewhere)" or ""),
+            action = function() if w.away then fetchWindow(id) else desktop.bar.show(id) end end}
         end
         desktop.toggleMenu(items, b.from)
+      elseif b.away then
+        fetchWindow(b.window)
       else
         local win = compositor.getWindow(b.window)
         local focus = compositor.getFocus()
@@ -997,10 +1007,14 @@ local function handleTouch(name, x, y, button)
     if name == "drag" then
       if grab.kind == "move" then
         compositor.move(win.id, x - grab.dx, y)
+        noteGeometry(win)
       else
         local w = math.max(UI.MIN_WINDOW_WIDTH, x - win.x + 1)
         local h = math.max(1, y - compositor.bodyTop(win) + 1)
-        if (w ~= win.width or h ~= win.height) and compositor.resize(win.id, w, h) then notifyResized(win) end
+        if (w ~= win.width or h ~= win.height) and compositor.resize(win.id, w, h) then
+          notifyResized(win)
+          noteGeometry(win)
+        end
       end
       return
     end
@@ -1031,7 +1045,10 @@ local function handleTouch(name, x, y, button)
     if lx == w - 5 or lx == w - 4 then
       compositor.minimize(win.id)
     elseif (lx == w - 3 or lx == w - 2) and win.resizable then
-      if compositor.maximize(win.id) then notifyResized(win) end
+      if compositor.maximize(win.id) then
+        notifyResized(win)
+        noteGeometry(win)
+      end
     elseif lx == w - 1 or lx == w then
       closeWindow(win)
     else
@@ -1078,23 +1095,22 @@ function S.update()
 end
 
 
--- Runs a launched program in the foreground: the console waits until it
--- ends (any way: done, error, killed, lost), feeding it typed input
--- meanwhile, like an OpenOS shell.
-local function runForeground(id)
+-- A program runs in the foreground (K.runForeground): the console
+-- waits for it, feeding it typed input meanwhile, like an OpenOS shell.
+function S.beginForeground(id)
   S.foregroundJob, foregroundTyped = id, ""
-  while jobs[id] and jobs[id].status == "running" do
-    K.wait(0.5)
-  end
+end
+function S.endForeground()
   S.foregroundJob = nil
   if consolePartial ~= "" then
     consoleAppend(consolePartial)
     consolePartial = ""
   end
-  local job = jobs[id]
-  if job and job.status ~= "done" then
-    print(job.status .. ": " .. tostring(job.error))
-  end
+end
+function S.consoleWidth() return (viewSize()) end
+function S.clearConsole()
+  for i = #consoleLines, 1, -1 do consoleLines[i] = nil end
+  scrollOffset, consoleDirty = 0, true
 end
 
 
@@ -1142,60 +1158,9 @@ end
 
 -- --- The shell and logins ---
 
--- muxos's own commands, by first word: inside a shell line (`nodes;
--- ls`) these still reach the kernal's command handler, not the program
--- path.
-local MUXOS_COMMANDS = {}
-for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
-    .. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
-    .. "shutdown logout flags users useradd userdel who"):gmatch("%S+") do
-  MUXOS_COMMANDS[name] = true
-end
-
-local shellCtx = {
-  invoke = K.tryInvoke, root = K.fsAddr, tmp = computer.tmpAddress(), list = component.list,
-  write = consoleWrite,
-  width = function() return (viewSize()) end,
-  clear = function()
-    for i = #consoleLines, 1, -1 do consoleLines[i] = nil end
-    scrollOffset, consoleDirty = 0, true
-  end,
-  sleep = function(seconds)
-    local deadline = computer.uptime() + seconds
-    while computer.uptime() < deadline do K.wait(deadline - computer.uptime()) end
-  end,
-  help = function() K.help() end,
-  info = {version = K.MUXOS_VERSION, address = K.selfAddr or computer.address(), uptime = computer.uptime,
-    memory = function() return computer.freeMemory(), computer.totalMemory() end},
-  -- Not built in: a muxos command, or a program OpenOS-shell style (a
-  -- legacy program has its own window, as in gmux, so the console
-  -- doesn't wait for it; & runs any program in the background).
-  external = function(argv, background)
-    if MUXOS_COMMANDS[argv[1]] then
-      K.runCommand(S, table.concat(argv, " "))
-      return 0
-    end
-    local path = K.resolveProgram(argv[1])
-    if not path then
-      print("sh: " .. argv[1] .. ": command not found")
-      return 127
-    end
-    local id, addrOrErr = K.launchProgram(path, {table.unpack(argv, 2)})
-    if not id then
-      print("error: " .. addrOrErr)
-      return 1
-    elseif background or path:match("%.lua$") then
-      print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
-      return 0
-    end
-    runForeground(id)
-    return jobs[id] and jobs[id].status == "done" and 0 or 1
-  end,
-}
-
 -- The working directory: the shell's, else home.
 function S.cwd()
-  return shell and shell.cwd() or (S.user and system.home(S.user)) or "/"
+  return shell and shell.cwd() or S.remoteCwd or (S.user and system.home(S.user)) or "/"
 end
 
 -- A shell line: POSIX-style commands, pipes and redirection, programs
@@ -1225,11 +1190,7 @@ end
 
 function S.startSession(name)
   S.user, S.login = name, K.nextLogin()
-  K.tryInvoke(K.fsAddr, "makeDirectory", system.home(name))
-  if K.shellFactory then
-    shellCtx.user, shellCtx.home = name, system.home(name)
-    shell = K.shellFactory(shellCtx)
-  end
+  shell = K.newShell(S, name)
   editor = K.lineedit.new()
   if compositor.exclusiveOwner() == "console" then compositor.setExclusive(nil) end
   desktop.refresh()
@@ -1249,17 +1210,12 @@ function S.loginLine(line)
   S.startSession(name)
 end
 
--- Ends the login: its processes (flag logout_ends_jobs), what's left of
--- its windows, the console's contents; back to login:.
+-- Ends the login: its processes (flag logout_ends_jobs; never a
+-- persistent one's), its programs' windows (detached: still running,
+-- they wait for the user's next session), the console's contents; back
+-- to login:.
 function S.logout()
-  local ending = system.flag("logout_ends_jobs")
-  for id in pairs(K.runningJobs) do
-    local job = jobs[id]
-    if job.login == S.login and ending then
-      job.loggedOut = true -- its windows close when it ends (finishJob)
-      K.controlJob(id, "KILL", "killed (logged out)")
-    end
-  end
+  K.endLogin(S)
   for _, w in ipairs(compositor.listWindows()) do
     local own = w.id == (consoleWin and consoleWin.id) or w.id == (desktop.win and desktop.win.id)
       or w.id == (desktop.bar.win and desktop.bar.win.id)

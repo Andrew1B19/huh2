@@ -50,6 +50,8 @@ local kernalFiles = {
   ["/session.lua"] = readFile(REPO_ROOT .. "/kernal/session.lua"),
   ["/vgpu.lua"] = readFile(REPO_ROOT .. "/kernal/vgpu.lua"),
   ["/terminals.lua"] = readFile(REPO_ROOT .. "/kernal/terminals.lua"),
+  ["/windows.lua"] = readFile(REPO_ROOT .. "/kernal/windows.lua"),
+  ["/terminal.lua"] = readFile(REPO_ROOT .. "/kernal/terminal.lua"),
   ["/etc/kernal.cfg"] = "login_required = false\n",
   ["/runtime.lua"] = runtimeSrc,
   -- Sample programs for the launcher (test 29).
@@ -1034,9 +1036,9 @@ emu:advance(2)
 assertScreenContains("R28=hi28", "the process received the keys and returned them")
 print("  OK -- keys went to the focused window's process (not the console), which redrew its window")
 
-typeLine([[run local ok, err = gmuxapi.draw_window(1, {code = "gpu.set(1,1,'x')"}) return "d28=" .. tostring(err)]])
+typeLine([[run local other for _, w in ipairs(gmuxapi.get_windows()) do if w.ownerJobId and w.ownerJobId ~= jobId then other = w.id end end local ok, err = gmuxapi.draw_window(other, {code = "gpu.set(1,1,'x')"}) return "d28=" .. tostring(err)]])
 emu:advance(2)
-assertScreenContains("d28=window 1 belongs to another process", "a process can't draw into a window it doesn't own")
+assertScreenContains("belongs to another process", "a process can't draw into a window it doesn't own")
 print("  OK -- drawing into another process's window is refused")
 
 print("test 29: the program launcher -- .mxe headers and libraries, legacy .lua programs, foreground/background")
@@ -2175,5 +2177,93 @@ do
   assert(c.text():find("on=" .. busy, 1, true), "by count: the worker with fewer processes:\n" .. c.text())
 end
 print("  OK -- load averages reported and shown; placement by load, or by count")
+
+print("test 56: a persistent program outlives its user's logout; the next login's taskbar brings its window back")
+do
+  local keeper = [==[--[[mxe
+name = "keeper"
+]]
+gmuxapi.set_persistent(true)
+local det, att = 0, 0
+local win = gmuxapi.create_window({title = "keeper", x = 3, y = 3, width = 24, height = 1,
+  code = "gpu.set(1, 1, 'KEEP det=0 att=0')"}).id
+while true do
+  local e = gmuxapi.pull_event(60)
+  if e and e[1] == "window_detached" then det = det + 1 end
+  if e and e[1] == "window_attached" then
+    att = att + 1
+    gmuxapi.draw_window(win, {code = "gpu.set(1, 1, args.t)", args = {t = "KEEP det=" .. det .. " att=" .. att}})
+  end
+end
+]==]
+  local plain = [==[--[[mxe
+name = "plain"
+]]
+gmuxapi.create_window({title = "plain", x = 3, y = 6, width = 10, height = 1, code = "gpu.set(1, 1, 'PLAIN')"})
+sleep(60)
+]==]
+  local c = newCluster(80, 25, {["/bin/keeper.mxe"] = keeper, ["/bin/plain.mxe"] = plain}, 2)
+  local function console() -- its taskbar button gives it the keyboard back
+    local bar = c.cells(1, 25, 80)
+    local bx = bar:find(" console ", 1, true)
+    if bx then c.touch(bx + 2, 25) end
+  end
+  local function run(line, wait) console() c.typeLine(line) c.emu:advance(wait or 1) end
+  run("keeper &", 2)
+  run("plain &", 2)
+  local text = c.text()
+  assert(text:find("KEEP det=0 att=0", 1, true) and text:find("PLAIN", 1, true), "both windows up:\n" .. text)
+  run("logout", 2)
+  c.typeLine("root")
+  c.emu:advance(2)
+  text = c.text()
+  assert(not text:find("KEEP", 1, true) and not text:find("PLAIN", 1, true), "neither shown after logging in again:\n" .. text)
+  local bar = c.cells(1, 25, 80)
+  local kx = bar:find("keeper", 1, true)
+  assert(kx and not bar:find("plain", 1, true), "the persistent program is on the new login's taskbar, the other ended:\n" .. bar)
+  assert(c.cell(kx, 25).fg == 0x88AAFF, "...marked as shown elsewhere")
+  c.touch(kx, 25)
+  c.emu:advance(2)
+  text = c.text()
+  assert(text:find("KEEP det=1 att=1", 1, true), "touching it brings the window here; the program heard it all:\n" .. text)
+  run("processes", 1)
+  text = c.text()
+  assert(text:find("killed (logged out)", 1, true), "the other program was ended by the logout:\n" .. text)
+end
+print("  OK -- set_persistent, detached on logout, listed on the next login's taskbar, reattached with its content")
+
+print("test 57: the bitmap library -- a program encodes pixels into cells itself and draws them")
+do
+  local program = [==[--[[mxe
+name = "bits57"
+libraries = {"bitmap"}
+]]
+local bitmap = require("bitmap")
+local win = gmuxapi.create_window({title = "bits57", x = 2, y = 2, width = 8, height = 2, code = "gpu.fill(1, 1, 8, 2, ' ')"}).id
+-- Red over blue, as half blocks: 4x2 pixels -> 4x1 cells.
+local pixels = {{0xFF0000, 0xFF0000, 0xFF0000, 0xFF0000}, {0x0000FF, 0x0000FF, 0x0000FF, 0x0000FF}}
+local cells, cols, rows = bitmap.cells("halfblock", pixels, 4, 2, 0x000000)
+gmuxapi.draw_window(win, {cells = cells, clear = false})
+-- The cells themselves, changed before drawing: a green one on row 2.
+local grid, gcols, grows = bitmap.encode("halfblock", {{0x00FF00}, {0x00FF00}}, 1, 2, 0x000000)
+local runs = bitmap.runs(grid, gcols, grows)
+runs[1][1] = 2 -- row 2
+local ok, err = gmuxapi.draw_window(win, {cells = runs, clear = false})
+print("bits57 " .. cols .. "x" .. rows .. " " .. tostring(ok) .. " " .. tostring(err))
+]==]
+  local c = newCluster(80, 25, {["/bin/bits57.mxe"] = program}, 1)
+  c.typeLine("bits57")
+  for _ = 1, 20 do
+    if c.text():find("bits57 4x1", 1, true) then break end
+    c.emu:advance(0.5)
+  end
+  assert(c.text():find("bits57 4x1 true nil", 1, true), "bitmap.cells encodes 4x2 pixels as 4x1 cells:\n" .. c.text())
+  local top = c.cell(2, 3)
+  assert(top and top.char == "\u{2580}" and top.fg == 0xFF0000 and top.bg == 0x0000FF,
+    "a half block, red over blue: " .. tostring(top and top.char) .. " " .. tostring(top and top.fg))
+  local green = c.cell(2, 4)
+  assert(green and ((green.char == " " and green.bg == 0x00FF00) or green.fg == 0x00FF00), "the changed cell on row 2 is green")
+end
+print("  OK -- bitmap.cells, bitmap.encode + runs, drawn as cells")
 
 print("ALL OK")

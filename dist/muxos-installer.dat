@@ -1,17 +1,19 @@
 --[[MUXOS-PAYLOAD 0.1.2
-@@MANIFEST 32
+@@MANIFEST 34
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-73333 /muxos.lua
-28806 /compositor.lua
+82377 /muxos.lua
+30258 /compositor.lua
 33883 /shell.lua
 2663 /bitmap.lua
 3046 /lineedit.lua
 5994 /system.lua
-36766 /session.lua
+34674 /session.lua
 5514 /vgpu.lua
-3384 /terminals.lua
-81126 /runtime.lua
+9045 /terminals.lua
+4365 /windows.lua
+14488 /terminal.lua
+85762 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 1682 /lib/bit32.lua
 3800 /lib/buffer.lua
@@ -226,7 +228,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 73333 /muxos.lua
+@@ 82377 /muxos.lua
 
 
 
@@ -520,7 +522,9 @@ end
 local CHUNK_SIZE = 7000
 local nextMsgId = 1
 
-local function send(msg)
+
+local function send(msg, port)
+port = port or PORT
 local payload = serialize(msg)
 local id = nextMsgId
 nextMsgId = nextMsgId + 1
@@ -529,7 +533,7 @@ for i = 1, total do
 local chunk = payload:sub((i - 1) * CHUNK_SIZE + 1, i * CHUNK_SIZE)
 local frame = "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk
 
-if msg.to then modem.send(msg.to, PORT, frame) else modem.broadcast(PORT, frame) end
+if msg.to then modem.send(msg.to, port, frame) else modem.broadcast(port, frame) end
 end
 end
 
@@ -736,10 +740,19 @@ return job and job.session and K.byId[job.session]
 end
 
 
+
 function K.windowOwner(id)
+local rec = K.win and K.win.get(id)
+local S = rec and rec.session and K.byId[rec.session]
+local win = S and S.compositor and S.compositor.getWindow(id)
+if win then return S, win, rec end
+end
+
+
+
+function K.windowsChanged(user)
 for _, S in ipairs(K.sessions) do
-local win = S.compositor.getWindow(id)
-if win then return S, win end
+if S.user == user and S.windowsChanged then S.windowsChanged() end
 end
 end
 
@@ -802,9 +815,19 @@ if parent and jobs[id].orphanPolicy == "orphan" then
 registerOrphanCandidate(appName, id)
 end
 
-if window then window.ownerJobId = id end
+
+
+local route
+if window then
+window.owner, window.user = id, jobs[id].user
+local address, key, port = K.win.hold(window, id)
+route = address and {address, key, port}
+local S = K.byId[window.session]
+if S and S.display.setOwner then S.display.setOwner(window.id, id, targetAddr) end
+end
 send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args, program = program,
-windowId = window and window.id, width = window and window.width, height = window and window.height})
+windowId = window and window.id, width = window and window.width, height = window and window.height,
+windowRoute = route})
 return id, targetAddr
 end
 
@@ -828,7 +851,7 @@ end
 
 local PROGRAM_PATH = {"/bin", "/usr/bin"}
 
-local BUILTIN_MXE_LIBRARIES = {mux = true, http = true, thread = true, modem = true}
+local BUILTIN_MXE_LIBRARIES = {mux = true, http = true, thread = true, modem = true, bitmap = true}
 
 local MXE_LIBRARY_DIRS = {"/lib/mxe/", "/usr/lib/mxe/"}
 
@@ -1277,6 +1300,7 @@ if fullscreen.job == id then
 fullscreen.node, fullscreen.job = nil, nil
 K.releaseScreen()
 end
+if K.terminals then K.terminals.releaseFullscreen(id) end
 runningJobs[id] = nil
 runningCount = runningCount - 1
 local node = nodes[job.node]
@@ -1297,11 +1321,7 @@ end
 end
 
 
-local windowStatus = (status == "done" or status == "killed") and "dead" or "error"
-local S = K.sessionOf(job)
-for _, winId in ipairs(S and S.compositor.windowsOwnedBy(id) or {}) do
-if job.loggedOut then S.compositor.close(winId) else S.compositor.setStatus(winId, windowStatus) end
-end
+K.win.jobEnded(id, (status == "done" or status == "killed") and "dead" or "error")
 
 
 applyOrphanPolicyForChildrenOf(id)
@@ -1708,9 +1728,18 @@ end
 local job = jobs[msg.caller]
 job = job and job.status == "running" and job.node == msg.from and job or nil
 
-if not K.console or (job and K.sessionOf(job) ~= K.console) then
-send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
-error = "fullscreen is for programs on the kernal's own screen, not a terminal's"})
+local S = job and K.sessionOf(job)
+if S and S.kind == "terminal" then
+local route, err = K.terminals.grantFullscreen(S, job)
+if route then
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {granted = true, route = route}})
+else
+send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
+end
+return
+end
+if not K.console then
+send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "the kernal has no screen"})
 return
 end
 fullscreen.node, fullscreen.job = msg.from, job and job.id
@@ -1719,6 +1748,11 @@ send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {gr
 end
 
 local function handleReleaseFullscreen(msg)
+local caller = jobs[msg.caller]
+if caller and caller.node == msg.from and K.terminals.releaseFullscreen(caller.id) then
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {released = true}})
+return
+end
 if fullscreen.node ~= msg.from then
 send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
 error = "you do not hold the fullscreen grant"})
@@ -1773,7 +1807,7 @@ if not S then
 send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "its session has ended -- no screen to open a window on"})
 return
 end
-window, err = S.compositor.createWindow({title = tostring(g.title or "graphics"), x = g.x, y = g.y,
+window, err = K.win.open(S, {title = tostring(g.title or "graphics"), x = g.x, y = g.y,
 width = tonumber(g.width) or 40, height = tonumber(g.height) or 12,
 resizable = g.resizable, decorated = g.decorated,
 code = "gpu.setBackground(0x000000) gpu.fill(1, 1, " .. (tonumber(g.width) or 40) .. ", "
@@ -1786,12 +1820,12 @@ end
 local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node, msg.parent, msg.appName, msg.orphanPolicy,
 nil, window)
 if not jobId then
-if window then S.compositor.close(window.id) end
+if window then K.win.close(window) end
 send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = targetAddr})
 return
 end
 send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id,
-result = {id = jobId, node = targetAddr, window = window and S.compositor.describe(window)}})
+result = {id = jobId, node = targetAddr, window = window and K.win.describe(window)}})
 end
 
 
@@ -1878,8 +1912,10 @@ if not callerJob(msg) then
 send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "not called from a running process"})
 return
 end
-local path = resolveModule(msg.name)
-local source = path and readModuleFile(path)
+
+
+local path = msg.name == "muxos:bitmap" and "/bitmap.lua" or resolveModule(msg.name)
+local source = path and (msg.name == "muxos:bitmap" and readFile(path) or readModuleFile(path))
 if source then
 send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {path = path, source = source}})
 else
@@ -1984,14 +2020,17 @@ if not msg.ownerJobId then
 local caller = callerJob(msg)
 msg.ownerJobId = caller and caller.id
 end
-local S = K.sessionOf(jobs[msg.ownerJobId] or callerJob(msg))
-local win, err
-if S then win, err = S.compositor.createWindow(msg) else err = "its session has ended -- no screen to open a window on" end
-if not win then
+local caller = callerJob(msg)
+local S = K.sessionOf(jobs[msg.ownerJobId] or caller)
+local rec, err = K.win.open(S, msg, msg.ownerJobId)
+if not rec then
 send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
 return
 end
-send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S.compositor.describe(win)})
+
+local result = K.win.describe(rec)
+if caller then result.route, result.key, result.port = K.win.hold(rec, caller.id) end
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = result})
 end
 
 
@@ -2001,13 +2040,15 @@ end
 
 local function handleDrawWindow(msg)
 local caller = callerJob(msg)
-local S, win = K.windowOwner(msg.windowId)
+local S, win, rec = K.windowOwner(msg.windowId)
 local reply
 if not caller then
 reply = "not called from a running process"
 elseif not win then
-reply = "no such window: " .. tostring(msg.windowId)
-elseif win.ownerJobId ~= caller.id and not (win.ownerJobId and isDescendantOf(win.ownerJobId, caller.id)) then
+reply = K.win.get(msg.windowId) and "window " .. tostring(msg.windowId) .. " isn't shown on this screen"
+or "no such window: " .. tostring(msg.windowId)
+elseif msg.key ~= rec.key and win.ownerJobId ~= caller.id
+and not (win.ownerJobId and isDescendantOf(win.ownerJobId, caller.id)) then
 reply = "window " .. tostring(msg.windowId) .. " belongs to another process"
 end
 
@@ -2016,7 +2057,7 @@ end
 if not reply and not msg.pixels and type(msg.width) == "number" and type(msg.height) == "number"
 and (msg.width ~= win.width or msg.height ~= win.height) then
 local ok, err = S.compositor.setGeometry(win.id, win.x, win.y, msg.width, msg.height)
-if not ok then reply = err end
+if not ok then reply = err else K.win.moved(rec, win.x, win.y, win.width, win.height) end
 end
 if not reply then
 local ok, err = S.compositor.redrawWindow(msg.windowId, msg)
@@ -2068,17 +2109,57 @@ end
 
 
 function K.dropShares(id)
+for _, rec in pairs(K.win.byId) do
+if rec.shares then rec.shares[id] = nil end
+end
 for _, S in ipairs(K.sessions) do
-for _, winId in ipairs(S.compositor.unshareAll(id)) do
+for _, winId in ipairs(S.compositor and S.compositor.unshareAll(id) or {}) do
 local win = S.compositor.getWindow(winId)
 local owner = win and win.ownerJobId and K.liveJob(win.ownerJobId)
 if owner then K.deliverEvent(owner, {"region_lost", winId, id}) end
 end
 end
+if K.terminals then K.terminals.jobEnded(id) end
+end
+
+
+
+local function shareElsewhere(rec, caller, child, rect)
+local S = rec.session and K.byId[rec.session]
+if rect ~= nil then
+local x, y = math.tointeger(rect.x or rect[1]), math.tointeger(rect.y or rect[2])
+local w, h = math.tointeger(rect.w or rect[3]), math.tointeger(rect.h or rect[4])
+if not (x and y and w and h) or x < 1 or y < 1 or w < 1 or h < 1 or x + w - 1 > rec.width or y + h - 1 > rec.height then
+return nil, "the rectangle must be whole cells within the window (" .. rec.width .. "x" .. rec.height .. ")"
+end
+rect = {x = x, y = y, w = w, h = h}
+end
+rec.shares = rec.shares or {}
+rec.shares[child.id] = rect
+if S and S.display.share then S.display.share(rec.id, child.id, rect, child.node) end
+if rect then K.win.hold(rec, child.id) end
+return rect
 end
 
 local function handleRender(msg)
 local caller = callerJob(msg)
+local rec = K.win.get(msg.windowId)
+if msg.type == "SHAREWINDOW" and rec and not K.windowOwner(msg.windowId) then
+local child = K.liveJob(msg.child)
+local function fail(err) send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err}) end
+if not caller then return fail("not called from a running process") end
+if rec.owner ~= caller.id and not (rec.owner and isDescendantOf(rec.owner, caller.id)) then
+return fail("window " .. rec.id .. " belongs to another process")
+end
+if not child or not isDescendantOf(child.id, caller.id) then
+return fail("process " .. tostring(msg.child) .. " isn't a running descendant of yours")
+end
+local rect, err = shareElsewhere(rec, caller, child, msg.rect)
+if msg.rect ~= nil and not rect then return fail(err) end
+K.deliverEvent(child, rect and {"window_shared", rec.id, rect.x, rect.y, rect.w, rect.h} or {"window_unshared", rec.id})
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
+return
+end
 local S, win = K.windowOwner(msg.windowId)
 local function reply(result, err)
 if msg.noReply then return end
@@ -2100,6 +2181,10 @@ end
 local ok, err = S.compositor.share(win.id, child.id, msg.rect)
 if not ok then return reply(nil, err) end
 local rect = S.compositor.shares(win.id)[child.id]
+local rec = K.win.get(win.id)
+rec.shares = rec.shares or {}
+rec.shares[child.id] = rect
+if rect then K.win.hold(rec, child.id) end
 K.deliverEvent(child, rect and {"window_shared", win.id, rect.x, rect.y, rect.w, rect.h} or {"window_unshared", win.id})
 return reply(true)
 elseif msg.type == "RENDERCONFIG" then
@@ -2130,9 +2215,41 @@ if msg.close then K.deliverEvent(child, {"pipe_closed", "stdin"}) end
 send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
 end
 
+
 local function handleGetWindows(msg)
-local S = K.sessionOf(callerJob(msg))
-send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S and S.compositor.listWindows() or {}})
+local caller = callerJob(msg)
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = caller and K.win.ofUser(caller.user) or {}})
+end
+
+
+
+
+local function handleWindowRoute(msg)
+local caller = callerJob(msg)
+local rec = K.win.get(msg.windowId)
+local may = caller and rec and (rec.owner == caller.id or (rec.owner and isDescendantOf(rec.owner, caller.id))
+or (rec.shares and rec.shares[caller.id]))
+if not may then
+send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = rec and "window " .. rec.id
+.. " belongs to another process" or "no such window: " .. tostring(msg.windowId)})
+return
+end
+local address, key, port = K.win.hold(rec, caller.id)
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id,
+result = {address = address, key = key, port = port, width = rec.width, height = rec.height}})
+end
+
+
+
+
+local function handlePersist(msg)
+local caller = callerJob(msg)
+if not caller then
+send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "not called from a running process"})
+return
+end
+caller.persistent = msg.on ~= false or nil
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = caller.persistent == true})
 end
 
 
@@ -2213,6 +2330,10 @@ elseif msg.type == "SHAREWINDOW" or msg.type == "RENDERCONFIG" or msg.type == "D
 handleRender(msg)
 elseif msg.type == "PIPEWRITE" then
 handlePipeWrite(msg)
+elseif msg.type == "WINDOWROUTE" then
+handleWindowRoute(msg)
+elseif msg.type == "PERSIST" then
+handlePersist(msg)
 elseif msg.type == "ISFOREGROUND" then
 
 local caller = callerJob(msg)
@@ -2353,8 +2474,10 @@ bus.refreshOwn()
 elseif name == "modem_message" then
 if a4 == PORT then
 handleModemMessage(a3, a4, a6)
-elseif K.terminals then
-K.terminals.message(a3, a4, a6)
+elseif K.terminals and a4 == K.terminals.PORT and type(a6) == "string" then
+local payload = reassemble(a3, a6)
+local msg = payload and deserialize(payload)
+if type(msg) == "table" and msg.from == a3 then K.terminals.message(a3, msg) end
 end
 end
 sweepStaleChunks()
@@ -2363,7 +2486,9 @@ sweepStaleOrphans()
 checkLiveness()
 if K.terminals then K.terminals.sweep() end
 for _, S in ipairs(K.sessions) do
+if S.compositor then
 K.framesPresented(S, S.compositor.renderTick(function(id) return K.expectedRegions(S, id) end))
+end
 K.inSession(S, S.update)
 end
 end)
@@ -2886,6 +3011,7 @@ K.resolveProgram, K.readManifest, K.launchProgram, K.PROGRAM_PATH = resolveProgr
 PROGRAM_PATH
 K.MUXOS_VERSION, K.selfAddr, K.fullscreen, K.controlJob = MUXOS_VERSION, selfAddr, fullscreen, controlJob
 K.lineedit = loadSibling("lineedit.lua")()
+K.win = loadSibling("windows.lua")(K)
 K.sessionChunk = loadSibling("session.lua")
 K.nextSession = 0
 
@@ -2897,6 +3023,46 @@ end
 function K.liveJob(id)
 local job = jobs[id]
 if job and job.status == "running" and nodes[job.node] and not nodes[job.node].down then return job end
+end
+
+
+
+function K.closeWindow(id)
+local rec = K.win.get(id)
+if not rec then return false end
+K.win.close(rec)
+local job = rec.owner and K.liveJob(rec.owner)
+if job then controlJob(job.id, "KILL", "killed (window closed)") end
+return true
+end
+
+function K.windowGeometry(id, x, y, width, height)
+local rec = K.win.get(id)
+if rec then K.win.moved(rec, x, y, width, height) end
+end
+
+function K.userWindows(user) return K.win.ofUser(user) end
+
+
+function K.attachWindow(id, S)
+local rec = K.win.get(id)
+if not rec or rec.user ~= S.user then return nil, "no such window of yours" end
+return K.win.attach(rec, S)
+end
+
+
+
+
+function K.endLogin(S)
+local ending = system.flag("logout_ends_jobs")
+for id in pairs(runningJobs) do
+local job = jobs[id]
+if job.login == S.login and ending and not job.persistent then
+job.loggedOut = true
+controlJob(id, "KILL", "killed (logged out)")
+end
+end
+K.win.sessionEnded(S)
 end
 
 
@@ -2928,10 +3094,139 @@ K.shellError = not ok and tostring(factory) or nil
 end
 
 
+
+
+
+
+
+
+function K.apps()
+local apps, seen = {}, {}
+for _, dir in ipairs(PROGRAM_PATH) do
+local names = tryInvoke(fsAddr, "list", dir)
+if type(names) == "table" then
+table.sort(names)
+for _, n in ipairs(names) do
+local base = n:match("^(.-)%.mxe$") or n:match("^(.-)%.lua$")
+local path = base and not seen[base] and resolveProgram(base)
+if path then
+seen[base] = true
+local art, color
+local source = path:match("%.mxe$") and readFile(path)
+local manifest = source and readManifest(source)
+if manifest and type(manifest.icon) == "table" then art, color = manifest.icon, manifest.icon_color end
+if not art then
+local text = readFile((path:gsub("%.[^./]*$", "")) .. ".icon")
+if text then
+art = {}
+for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+local hex = #art == 0 and not color and line:match("^#(%x%x%x%x%x%x)%s*$")
+if hex then color = tonumber(hex, 16) elseif #art < 4 then art[#art + 1] = line end
+end
+while #art > 0 and art[#art] == "" do art[#art] = nil end
+end
+end
+apps[#apps + 1] = {name = base, path = path, art = art, color = color}
+end
+end
+end
+end
+return apps
+end
+
+
+function K.fileSize(path)
+if not tryInvoke(fsAddr, "exists", path) or tryInvoke(fsAddr, "isDirectory", path) then return nil end
+return tryInvoke(fsAddr, "size", path) or 0
+end
+
+
+function K.writeFile(path, data)
+if data == nil then return tryInvoke(fsAddr, "remove", path) end
+local dir = path:match("^(.*)/[^/]*$")
+if dir and dir ~= "" then tryInvoke(fsAddr, "makeDirectory", dir) end
+local h, err = tryInvoke(fsAddr, "open", path, "w")
+if not h then return nil, err end
+tryInvoke(fsAddr, "write", h, data)
+tryInvoke(fsAddr, "close", h)
+return true
+end
+
+
+
+K.MUXOS_COMMANDS = {}
+for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
+.. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
+.. "shutdown logout flags users useradd userdel who"):gmatch("%S+") do
+K.MUXOS_COMMANDS[name] = true
+end
+
+
+
+
+
+function K.runForeground(S, id)
+S.beginForeground(id)
+while jobs[id] and jobs[id].status == "running" do K.wait(0.5) end
+S.endForeground()
+local job = jobs[id]
+if job and job.status ~= "done" then S.print(job.status .. ": " .. tostring(job.error)) end
+end
+
+
+
+
+function K.newShell(S, user)
+tryInvoke(fsAddr, "makeDirectory", system.home(user))
+if not K.shellFactory then return nil end
+return K.shellFactory({
+invoke = tryInvoke, root = fsAddr, tmp = computer.tmpAddress(), list = component.list,
+write = S.write, width = S.consoleWidth, clear = S.clearConsole,
+sleep = function(seconds)
+local deadline = computer.uptime() + seconds
+while computer.uptime() < deadline do K.wait(deadline - computer.uptime()) end
+end,
+help = function() K.help() end,
+info = {version = MUXOS_VERSION, address = selfAddr or computer.address(), uptime = computer.uptime,
+memory = function() return computer.freeMemory(), computer.totalMemory() end},
+user = user, home = system.home(user),
+
+
+
+external = function(argv, background)
+if K.MUXOS_COMMANDS[argv[1]] then
+K.runCommand(S, table.concat(argv, " "))
+return 0
+end
+local path = resolveProgram(argv[1])
+if not path then
+S.print("sh: " .. argv[1] .. ": command not found")
+return 127
+end
+local id, addrOrErr = launchProgram(path, {table.unpack(argv, 2)})
+if not id then
+S.print("error: " .. addrOrErr)
+return 1
+elseif background or path:match("%.lua$") then
+S.print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
+return 0
+end
+K.runForeground(S, id)
+return jobs[id] and jobs[id].status == "done" and 0 or 1
+end,
+})
+end
+
+
 function K.newSession(opts)
+opts.id = K.nextSession + 1
+return K.addSession(K.sessionChunk(K, opts))
+end
+
+
+function K.addSession(S)
 K.nextSession = K.nextSession + 1
-opts.id = K.nextSession
-local S = K.sessionChunk(K, opts)
+S.id = K.nextSession
 K.sessions[#K.sessions + 1] = S
 K.byId[S.id] = S
 return S
@@ -2971,8 +3266,7 @@ end
 
 
 if gpu and screenAddr then K.console = K.newSession({gpu = gpu, kind = "local"}) end
-K.terminals = loadSibling("terminals.lua")(K, {modem = modem, serialize = serialize, deserialize = deserialize,
-vgpu = loadSibling("vgpu.lua")()})
+K.terminals = loadSibling("terminals.lua")(K, {modem = modem, send = send})
 print("muxos kernal -- " .. selfAddr)
 K.help()
 if K.shellFactory then
@@ -2999,7 +3293,7 @@ if not ok then print("session error (continuing): " .. tostring(err)) end
 end
 end
 
-@@ 28806 /compositor.lua
+@@ 30258 /compositor.lua
 
 
 
@@ -3543,6 +3837,31 @@ end
 
 
 
+local function drawCells(gpu, rows, ox, oy, area)
+if type(rows) ~= "table" then return end
+for _, row in ipairs(rows) do
+local y = oy + (math.tointeger(row[1]) or 1) - 1
+if not area or (y >= area.y and y < area.y + area.h) then
+for i = 2, #row, 4 do
+local x, text = ox + (math.tointeger(row[i]) or 1) - 1, tostring(row[i + 3] or "")
+local len = utf8.len(text) or #text
+local from, to = x, x + len - 1
+if area then from, to = math.max(from, area.x), math.min(to, area.x + area.w - 1) end
+if to >= from then
+gpu.setForeground(tonumber(row[i + 1]) or 0xFFFFFF)
+gpu.setBackground(tonumber(row[i + 2]) or 0x000000)
+gpu.set(from, y, from == x and to == x + len - 1 and text or textSlice(text, from - x + 1, to - from + 1))
+end
+end
+end
+end
+end
+
+
+
+
+
+
 
 
 
@@ -3604,7 +3923,7 @@ end
 
 if options.text then
 local x, y = options.x or 1, options.y or 1
-local id = nextId()
+local id = options.id or nextId()
 local win = {id = id, title = options.title or ("window " .. id), x = x, y = y,
 width = width, height = height, layer = options.layer or 0, dirty = true,
 textRows = {}, fg = options.fg or 0xFFFFFF, bg = options.bg or 0x000000,
@@ -3625,6 +3944,16 @@ return nil, "bitmap draw failed: " .. tostring(drawErr)
 end
 end
 
+if options.cells then
+gpu.setActiveBuffer(buffer)
+local ok, drawErr = pcall(drawCells, gpu, options.cells, 1, 1)
+gpu.setActiveBuffer(0)
+if not ok then
+gpu.freeBuffer(buffer)
+return nil, "drawing cells failed: " .. tostring(drawErr)
+end
+end
+
 if options.code then
 local ok, drawErr = drawIntoBuffer(gpu, buffer, options.code, options.args)
 if not ok then
@@ -3634,7 +3963,7 @@ end
 end
 
 local x, y = options.x or 1, options.y or 1
-local id = nextId()
+local id = options.id or nextId()
 
 
 
@@ -3922,6 +4251,12 @@ local ok, err = pcall(bitmap.draw, gpu, cells, math.min(cellRows, win.height), m
 gpu.setActiveBuffer(0)
 if not ok then return nil, "bitmap draw failed: " .. tostring(err) end
 end
+if options.cells then
+gpu.setActiveBuffer(win.buffer)
+local ok, err = pcall(drawCells, gpu, options.cells, 1, 1)
+gpu.setActiveBuffer(0)
+if not ok then return nil, "drawing cells failed: " .. tostring(err) end
+end
 if options.code then
 local cached = win.drawCache[options.code]
 if not cached then
@@ -4172,6 +4507,11 @@ cols = math.min(cols, area.x + area.w - x)
 rows = math.min(rows, area.y + area.h - y)
 if x < area.x or y < area.y or cols < 1 or rows < 1 then error("the region is outside the share", 0) end
 bitmap.draw(gpu, cells, rows, cols, x, y)
+elseif type(content.cells) == "table" then
+if x < area.x or y < area.y or x > area.x + area.w - 1 or y > area.y + area.h - 1 then
+error("the region is outside the share", 0)
+end
+drawCells(gpu, content.cells, x, y, area)
 elseif type(content.text) == "table" then
 for i, row in ipairs(content.text) do
 local yy = y + i - 1
@@ -4191,7 +4531,7 @@ end
 end
 end
 else
-error("a region needs pixels or text", 0)
+error("a region needs cells, pixels or text", 0)
 end
 end)
 gpu.setActiveBuffer(0)
@@ -5973,7 +6313,7 @@ end
 
 return M
 
-@@ 36766 /session.lua
+@@ 34674 /session.lua
 
 
 
@@ -5991,12 +6331,27 @@ return M
 local K, opts = ...
 local S = {id = opts.id, kind = opts.kind, address = opts.address, user = nil, login = 0}
 local system, jobs = K.system, K.jobs
-local readFile, tryInvoke, fsAddr, loadSibling = K.readFile, K.tryInvoke, K.fsAddr, K.loadSibling
-local resolveProgram, readManifest, launchProgram, PROGRAM_PATH = K.resolveProgram, K.readManifest,
-K.launchProgram, K.PROGRAM_PATH
+local loadSibling, launchProgram = K.loadSibling, K.launchProgram
 local gpu = opts.gpu
 local compositor = K.newCompositor(gpu)
 S.compositor, S.gpu = compositor, gpu
+
+
+
+S.display = {
+address = K.selfAddr,
+create = function(spec)
+local win, err = compositor.createWindow(spec)
+if not win then return nil, err end
+return {width = win.width, height = win.height}
+end,
+remove = function(id) compositor.close(id) end,
+status = function(id, status) compositor.setStatus(id, status) end,
+setOwner = function(id, jobId)
+local win = compositor.getWindow(id)
+if win then win.ownerJobId = jobId end
+end,
+}
 
 
 
@@ -6083,7 +6438,7 @@ end
 function S.prompt()
 local user = S.user
 if not user then return "login: " end
-local cwd, home = shell and shell.cwd() or "/", system.home(user)
+local cwd, home = S.cwd(), system.home(user)
 if cwd == home then
 cwd = "~"
 elseif cwd:sub(1, #home + 1) == home .. "/" then
@@ -6491,9 +6846,15 @@ end
 local function closeWindow(win)
 
 if consoleWin and win.id == consoleWin.id then compositor.minimize(win.id, true) return end
-local job = windowProcess(win)
+
+if win.ownerJobId and K.closeWindow(win.id) then return end
 compositor.close(win.id)
-if job then K.controlJob(job.id, "KILL", "killed (window closed)") end
+end
+
+
+
+local function noteGeometry(win)
+if win.ownerJobId then K.windowGeometry(win.id, win.x, win.y, win.width, win.height) end
 end
 
 
@@ -6535,54 +6896,19 @@ end
 
 
 
-
-
-function desktop.iconOf(path)
-local art, color
-local source = path:match("%.mxe$") and readFile(path)
-if source then
-local manifest = readManifest(source)
-if manifest and type(manifest.icon) == "table" then art, color = manifest.icon, manifest.icon_color end
-end
-if not art then
-local text = readFile((path:gsub("%.[^./]*$", "")) .. ".icon")
-if text then
-art = {}
-for line in (text .. "\n"):gmatch("([^\n]*)\n") do
-local hex = #art == 0 and not color and line:match("^#(%x%x%x%x%x%x)%s*$")
-if hex then color = tonumber(hex, 16) elseif #art < 4 then art[#art + 1] = line end
-end
-while #art > 0 and art[#art] == "" do art[#art] = nil end
-end
-end
-if not art or #art == 0 then return nil end
-local rows, colors = {}, {}
-for i = 1, 4 do
-rows[i] = desktop.fit(art[i], desktop.ICON_W, true)
-local c = type(color) == "table" and color[i] or color
-colors[i] = (not desktop.mono and math.type(c) == "integer") and c or nil
-end
-return {rows = rows, colors = colors}
-end
-
 function desktop.scan()
-local apps, seen = {{name = "console", console = true}}, {console = true}
-for _, dir in ipairs(PROGRAM_PATH) do
-local names = tryInvoke(fsAddr, "list", dir)
-if type(names) == "table" then
-table.sort(names)
-for _, n in ipairs(names) do
-local base = n:match("^(.-)%.mxe$") or n:match("^(.-)%.lua$")
-if base and not seen[base] then
-local path = resolveProgram(base)
-if path then
-seen[base] = true
-local ok, icon = pcall(desktop.iconOf, path)
-apps[#apps + 1] = {name = base, path = path, icon = ok and icon or nil}
+local apps = {{name = "console", console = true}}
+for _, app in ipairs(K.apps()) do
+local icon
+if type(app.art) == "table" and #app.art > 0 then
+icon = {rows = {}, colors = {}}
+for i = 1, 4 do
+icon.rows[i] = desktop.fit(app.art[i], desktop.ICON_W, true)
+local c = type(app.color) == "table" and app.color[i] or app.color
+icon.colors[i] = (not desktop.mono and math.type(c) == "integer") and c or nil
 end
 end
-end
-end
+apps[#apps + 1] = {name = app.name, path = app.path, icon = icon}
 end
 desktop.apps = apps
 end
@@ -6648,10 +6974,10 @@ end
 
 
 function desktop.wallpaperCells(path)
-local size = tryInvoke(fsAddr, "size", path)
-if not tryInvoke(fsAddr, "exists", path) then return nil, path .. ": no such file" end
-if (size or 0) > desktop.MAX_WALLPAPER then return nil, path .. ": too big (1 MB at most)" end
-local data = readFile(path)
+local size = K.fileSize(path)
+if not size then return nil, path .. ": no such file" end
+if size > desktop.MAX_WALLPAPER then return nil, path .. ": too big (1 MB at most)" end
+local data = K.readFile(path)
 if not data then return nil, path .. ": can't read it" end
 local w, h, pixel = desktop.readPPM(data)
 if not w then return nil, path .. ": " .. tostring(h) end
@@ -6667,7 +6993,7 @@ end
 
 function desktop.loadWallpaper()
 desktop.wall = nil
-local config = readFile(desktop.WALLPAPER_CONFIG)
+local config = K.readFile(desktop.WALLPAPER_CONFIG)
 local path = config and config:match("^%s*(.-)%s*$")
 if not path or path == "" then return end
 local cells, err = desktop.wallpaperCells(path)
@@ -6733,25 +7059,23 @@ end
 
 function desktop.setWallpaper(arg)
 if not arg or arg == "" then
-local config = readFile(desktop.WALLPAPER_CONFIG)
+local config = K.readFile(desktop.WALLPAPER_CONFIG)
 print("wallpaper: " .. (config and config:match("^%s*(.-)%s*$") or "none")
 .. "  (wallpaper <file.ppm> | wallpaper none)")
 return
 end
 if arg == "none" then
-tryInvoke(fsAddr, "remove", desktop.WALLPAPER_CONFIG)
+K.writeFile(desktop.WALLPAPER_CONFIG, nil)
 desktop.wall = nil
 desktop.render()
 print("wallpaper cleared")
 return
 end
 local path = arg
-if path:sub(1, 1) ~= "/" then path = (shell and shell.cwd() or "/") .. "/" .. path end
+if path:sub(1, 1) ~= "/" then path = S.cwd() .. "/" .. path end
 local cells, err = desktop.wallpaperCells(path)
 if not cells then print("wallpaper: " .. tostring(err)) return end
-tryInvoke(fsAddr, "makeDirectory", "/etc")
-local h = tryInvoke(fsAddr, "open", desktop.WALLPAPER_CONFIG, "w")
-if h then tryInvoke(fsAddr, "write", h, path .. "\n") tryInvoke(fsAddr, "close", h) end
+K.writeFile(desktop.WALLPAPER_CONFIG, path .. "\n")
 desktop.wall = cells
 desktop.render()
 print("wallpaper: " .. path)
@@ -6770,6 +7094,7 @@ end
 function desktop.launch(app)
 if app.console then desktop.showConsole() return end
 local id, addrOrErr = launchProgram(app.path, {})
+if id == true then return end
 if id then
 print("[" .. id .. "] " .. app.path .. " started on " .. addrOrErr)
 else
@@ -6799,16 +7124,36 @@ layer = 3000, text = true, decorated = false, bg = 0x222222, fg = 0xFFFFFF}) or 
 
 if consoleWin then compositor.setFocus(consoleWin.id) end
 
+
+
+
 function desktop.bar.windows()
-local list = {}
+local list, here = {}, {}
 for _, w in ipairs(compositor.listWindows()) do
 if w.id ~= (desktop.win and desktop.win.id) and w.id ~= (desktop.bar.win and desktop.bar.win.id)
 and w.id ~= (desktop.menu and desktop.menu.id) then
+list[#list + 1] = w
+here[w.id] = true
+end
+end
+for _, w in ipairs(S.user and K.userWindows(S.user) or {}) do
+if not here[w.id] and not w.status then
+w.away = true
 list[#list + 1] = w
 end
 end
 table.sort(list, function(a, b) return a.id < b.id end)
 return list
+end
+
+
+function S.windowsChanged() desktop.bar.nextCheck = 0 end
+
+
+local function fetchWindow(id)
+local ok, err = K.attachWindow(id, S)
+if not ok then print("can't bring window " .. id .. " here: " .. tostring(err)) return end
+desktop.bar.show(id)
 end
 
 function desktop.bar.render(list)
@@ -6839,14 +7184,16 @@ local w = list[i]
 local label = " " .. desktop.fit(w.title, math.min(title, utf8.len(w.title) or #w.title)) .. " "
 local width = utf8.len(label) or #label
 local fg, bg = 0xFFFFFF, 0x555555
-if w.minimized then
+if w.away then
+fg, bg = 0x88AAFF, 0x222244
+elseif w.minimized then
 fg, bg = 0x999999, 0x333333
 elseif focus and focus.id == w.id then
 fg, bg = 0x000000, 0xFFFFFF
 end
 if desktop.mono then fg, bg = 0xFFFFFF, 0x000000 end
 placed[#placed + 1] = {x, label, fg, bg}
-buttons[#buttons + 1] = {from = x, to = x + width - 1, window = w.id}
+buttons[#buttons + 1] = {from = x, to = x + width - 1, window = w.id, away = w.away}
 x = x + width + 1
 end
 if more then
@@ -6868,7 +7215,7 @@ desktop.bar.nextCheck = now + 0.5
 local list = desktop.bar.windows()
 local focus = compositor.getFocus()
 local parts = {focus and focus.id or 0, math.floor(now / 30)}
-for _, w in ipairs(list) do parts[#parts + 1] = w.id .. w.title .. tostring(w.minimized) end
+for _, w in ipairs(list) do parts[#parts + 1] = w.id .. w.title .. tostring(w.minimized) .. tostring(w.away) end
 local okClock, clock = pcall(os.date, "%H:%M")
 parts[#parts + 1] = okClock and tostring(clock) or ""
 local signature = table.concat(parts, "|")
@@ -6897,10 +7244,13 @@ elseif b.more then
 local items = {}
 for _, w in ipairs(desktop.bar.windows()) do
 local id = w.id
-items[#items + 1] = {label = w.title .. (w.minimized and " (minimized)" or ""),
-action = function() desktop.bar.show(id) end}
+items[#items + 1] = {label = w.title .. (w.minimized and " (minimized)" or "")
+.. (w.away and " (elsewhere)" or ""),
+action = function() if w.away then fetchWindow(id) else desktop.bar.show(id) end end}
 end
 desktop.toggleMenu(items, b.from)
+elseif b.away then
+fetchWindow(b.window)
 else
 local win = compositor.getWindow(b.window)
 local focus = compositor.getFocus()
@@ -6973,10 +7323,14 @@ if name == "drop" or not win then currentGrab = nil return end
 if name == "drag" then
 if grab.kind == "move" then
 compositor.move(win.id, x - grab.dx, y)
+noteGeometry(win)
 else
 local w = math.max(UI.MIN_WINDOW_WIDTH, x - win.x + 1)
 local h = math.max(1, y - compositor.bodyTop(win) + 1)
-if (w ~= win.width or h ~= win.height) and compositor.resize(win.id, w, h) then notifyResized(win) end
+if (w ~= win.width or h ~= win.height) and compositor.resize(win.id, w, h) then
+notifyResized(win)
+noteGeometry(win)
+end
 end
 return
 end
@@ -7007,7 +7361,10 @@ local w = win.width
 if lx == w - 5 or lx == w - 4 then
 compositor.minimize(win.id)
 elseif (lx == w - 3 or lx == w - 2) and win.resizable then
-if compositor.maximize(win.id) then notifyResized(win) end
+if compositor.maximize(win.id) then
+notifyResized(win)
+noteGeometry(win)
+end
 elseif lx == w - 1 or lx == w then
 closeWindow(win)
 else
@@ -7056,21 +7413,20 @@ end
 
 
 
-
-local function runForeground(id)
+function S.beginForeground(id)
 S.foregroundJob, foregroundTyped = id, ""
-while jobs[id] and jobs[id].status == "running" do
-K.wait(0.5)
 end
+function S.endForeground()
 S.foregroundJob = nil
 if consolePartial ~= "" then
 consoleAppend(consolePartial)
 consolePartial = ""
 end
-local job = jobs[id]
-if job and job.status ~= "done" then
-print(job.status .. ": " .. tostring(job.error))
 end
+function S.consoleWidth() return (viewSize()) end
+function S.clearConsole()
+for i = #consoleLines, 1, -1 do consoleLines[i] = nil end
+scrollOffset, consoleDirty = 0, true
 end
 
 
@@ -7119,59 +7475,8 @@ end
 
 
 
-
-
-local MUXOS_COMMANDS = {}
-for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
-.. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
-.. "shutdown logout flags users useradd userdel who"):gmatch("%S+") do
-MUXOS_COMMANDS[name] = true
-end
-
-local shellCtx = {
-invoke = K.tryInvoke, root = K.fsAddr, tmp = computer.tmpAddress(), list = component.list,
-write = consoleWrite,
-width = function() return (viewSize()) end,
-clear = function()
-for i = #consoleLines, 1, -1 do consoleLines[i] = nil end
-scrollOffset, consoleDirty = 0, true
-end,
-sleep = function(seconds)
-local deadline = computer.uptime() + seconds
-while computer.uptime() < deadline do K.wait(deadline - computer.uptime()) end
-end,
-help = function() K.help() end,
-info = {version = K.MUXOS_VERSION, address = K.selfAddr or computer.address(), uptime = computer.uptime,
-memory = function() return computer.freeMemory(), computer.totalMemory() end},
-
-
-
-external = function(argv, background)
-if MUXOS_COMMANDS[argv[1]] then
-K.runCommand(S, table.concat(argv, " "))
-return 0
-end
-local path = K.resolveProgram(argv[1])
-if not path then
-print("sh: " .. argv[1] .. ": command not found")
-return 127
-end
-local id, addrOrErr = K.launchProgram(path, {table.unpack(argv, 2)})
-if not id then
-print("error: " .. addrOrErr)
-return 1
-elseif background or path:match("%.lua$") then
-print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
-return 0
-end
-runForeground(id)
-return jobs[id] and jobs[id].status == "done" and 0 or 1
-end,
-}
-
-
 function S.cwd()
-return shell and shell.cwd() or (S.user and system.home(S.user)) or "/"
+return shell and shell.cwd() or S.remoteCwd or (S.user and system.home(S.user)) or "/"
 end
 
 
@@ -7201,11 +7506,7 @@ end
 
 function S.startSession(name)
 S.user, S.login = name, K.nextLogin()
-K.tryInvoke(K.fsAddr, "makeDirectory", system.home(name))
-if K.shellFactory then
-shellCtx.user, shellCtx.home = name, system.home(name)
-shell = K.shellFactory(shellCtx)
-end
+shell = K.newShell(S, name)
 editor = K.lineedit.new()
 if compositor.exclusiveOwner() == "console" then compositor.setExclusive(nil) end
 desktop.refresh()
@@ -7227,15 +7528,10 @@ end
 
 
 
+
+
 function S.logout()
-local ending = system.flag("logout_ends_jobs")
-for id in pairs(K.runningJobs) do
-local job = jobs[id]
-if job.login == S.login and ending then
-job.loggedOut = true
-K.controlJob(id, "KILL", "killed (logged out)")
-end
-end
+K.endLogin(S)
 for _, w in ipairs(compositor.listWindows()) do
 local own = w.id == (consoleWin and consoleWin.id) or w.id == (desktop.win and desktop.win.id)
 or w.id == (desktop.bar.win and desktop.bar.win.id)
@@ -7569,7 +7865,13 @@ end
 
 return M
 
-@@ 3384 /terminals.lua
+@@ 9045 /terminals.lua
+
+
+
+
+
+
 
 
 
@@ -7599,121 +7901,964 @@ return M
 
 
 local K, deps = ...
-local system, modem, serialize, deserialize, vgpu = K.system, deps.modem, deps.serialize, deps.deserialize, deps.vgpu
+local system = K.system
 
 local T = {byAddress = {}}
 local PORT = system.flag("terminal_port")
-local QUIET, SILENT = 2, 10
-local INPUT = {key_down = true, key_up = true, scroll = true, clipboard = true, touch = true, drag = true, drop = true}
-local MAX_MESSAGE = math.min(6000, ((modem.maxPacketSize and modem.maxPacketSize()) or 8192) - 512)
-
 T.PORT = PORT
-if system.flag("remote_terminals") then modem.open(PORT) end
+local SILENT, QUIET = 10, 2
+local MAX_READ = 1024 * 1024
+local FILES = {"terminal.lua", "session.lua", "compositor.lua", "bitmap.lua", "lineedit.lua", "vgpu.lua"}
 
-local function send(address, msg)
-modem.send(address, PORT, serialize(msg))
+if system.flag("remote_terminals") then deps.modem.open(PORT) end
+
+local function sendTo(address, msg)
+msg.from, msg.to = K.selfAddr, address
+deps.send(msg, PORT)
+end
+
+local function newKey()
+return string.format("%04x%04x%04x", math.random(0, 0xFFFF), math.random(0, 0xFFFF), math.random(0, 0xFFFF))
 end
 
 
-
-local function flushed(S)
-local term = S.terminal
-if not term then return end
+local function newProxy(address, info)
 local now = computer.uptime()
-local runs = term.gpu.takeDamage(term.full)
-term.full = false
-local batch, size = {}, 0
-local function ship()
-if #batch == 0 then return end
-send(term.address, {t = "draw", r = batch})
-batch, size, term.lastSent = {}, 0, now
+local P = {kind = "terminal", address = address, width = tonumber(info.console) or 80,
+screen = {tonumber(info.width) or 80, tonumber(info.height) or 25}, lastSeen = now, lastSent = now}
+P.display = {
+address = address, port = PORT,
+create = function(spec)
+local w, h = math.tointeger(tonumber(spec.width)) or 30, math.tointeger(tonumber(spec.height)) or 10
+sendTo(address, {type = "TWINDOW", spec = {id = spec.id, title = spec.title, x = spec.x, y = spec.y,
+width = w, height = h, resizable = spec.resizable, decorated = spec.decorated, ownerJobId = spec.ownerJobId,
+ownerNode = spec.ownerNode, key = spec.key, code = spec.code, args = spec.args, cells = spec.cells, bg = spec.bg}})
+return {width = w, height = h}
+end,
+remove = function(id) sendTo(address, {type = "TWINREMOVE", window = id}) end,
+status = function(id, status) sendTo(address, {type = "TWINSTATUS", window = id, status = status}) end,
+setOwner = function(id, jobId, node) sendTo(address, {type = "TOWNER", window = id, job = jobId, node = node}) end,
+share = function(id, jobId, rect, node) sendTo(address, {type = "TSHARE", window = id, job = jobId, rect = rect, node = node}) end,
+}
+P.width, P.height = P.screen[1], P.screen[2]
+P.consoleColumns = tonumber(info.console) or 80
+function P.write(text) sendTo(address, {type = "TOUT", text = tostring(text)}) P.lastSent = computer.uptime() end
+function P.print(...)
+local parts = {}
+for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+P.write(table.concat(parts, "\t") .. "\n")
 end
-for _, run in ipairs(runs) do
-local cost = #run[3] + 40
-if size + cost > MAX_MESSAGE then ship() end
-batch[#batch + 1] = run
-size = size + cost
+function P.command() return false end
+function P.deny(flagName, doing)
+local ok, why = system.allowed(P.user, flagName, doing)
+if not ok then P.print(why) return true end
 end
-ship()
-if now - term.lastSent > QUIET then
-send(term.address, {t = "ping"})
-term.lastSent = now
+function P.shellRun(line)
+if P.shell then P.shell.run(line) else P.print("no shell -- run `update` with the installer floppy in") end
+end
+function P.cwd() return P.shell and P.shell.cwd() or (P.user and system.home(P.user)) or "/" end
+function P.beginForeground(id)
+P.foregroundJob = id
+local job = K.jobs[id]
+sendTo(address, {type = "TFG", job = id, node = job and job.node})
+end
+function P.endForeground()
+P.foregroundJob = nil
+sendTo(address, {type = "TFG"})
+end
+function P.consoleWidth() return P.consoleColumns end
+function P.clearConsole() sendTo(address, {type = "TCLEAR"}) end
+function P.windowsChanged()
+if P.user then sendTo(address, {type = "TUSERWINDOWS", list = K.win.ofUser(P.user)}) end
+end
+function P.update() end
+function P.input() end
+function P.redraw() end
+
+
+function P.resume()
+if not P.co then return end
+local ok, err = K.resumeCommand(P, P.co)
+if coroutine.status(P.co) == "dead" then
+local id = P.cmdId
+P.co, P.cmdId = nil, nil
+if not ok then P.print("command error: " .. tostring(err)) end
+sendTo(address, {type = "RESULT", id = id, result = {cwd = P.cwd()}})
+end
+end
+function P.logout()
+K.endLogin(P)
+P.user, P.shell, P.login = nil, nil, nil
+end
+return P
+end
+
+local function reply(P, msg, result, err)
+if not msg.id then return end
+if result == nil then
+sendTo(P.address, {type = "ERROR", id = msg.id, error = err})
+else
+sendTo(P.address, {type = "RESULT", id = msg.id, result = result})
 end
 end
 
-local function hangUp(term, why)
-T.byAddress[term.address] = nil
-K.endSession(term.session)
-send(term.address, {t = "bye", why = why})
+local function hangUp(P, why)
+T.byAddress[P.address] = nil
+K.endSession(P)
+sendTo(P.address, {type = "TBYE", why = why})
 end
 
-local function clamp(n, lo, hi, default)
-n = math.tointeger(tonumber(n))
-if not n then return default end
-return math.max(lo, math.min(hi, n))
+
+local handlers = {}
+function handlers.TLOGIN(P, msg)
+local name = tostring(msg.name)
+if not system.userExists(name) then return reply(P, msg, nil, "no such user: " .. name) end
+if P.user then K.endLogin(P) end
+P.user, P.login = name, K.nextLogin()
+P.shell = K.newShell(P, name)
+reply(P, msg, {login = P.login, cwd = P.cwd(), windows = K.win.ofUser(name)})
+end
+function handlers.TCMD(P, msg)
+if not P.user then return reply(P, msg, nil, "log in first") end
+if P.co then return reply(P, msg, nil, "a command is already running") end
+P.consoleColumns = tonumber(msg.width) or P.consoleColumns
+local line = tostring(msg.line)
+P.cmdId = msg.id
+P.co = coroutine.create(function() return K.runCommand(P, line) end)
+P.resume()
+end
+function handlers.TAPPS(P, msg) reply(P, msg, K.apps()) end
+function handlers.TSIZE(P, msg) reply(P, msg, K.fileSize(tostring(msg.path)) or false) end
+function handlers.TREAD(P, msg)
+local path = tostring(msg.path)
+local size = K.fileSize(path)
+if not size then return reply(P, msg, false) end
+if size > MAX_READ then return reply(P, msg, nil, path .. ": too big") end
+reply(P, msg, K.readFile(path) or false)
+end
+function handlers.TWRITE(P, msg)
+if not P.user then return reply(P, msg, nil, "log in first") end
+reply(P, msg, K.writeFile(tostring(msg.path), msg.data) or false)
+end
+function handlers.TLAUNCH(P, msg)
+if not P.user then return end
+K.inSession(P, function()
+local id, addrOrErr = K.launchProgram(tostring(msg.path), type(msg.args) == "table" and msg.args or {})
+if id then
+P.print("[" .. id .. "] " .. tostring(msg.path) .. " started on " .. addrOrErr)
+else
+P.print("error: " .. tostring(addrOrErr))
+end
+end)
+end
+function handlers.TCONTROL(P, msg)
+local job = K.jobs[msg.job]
+if not P.user or not job then return end
+if job.user ~= P.user and P.user ~= "root" and system.flag("kill_requires_owner") then
+return P.print("process " .. tostring(msg.job) .. " is " .. tostring(job.user) .. "'s (flag kill_requires_owner)")
+end
+K.controlJob(job.id, tostring(msg.verb), msg.why or ("killed by " .. P.user))
+end
+function handlers.TCLOSE(P, msg)
+local rec = K.win.get(msg.window)
+if rec and rec.user == P.user then K.closeWindow(rec.id) end
+end
+function handlers.TGEOM(P, msg)
+local rec = K.win.get(msg.window)
+if rec and rec.session == P.id then K.windowGeometry(rec.id, msg.x, msg.y, msg.width, msg.height) end
+end
+function handlers.TATTACH(P, msg)
+if not P.user then return end
+local ok, err = K.attachWindow(msg.window, P)
+if not ok then P.print("can't bring window " .. tostring(msg.window) .. " here: " .. tostring(err)) end
+end
+function handlers.TLOGOUT(P)
+K.endLogin(P)
+P.user, P.shell, P.login = nil, nil, nil
+end
+function handlers.TWINERR(P, msg)
+local rec = K.win.get(msg.window)
+if rec and rec.session == P.id then
+P.print("window " .. rec.id .. " couldn't be shown here: " .. tostring(msg.error))
+K.win.detach(rec)
+end
+end
+function handlers.TFULLREL(P)
+if P.fullscreen then P.fullscreen = nil end
+end
+function handlers.TPING() end
+function handlers.TBYE(P)
+T.byAddress[P.address] = nil
+K.endSession(P)
 end
 
-local function hello(address, msg)
+
+function T.message(from, msg)
+if msg.type == "TERMHELLO" then
 if not system.flag("remote_terminals") then
-send(address, {t = "bye", why = "this muxos doesn't take terminals (flag remote_terminals)"})
+return sendTo(from, {type = "TBYE", why = "this muxos doesn't take terminals (flag remote_terminals)"})
+end
+local files = {}
+for _, name in ipairs(FILES) do files[name] = K.readFile("/" .. name) end
+return sendTo(from, {type = "TCODE", files = files, version = K.MUXOS_VERSION})
+elseif msg.type == "TREADY" then
+local old = T.byAddress[from]
+if old then hangUp(old, "restarted") end
+local P = newProxy(from, msg)
+K.addSession(P)
+T.byAddress[from] = P
 return
 end
-local old = T.byAddress[address]
-if old then hangUp(old, "restarted") end
-local w, h = clamp(msg.w, 20, 160, 80), clamp(msg.h, 8, 50, 25)
-local depth = ({[1] = 1, [4] = 4, [8] = 8})[tonumber(msg.depth)] or 8
-local gpu = vgpu.new(w, h, depth)
-local S = K.newSession({gpu = gpu, kind = "terminal", address = address, flushed = flushed})
-local now = computer.uptime()
-local term = {address = address, session = S, gpu = gpu, lastSeen = now, lastSent = now, full = true}
-S.terminal = term
-T.byAddress[address] = term
-send(address, {t = "welcome", kernal = K.selfAddr, session = S.id, w = w, h = h})
-K.inSession(S, S.showLogin)
+local P = T.byAddress[from]
+if not P then
+if msg.type ~= "TBYE" then sendTo(from, {type = "TBYE", why = "no session here -- restart muxterm"}) end
+return
 end
-
-
-function T.message(from, port, data)
-if port ~= PORT or type(data) ~= "string" then return end
-local msg = deserialize(data)
-if type(msg) ~= "table" then return end
-local term = T.byAddress[from]
-if msg.t == "hello" then
-hello(from, msg)
-elseif not term then
-if msg.t ~= "bye" then send(from, {t = "bye", why = "no session here -- start one with hello"}) end
-elseif msg.t == "bye" then
-T.byAddress[from] = nil
-K.endSession(term.session)
-else
-term.lastSeen = computer.uptime()
-local e = msg.e
-if msg.t == "in" and type(e) == "table" and INPUT[e[1]] then
-for i = 2, 4 do
-if e[i] ~= nil and type(e[i]) ~= "number" and type(e[i]) ~= "string" then return end
-end
-K.inSession(term.session, term.session.input, e[1], e[2], e[3], e[4])
-end
+P.lastSeen = computer.uptime()
+local handler = handlers[msg.type]
+if handler then
+local ok, err = pcall(handler, P, msg)
+if not ok then reply(P, msg, nil, tostring(err)) end
 end
 end
 
 
 function T.sweep()
 local now = computer.uptime()
-for _, term in pairs(T.byAddress) do
-if now - term.lastSeen > SILENT then hangUp(term, "the terminal stopped answering") end
+for _, P in pairs(T.byAddress) do
+if now - P.lastSeen > SILENT then
+hangUp(P, "the terminal stopped answering")
+elseif now - P.lastSent > QUIET then
+sendTo(P.address, {type = "TPING"})
+P.lastSent = now
 end
+end
+end
+
+
+
+function T.grantFullscreen(P, job)
+local holder = P.fullscreen and K.liveJob(P.fullscreen.job)
+if holder and holder.id ~= job.id then
+return nil, "this terminal's screen is held by process " .. holder.id
+end
+local key = newKey()
+P.fullscreen = {job = job.id, node = job.node, key = key}
+sendTo(P.address, {type = "TFULL", node = job.node, job = job.id, key = key})
+return {P.address, key, PORT}
+end
+
+
+function T.releaseFullscreen(jobId)
+local any = false
+for _, P in pairs(T.byAddress) do
+if P.fullscreen and P.fullscreen.job == jobId then
+P.fullscreen = nil
+sendTo(P.address, {type = "TUNFULL"})
+any = true
+end
+end
+return any
+end
+
+
+function T.jobEnded(jobId)
+for _, P in pairs(T.byAddress) do sendTo(P.address, {type = "TJOBEND", job = jobId}) end
 end
 
 function T.list()
 local list = {}
-for _, term in pairs(T.byAddress) do list[#list + 1] = term end
+for _, P in pairs(T.byAddress) do list[#list + 1] = P end
 return list
 end
 
 return T
 
-@@ 81126 /runtime.lua
+@@ 4365 /windows.lua
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local K = ...
+local W = {byId = {}}
+
+local function newKey()
+local parts = {}
+for i = 1, 4 do parts[i] = string.format("%04x", math.random(0, 0xFFFF)) end
+return table.concat(parts)
+end
+
+
+function W.describe(rec)
+local S = rec.session and K.byId[rec.session]
+return {id = rec.id, title = rec.title, x = rec.x, y = rec.y, width = rec.width, height = rec.height,
+ownerJobId = rec.owner, user = rec.user, resizable = rec.resizable, decorated = rec.decorated,
+attached = S ~= nil, session = S and S.id, status = rec.status}
+end
+
+function W.get(id) return W.byId[id] end
+
+
+function W.route(rec)
+local S = rec.session and K.byId[rec.session]
+if not S then return nil end
+return S.display.address, rec.key, S.display.port
+end
+
+
+local function announce(rec)
+local address, key, port = W.route(rec)
+for id in pairs(rec.holders) do
+local job = K.liveJob(id)
+if job then K.deliverEvent(job, {"window_route", rec.id, address or false, key or false, rec.width, rec.height, port}) end
+end
+end
+
+
+
+function W.open(S, spec, owner)
+if not S or not S.display then return nil, "its session has ended -- no screen to open a window on" end
+K.windowIds = K.windowIds + 1
+local id = K.windowIds
+local job = owner and K.jobs[owner]
+local key = newKey()
+local shown = {}
+for k, v in pairs(spec) do shown[k] = v end
+shown.id, shown.ownerJobId, shown.text, shown.key = id, owner, nil, key
+shown.ownerNode = job and job.node
+local size, err = S.display.create(shown)
+if not size then return nil, err end
+local rec = {id = id, owner = owner, user = job and job.user or S.user, session = S.id,
+title = tostring(spec.title or ("window " .. id)), x = spec.x or 1, y = spec.y or 1,
+width = size.width, height = size.height, resizable = spec.resizable == true,
+decorated = spec.decorated ~= false, key = key, holders = {}}
+if owner then rec.holders[owner] = true end
+W.byId[id] = rec
+K.windowsChanged(rec.user)
+return rec
+end
+
+
+
+function W.hold(rec, jobId)
+rec.holders[jobId] = true
+return W.route(rec)
+end
+
+
+function W.detach(rec)
+local S = rec.session and K.byId[rec.session]
+rec.session = nil
+if S then pcall(S.display.remove, rec.id) end
+announce(rec)
+K.windowsChanged(rec.user)
+end
+
+
+
+function W.attach(rec, S)
+if rec.session == S.id then return true end
+local old = rec.session and K.byId[rec.session]
+if old then pcall(old.display.remove, rec.id) end
+rec.session = nil
+local key = newKey()
+local job = rec.owner and K.jobs[rec.owner]
+local size, err = S.display.create({id = rec.id, title = rec.title, x = rec.x, y = rec.y,
+width = rec.width, height = rec.height, resizable = rec.resizable, decorated = rec.decorated,
+ownerJobId = rec.owner, ownerNode = job and job.node, key = key,
+code = "gpu.setBackground(0x000000) gpu.fill(1, 1, " .. rec.width .. ", " .. rec.height .. ", ' ')"})
+if not size then
+K.windowsChanged(rec.user)
+return nil, err
+end
+rec.session, rec.key = S.id, key
+
+for jobId, rect in pairs(rec.shares or {}) do
+local sharer = K.liveJob(jobId)
+if sharer and S.display.share then S.display.share(rec.id, jobId, rect, sharer.node) end
+end
+if rec.status and S.display.status then S.display.status(rec.id, rec.status) end
+announce(rec)
+K.windowsChanged(rec.user)
+return true
+end
+
+
+function W.close(rec)
+local S = rec.session and K.byId[rec.session]
+W.byId[rec.id] = nil
+if S then pcall(S.display.remove, rec.id) end
+K.windowsChanged(rec.user)
+end
+
+
+function W.moved(rec, x, y, width, height)
+rec.x, rec.y = x or rec.x, y or rec.y
+rec.width, rec.height = width or rec.width, height or rec.height
+end
+
+function W.ownedBy(jobId)
+local list = {}
+for _, rec in pairs(W.byId) do
+if rec.owner == jobId then list[#list + 1] = rec end
+end
+return list
+end
+
+
+function W.ofUser(user)
+local list = {}
+for _, rec in pairs(W.byId) do
+if rec.user == user then list[#list + 1] = W.describe(rec) end
+end
+table.sort(list, function(a, b) return a.id < b.id end)
+return list
+end
+
+
+function W.jobEnded(jobId, status)
+for _, rec in ipairs(W.ownedBy(jobId)) do
+rec.status = status
+local S = rec.session and K.byId[rec.session]
+if S then
+if S.display.status then S.display.status(rec.id, status) end
+else
+W.close(rec)
+end
+K.windowsChanged(rec.user)
+end
+for _, rec in pairs(W.byId) do rec.holders[jobId] = nil end
+end
+
+
+
+function W.sessionEnded(S)
+for _, rec in pairs(W.byId) do
+if rec.session == S.id then
+if rec.status then W.close(rec) else W.detach(rec) end
+end
+end
+end
+
+return W
+
+@@ 14488 /terminal.lua
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local ctx = ...
+local CLUSTER_PORT = 4477
+local PORT = ctx.port
+local kernalAddr, modemAddr = ctx.kernal, ctx.modem
+local myAddr = modemAddr
+local component, computer = component, computer
+
+local function serializeNumber(v)
+if v ~= v then return "0/0" end
+if v == math.huge then return "1/0" end
+if v == -math.huge then return "-1/0" end
+if math.type(v) == "integer" then return tostring(v) end
+local s = string.format("%.17g", v)
+if not s:find("[%.eE]") then s = s .. ".0" end
+return s
+end
+
+local function serialize(v, seen)
+seen = seen or {}
+local t = type(v)
+if t == "nil" or t == "boolean" then
+return tostring(v)
+elseif t == "number" then
+return serializeNumber(v)
+elseif t == "string" then
+return string.format("%q", v)
+elseif t == "table" then
+if seen[v] then error("cannot serialize a cyclic table") end
+seen[v] = true
+
+
+local parts = {}
+local n = #v
+for i = 1, n do parts[i] = serialize(v[i], seen) end
+for k, val in pairs(v) do
+if not (math.type(k) == "integer" and k >= 1 and k <= n) then
+parts[#parts + 1] = "[" .. serialize(k, seen) .. "]=" .. serialize(val, seen)
+end
+end
+
+
+seen[v] = nil
+return "{" .. table.concat(parts, ",") .. "}"
+else
+error("cannot serialize a value of type " .. t)
+end
+end
+
+local deserialize
+do
+
+
+
+
+
+
+local function isData(s)
+local i, n = 1, #s
+while i <= n do
+local q = s:find('"', i, true)
+local outside = s:sub(i, (q or n + 1) - 1)
+if outside:find("[^%w%s{}%[%]=,%.%-%+/]") or outside:find("%[[%[=]") or outside:find("%-%-") then
+return false
+end
+if not q then return true end
+i = q + 1
+while true do
+local c = s:find('[\\"]', i)
+if not c then return false end
+if s:byte(c) == 92 then
+i = c + 2
+else
+i = c + 1
+break
+end
+end
+end
+return true
+end
+
+deserialize = function(s)
+if not isData(s) then return nil end
+local chunk = load("return " .. s, "=msg", "t", {})
+if not chunk then return nil end
+local ok, v = pcall(chunk)
+if not ok then return nil end
+return v
+end
+end
+
+local CHUNK_SIZE = 7000
+local nextMsgId = 1
+
+
+
+local function send(msg, port)
+local payload = serialize(msg)
+local id = nextMsgId
+nextMsgId = nextMsgId + 1
+local total = math.ceil(#payload / CHUNK_SIZE)
+for i = 1, total do
+local frame = "MSG " .. id .. " " .. i .. "/" .. total .. " " .. payload:sub((i - 1) * CHUNK_SIZE + 1, i * CHUNK_SIZE)
+component.invoke(modemAddr, "send", msg.to, port or PORT, frame)
+end
+end
+
+local incoming = {}
+local function reassemble(from, data)
+local msgId, i, n, chunk = data:match("^MSG (%d+) (%d+)/(%d+) (.*)$")
+if not msgId then return nil end
+i, n = tonumber(i), tonumber(n)
+local key = from .. ":" .. msgId
+local entry = incoming[key] or {chunks = {}, total = n, at = computer.uptime()}
+incoming[key] = entry
+entry.chunks[i] = chunk
+for j = 1, entry.total do
+if not entry.chunks[j] then return nil end
+end
+incoming[key] = nil
+return table.concat(entry.chunks, "", 1, entry.total)
+end
+
+local function loadFile(name)
+local source = ctx.files[name]
+if not source then error("the kernal didn't send " .. name, 0) end
+return assert(load(source, "=" .. name, "t", _ENV))
+end
+
+
+
+local realGpu = component.proxy(ctx.gpu)
+local screenW, screenH = realGpu.getResolution()
+local compositorGpu, mirror = realGpu, nil
+if not realGpu.allocateBuffer then
+
+
+compositorGpu = loadFile("vgpu.lua")().new(screenW, screenH, realGpu.getDepth())
+mirror = function()
+local cf, cb
+for _, run in ipairs(compositorGpu.takeDamage()) do
+if run[4] ~= cf then realGpu.setForeground(run[4]) cf = run[4] end
+if run[5] ~= cb then realGpu.setBackground(run[5]) cb = run[5] end
+realGpu.set(run[1], run[2], run[3])
+end
+end
+end
+
+
+
+local K = {selfAddr = kernalAddr, MUXOS_VERSION = ctx.version, jobs = {}, fullscreen = {},
+commands = setmetatable({}, {__mode = "k"}), loadSibling = loadFile}
+K.lineedit = loadFile("lineedit.lua")()
+K.system = {home = function(name) return name == "root" and "/root" or "/home/" .. name end}
+
+local S
+local running, reason = true, nil
+local lastHeard, lastSent = computer.uptime(), computer.uptime()
+local keys = {}
+local userWindows = {}
+local replies, nextRequest = {}, 1
+local pump
+
+
+
+local nextLocalId = 0
+function K.newCompositor(g)
+return loadFile("compositor.lua")(loadFile, {gpu = g, nextId = function()
+nextLocalId = nextLocalId - 1
+return nextLocalId
+end})
+end
+
+function K.wait(timeout)
+if K.commands[coroutine.running()] then coroutine.yield() else pump(timeout) end
+end
+
+function K.resumeCommand(_, co)
+K.commands[co] = true
+return coroutine.resume(co)
+end
+
+function K.inSession(_, fn, ...)
+local ok, err = pcall(fn, ...)
+if not ok then error(err, 0) end
+end
+
+local function tell(msgType, fields)
+local msg = {type = msgType, from = myAddr, to = kernalAddr}
+for k, v in pairs(fields or {}) do msg[k] = v end
+send(msg)
+lastSent = computer.uptime()
+end
+
+
+
+local function request(msgType, fields, timeout)
+local id = nextRequest
+nextRequest = nextRequest + 1
+local f = {id = id}
+for k, v in pairs(fields or {}) do f[k] = v end
+replies[id] = false
+tell(msgType, f)
+local deadline = timeout and computer.uptime() + timeout
+while running and not replies[id] and (not deadline or computer.uptime() < deadline) do K.wait(0.1) end
+local r = replies[id]
+replies[id] = nil
+if not r then return nil, "the kernal didn't answer" end
+if r.type == "RESULT" then return r.result end
+return nil, r.error
+end
+
+function K.liveJob(id)
+local job = K.jobs[id]
+if job and job.status == "running" then return job end
+end
+
+
+function K.deliverEvent(job, event)
+send({type = "EVENT", from = myAddr, to = job.node, jobId = job.id, event = event}, CLUSTER_PORT)
+end
+
+function K.controlJob(id, verb, why) tell("TCONTROL", {job = id, verb = verb, why = why}) return true end
+function K.closeWindow(id)
+if not keys[id] then return false end
+tell("TCLOSE", {window = id})
+return true
+end
+function K.windowGeometry(id, x, y, w, h)
+if keys[id] then tell("TGEOM", {window = id, x = x, y = y, width = w, height = h}) end
+end
+function K.userWindows() return userWindows end
+function K.attachWindow(id) tell("TATTACH", {window = id}) return true end
+function K.endLogin() tell("TLOGOUT") end
+function K.newShell() return nil end
+function K.nextLogin() return K.pendingLogin end
+function K.apps() return request("TAPPS", nil, 30) or {} end
+function K.fileSize(path) return request("TSIZE", {path = path}, 10) end
+function K.readFile(path) return request("TREAD", {path = path}, 60) end
+function K.writeFile(path, data) return request("TWRITE", {path = path, data = data}, 10) end
+
+function K.launchProgram(path, args) tell("TLAUNCH", {path = path, args = args}) return true end
+
+
+
+
+function K.runCommand(sess, line)
+if not sess.user then
+local name = (line or ""):match("^%s*(.-)%s*$")
+if name == "" then return end
+local r, err = request("TLOGIN", {name = name}, 30)
+if not r then sess.print(err) return end
+K.pendingLogin, sess.remoteCwd, userWindows = r.login, r.cwd, r.windows or {}
+sess.startSession(name)
+return
+end
+if sess.command(line) then return end
+local r, err = request("TCMD", {line = line, width = sess.consoleWidth()})
+if r then sess.remoteCwd = r.cwd elseif err then sess.print(err) end
+end
+
+
+
+local function answer(msg, result, err)
+if msg.noReply or not msg.id then return end
+if result == nil then
+send({type = "ERROR", from = myAddr, to = msg.from, id = msg.id, error = err}, CLUSTER_PORT)
+else
+send({type = "RESULT", from = myAddr, to = msg.from, id = msg.id, result = result}, CLUSTER_PORT)
+end
+end
+
+local function framesPresented(list)
+for _, p in ipairs(list) do
+local win = S.compositor.getWindow(p.id)
+if win then
+local told = {}
+local function tellJob(id)
+local job = K.liveJob(id)
+if job and not told[id] then
+told[id] = true
+K.deliverEvent(job, {"frame_presented", p.id, p.frame, p.complete})
+end
+end
+if win.ownerJobId then tellJob(win.ownerJobId) end
+for key in pairs(S.compositor.shares(p.id)) do tellJob(key) end
+end
+end
+end
+
+local function fromProgram(msg)
+local id = msg.windowId
+local win = id and S.compositor.getWindow(id)
+if msg.type == "GPUCALL" then
+local fs = K.fullscreen
+if not (fs.node and fs.node == msg.from and msg.key == fs.key) then
+return answer(msg, nil, "this screen's fullscreen grant isn't yours")
+end
+local args = type(msg.args) == "table" and msg.args or {}
+local packed = table.pack(pcall(realGpu[msg.method], table.unpack(args, 1, args.n or #args)))
+if not packed[1] then return answer(msg, nil, tostring(packed[2])) end
+local returns = {n = packed.n - 1}
+for i = 2, packed.n do returns[i - 1] = packed[i] end
+return answer(msg, returns)
+end
+if not win or not keys[id] then return answer(msg, nil, "window " .. tostring(id) .. " isn't shown here") end
+if msg.key ~= keys[id] then return answer(msg, nil, "window " .. tostring(id) .. " belongs to another process") end
+local compositor = S.compositor
+if msg.type == "DRAWWINDOW" then
+if not msg.pixels and type(msg.width) == "number" and type(msg.height) == "number"
+and (msg.width ~= win.width or msg.height ~= win.height) then
+local ok, err = compositor.setGeometry(id, win.x, win.y, msg.width, msg.height)
+if not ok then return answer(msg, nil, err) end
+K.windowGeometry(id, win.x, win.y, win.width, win.height)
+end
+local ok, err = compositor.redrawWindow(id, msg)
+return answer(msg, ok, err)
+elseif msg.type == "DRAWREGION" then
+local drawer = msg.caller == win.ownerJobId and "owner" or msg.caller
+local ok, presented = compositor.drawRegion(id, drawer, msg.frame, msg, msg.done)
+if not ok then return answer(msg, nil, presented) end
+framesPresented(presented)
+return answer(msg, true)
+elseif msg.type == "RENDERCONFIG" then
+if msg.options ~= nil and msg.caller ~= win.ownerJobId then
+return answer(msg, nil, "window " .. id .. " belongs to another process")
+end
+return answer(msg, compositor.renderConfig(id, msg.options))
+end
+end
+
+
+
+local fromKernal = {}
+function fromKernal.RESULT(msg) replies[msg.id] = msg end
+fromKernal.ERROR = fromKernal.RESULT
+function fromKernal.TOUT(msg) S.write(tostring(msg.text)) end
+function fromKernal.TCLEAR() S.clearConsole() end
+function fromKernal.TFG(msg)
+if msg.job then
+K.jobs[msg.job] = {id = msg.job, node = msg.node, status = "running"}
+S.beginForeground(msg.job)
+else
+S.endForeground()
+end
+end
+function fromKernal.TWINDOW(msg)
+local spec = msg.spec
+if spec.ownerJobId and spec.ownerNode then
+K.jobs[spec.ownerJobId] = {id = spec.ownerJobId, node = spec.ownerNode, status = "running"}
+end
+keys[spec.id] = spec.key
+local ok, err = S.display.create(spec)
+if not ok then
+keys[spec.id] = nil
+tell("TWINERR", {window = spec.id, error = tostring(err)})
+end
+end
+function fromKernal.TWINREMOVE(msg)
+keys[msg.window] = nil
+if S.compositor.getWindow(msg.window) then S.compositor.close(msg.window) end
+end
+function fromKernal.TWINSTATUS(msg)
+local win = S.compositor.getWindow(msg.window)
+if win then
+S.compositor.setStatus(msg.window, msg.status)
+local job = win.ownerJobId and K.jobs[win.ownerJobId]
+if job then job.status = "ended" end
+end
+end
+function fromKernal.TOWNER(msg)
+K.jobs[msg.job] = {id = msg.job, node = msg.node, status = "running"}
+S.display.setOwner(msg.window, msg.job)
+end
+function fromKernal.TSHARE(msg)
+if msg.rect and msg.node then K.jobs[msg.job] = {id = msg.job, node = msg.node, status = "running"} end
+S.compositor.share(msg.window, msg.job, msg.rect)
+end
+function fromKernal.TUSERWINDOWS(msg)
+userWindows = type(msg.list) == "table" and msg.list or {}
+S.windowsChanged()
+end
+function fromKernal.TJOBEND(msg)
+local job = K.jobs[msg.job]
+if job then job.status = "ended" end
+for _, winId in ipairs(S.compositor.unshareAll(msg.job)) do
+local win = S.compositor.getWindow(winId)
+local owner = win and win.ownerJobId and K.liveJob(win.ownerJobId)
+if owner then K.deliverEvent(owner, {"region_lost", winId, msg.job}) end
+end
+end
+function fromKernal.TFULL(msg)
+K.fullscreen.node, K.fullscreen.job, K.fullscreen.key = msg.node, msg.job, msg.key
+S.compositor.setExclusive(msg.node)
+end
+function fromKernal.TUNFULL()
+K.fullscreen.node, K.fullscreen.job, K.fullscreen.key = nil, nil, nil
+S.compositor.setExclusive(not S.user and "console" or nil)
+S.redraw()
+end
+function fromKernal.TBYE(msg)
+running, reason = false, "disconnected -- " .. tostring(msg.why)
+end
+function fromKernal.TPING() end
+
+
+
+local INPUT = {key_down = true, key_up = true, scroll = true, clipboard = true, touch = true, drag = true, drop = true}
+local held = {}
+
+local function ours(address) return address == realGpu.getScreen() or ctx.keyboards[address] end
+
+pump = function(timeout)
+local sig = table.pack(computer.pullSignal(timeout))
+local name = sig[1]
+local now = computer.uptime()
+if name == "modem_message" and sig[4] == PORT and type(sig[6]) == "string" then
+local payload = reassemble(sig[3], sig[6])
+local msg = payload and deserialize(payload)
+if type(msg) == "table" and msg.from == sig[3] then
+if sig[3] == kernalAddr then
+lastHeard = now
+local handler = fromKernal[msg.type]
+if handler then
+local ok, err = pcall(handler, msg)
+if not ok then S.print("terminal: " .. tostring(err)) end
+end
+else
+local ok, err = pcall(fromProgram, msg)
+if not ok then answer(msg, nil, tostring(err)) end
+end
+end
+elseif INPUT[name] and ours(sig[2]) then
+if name == "key_down" then held[sig[4]] = true elseif name == "key_up" then held[sig[4]] = nil end
+
+if name == "key_down" and sig[4] == 0x20 and (held[0x1D] or held[0x9D]) and (held[0x38] or held[0xB8]) then
+tell("TBYE")
+running, reason = false, "disconnected"
+return
+end
+
+if name == "key_down" and sig[4] == 0x2E and K.fullscreen.node and (held[0x1D] or held[0x9D])
+and (held[0x38] or held[0xB8]) then
+tell("TFULLREL")
+fromKernal.TUNFULL()
+end
+local ok, err = pcall(S.input, name, sig[3], sig[4], sig[5])
+if not ok then S.print("terminal: " .. tostring(err)) end
+end
+for key, entry in pairs(incoming) do
+if now - entry.at > 30 then incoming[key] = nil end
+end
+end
+
+local function upkeep()
+local now = computer.uptime()
+local ok, err = pcall(function()
+framesPresented(S.compositor.renderTick(function(id)
+local list = {}
+for key in pairs(S.compositor.shares(id)) do
+if K.liveJob(key) then list[#list + 1] = key end
+end
+return list
+end))
+S.update()
+S.resume()
+end)
+if not ok then S.print("terminal: " .. tostring(err)) end
+if now - lastSent > 2 then tell("TPING") end
+if now - lastHeard > 10 then running, reason = false, "lost the kernal (nothing heard for 10 s)" end
+end
+
+S = loadFile("session.lua")(K, {id = 1, gpu = compositorGpu, kind = "terminal", address = myAddr, flushed = mirror})
+K.inSession(S, S.showLogin)
+tell("TREADY", {width = screenW, height = screenH, depth = realGpu.getDepth(), console = S.consoleWidth()})
+while running do
+pump(0.05)
+upkeep()
+end
+return reason
+
+@@ 85762 /runtime.lua
 
 
 
@@ -7839,6 +8984,9 @@ local current = nil
 local WAIT = {}
 local COOPERATE = {cooperate = true}
 local rpcWaiting, rpcReplies = {}, {}
+
+
+local displays = {}
 local receive, handleMessage
 
 local function findModem()
@@ -7871,7 +9019,10 @@ local nodeId = modemAddr
 local CHUNK_SIZE = 7000
 local nextMsgId = 1
 
-local function send(msg)
+
+
+local function send(msg, port)
+port = port or PORT
 local payload = serialize(msg)
 local id = nextMsgId
 nextMsgId = nextMsgId + 1
@@ -7881,9 +9032,9 @@ local chunk = payload:sub((i - 1) * CHUNK_SIZE + 1, i * CHUNK_SIZE)
 local frame = "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk
 
 if msg.to then
-component.invoke(modemAddr, "send", msg.to, PORT, frame)
+component.invoke(modemAddr, "send", msg.to, port, frame)
 else
-component.invoke(modemAddr, "broadcast", PORT, frame)
+component.invoke(modemAddr, "broadcast", port, frame)
 end
 end
 end
@@ -7956,8 +9107,11 @@ local migrationHandlers = {}
 local eventQueues = {}
 local MAX_QUEUED_EVENTS = 64
 
+local windowRouted
+
 local function queueEvent(id, event)
 if type(id) ~= "number" or type(event) ~= "table" then return end
+if event[1] == "window_route" then event = windowRouted(id, event) end
 local q = eventQueues[id]
 if not q then q = {}; eventQueues[id] = q end
 if #q < MAX_QUEUED_EVENTS then q[#q + 1] = event end
@@ -8091,7 +9245,10 @@ return
 end
 
 
-if from ~= kernalAddr then return end
+
+
+if from ~= kernalAddr and not (displays[from]
+and (msg.type == "EVENT" or msg.type == "RESULT" or msg.type == "ERROR")) then return end
 if msg.type == "RESULT" or msg.type == "ERROR" then
 if rpcWaiting[msg.id] then rpcReplies[msg.id] = msg end
 return
@@ -8155,14 +9312,16 @@ local RPC_TIMEOUT = 5
 
 
 
-local function remoteRequest(msgType, extra)
+
+
+local function remoteRequest(msgType, extra, to, port)
 if not kernalAddr then
 return nil, "kernal address not known yet"
 end
 local id = nextId()
-local msg = {type = msgType, from = nodeId, to = kernalAddr, id = id}
+local msg = {type = msgType, from = nodeId, to = to or kernalAddr, id = id}
 for k, v in pairs(extra or {}) do msg[k] = v end
-send(msg)
+send(msg, port)
 
 
 rpcWaiting[id] = true
@@ -8171,9 +9330,125 @@ while not satisfied(w) do wait(w) end
 rpcWaiting[id] = nil
 local reply = rpcReplies[id]
 rpcReplies[id] = nil
-if not reply then return nil, "timed out waiting for kernal" end
+if not reply then return nil, "timed out waiting for " .. (to and to ~= kernalAddr and "the terminal" or "kernal") end
 if reply.type == "RESULT" then return reply.result end
 return nil, reply.error
+end
+
+
+
+
+
+
+
+
+
+
+
+
+local winRoutes = {}
+local winDraws = {}
+local winRedraw = {}
+
+local function setRoute(id, address, key, port)
+winRoutes[id] = {address = address or false, key = key, port = port}
+if address and address ~= kernalAddr then displays[address] = true end
+end
+
+local function routeOf(id, caller)
+if winRoutes[id] then return winRoutes[id] end
+local r, err = remoteRequest("WINDOWROUTE", {windowId = id, caller = caller})
+if not r then return nil, err end
+setRoute(id, r.address, r.key, r.port)
+return winRoutes[id]
+end
+
+
+
+
+local function sendDraw(id, msgType, fields, caller, noReply)
+local r, err = routeOf(id, caller)
+if not r then return nil, err end
+if not r.address then return true end
+fields.windowId, fields.key, fields.caller = id, r.key, caller
+if not noReply then return remoteRequest(msgType, fields, r.address, r.port) end
+fields.type, fields.from, fields.to, fields.id, fields.noReply = msgType, nodeId, r.address, nextId(), true
+send(fields, r.port)
+return true
+end
+
+
+
+
+
+
+
+
+
+local bitmapModule
+local function bitmapLib(caller)
+if not bitmapModule then
+local r, err = remoteRequest("GETMODULE", {name = "muxos:bitmap", caller = caller})
+if not r then error("the bitmap encoder: " .. tostring(err), 0) end
+bitmapModule = assert(load(r.source, "=bitmap.lua"))()
+end
+return bitmapModule
+end
+
+
+local function cellRuns(cells, cols, rows)
+local out = {}
+for y = 1, rows do
+local row, r, x = cells[y], {y}, 1
+while x <= cols do
+local fg, bg, start, chars = row[x].fg, row[x].bg, x, {}
+while x <= cols and row[x].fg == fg and row[x].bg == bg do
+chars[#chars + 1] = row[x].char
+x = x + 1
+end
+r[#r + 1], r[#r + 2], r[#r + 3], r[#r + 4] = start, fg, bg, table.concat(chars)
+end
+out[#out + 1] = r
+end
+return out
+end
+
+
+local function pixelsToCells(o, caller)
+local cells, cols, rows = bitmapLib(caller).encode(o.mode, o.pixels, o.width, o.height, o.bg)
+return cellRuns(cells, cols, rows), cols, rows
+end
+
+
+local function rememberDraw(id, draw)
+if draw.clear ~= false then
+winDraws[id] = {draw}
+else
+local list = winDraws[id] or {}
+if #list < 16 then list[#list + 1] = draw end
+winDraws[id] = list
+end
+end
+
+
+
+windowRouted = function(jobId, e)
+local id = e[2]
+local old = winRoutes[id]
+setRoute(id, e[3], e[4], e[7])
+if not e[3] then return {"window_detached", id} end
+if not (old and old.key == e[4]) then
+if winRedraw[id] then
+winRedraw[id]()
+else
+for _, draw in ipairs(winDraws[id] or {}) do
+local fields = {}
+for k, v in pairs(draw) do fields[k] = v end
+sendDraw(id, "DRAWWINDOW", fields, jobId, true)
+end
+end
+end
+return {"window_attached", id, e[5], e[6]}
 end
 
 
@@ -8219,7 +9494,15 @@ end
 
 
 local remoteGpuAddr = nil
+
+local screenRoute = nil
 local function faceGpu(method, ...)
+if screenRoute then
+local results, err = remoteRequest("GPUCALL", {method = method, args = table.pack(...), key = screenRoute.key},
+screenRoute.address, screenRoute.port)
+if not results then return nil, err end
+return table.unpack(results, 1, results.n or #results)
+end
 for addr in component.list("gpu") do
 return component.invoke(addr, method, ...)
 end
@@ -8486,12 +9769,28 @@ options = options or {}
 
 
 
-return remoteRequest("CREATEWINDOW", {
+
+
+local width, height, cells = options.width, options.height, options.cells
+if options.pixels then
+if not width or not height then
+return nil, "options.pixels needs options.width/options.height (the pixel grid's own dimensions)"
+end
+cells, width, height = pixelsToCells(options, currentJobId)
+end
+local win, err = remoteRequest("CREATEWINDOW", {
 title = options.title, x = options.x, y = options.y,
-width = options.width, height = options.height, code = options.code,
-pixels = options.pixels, mode = options.mode, bg = options.bg, args = options.args,
+width = width, height = height, code = options.code, cells = cells, bg = options.bg, args = options.args,
 resizable = options.resizable, decorated = options.title_bar, caller = currentJobId,
 })
+if win then
+setRoute(win.id, win.route, win.key, win.port)
+if options.code or cells then
+rememberDraw(win.id, {code = options.code, args = options.args, cells = cells, bg = options.bg})
+end
+win.route, win.key, win.port = nil, nil, nil
+end
+return win, err
 end,
 
 
@@ -8501,9 +9800,26 @@ end,
 
 draw_window = function(id, options)
 options = options or {}
-return remoteRequest("DRAWWINDOW", {windowId = id, code = options.code, args = options.args,
-pixels = options.pixels, mode = options.mode, width = options.width, height = options.height,
-bg = options.bg, clear = options.clear, caller = currentJobId})
+local draw = {code = options.code, args = options.args, cells = options.cells,
+width = options.width, height = options.height, bg = options.bg, clear = options.clear}
+if options.pixels then
+if not options.width or not options.height then
+return nil, "options.pixels needs options.width/options.height"
+end
+draw.cells, draw.width, draw.height = pixelsToCells(options, currentJobId)
+draw.width, draw.height = nil, nil
+end
+rememberDraw(id, draw)
+local fields = {}
+for k, v in pairs(draw) do fields[k] = v end
+return sendDraw(id, "DRAWWINDOW", fields, currentJobId)
+end,
+
+
+
+
+set_persistent = function(on)
+return remoteRequest("PERSIST", {on = on ~= false, caller = currentJobId})
 end,
 
 get_windows = function()
@@ -8525,7 +9841,14 @@ end,
 
 
 render_config = function(id, options)
-local config, err = remoteRequest("RENDERCONFIG", {windowId = id, options = options, caller = currentJobId})
+local r = routeOf(id, currentJobId)
+local config, err
+if r and r.address and r.address ~= kernalAddr then
+config, err = remoteRequest("RENDERCONFIG", {windowId = id, options = options, key = r.key, caller = currentJobId},
+r.address, r.port)
+else
+config, err = remoteRequest("RENDERCONFIG", {windowId = id, options = options, caller = currentJobId})
+end
 if config then renderChunks[id] = config.chunk end
 return config, err
 end,
@@ -8539,43 +9862,50 @@ end,
 draw_region = function(id, frame, content)
 content = content or {}
 if renderChunks[id] == nil then
-local config = remoteRequest("RENDERCONFIG", {windowId = id, caller = currentJobId})
+local config = gmuxapi.render_config(id)
 renderChunks[id] = config and config.chunk or false
 end
 local chunk = renderChunks[id] or 4096
+
+
+local cells = content.cells
+if content.pixels then
+if not content.width or not content.height then return nil, "pixels need width and height" end
+cells = pixelsToCells(content, currentJobId)
+end
 local bands = {}
-if content.pixels and content.width and content.height then
-local perCell = content.mode == "braille" and 4 or 2
-local rows = math.max(perCell, (chunk // math.max(1, content.width * 9)) // perCell * perCell)
-for top = 1, content.height, rows do
-local band = {}
-for y = top, math.min(content.height, top + rows - 1) do band[#band + 1] = content.pixels[y] or {} end
-bands[#bands + 1] = {pixels = band, width = content.width, height = #band, mode = content.mode,
-bg = content.bg, x = content.x, y = (content.y or nil) and content.y + (top - 1) // perCell,
-offset = (top - 1) // perCell}
+local function band(rowsOrText, isText)
+bands[#bands + 1] = isText and {text = rowsOrText} or {cells = rowsOrText}
 end
-elseif type(content.text) == "table" then
-local size, start = 0, 1
-for i, row in ipairs(content.text) do
-size = size + (type(row) == "string" and #row or 40 * #row) + 8
-if size > chunk or i == #content.text then
-local part = {}
-for j = start, i do part[#part + 1] = content.text[j] end
-bands[#bands + 1] = {text = part, x = content.x, y = content.y and content.y + start - 1, offset = start - 1}
-start, size = i + 1, 0
-end
-end
-end
-if #bands == 0 then return nil, "a region needs pixels (with width and height) or text" end
-for i, band in ipairs(bands) do
-local msg = {windowId = id, frame = frame, pixels = band.pixels, width = band.width, height = band.height,
-mode = band.mode, bg = band.bg, text = band.text, x = band.x, y = band.y, offset = band.offset,
-done = i == #bands and content.done ~= false, caller = currentJobId}
-if i < #bands then
-msg.type, msg.from, msg.to, msg.id, msg.noReply = "DRAWREGION", nodeId, kernalAddr, nextId(), true
-send(msg)
+local list = cells or (type(content.text) == "table" and content.text)
+if not list then return nil, "a region needs cells, pixels (with width and height) or text" end
+local part, size = {}, 0
+for i, row in ipairs(list) do
+local cost = 8
+if type(row) == "string" then
+cost = cost + #row
 else
-return remoteRequest("DRAWREGION", msg)
+for j = 1, #row do cost = cost + (type(row[j]) == "string" and #row[j] or 12) end
+end
+if size + cost > chunk and #part > 0 then
+band(part, not cells)
+part, size = {}, 0
+end
+part[#part + 1] = row
+size = size + cost
+
+
+if not cells and #part == 1 then part.offset = i - 1 end
+end
+if #part > 0 then band(part, not cells) end
+for i, b in ipairs(bands) do
+local offset = b.text and b.text.offset or 0
+local fields = {frame = frame, cells = b.cells, text = b.text, x = content.x,
+y = content.y and content.y + offset, offset = offset, done = i == #bands and content.done ~= false}
+if i < #bands then
+sendDraw(id, "DRAWREGION", fields, currentJobId, true)
+else
+return sendDraw(id, "DRAWREGION", fields, currentJobId)
 end
 end
 end,
@@ -8592,11 +9922,20 @@ end,
 
 
 request_fullscreen = function()
-return remoteRequest("REQUESTFULLSCREEN", {caller = currentJobId})
+local grant, err = remoteRequest("REQUESTFULLSCREEN", {caller = currentJobId})
+
+if grant and grant.route then
+screenRoute = {address = grant.route[1], key = grant.route[2], port = grant.route[3]}
+displays[screenRoute.address] = true
+grant.route = nil
+end
+return grant, err
 end,
 
 release_fullscreen = function()
-return remoteRequest("RELEASEFULLSCREEN")
+local done, err = remoteRequest("RELEASEFULLSCREEN", {caller = currentJobId})
+if done then screenRoute = nil end
+return done, err
 end,
 
 
@@ -8792,6 +10131,26 @@ end,
 
 
 
+
+
+
+
+
+
+
+
+
+
+bitmap = function(id)
+local encoder = bitmapLib(id)
+return {
+encode = encoder.encode,
+runs = cellRuns,
+cells = function(mode, pixels, width, height, bg)
+return pixelsToCells({mode = mode, pixels = pixels, width = width, height = height, bg = bg}, id)
+end,
+}
+end,
 thread = function(id)
 local count = 0
 local lib = {}
@@ -9124,8 +10483,6 @@ local VGPU_MAX_W, VGPU_MAX_H = 160, 50
 local VGPU_MEMORY = VGPU_MAX_W * VGPU_MAX_H * 2
 local GRAPHICS_FLUSH_INTERVAL = 0.05
 
-local WINDOW_DRAW_CODE = "for _, row in ipairs(args.rows) do local y = row[1] for i = 2, #row, 4 do " ..
-"gpu.setForeground(row[i + 1]) gpu.setBackground(row[i + 2]) gpu.set(row[i], y, row[i + 3]) end end"
 
 local function newGrid(w, h, fg, bg)
 local g = {w = w, h = h, chars = {}, fgs = {}, bgs = {}}
@@ -9389,6 +10746,13 @@ writeOutput(ctx.id, "no window for gpu output: " .. tostring(err) .. "\n")
 return
 end
 ctx.windowId = win.id
+setRoute(win.id, win.route, win.key, win.port)
+end
+
+winRedraw[ctx.windowId] = winRedraw[ctx.windowId] or function()
+for y = 1, v.grid().h do v.dirtyRows[y] = true end
+v.dirty = true
+flushVirtualGpu(ctx, true)
 end
 local rows = {}
 for y in pairs(v.dirtyRows) do
@@ -9410,9 +10774,7 @@ rows[#rows + 1] = row
 end
 end
 v.dirtyRows, v.dirty, v.lastFlush = {}, false, now
-send({type = "DRAWWINDOW", from = nodeId, to = kernalAddr, id = nextId(), windowId = ctx.windowId,
-code = WINDOW_DRAW_CODE, args = {rows = rows}, clear = false, width = g.w, height = g.h,
-caller = ctx.id, noReply = true})
+sendDraw(ctx.windowId, "DRAWWINDOW", {cells = rows, clear = false, width = g.w, height = g.h}, ctx.id, true)
 end
 
 
@@ -10702,6 +12064,8 @@ if msg.windowId then
 
 local ctx = {id = msg.id, name = "graphics", windowId = msg.windowId,
 screenSize = {tonumber(msg.width) or 40, (tonumber(msg.height) or 12) + 1}}
+local route = type(msg.windowRoute) == "table" and msg.windowRoute or {}
+setRoute(msg.windowId, route[1], route[2], route[3])
 ctx.vgpu = newVirtualGpu(ctx, tonumber(msg.width) or 40, tonumber(msg.height) or 12)
 graphicsFlushers[msg.id] = function(force) flushVirtualGpu(ctx, force) end
 rawset(env, "gpu", ctx.vgpu.proxy)

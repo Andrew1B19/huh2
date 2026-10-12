@@ -291,7 +291,9 @@ end
 local CHUNK_SIZE = 7000
 local nextMsgId = 1
 
-local function send(msg)
+-- `port`: the cluster's own unless given (the terminal port).
+local function send(msg, port)
+  port = port or PORT
   local payload = serialize(msg)
   local id = nextMsgId
   nextMsgId = nextMsgId + 1
@@ -300,7 +302,7 @@ local function send(msg)
     local chunk = payload:sub((i - 1) * CHUNK_SIZE + 1, i * CHUNK_SIZE)
     local frame = "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk
     -- Addressed messages go to that card only; only discovery broadcasts.
-    if msg.to then modem.send(msg.to, PORT, frame) else modem.broadcast(PORT, frame) end
+    if msg.to then modem.send(msg.to, port, frame) else modem.broadcast(port, frame) end
   end
 end
 
@@ -506,11 +508,20 @@ function K.sessionOf(job)
   return job and job.session and K.byId[job.session]
 end
 
--- The session showing window `id`, and the window.
+-- The session showing program window `id` with a compositor here (the
+-- kernal's own screen), and the compositor's window -- or nil.
 function K.windowOwner(id)
+  local rec = K.win and K.win.get(id)
+  local S = rec and rec.session and K.byId[rec.session]
+  local win = S and S.compositor and S.compositor.getWindow(id)
+  if win then return S, win, rec end
+end
+
+-- A user's windows changed (opened, closed, moved between sessions):
+-- their sessions' taskbars redraw.
+function K.windowsChanged(user)
   for _, S in ipairs(K.sessions) do
-    local win = S.compositor.getWindow(id)
-    if win then return S, win end
+    if S.user == user and S.windowsChanged then S.windowsChanged() end
   end
 end
 
@@ -573,9 +584,19 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
     registerOrphanCandidate(appName, id)
   end
   -- `window`: a graphics process's own window, which it draws into.
-  if window then window.ownerJobId = id end
+  -- `window`: a graphics process's own window (a registry record), which
+  -- it draws into.
+  local route
+  if window then
+    window.owner, window.user = id, jobs[id].user
+    local address, key, port = K.win.hold(window, id)
+    route = address and {address, key, port}
+    local S = K.byId[window.session]
+    if S and S.display.setOwner then S.display.setOwner(window.id, id, targetAddr) end
+  end
   send({type = "JOB", from = selfAddr, to = targetAddr, id = id, code = code, args = args, program = program,
-    windowId = window and window.id, width = window and window.width, height = window and window.height})
+    windowId = window and window.id, width = window and window.width, height = window and window.height,
+    windowRoute = route})
   return id, targetAddr
 end
 
@@ -599,7 +620,7 @@ end
 -- the program. Either way, the scheduler places it.
 local PROGRAM_PATH = {"/bin", "/usr/bin"}
 -- Libraries built into the worker runtime rather than shipped from disk.
-local BUILTIN_MXE_LIBRARIES = {mux = true, http = true, thread = true, modem = true}
+local BUILTIN_MXE_LIBRARIES = {mux = true, http = true, thread = true, modem = true, bitmap = true}
 -- Searched in order (docs/MXE.md section 5).
 local MXE_LIBRARY_DIRS = {"/lib/mxe/", "/usr/lib/mxe/"}
 
@@ -1048,6 +1069,7 @@ local function finishJob(id, status, result, err)
     fullscreen.node, fullscreen.job = nil, nil
     K.releaseScreen()
   end
+  if K.terminals then K.terminals.releaseFullscreen(id) end
   runningJobs[id] = nil
   runningCount = runningCount - 1
   local node = nodes[job.node]
@@ -1068,11 +1090,7 @@ local function finishJob(id, status, result, err)
   end
   -- Its windows stay up, marked like gmux's: ended (done or killed) or
   -- failed (error, lost).
-  local windowStatus = (status == "done" or status == "killed") and "dead" or "error"
-  local S = K.sessionOf(job)
-  for _, winId in ipairs(S and S.compositor.windowsOwnedBy(id) or {}) do
-    if job.loggedOut then S.compositor.close(winId) else S.compositor.setStatus(winId, windowStatus) end
-  end
+  K.win.jobEnded(id, (status == "done" or status == "killed") and "dead" or "error")
   -- This job is no longer running -- apply whatever orphan policy ITS
   -- OWN children declared at spawn time.
   applyOrphanPolicyForChildrenOf(id)
@@ -1478,10 +1496,19 @@ local function handleRequestFullscreen(msg)
   end
   local job = jobs[msg.caller]
   job = job and job.status == "running" and job.node == msg.from and job or nil
-  -- The grant is the kernal's own screen: for its own session's programs.
-  if not K.console or (job and K.sessionOf(job) ~= K.console) then
-    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
-      error = "fullscreen is for programs on the kernal's own screen, not a terminal's"})
+  -- A program in a terminal's session gets that terminal's screen.
+  local S = job and K.sessionOf(job)
+  if S and S.kind == "terminal" then
+    local route, err = K.terminals.grantFullscreen(S, job)
+    if route then
+      send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {granted = true, route = route}})
+    else
+      send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
+    end
+    return
+  end
+  if not K.console then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "the kernal has no screen"})
     return
   end
   fullscreen.node, fullscreen.job = msg.from, job and job.id
@@ -1490,6 +1517,11 @@ local function handleRequestFullscreen(msg)
 end
 
 local function handleReleaseFullscreen(msg)
+  local caller = jobs[msg.caller]
+  if caller and caller.node == msg.from and K.terminals.releaseFullscreen(caller.id) then
+    send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {released = true}})
+    return
+  end
   if fullscreen.node ~= msg.from then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id,
       error = "you do not hold the fullscreen grant"})
@@ -1544,7 +1576,7 @@ local function handleSpawn(msg)
       send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "its session has ended -- no screen to open a window on"})
       return
     end
-    window, err = S.compositor.createWindow({title = tostring(g.title or "graphics"), x = g.x, y = g.y,
+    window, err = K.win.open(S, {title = tostring(g.title or "graphics"), x = g.x, y = g.y,
       width = tonumber(g.width) or 40, height = tonumber(g.height) or 12,
       resizable = g.resizable, decorated = g.decorated,
       code = "gpu.setBackground(0x000000) gpu.fill(1, 1, " .. (tonumber(g.width) or 40) .. ", "
@@ -1557,12 +1589,12 @@ local function handleSpawn(msg)
   local jobId, targetAddr = dispatchJob(msg.code, msg.args, msg.node, msg.parent, msg.appName, msg.orphanPolicy,
     nil, window)
   if not jobId then
-    if window then S.compositor.close(window.id) end
+    if window then K.win.close(window) end
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = targetAddr})
     return
   end
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id,
-    result = {id = jobId, node = targetAddr, window = window and S.compositor.describe(window)}})
+    result = {id = jobId, node = targetAddr, window = window and K.win.describe(window)}})
 end
 
 -- gmuxapi.get_orphans(name): hands back the still-unclaimed orphan
@@ -1649,8 +1681,10 @@ local function handleGetModule(msg)
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "not called from a running process"})
     return
   end
-  local path = resolveModule(msg.name)
-  local source = path and readModuleFile(path)
+  -- "muxos:bitmap": the kernal's own pixel encoder, which the runtime
+  -- uses to encode pixels on the program's node (its `bitmap` library).
+  local path = msg.name == "muxos:bitmap" and "/bitmap.lua" or resolveModule(msg.name)
+  local source = path and (msg.name == "muxos:bitmap" and readFile(path) or readModuleFile(path))
   if source then
     send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {path = path, source = source}})
   else
@@ -1755,14 +1789,17 @@ local function handleCreateWindow(msg)
     local caller = callerJob(msg)
     msg.ownerJobId = caller and caller.id
   end
-  local S = K.sessionOf(jobs[msg.ownerJobId] or callerJob(msg))
-  local win, err
-  if S then win, err = S.compositor.createWindow(msg) else err = "its session has ended -- no screen to open a window on" end
-  if not win then
+  local caller = callerJob(msg)
+  local S = K.sessionOf(jobs[msg.ownerJobId] or caller)
+  local rec, err = K.win.open(S, msg, msg.ownerJobId)
+  if not rec then
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err})
     return
   end
-  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S.compositor.describe(win)})
+  -- The window's description, and where the caller draws it.
+  local result = K.win.describe(rec)
+  if caller then result.route, result.key, result.port = K.win.hold(rec, caller.id) end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = result})
 end
 
 -- Redraw an existing window. Only its owner process (or an ancestor of
@@ -1772,13 +1809,15 @@ end
 -- flushes).
 local function handleDrawWindow(msg)
   local caller = callerJob(msg)
-  local S, win = K.windowOwner(msg.windowId)
+  local S, win, rec = K.windowOwner(msg.windowId)
   local reply
   if not caller then
     reply = "not called from a running process"
   elseif not win then
-    reply = "no such window: " .. tostring(msg.windowId)
-  elseif win.ownerJobId ~= caller.id and not (win.ownerJobId and isDescendantOf(win.ownerJobId, caller.id)) then
+    reply = K.win.get(msg.windowId) and "window " .. tostring(msg.windowId) .. " isn't shown on this screen"
+      or "no such window: " .. tostring(msg.windowId)
+  elseif msg.key ~= rec.key and win.ownerJobId ~= caller.id
+      and not (win.ownerJobId and isDescendantOf(win.ownerJobId, caller.id)) then
     reply = "window " .. tostring(msg.windowId) .. " belongs to another process"
   end
   -- width/height resize the window -- except with pixels, where they're
@@ -1787,7 +1826,7 @@ local function handleDrawWindow(msg)
   if not reply and not msg.pixels and type(msg.width) == "number" and type(msg.height) == "number"
       and (msg.width ~= win.width or msg.height ~= win.height) then
     local ok, err = S.compositor.setGeometry(win.id, win.x, win.y, msg.width, msg.height)
-    if not ok then reply = err end
+    if not ok then reply = err else K.win.moved(rec, win.x, win.y, win.width, win.height) end
   end
   if not reply then
     local ok, err = S.compositor.redrawWindow(msg.windowId, msg)
@@ -1839,17 +1878,57 @@ end
 -- A process ended: its shares go, and each window's owner hears
 -- {"region_lost", window, process}.
 function K.dropShares(id)
+  for _, rec in pairs(K.win.byId) do
+    if rec.shares then rec.shares[id] = nil end
+  end
   for _, S in ipairs(K.sessions) do
-    for _, winId in ipairs(S.compositor.unshareAll(id)) do
+    for _, winId in ipairs(S.compositor and S.compositor.unshareAll(id) or {}) do
       local win = S.compositor.getWindow(winId)
       local owner = win and win.ownerJobId and K.liveJob(win.ownerJobId)
       if owner then K.deliverEvent(owner, {"region_lost", winId, id}) end
     end
   end
+  if K.terminals then K.terminals.jobEnded(id) end
+end
+
+-- A share of a window shown on a terminal (or nowhere): recorded in the
+-- registry, sent to the terminal (which checks the drawing).
+local function shareElsewhere(rec, caller, child, rect)
+  local S = rec.session and K.byId[rec.session]
+  if rect ~= nil then
+    local x, y = math.tointeger(rect.x or rect[1]), math.tointeger(rect.y or rect[2])
+    local w, h = math.tointeger(rect.w or rect[3]), math.tointeger(rect.h or rect[4])
+    if not (x and y and w and h) or x < 1 or y < 1 or w < 1 or h < 1 or x + w - 1 > rec.width or y + h - 1 > rec.height then
+      return nil, "the rectangle must be whole cells within the window (" .. rec.width .. "x" .. rec.height .. ")"
+    end
+    rect = {x = x, y = y, w = w, h = h}
+  end
+  rec.shares = rec.shares or {}
+  rec.shares[child.id] = rect
+  if S and S.display.share then S.display.share(rec.id, child.id, rect, child.node) end
+  if rect then K.win.hold(rec, child.id) end
+  return rect
 end
 
 local function handleRender(msg)
   local caller = callerJob(msg)
+  local rec = K.win.get(msg.windowId)
+  if msg.type == "SHAREWINDOW" and rec and not K.windowOwner(msg.windowId) then
+    local child = K.liveJob(msg.child)
+    local function fail(err) send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = err}) end
+    if not caller then return fail("not called from a running process") end
+    if rec.owner ~= caller.id and not (rec.owner and isDescendantOf(rec.owner, caller.id)) then
+      return fail("window " .. rec.id .. " belongs to another process")
+    end
+    if not child or not isDescendantOf(child.id, caller.id) then
+      return fail("process " .. tostring(msg.child) .. " isn't a running descendant of yours")
+    end
+    local rect, err = shareElsewhere(rec, caller, child, msg.rect)
+    if msg.rect ~= nil and not rect then return fail(err) end
+    K.deliverEvent(child, rect and {"window_shared", rec.id, rect.x, rect.y, rect.w, rect.h} or {"window_unshared", rec.id})
+    send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
+    return
+  end
   local S, win = K.windowOwner(msg.windowId)
   local function reply(result, err)
     if msg.noReply then return end
@@ -1871,6 +1950,10 @@ local function handleRender(msg)
     local ok, err = S.compositor.share(win.id, child.id, msg.rect)
     if not ok then return reply(nil, err) end
     local rect = S.compositor.shares(win.id)[child.id]
+    local rec = K.win.get(win.id)
+    rec.shares = rec.shares or {}
+    rec.shares[child.id] = rect
+    if rect then K.win.hold(rec, child.id) end
     K.deliverEvent(child, rect and {"window_shared", win.id, rect.x, rect.y, rect.w, rect.h} or {"window_unshared", win.id})
     return reply(true)
   elseif msg.type == "RENDERCONFIG" then
@@ -1901,9 +1984,41 @@ local function handlePipeWrite(msg)
   send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = true})
 end
 
+-- The caller's user's windows, wherever they're shown (or not).
 local function handleGetWindows(msg)
-  local S = K.sessionOf(callerJob(msg))
-  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = S and S.compositor.listWindows() or {}})
+  local caller = callerJob(msg)
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = caller and K.win.ofUser(caller.user) or {}})
+end
+
+-- Where a window is drawn now, for a process that may draw it (its
+-- owner, an ancestor of it, or one sharing part of it): {address, key,
+-- port}, or {} while it's detached.
+local function handleWindowRoute(msg)
+  local caller = callerJob(msg)
+  local rec = K.win.get(msg.windowId)
+  local may = caller and rec and (rec.owner == caller.id or (rec.owner and isDescendantOf(rec.owner, caller.id))
+    or (rec.shares and rec.shares[caller.id]))
+  if not may then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = rec and "window " .. rec.id
+      .. " belongs to another process" or "no such window: " .. tostring(msg.windowId)})
+    return
+  end
+  local address, key, port = K.win.hold(rec, caller.id)
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id,
+    result = {address = address, key = key, port = port, width = rec.width, height = rec.height}})
+end
+
+-- gmuxapi.set_persistent(on): the process keeps running when its user
+-- logs out (whatever flag logout_ends_jobs says); its windows wait,
+-- detached, for the user's next session.
+local function handlePersist(msg)
+  local caller = callerJob(msg)
+  if not caller then
+    send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "not called from a running process"})
+    return
+  end
+  caller.persistent = msg.on ~= false or nil
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = caller.persistent == true})
 end
 
 -- First real slice of the gmux application API, muxos-shaped:
@@ -1984,6 +2099,10 @@ local function handleModemMessage(from, port, data)
     handleRender(msg)
   elseif msg.type == "PIPEWRITE" then
     handlePipeWrite(msg)
+  elseif msg.type == "WINDOWROUTE" then
+    handleWindowRoute(msg)
+  elseif msg.type == "PERSIST" then
+    handlePersist(msg)
   elseif msg.type == "ISFOREGROUND" then
     -- readLine (docs/MXE.md): only the console's foreground program reads typed lines.
     local caller = callerJob(msg)
@@ -2124,8 +2243,10 @@ local function tick(timeout)
     elseif name == "modem_message" then
       if a4 == PORT then
         handleModemMessage(a3, a4, a6)
-      elseif K.terminals then
-        K.terminals.message(a3, a4, a6)
+      elseif K.terminals and a4 == K.terminals.PORT and type(a6) == "string" then
+        local payload = reassemble(a3, a6)
+        local msg = payload and deserialize(payload)
+        if type(msg) == "table" and msg.from == a3 then K.terminals.message(a3, msg) end
       end
     end
     sweepStaleChunks()
@@ -2134,7 +2255,9 @@ local function tick(timeout)
     checkLiveness()
     if K.terminals then K.terminals.sweep() end
     for _, S in ipairs(K.sessions) do
-      K.framesPresented(S, S.compositor.renderTick(function(id) return K.expectedRegions(S, id) end))
+      if S.compositor then
+        K.framesPresented(S, S.compositor.renderTick(function(id) return K.expectedRegions(S, id) end))
+      end
       K.inSession(S, S.update)
     end
   end)
@@ -2657,6 +2780,7 @@ K.resolveProgram, K.readManifest, K.launchProgram, K.PROGRAM_PATH = resolveProgr
   PROGRAM_PATH
 K.MUXOS_VERSION, K.selfAddr, K.fullscreen, K.controlJob = MUXOS_VERSION, selfAddr, fullscreen, controlJob
 K.lineedit = loadSibling("lineedit.lua")()
+K.win = loadSibling("windows.lua")(K)
 K.sessionChunk = loadSibling("session.lua")
 K.nextSession = 0
 
@@ -2668,6 +2792,46 @@ end
 function K.liveJob(id)
   local job = jobs[id]
   if job and job.status == "running" and nodes[job.node] and not nodes[job.node].down then return job end
+end
+
+-- A program's window closed by its user: gone, and its program with it.
+-- False if `id` isn't a program window.
+function K.closeWindow(id)
+  local rec = K.win.get(id)
+  if not rec then return false end
+  K.win.close(rec)
+  local job = rec.owner and K.liveJob(rec.owner)
+  if job then controlJob(job.id, "KILL", "killed (window closed)") end
+  return true
+end
+
+function K.windowGeometry(id, x, y, width, height)
+  local rec = K.win.get(id)
+  if rec then K.win.moved(rec, x, y, width, height) end
+end
+
+function K.userWindows(user) return K.win.ofUser(user) end
+
+-- Brings one of the session's user's windows to its screen.
+function K.attachWindow(id, S)
+  local rec = K.win.get(id)
+  if not rec or rec.user ~= S.user then return nil, "no such window of yours" end
+  return K.win.attach(rec, S)
+end
+
+-- A login ends: its processes end (flag logout_ends_jobs) unless they
+-- asked to keep running (gmuxapi.set_persistent); windows of those that
+-- do are detached, to wait for the user's next session.
+function K.endLogin(S)
+  local ending = system.flag("logout_ends_jobs")
+  for id in pairs(runningJobs) do
+    local job = jobs[id]
+    if job.login == S.login and ending and not job.persistent then
+      job.loggedOut = true
+      controlJob(id, "KILL", "killed (logged out)")
+    end
+  end
+  K.win.sessionEnded(S)
 end
 
 -- A compositor for a session's gpu; window ids are unique across all.
@@ -2698,11 +2862,140 @@ do
   K.shellError = not ok and tostring(factory) or nil
 end
 
+-- --- What a session asks of the kernal (the same over the network, for
+-- a terminal's session; kernal/terminals.lua) ---
+
+-- The programs in /bin and /usr/bin (.mxe before .lua, as typing a name
+-- resolves it), each with its icon's art and color if it has one: an
+-- .mxe header's icon/icon_color, or a <name>.icon file next to it (art,
+-- optionally after a "#RRGGBB" line).
+function K.apps()
+  local apps, seen = {}, {}
+  for _, dir in ipairs(PROGRAM_PATH) do
+    local names = tryInvoke(fsAddr, "list", dir)
+    if type(names) == "table" then
+      table.sort(names)
+      for _, n in ipairs(names) do
+        local base = n:match("^(.-)%.mxe$") or n:match("^(.-)%.lua$")
+        local path = base and not seen[base] and resolveProgram(base)
+        if path then
+          seen[base] = true
+          local art, color
+          local source = path:match("%.mxe$") and readFile(path)
+          local manifest = source and readManifest(source)
+          if manifest and type(manifest.icon) == "table" then art, color = manifest.icon, manifest.icon_color end
+          if not art then
+            local text = readFile((path:gsub("%.[^./]*$", "")) .. ".icon")
+            if text then
+              art = {}
+              for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+                local hex = #art == 0 and not color and line:match("^#(%x%x%x%x%x%x)%s*$")
+                if hex then color = tonumber(hex, 16) elseif #art < 4 then art[#art + 1] = line end
+              end
+              while #art > 0 and art[#art] == "" do art[#art] = nil end
+            end
+          end
+          apps[#apps + 1] = {name = base, path = path, art = art, color = color}
+        end
+      end
+    end
+  end
+  return apps
+end
+
+-- A file's size, or nil if there's no such file.
+function K.fileSize(path)
+  if not tryInvoke(fsAddr, "exists", path) or tryInvoke(fsAddr, "isDirectory", path) then return nil end
+  return tryInvoke(fsAddr, "size", path) or 0
+end
+
+-- Writes a whole file (making its directory); data nil removes it.
+function K.writeFile(path, data)
+  if data == nil then return tryInvoke(fsAddr, "remove", path) end
+  local dir = path:match("^(.*)/[^/]*$")
+  if dir and dir ~= "" then tryInvoke(fsAddr, "makeDirectory", dir) end
+  local h, err = tryInvoke(fsAddr, "open", path, "w")
+  if not h then return nil, err end
+  tryInvoke(fsAddr, "write", h, data)
+  tryInvoke(fsAddr, "close", h)
+  return true
+end
+
+-- muxos's own commands, by first word: inside a shell line (`nodes;
+-- ls`) these still reach K.runCommand, not the program path.
+K.MUXOS_COMMANDS = {}
+for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
+    .. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
+    .. "shutdown logout flags users useradd userdel who"):gmatch("%S+") do
+  K.MUXOS_COMMANDS[name] = true
+end
+
+-- Runs a launched program in session S's foreground: S's console waits
+-- until it ends (any way: done, error, killed, lost), feeding it typed
+-- input meanwhile (S.beginForeground / S.endForeground), as OpenOS's
+-- shell does.
+function K.runForeground(S, id)
+  S.beginForeground(id)
+  while jobs[id] and jobs[id].status == "running" do K.wait(0.5) end
+  S.endForeground()
+  local job = jobs[id]
+  if job and job.status ~= "done" then S.print(job.status .. ": " .. tostring(job.error)) end
+end
+
+-- A fresh shell for a login of `user` at session S (its home made
+-- first): commands run on the kernal against its disks, programs
+-- launch in S. Nil without shell.lua.
+function K.newShell(S, user)
+  tryInvoke(fsAddr, "makeDirectory", system.home(user))
+  if not K.shellFactory then return nil end
+  return K.shellFactory({
+    invoke = tryInvoke, root = fsAddr, tmp = computer.tmpAddress(), list = component.list,
+    write = S.write, width = S.consoleWidth, clear = S.clearConsole,
+    sleep = function(seconds)
+      local deadline = computer.uptime() + seconds
+      while computer.uptime() < deadline do K.wait(deadline - computer.uptime()) end
+    end,
+    help = function() K.help() end,
+    info = {version = MUXOS_VERSION, address = selfAddr or computer.address(), uptime = computer.uptime,
+      memory = function() return computer.freeMemory(), computer.totalMemory() end},
+    user = user, home = system.home(user),
+    -- Not built in: a muxos command, or a program OpenOS-shell style (a
+    -- legacy program has its own window, as in gmux, so the console
+    -- doesn't wait for it; & runs any program in the background).
+    external = function(argv, background)
+      if K.MUXOS_COMMANDS[argv[1]] then
+        K.runCommand(S, table.concat(argv, " "))
+        return 0
+      end
+      local path = resolveProgram(argv[1])
+      if not path then
+        S.print("sh: " .. argv[1] .. ": command not found")
+        return 127
+      end
+      local id, addrOrErr = launchProgram(path, {table.unpack(argv, 2)})
+      if not id then
+        S.print("error: " .. addrOrErr)
+        return 1
+      elseif background or path:match("%.lua$") then
+        S.print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
+        return 0
+      end
+      K.runForeground(S, id)
+      return jobs[id] and jobs[id].status == "done" and 0 or 1
+    end,
+  })
+end
+
 -- opts: {gpu, kind = "local" | "terminal", address}.
 function K.newSession(opts)
+  opts.id = K.nextSession + 1
+  return K.addSession(K.sessionChunk(K, opts))
+end
+
+-- Registers a session made elsewhere (a terminal's, kernal/terminals.lua).
+function K.addSession(S)
   K.nextSession = K.nextSession + 1
-  opts.id = K.nextSession
-  local S = K.sessionChunk(K, opts)
+  S.id = K.nextSession
   K.sessions[#K.sessions + 1] = S
   K.byId[S.id] = S
   return S
@@ -2742,8 +3035,7 @@ end
 -- The kernal's own screen is the local session's; network terminals get
 -- sessions of their own (kernal/terminals.lua).
 if gpu and screenAddr then K.console = K.newSession({gpu = gpu, kind = "local"}) end
-K.terminals = loadSibling("terminals.lua")(K, {modem = modem, serialize = serialize, deserialize = deserialize,
-  vgpu = loadSibling("vgpu.lua")()})
+K.terminals = loadSibling("terminals.lua")(K, {modem = modem, send = send})
 print("muxos kernal -- " .. selfAddr)
 K.help()
 if K.shellFactory then

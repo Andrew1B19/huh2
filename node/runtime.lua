@@ -123,6 +123,9 @@ local current = nil             -- the process being resumed right now
 local WAIT = {}                 -- what a process yields with, plus its condition
 local COOPERATE = {cooperate = true}
 local rpcWaiting, rpcReplies = {}, {} -- RPC id -> true while awaited; -> reply
+-- Terminals' screens showing windows of this node's processes (see
+-- "Window routes"): they may send input events and answers.
+local displays = {}
 local receive, handleMessage    -- defined below
 
 local function findModem()
@@ -155,7 +158,10 @@ local nodeId = modemAddr
 local CHUNK_SIZE = 7000
 local nextMsgId = 1
 
-local function send(msg)
+-- `port`: the cluster's own unless given (a terminal's screen listens on
+-- the terminal port).
+local function send(msg, port)
+  port = port or PORT
   local payload = serialize(msg)
   local id = nextMsgId
   nextMsgId = nextMsgId + 1
@@ -165,9 +171,9 @@ local function send(msg)
     local frame = "MSG " .. id .. " " .. i .. "/" .. total .. " " .. chunk
     -- Addressed messages go to that card only; only discovery broadcasts.
     if msg.to then
-      component.invoke(modemAddr, "send", msg.to, PORT, frame)
+      component.invoke(modemAddr, "send", msg.to, port, frame)
     else
-      component.invoke(modemAddr, "broadcast", PORT, frame)
+      component.invoke(modemAddr, "broadcast", port, frame)
     end
   end
 end
@@ -240,8 +246,11 @@ local migrationHandlers = {}
 local eventQueues = {}
 local MAX_QUEUED_EVENTS = 64
 
+local windowRouted -- below, with the window routes
+
 local function queueEvent(id, event)
   if type(id) ~= "number" or type(event) ~= "table" then return end
+  if event[1] == "window_route" then event = windowRouted(id, event) end
   local q = eventQueues[id]
   if not q then q = {}; eventQueues[id] = q end
   if #q < MAX_QUEUED_EVENTS then q[#q + 1] = event end
@@ -374,8 +383,11 @@ receive = function(name, ...)
     return
   end
   -- Everything else runs code or touches hardware on this node, so it's
-  -- only accepted from the kernal itself, never from a peer.
-  if from ~= kernalAddr then return end
+  -- only accepted from the kernal itself, never from a peer -- except a
+  -- terminal's screen showing this node's windows: its input events and
+  -- its answers to what was asked of it.
+  if from ~= kernalAddr and not (displays[from]
+      and (msg.type == "EVENT" or msg.type == "RESULT" or msg.type == "ERROR")) then return end
   if msg.type == "RESULT" or msg.type == "ERROR" then
     if rpcWaiting[msg.id] then rpcReplies[msg.id] = msg end
     return
@@ -439,14 +451,16 @@ local RPC_TIMEOUT = 5
 -- node needs a resource it doesn't have locally (no screen of its own,
 -- say) and falls back to the kernal's hardware instead, at the cost of
 -- one network round trip instead of zero.
-local function remoteRequest(msgType, extra)
+-- Asks the kernal -- or `to`, a screen of a network terminal (on its
+-- `port`), for what's drawn there -- and waits for the answer.
+local function remoteRequest(msgType, extra, to, port)
   if not kernalAddr then
     return nil, "kernal address not known yet"
   end
   local id = nextId()
-  local msg = {type = msgType, from = nodeId, to = kernalAddr, id = id}
+  local msg = {type = msgType, from = nodeId, to = to or kernalAddr, id = id}
   for k, v in pairs(extra or {}) do msg[k] = v end
-  send(msg)
+  send(msg, port)
   -- RPC ids are this node's own counter; the kernal's JOB ids are a
   -- different counter, but only RESULT/ERROR count as replies.
   rpcWaiting[id] = true
@@ -455,9 +469,125 @@ local function remoteRequest(msgType, extra)
   rpcWaiting[id] = nil
   local reply = rpcReplies[id]
   rpcReplies[id] = nil
-  if not reply then return nil, "timed out waiting for kernal" end
+  if not reply then return nil, "timed out waiting for " .. (to and to ~= kernalAddr and "the terminal" or "kernal") end
   if reply.type == "RESULT" then return reply.result end
   return nil, reply.error
+end
+
+-- --- Window routes ---
+--
+-- A program's window is drawn wherever it's shown now (see
+-- kernal/windows.lua): the kernal's own screen, a network terminal's,
+-- or nowhere while it's detached (its user logged out, the program
+-- kept running). The kernal tells every process holding a window's
+-- route when it moves ({"window_route", ...}, handled in queueEvent);
+-- drawing goes straight there. What a window was last drawn with is
+-- kept, so it's drawn again by itself when the window is shown on a new
+-- screen -- the program also hears {"window_attached", id, w, h} or
+-- {"window_detached", id}.
+local winRoutes = {}  -- window id -> {address (false: detached), key, port}
+local winDraws = {}   -- window id -> the draws since the last full one
+local winRedraw = {}  -- window id -> function() redrawing it all (a virtual gpu's)
+
+local function setRoute(id, address, key, port)
+  winRoutes[id] = {address = address or false, key = key, port = port}
+  if address and address ~= kernalAddr then displays[address] = true end
+end
+
+local function routeOf(id, caller)
+  if winRoutes[id] then return winRoutes[id] end
+  local r, err = remoteRequest("WINDOWROUTE", {windowId = id, caller = caller})
+  if not r then return nil, err end
+  setRoute(id, r.address, r.key, r.port)
+  return winRoutes[id]
+end
+
+-- Sends a draw (DRAWWINDOW/DRAWREGION fields) to the window wherever it
+-- is shown; waits for the answer only from the kernal, and only unless
+-- `noReply`. Detached: nothing to send.
+local function sendDraw(id, msgType, fields, caller, noReply)
+  local r, err = routeOf(id, caller)
+  if not r then return nil, err end
+  if not r.address then return true end
+  fields.windowId, fields.key, fields.caller = id, r.key, caller
+  if not noReply then return remoteRequest(msgType, fields, r.address, r.port) end
+  fields.type, fields.from, fields.to, fields.id, fields.noReply = msgType, nodeId, r.address, nextId(), true
+  send(fields, r.port)
+  return true
+end
+
+-- --- Pixels to cells, on this node ---
+--
+-- OC's GPUs have no pixels: an image is encoded into character cells
+-- (half blocks or braille; kernal/bitmap.lua). That's done here, on the
+-- program's node, not by whichever screen shows the window: a draw goes
+-- out as ready cell runs -- rows of {y, x, fg, bg, text, ...} -- that
+-- the screen only paints. The encoder is the kernal's own bitmap.lua,
+-- fetched once.
+local bitmapModule
+local function bitmapLib(caller)
+  if not bitmapModule then
+    local r, err = remoteRequest("GETMODULE", {name = "muxos:bitmap", caller = caller})
+    if not r then error("the bitmap encoder: " .. tostring(err), 0) end
+    bitmapModule = assert(load(r.source, "=bitmap.lua"))()
+  end
+  return bitmapModule
+end
+
+-- An encoded cell grid (cells[row][col] = {char, fg, bg}) as runs.
+local function cellRuns(cells, cols, rows)
+  local out = {}
+  for y = 1, rows do
+    local row, r, x = cells[y], {y}, 1
+    while x <= cols do
+      local fg, bg, start, chars = row[x].fg, row[x].bg, x, {}
+      while x <= cols and row[x].fg == fg and row[x].bg == bg do
+        chars[#chars + 1] = row[x].char
+        x = x + 1
+      end
+      r[#r + 1], r[#r + 2], r[#r + 3], r[#r + 4] = start, fg, bg, table.concat(chars)
+    end
+    out[#out + 1] = r
+  end
+  return out
+end
+
+-- {pixels, width, height, mode, bg} as cell runs, and their size in cells.
+local function pixelsToCells(o, caller)
+  local cells, cols, rows = bitmapLib(caller).encode(o.mode, o.pixels, o.width, o.height, o.bg)
+  return cellRuns(cells, cols, rows), cols, rows
+end
+
+-- Keeps a window's draws since its last full one (clear ~= false).
+local function rememberDraw(id, draw)
+  if draw.clear ~= false then
+    winDraws[id] = {draw}
+  else
+    local list = winDraws[id] or {}
+    if #list < 16 then list[#list + 1] = draw end
+    winDraws[id] = list
+  end
+end
+
+-- The kernal moved a window: note where, draw it there, and tell the
+-- program.
+windowRouted = function(jobId, e)
+  local id = e[2]
+  local old = winRoutes[id]
+  setRoute(id, e[3], e[4], e[7])
+  if not e[3] then return {"window_detached", id} end
+  if not (old and old.key == e[4]) then
+    if winRedraw[id] then
+      winRedraw[id]()
+    else
+      for _, draw in ipairs(winDraws[id] or {}) do
+        local fields = {}
+        for k, v in pairs(draw) do fields[k] = v end
+        sendDraw(id, "DRAWWINDOW", fields, jobId, true)
+      end
+    end
+  end
+  return {"window_attached", id, e[5], e[6]}
 end
 
 -- id -> function(force): pushes a legacy process's virtual gpu changes
@@ -503,7 +633,15 @@ end
 -- node has none. Cached after the first remote lookup so repeated calls
 -- don't pay for a LIST round trip every time.
 local remoteGpuAddr = nil
+-- Holding the fullscreen grant of a terminal's screen: its gpu.
+local screenRoute = nil
 local function faceGpu(method, ...)
+  if screenRoute then
+    local results, err = remoteRequest("GPUCALL", {method = method, args = table.pack(...), key = screenRoute.key},
+      screenRoute.address, screenRoute.port)
+    if not results then return nil, err end
+    return table.unpack(results, 1, results.n or #results)
+  end
   for addr in component.list("gpu") do
     return component.invoke(addr, method, ...)
   end
@@ -770,12 +908,28 @@ gmuxapi = {
     -- a 2D pixel grid encoded into half-block or braille sub-cell
     -- characters instead of running `code` -- OC's GPUs have no pixel
     -- API, so this is the only way to get anything bitmap-like.
-    return remoteRequest("CREATEWINDOW", {
+    -- A bit window's pixels go as cells, encoded here; width/height
+    -- then mean the window's size in cells.
+    local width, height, cells = options.width, options.height, options.cells
+    if options.pixels then
+      if not width or not height then
+        return nil, "options.pixels needs options.width/options.height (the pixel grid's own dimensions)"
+      end
+      cells, width, height = pixelsToCells(options, currentJobId)
+    end
+    local win, err = remoteRequest("CREATEWINDOW", {
       title = options.title, x = options.x, y = options.y,
-      width = options.width, height = options.height, code = options.code,
-      pixels = options.pixels, mode = options.mode, bg = options.bg, args = options.args,
+      width = width, height = height, code = options.code, cells = cells, bg = options.bg, args = options.args,
       resizable = options.resizable, decorated = options.title_bar, caller = currentJobId,
     })
+    if win then
+      setRoute(win.id, win.route, win.key, win.port)
+      if options.code or cells then
+        rememberDraw(win.id, {code = options.code, args = options.args, cells = cells, bg = options.bg})
+      end
+      win.route, win.key, win.port = nil, nil, nil
+    end
+    return win, err
   end,
 
   -- Redraw a window this process owns (or one owned by a descendant):
@@ -785,9 +939,26 @@ gmuxapi = {
   -- blanking it first. Same sandbox as create_window.
   draw_window = function(id, options)
     options = options or {}
-    return remoteRequest("DRAWWINDOW", {windowId = id, code = options.code, args = options.args,
-      pixels = options.pixels, mode = options.mode, width = options.width, height = options.height,
-      bg = options.bg, clear = options.clear, caller = currentJobId})
+    local draw = {code = options.code, args = options.args, cells = options.cells,
+      width = options.width, height = options.height, bg = options.bg, clear = options.clear}
+    if options.pixels then
+      if not options.width or not options.height then
+        return nil, "options.pixels needs options.width/options.height"
+      end
+      draw.cells, draw.width, draw.height = pixelsToCells(options, currentJobId)
+      draw.width, draw.height = nil, nil -- the window keeps its size
+    end
+    rememberDraw(id, draw)
+    local fields = {}
+    for k, v in pairs(draw) do fields[k] = v end
+    return sendDraw(id, "DRAWWINDOW", fields, currentJobId)
+  end,
+
+  -- Keep running when this process's user logs out (on = true, or nil):
+  -- its windows wait, detached, for the user's next session, on whose
+  -- taskbar it shows. set_persistent(false) undoes it.
+  set_persistent = function(on)
+    return remoteRequest("PERSIST", {on = on ~= false, caller = currentJobId})
   end,
 
   get_windows = function()
@@ -809,7 +980,14 @@ gmuxapi = {
   -- owner only): mode (split | alternate | tearing), deadline, stale
   -- (keep | clear), queue, chunk.
   render_config = function(id, options)
-    local config, err = remoteRequest("RENDERCONFIG", {windowId = id, options = options, caller = currentJobId})
+    local r = routeOf(id, currentJobId)
+    local config, err
+    if r and r.address and r.address ~= kernalAddr then
+      config, err = remoteRequest("RENDERCONFIG", {windowId = id, options = options, key = r.key, caller = currentJobId},
+        r.address, r.port)
+    else
+      config, err = remoteRequest("RENDERCONFIG", {windowId = id, options = options, caller = currentJobId})
+    end
     if config then renderChunks[id] = config.chunk end
     return config, err
   end,
@@ -823,43 +1001,50 @@ gmuxapi = {
   draw_region = function(id, frame, content)
     content = content or {}
     if renderChunks[id] == nil then
-      local config = remoteRequest("RENDERCONFIG", {windowId = id, caller = currentJobId})
+      local config = gmuxapi.render_config(id)
       renderChunks[id] = config and config.chunk or false
     end
     local chunk = renderChunks[id] or 4096
-    local bands = {}
-    if content.pixels and content.width and content.height then
-      local perCell = content.mode == "braille" and 4 or 2
-      local rows = math.max(perCell, (chunk // math.max(1, content.width * 9)) // perCell * perCell)
-      for top = 1, content.height, rows do
-        local band = {}
-        for y = top, math.min(content.height, top + rows - 1) do band[#band + 1] = content.pixels[y] or {} end
-        bands[#bands + 1] = {pixels = band, width = content.width, height = #band, mode = content.mode,
-          bg = content.bg, x = content.x, y = (content.y or nil) and content.y + (top - 1) // perCell,
-          offset = (top - 1) // perCell}
-      end
-    elseif type(content.text) == "table" then
-      local size, start = 0, 1
-      for i, row in ipairs(content.text) do
-        size = size + (type(row) == "string" and #row or 40 * #row) + 8
-        if size > chunk or i == #content.text then
-          local part = {}
-          for j = start, i do part[#part + 1] = content.text[j] end
-          bands[#bands + 1] = {text = part, x = content.x, y = content.y and content.y + start - 1, offset = start - 1}
-          start, size = i + 1, 0
-        end
-      end
+    -- Pixels are encoded here, into cell runs; a region bigger than
+    -- `chunk` goes in bands of rows, all at the same corner.
+    local cells = content.cells
+    if content.pixels then
+      if not content.width or not content.height then return nil, "pixels need width and height" end
+      cells = pixelsToCells(content, currentJobId)
     end
-    if #bands == 0 then return nil, "a region needs pixels (with width and height) or text" end
-    for i, band in ipairs(bands) do
-      local msg = {windowId = id, frame = frame, pixels = band.pixels, width = band.width, height = band.height,
-        mode = band.mode, bg = band.bg, text = band.text, x = band.x, y = band.y, offset = band.offset,
-        done = i == #bands and content.done ~= false, caller = currentJobId}
-      if i < #bands then
-        msg.type, msg.from, msg.to, msg.id, msg.noReply = "DRAWREGION", nodeId, kernalAddr, nextId(), true
-        send(msg)
+    local bands = {}
+    local function band(rowsOrText, isText)
+      bands[#bands + 1] = isText and {text = rowsOrText} or {cells = rowsOrText}
+    end
+    local list = cells or (type(content.text) == "table" and content.text)
+    if not list then return nil, "a region needs cells, pixels (with width and height) or text" end
+    local part, size = {}, 0
+    for i, row in ipairs(list) do
+      local cost = 8
+      if type(row) == "string" then
+        cost = cost + #row
       else
-        return remoteRequest("DRAWREGION", msg)
+        for j = 1, #row do cost = cost + (type(row[j]) == "string" and #row[j] or 12) end
+      end
+      if size + cost > chunk and #part > 0 then
+        band(part, not cells)
+        part, size = {}, 0
+      end
+      part[#part + 1] = row
+      size = size + cost
+      -- Text rows keep their place: a band of them starts lower down.
+      -- (Cell rows carry their own row numbers.)
+      if not cells and #part == 1 then part.offset = i - 1 end
+    end
+    if #part > 0 then band(part, not cells) end
+    for i, b in ipairs(bands) do
+      local offset = b.text and b.text.offset or 0
+      local fields = {frame = frame, cells = b.cells, text = b.text, x = content.x,
+        y = content.y and content.y + offset, offset = offset, done = i == #bands and content.done ~= false}
+      if i < #bands then
+        sendDraw(id, "DRAWREGION", fields, currentJobId, true)
+      else
+        return sendDraw(id, "DRAWREGION", fields, currentJobId)
       end
     end
   end,
@@ -876,11 +1061,20 @@ gmuxapi = {
   -- whole display. First-come-first-served, one holder at a time;
   -- released when the process that asked ends, or its node goes down.
   request_fullscreen = function()
-    return remoteRequest("REQUESTFULLSCREEN", {caller = currentJobId})
+    local grant, err = remoteRequest("REQUESTFULLSCREEN", {caller = currentJobId})
+    -- A terminal's screen: the gpu calls go there (GPUCALL), with its key.
+    if grant and grant.route then
+      screenRoute = {address = grant.route[1], key = grant.route[2], port = grant.route[3]}
+      displays[screenRoute.address] = true
+      grant.route = nil
+    end
+    return grant, err
   end,
 
   release_fullscreen = function()
-    return remoteRequest("RELEASEFULLSCREEN")
+    local done, err = remoteRequest("RELEASEFULLSCREEN", {caller = currentJobId})
+    if done then screenRoute = nil end
+    return done, err
   end,
 
   -- Hands back the still-unclaimed orphan handles (each {id, node})
@@ -1076,6 +1270,26 @@ local BUILTIN_LIBRARIES = {
   --   t:kill()                          end it
   --   thread.yield()                    let the others run
   -- An error in a thread nobody joins is printed to the console.
+  -- Pixels to cells on this node (kernal/bitmap.lua's encoder), for
+  -- drawing bit graphics yourself:
+  --   cells, cols, rows = bitmap.cells(mode, pixels, width, height, bg)
+  --                         -- "halfblock" or "braille"; cell runs, ready
+  --                         -- for draw_window{cells} / draw_region{cells}
+  --   grid, cols, rows = bitmap.encode(mode, pixels, width, height, bg)
+  --                         -- the cells themselves: grid[row][col] =
+  --                         -- {char, fg, bg}, to change before drawing
+  --   cells = bitmap.runs(grid, cols, rows)
+  -- (draw_window and draw_region also take pixels, and encode them here.)
+  bitmap = function(id)
+    local encoder = bitmapLib(id)
+    return {
+      encode = encoder.encode,
+      runs = cellRuns,
+      cells = function(mode, pixels, width, height, bg)
+        return pixelsToCells({mode = mode, pixels = pixels, width = width, height = height, bg = bg}, id)
+      end,
+    }
+  end,
   thread = function(id)
     local count = 0
     local lib = {}
@@ -1407,9 +1621,7 @@ local hostUnicode = unicode
 local VGPU_MAX_W, VGPU_MAX_H = 160, 50
 local VGPU_MEMORY = VGPU_MAX_W * VGPU_MAX_H * 2 -- cells, for allocateBuffer
 local GRAPHICS_FLUSH_INTERVAL = 0.05
--- Rows arrive as {y, x, fg, bg, text, x, fg, bg, text, ...}.
-local WINDOW_DRAW_CODE = "for _, row in ipairs(args.rows) do local y = row[1] for i = 2, #row, 4 do " ..
-  "gpu.setForeground(row[i + 1]) gpu.setBackground(row[i + 2]) gpu.set(row[i], y, row[i + 3]) end end"
+-- A flush sends changed rows as cell runs: {y, x, fg, bg, text, x, fg, bg, text, ...}.
 
 local function newGrid(w, h, fg, bg)
   local g = {w = w, h = h, chars = {}, fgs = {}, bgs = {}}
@@ -1673,6 +1885,13 @@ local function flushVirtualGpu(ctx, force)
       return
     end
     ctx.windowId = win.id
+    setRoute(win.id, win.route, win.key, win.port)
+  end
+  -- Shown on a new screen: everything again.
+  winRedraw[ctx.windowId] = winRedraw[ctx.windowId] or function()
+    for y = 1, v.grid().h do v.dirtyRows[y] = true end
+    v.dirty = true
+    flushVirtualGpu(ctx, true)
   end
   local rows = {}
   for y in pairs(v.dirtyRows) do
@@ -1694,9 +1913,7 @@ local function flushVirtualGpu(ctx, force)
     end
   end
   v.dirtyRows, v.dirty, v.lastFlush = {}, false, now
-  send({type = "DRAWWINDOW", from = nodeId, to = kernalAddr, id = nextId(), windowId = ctx.windowId,
-    code = WINDOW_DRAW_CODE, args = {rows = rows}, clear = false, width = g.w, height = g.h,
-    caller = ctx.id, noReply = true})
+  sendDraw(ctx.windowId, "DRAWWINDOW", {cells = rows, clear = false, width = g.w, height = g.h}, ctx.id, true)
 end
 
 -- The process's virtual gpu, screen and keyboard: address -> proxy.
@@ -2986,6 +3203,8 @@ local function spawnProc(msg)
       -- into its own window -- a virtual gpu, as a legacy program has.
       local ctx = {id = msg.id, name = "graphics", windowId = msg.windowId,
         screenSize = {tonumber(msg.width) or 40, (tonumber(msg.height) or 12) + 1}}
+      local route = type(msg.windowRoute) == "table" and msg.windowRoute or {}
+      setRoute(msg.windowId, route[1], route[2], route[3])
       ctx.vgpu = newVirtualGpu(ctx, tonumber(msg.width) or 40, tonumber(msg.height) or 12)
       graphicsFlushers[msg.id] = function(force) flushVirtualGpu(ctx, force) end
       rawset(env, "gpu", ctx.vgpu.proxy)

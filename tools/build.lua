@@ -57,6 +57,8 @@ local FILES = {
   {"/session.lua", "kernal/session.lua"},
   {"/vgpu.lua", "kernal/vgpu.lua"},
   {"/terminals.lua", "kernal/terminals.lua"},
+  {"/windows.lua", "kernal/windows.lua"},
+  {"/terminal.lua", "kernal/terminal.lua"},
   {"/runtime.lua", "node/runtime.lua"},
 }
 for _, rel in ipairs(listDir("kernal/lib")) do
@@ -102,6 +104,9 @@ local function build()
   local kernalCodec, runtimeCodec = codec(readFile("kernal/muxos.lua")), codec(readFile("node/runtime.lua"))
   if not kernalCodec or kernalCodec ~= runtimeCodec then
     errors[#errors + 1] = "the wire codec (serialize/deserialize) differs between kernal/muxos.lua and node/runtime.lua"
+  end
+  if kernalCodec ~= codec(readFile("kernal/terminal.lua")) then
+    errors[#errors + 1] = "the wire codec (serialize/deserialize) differs between kernal/muxos.lua and kernal/terminal.lua"
   end
   local version = readFile("kernal/muxos.lua"):match('local MUXOS_VERSION = "([^"]+)"')
   local runtimeVersion = readFile("node/runtime.lua"):match('local MUXOS_VERSION = "([^"]+)"')
