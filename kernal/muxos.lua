@@ -2799,6 +2799,130 @@ do
   K.shellError = not ok and tostring(factory) or nil
 end
 
+-- --- What a session asks of the kernal (the same over the network, for
+-- a terminal's session; kernal/terminals.lua) ---
+
+-- The programs in /bin and /usr/bin (.mxe before .lua, as typing a name
+-- resolves it), each with its icon's art and color if it has one: an
+-- .mxe header's icon/icon_color, or a <name>.icon file next to it (art,
+-- optionally after a "#RRGGBB" line).
+function K.apps()
+  local apps, seen = {}, {}
+  for _, dir in ipairs(PROGRAM_PATH) do
+    local names = tryInvoke(fsAddr, "list", dir)
+    if type(names) == "table" then
+      table.sort(names)
+      for _, n in ipairs(names) do
+        local base = n:match("^(.-)%.mxe$") or n:match("^(.-)%.lua$")
+        local path = base and not seen[base] and resolveProgram(base)
+        if path then
+          seen[base] = true
+          local art, color
+          local source = path:match("%.mxe$") and readFile(path)
+          local manifest = source and readManifest(source)
+          if manifest and type(manifest.icon) == "table" then art, color = manifest.icon, manifest.icon_color end
+          if not art then
+            local text = readFile((path:gsub("%.[^./]*$", "")) .. ".icon")
+            if text then
+              art = {}
+              for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+                local hex = #art == 0 and not color and line:match("^#(%x%x%x%x%x%x)%s*$")
+                if hex then color = tonumber(hex, 16) elseif #art < 4 then art[#art + 1] = line end
+              end
+              while #art > 0 and art[#art] == "" do art[#art] = nil end
+            end
+          end
+          apps[#apps + 1] = {name = base, path = path, art = art, color = color}
+        end
+      end
+    end
+  end
+  return apps
+end
+
+-- A file's size, or nil if there's no such file.
+function K.fileSize(path)
+  if not tryInvoke(fsAddr, "exists", path) or tryInvoke(fsAddr, "isDirectory", path) then return nil end
+  return tryInvoke(fsAddr, "size", path) or 0
+end
+
+-- Writes a whole file (making its directory); data nil removes it.
+function K.writeFile(path, data)
+  if data == nil then return tryInvoke(fsAddr, "remove", path) end
+  local dir = path:match("^(.*)/[^/]*$")
+  if dir and dir ~= "" then tryInvoke(fsAddr, "makeDirectory", dir) end
+  local h, err = tryInvoke(fsAddr, "open", path, "w")
+  if not h then return nil, err end
+  tryInvoke(fsAddr, "write", h, data)
+  tryInvoke(fsAddr, "close", h)
+  return true
+end
+
+-- muxos's own commands, by first word: inside a shell line (`nodes;
+-- ls`) these still reach K.runCommand, not the program path.
+K.MUXOS_COMMANDS = {}
+for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
+    .. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
+    .. "shutdown logout flags users useradd userdel who"):gmatch("%S+") do
+  K.MUXOS_COMMANDS[name] = true
+end
+
+-- Runs a launched program in session S's foreground: S's console waits
+-- until it ends (any way: done, error, killed, lost), feeding it typed
+-- input meanwhile (S.beginForeground / S.endForeground), as OpenOS's
+-- shell does.
+function K.runForeground(S, id)
+  S.beginForeground(id)
+  while jobs[id] and jobs[id].status == "running" do K.wait(0.5) end
+  S.endForeground()
+  local job = jobs[id]
+  if job and job.status ~= "done" then S.print(job.status .. ": " .. tostring(job.error)) end
+end
+
+-- A fresh shell for a login of `user` at session S (its home made
+-- first): commands run on the kernal against its disks, programs
+-- launch in S. Nil without shell.lua.
+function K.newShell(S, user)
+  tryInvoke(fsAddr, "makeDirectory", system.home(user))
+  if not K.shellFactory then return nil end
+  return K.shellFactory({
+    invoke = tryInvoke, root = fsAddr, tmp = computer.tmpAddress(), list = component.list,
+    write = S.write, width = S.consoleWidth, clear = S.clearConsole,
+    sleep = function(seconds)
+      local deadline = computer.uptime() + seconds
+      while computer.uptime() < deadline do K.wait(deadline - computer.uptime()) end
+    end,
+    help = function() K.help() end,
+    info = {version = MUXOS_VERSION, address = selfAddr or computer.address(), uptime = computer.uptime,
+      memory = function() return computer.freeMemory(), computer.totalMemory() end},
+    user = user, home = system.home(user),
+    -- Not built in: a muxos command, or a program OpenOS-shell style (a
+    -- legacy program has its own window, as in gmux, so the console
+    -- doesn't wait for it; & runs any program in the background).
+    external = function(argv, background)
+      if K.MUXOS_COMMANDS[argv[1]] then
+        K.runCommand(S, table.concat(argv, " "))
+        return 0
+      end
+      local path = resolveProgram(argv[1])
+      if not path then
+        S.print("sh: " .. argv[1] .. ": command not found")
+        return 127
+      end
+      local id, addrOrErr = launchProgram(path, {table.unpack(argv, 2)})
+      if not id then
+        S.print("error: " .. addrOrErr)
+        return 1
+      elseif background or path:match("%.lua$") then
+        S.print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
+        return 0
+      end
+      K.runForeground(S, id)
+      return jobs[id] and jobs[id].status == "done" and 0 or 1
+    end,
+  })
+end
+
 -- opts: {gpu, kind = "local" | "terminal", address}.
 function K.newSession(opts)
   K.nextSession = K.nextSession + 1

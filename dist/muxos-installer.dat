@@ -2,13 +2,13 @@
 @@MANIFEST 33
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-76049 /muxos.lua
+79580 /muxos.lua
 28834 /compositor.lua
 33883 /shell.lua
 2663 /bitmap.lua
 3046 /lineedit.lua
 5994 /system.lua
-37756 /session.lua
+34650 /session.lua
 5514 /vgpu.lua
 3384 /terminals.lua
 4025 /windows.lua
@@ -227,7 +227,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 76049 /muxos.lua
+@@ 79580 /muxos.lua
 
 
 
@@ -3027,6 +3027,130 @@ do
 local ok, factory = pcall(loadSibling, "shell.lua")
 K.shellFactory = ok and factory or nil
 K.shellError = not ok and tostring(factory) or nil
+end
+
+
+
+
+
+
+
+
+function K.apps()
+local apps, seen = {}, {}
+for _, dir in ipairs(PROGRAM_PATH) do
+local names = tryInvoke(fsAddr, "list", dir)
+if type(names) == "table" then
+table.sort(names)
+for _, n in ipairs(names) do
+local base = n:match("^(.-)%.mxe$") or n:match("^(.-)%.lua$")
+local path = base and not seen[base] and resolveProgram(base)
+if path then
+seen[base] = true
+local art, color
+local source = path:match("%.mxe$") and readFile(path)
+local manifest = source and readManifest(source)
+if manifest and type(manifest.icon) == "table" then art, color = manifest.icon, manifest.icon_color end
+if not art then
+local text = readFile((path:gsub("%.[^./]*$", "")) .. ".icon")
+if text then
+art = {}
+for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+local hex = #art == 0 and not color and line:match("^#(%x%x%x%x%x%x)%s*$")
+if hex then color = tonumber(hex, 16) elseif #art < 4 then art[#art + 1] = line end
+end
+while #art > 0 and art[#art] == "" do art[#art] = nil end
+end
+end
+apps[#apps + 1] = {name = base, path = path, art = art, color = color}
+end
+end
+end
+end
+return apps
+end
+
+
+function K.fileSize(path)
+if not tryInvoke(fsAddr, "exists", path) or tryInvoke(fsAddr, "isDirectory", path) then return nil end
+return tryInvoke(fsAddr, "size", path) or 0
+end
+
+
+function K.writeFile(path, data)
+if data == nil then return tryInvoke(fsAddr, "remove", path) end
+local dir = path:match("^(.*)/[^/]*$")
+if dir and dir ~= "" then tryInvoke(fsAddr, "makeDirectory", dir) end
+local h, err = tryInvoke(fsAddr, "open", path, "w")
+if not h then return nil, err end
+tryInvoke(fsAddr, "write", h, data)
+tryInvoke(fsAddr, "close", h)
+return true
+end
+
+
+
+K.MUXOS_COMMANDS = {}
+for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
+.. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
+.. "shutdown logout flags users useradd userdel who"):gmatch("%S+") do
+K.MUXOS_COMMANDS[name] = true
+end
+
+
+
+
+
+function K.runForeground(S, id)
+S.beginForeground(id)
+while jobs[id] and jobs[id].status == "running" do K.wait(0.5) end
+S.endForeground()
+local job = jobs[id]
+if job and job.status ~= "done" then S.print(job.status .. ": " .. tostring(job.error)) end
+end
+
+
+
+
+function K.newShell(S, user)
+tryInvoke(fsAddr, "makeDirectory", system.home(user))
+if not K.shellFactory then return nil end
+return K.shellFactory({
+invoke = tryInvoke, root = fsAddr, tmp = computer.tmpAddress(), list = component.list,
+write = S.write, width = S.consoleWidth, clear = S.clearConsole,
+sleep = function(seconds)
+local deadline = computer.uptime() + seconds
+while computer.uptime() < deadline do K.wait(deadline - computer.uptime()) end
+end,
+help = function() K.help() end,
+info = {version = MUXOS_VERSION, address = selfAddr or computer.address(), uptime = computer.uptime,
+memory = function() return computer.freeMemory(), computer.totalMemory() end},
+user = user, home = system.home(user),
+
+
+
+external = function(argv, background)
+if K.MUXOS_COMMANDS[argv[1]] then
+K.runCommand(S, table.concat(argv, " "))
+return 0
+end
+local path = resolveProgram(argv[1])
+if not path then
+S.print("sh: " .. argv[1] .. ": command not found")
+return 127
+end
+local id, addrOrErr = launchProgram(path, {table.unpack(argv, 2)})
+if not id then
+S.print("error: " .. addrOrErr)
+return 1
+elseif background or path:match("%.lua$") then
+S.print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
+return 0
+end
+K.runForeground(S, id)
+return jobs[id] and jobs[id].status == "done" and 0 or 1
+end,
+})
 end
 
 
@@ -6075,7 +6199,7 @@ end
 
 return M
 
-@@ 37756 /session.lua
+@@ 34650 /session.lua
 
 
 
@@ -6093,9 +6217,7 @@ return M
 local K, opts = ...
 local S = {id = opts.id, kind = opts.kind, address = opts.address, user = nil, login = 0}
 local system, jobs = K.system, K.jobs
-local readFile, tryInvoke, fsAddr, loadSibling = K.readFile, K.tryInvoke, K.fsAddr, K.loadSibling
-local resolveProgram, readManifest, launchProgram, PROGRAM_PATH = K.resolveProgram, K.readManifest,
-K.launchProgram, K.PROGRAM_PATH
+local loadSibling, launchProgram = K.loadSibling, K.launchProgram
 local gpu = opts.gpu
 local compositor = K.newCompositor(gpu)
 S.compositor, S.gpu = compositor, gpu
@@ -6660,54 +6782,19 @@ end
 
 
 
-
-
-function desktop.iconOf(path)
-local art, color
-local source = path:match("%.mxe$") and readFile(path)
-if source then
-local manifest = readManifest(source)
-if manifest and type(manifest.icon) == "table" then art, color = manifest.icon, manifest.icon_color end
-end
-if not art then
-local text = readFile((path:gsub("%.[^./]*$", "")) .. ".icon")
-if text then
-art = {}
-for line in (text .. "\n"):gmatch("([^\n]*)\n") do
-local hex = #art == 0 and not color and line:match("^#(%x%x%x%x%x%x)%s*$")
-if hex then color = tonumber(hex, 16) elseif #art < 4 then art[#art + 1] = line end
-end
-while #art > 0 and art[#art] == "" do art[#art] = nil end
-end
-end
-if not art or #art == 0 then return nil end
-local rows, colors = {}, {}
-for i = 1, 4 do
-rows[i] = desktop.fit(art[i], desktop.ICON_W, true)
-local c = type(color) == "table" and color[i] or color
-colors[i] = (not desktop.mono and math.type(c) == "integer") and c or nil
-end
-return {rows = rows, colors = colors}
-end
-
 function desktop.scan()
-local apps, seen = {{name = "console", console = true}}, {console = true}
-for _, dir in ipairs(PROGRAM_PATH) do
-local names = tryInvoke(fsAddr, "list", dir)
-if type(names) == "table" then
-table.sort(names)
-for _, n in ipairs(names) do
-local base = n:match("^(.-)%.mxe$") or n:match("^(.-)%.lua$")
-if base and not seen[base] then
-local path = resolveProgram(base)
-if path then
-seen[base] = true
-local ok, icon = pcall(desktop.iconOf, path)
-apps[#apps + 1] = {name = base, path = path, icon = ok and icon or nil}
+local apps = {{name = "console", console = true}}
+for _, app in ipairs(K.apps()) do
+local icon
+if type(app.art) == "table" and #app.art > 0 then
+icon = {rows = {}, colors = {}}
+for i = 1, 4 do
+icon.rows[i] = desktop.fit(app.art[i], desktop.ICON_W, true)
+local c = type(app.color) == "table" and app.color[i] or app.color
+icon.colors[i] = (not desktop.mono and math.type(c) == "integer") and c or nil
 end
 end
-end
-end
+apps[#apps + 1] = {name = app.name, path = app.path, icon = icon}
 end
 desktop.apps = apps
 end
@@ -6773,10 +6860,10 @@ end
 
 
 function desktop.wallpaperCells(path)
-local size = tryInvoke(fsAddr, "size", path)
-if not tryInvoke(fsAddr, "exists", path) then return nil, path .. ": no such file" end
-if (size or 0) > desktop.MAX_WALLPAPER then return nil, path .. ": too big (1 MB at most)" end
-local data = readFile(path)
+local size = K.fileSize(path)
+if not size then return nil, path .. ": no such file" end
+if size > desktop.MAX_WALLPAPER then return nil, path .. ": too big (1 MB at most)" end
+local data = K.readFile(path)
 if not data then return nil, path .. ": can't read it" end
 local w, h, pixel = desktop.readPPM(data)
 if not w then return nil, path .. ": " .. tostring(h) end
@@ -6792,7 +6879,7 @@ end
 
 function desktop.loadWallpaper()
 desktop.wall = nil
-local config = readFile(desktop.WALLPAPER_CONFIG)
+local config = K.readFile(desktop.WALLPAPER_CONFIG)
 local path = config and config:match("^%s*(.-)%s*$")
 if not path or path == "" then return end
 local cells, err = desktop.wallpaperCells(path)
@@ -6858,25 +6945,23 @@ end
 
 function desktop.setWallpaper(arg)
 if not arg or arg == "" then
-local config = readFile(desktop.WALLPAPER_CONFIG)
+local config = K.readFile(desktop.WALLPAPER_CONFIG)
 print("wallpaper: " .. (config and config:match("^%s*(.-)%s*$") or "none")
 .. "  (wallpaper <file.ppm> | wallpaper none)")
 return
 end
 if arg == "none" then
-tryInvoke(fsAddr, "remove", desktop.WALLPAPER_CONFIG)
+K.writeFile(desktop.WALLPAPER_CONFIG, nil)
 desktop.wall = nil
 desktop.render()
 print("wallpaper cleared")
 return
 end
 local path = arg
-if path:sub(1, 1) ~= "/" then path = (shell and shell.cwd() or "/") .. "/" .. path end
+if path:sub(1, 1) ~= "/" then path = S.cwd() .. "/" .. path end
 local cells, err = desktop.wallpaperCells(path)
 if not cells then print("wallpaper: " .. tostring(err)) return end
-tryInvoke(fsAddr, "makeDirectory", "/etc")
-local h = tryInvoke(fsAddr, "open", desktop.WALLPAPER_CONFIG, "w")
-if h then tryInvoke(fsAddr, "write", h, path .. "\n") tryInvoke(fsAddr, "close", h) end
+K.writeFile(desktop.WALLPAPER_CONFIG, path .. "\n")
 desktop.wall = cells
 desktop.render()
 print("wallpaper: " .. path)
@@ -7213,21 +7298,20 @@ end
 
 
 
-
-local function runForeground(id)
+function S.beginForeground(id)
 S.foregroundJob, foregroundTyped = id, ""
-while jobs[id] and jobs[id].status == "running" do
-K.wait(0.5)
 end
+function S.endForeground()
 S.foregroundJob = nil
 if consolePartial ~= "" then
 consoleAppend(consolePartial)
 consolePartial = ""
 end
-local job = jobs[id]
-if job and job.status ~= "done" then
-print(job.status .. ": " .. tostring(job.error))
 end
+function S.consoleWidth() return (viewSize()) end
+function S.clearConsole()
+for i = #consoleLines, 1, -1 do consoleLines[i] = nil end
+scrollOffset, consoleDirty = 0, true
 end
 
 
@@ -7276,57 +7360,6 @@ end
 
 
 
-
-
-local MUXOS_COMMANDS = {}
-for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
-.. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
-.. "shutdown logout flags users useradd userdel who"):gmatch("%S+") do
-MUXOS_COMMANDS[name] = true
-end
-
-local shellCtx = {
-invoke = K.tryInvoke, root = K.fsAddr, tmp = computer.tmpAddress(), list = component.list,
-write = consoleWrite,
-width = function() return (viewSize()) end,
-clear = function()
-for i = #consoleLines, 1, -1 do consoleLines[i] = nil end
-scrollOffset, consoleDirty = 0, true
-end,
-sleep = function(seconds)
-local deadline = computer.uptime() + seconds
-while computer.uptime() < deadline do K.wait(deadline - computer.uptime()) end
-end,
-help = function() K.help() end,
-info = {version = K.MUXOS_VERSION, address = K.selfAddr or computer.address(), uptime = computer.uptime,
-memory = function() return computer.freeMemory(), computer.totalMemory() end},
-
-
-
-external = function(argv, background)
-if MUXOS_COMMANDS[argv[1]] then
-K.runCommand(S, table.concat(argv, " "))
-return 0
-end
-local path = K.resolveProgram(argv[1])
-if not path then
-print("sh: " .. argv[1] .. ": command not found")
-return 127
-end
-local id, addrOrErr = K.launchProgram(path, {table.unpack(argv, 2)})
-if not id then
-print("error: " .. addrOrErr)
-return 1
-elseif background or path:match("%.lua$") then
-print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
-return 0
-end
-runForeground(id)
-return jobs[id] and jobs[id].status == "done" and 0 or 1
-end,
-}
-
-
 function S.cwd()
 return shell and shell.cwd() or (S.user and system.home(S.user)) or "/"
 end
@@ -7358,11 +7391,7 @@ end
 
 function S.startSession(name)
 S.user, S.login = name, K.nextLogin()
-K.tryInvoke(K.fsAddr, "makeDirectory", system.home(name))
-if K.shellFactory then
-shellCtx.user, shellCtx.home = name, system.home(name)
-shell = K.shellFactory(shellCtx)
-end
+shell = K.newShell(S, name)
 editor = K.lineedit.new()
 if compositor.exclusiveOwner() == "console" then compositor.setExclusive(nil) end
 desktop.refresh()
