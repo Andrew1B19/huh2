@@ -51,6 +51,7 @@ local kernalFiles = {
   ["/vgpu.lua"] = readFile(REPO_ROOT .. "/kernal/vgpu.lua"),
   ["/terminals.lua"] = readFile(REPO_ROOT .. "/kernal/terminals.lua"),
   ["/windows.lua"] = readFile(REPO_ROOT .. "/kernal/windows.lua"),
+  ["/sysbus.lua"] = readFile(REPO_ROOT .. "/kernal/sysbus.lua"),
   ["/terminal.lua"] = readFile(REPO_ROOT .. "/kernal/terminal.lua"),
   ["/etc/kernal.cfg"] = "login_required = false\n",
   ["/runtime.lua"] = runtimeSrc,
@@ -2352,5 +2353,124 @@ sleep(600)
     and f:find("[" .. N .. "] /bin/napper.mxe -- detached", 1, true), "jobs after attach:\n" .. c.text())
 end
 print("  OK -- set_persistent/require('muxos')/the toggle/nohup keep applications (children too); attach brings them back")
+
+print("test 59: the system bus -- named services, calls, signals, the kernal's services (OPM's muxos.update)")
+do
+  local files = {
+    ["/bin/counter.mxe"] = [==[--[[mxe
+name = "counter"
+libraries = {"sysbus"}
+]]
+local sysbus = require("sysbus")
+local total = 0
+sysbus.serve("counter", {
+  add = function(caller, n) total = total + n sysbus.emit("counter.changed", total) return total end,
+  whoami = function(caller) return caller.user, caller.job ~= nil end,
+  boom = function() error("kaboom", 0) end,
+  slow = function() sleep(3) return "late" end,
+})
+sysbus.run()
+]==],
+    ["/bin/watcher.mxe"] = [==[--[[mxe
+name = "watcher"
+libraries = {"sysbus"}
+]]
+local sysbus = require("sysbus")
+gmuxapi.set_persistent(true)
+sysbus.on("counter.*", function(signal, sender, total) print("SIG " .. signal .. " " .. total .. " from " .. sender.job) end)
+sysbus.listen("muxos.login")
+while true do
+  local e = gmuxapi.pull_event(60)
+  if e and e[1] == "sysbus_signal" then print("EV " .. e[2] .. " " .. tostring(e[4][1]) .. " " .. tostring(e[3].kernal)) end
+end
+]==],
+    ["/bin/client.mxe"] = [==[--[[mxe
+name = "client"
+libraries = {"sysbus"}
+]]
+local sysbus = require("sysbus")
+local c = sysbus.proxy("counter")
+print("ADD " .. c.add(5) .. " " .. c.add(2))
+print("WHO " .. table.concat({tostring(c.whoami())}, ",") .. " " .. tostring(select(2, c.whoami())))
+print("BOOM " .. tostring(select(2, pcall(c.boom))))
+print("NOBODY " .. tostring(select(2, pcall(sysbus.call, "nobody", "x"))))
+print("NOMETHOD " .. tostring(select(2, pcall(c.nope))))
+sysbus.timeout = 1
+print("SLOW " .. tostring(select(2, pcall(c.slow))))
+print("TAKEN " .. tostring(select(2, pcall(sysbus.own, "counter"))))
+print("RESERVED " .. tostring(select(2, pcall(sysbus.own, "muxos.mine"))))
+print("VER " .. sysbus.call("muxos.system", "version"))
+]==],
+    ["/bin/legsvc.lua"] = 'local bus = require("sysbus")\nbus.serve("legacy.echo", {echo = function(caller, s) return "echo:" .. s end})\nbus.run()',
+    ["/bin/updater.mxe"] = [==[--[[mxe
+name = "updater"
+libraries = {"sysbus"}
+]]
+local sysbus = require("sysbus")
+local update = sysbus.proxy("muxos.update")
+sysbus.timeout = 20
+print("UPD1 " .. tostring(select(2, pcall(update.install, {{path = "/opmbad.lua", data = "return ("}}, "9.8"))))
+print("UPD2 " .. tostring(select(2, pcall(update.install, {{path = "/opmtest.lua", data = "return 42"}}, "9.9"))))
+print("UPDV " .. update.version().installed)
+]==],
+  }
+  local c = newCluster(80, 25, files, 2)
+  local function console()
+    local bx = c.cells(1, 25, 80):find(" console ", 1, true)
+    if bx then c.touch(bx + 2, 25) end
+    if bx and not c.text():find("@muxos:~>", 1, true) then c.touch(bx + 2, 25) end
+  end
+  local function run(line, wait) console() c.typeLine(line) c.emu:advance(wait or 1) end
+  local function flat() return (c.text():gsub("\n", "")) end
+  run("counter &", 2)
+  run("watcher &", 2)
+  local W = c.text():match("%[(%d+)%] /bin/watcher%.mxe started")
+  run("legsvc", 2)
+  run("client", 8)
+  local f = flat()
+  assert(f:find("ADD 5 7", 1, true), "calls through a proxy:\n" .. c.text())
+  assert(f:find("WHO root true", 1, true), "the service sees who called:\n" .. c.text())
+  assert(f:find("BOOM kaboom", 1, true), "a method's error reaches the caller:\n" .. c.text())
+  assert(f:find("NOBODY no service named nobody", 1, true), "no such name:\n" .. c.text())
+  assert(f:find("NOMETHOD counter has no method nope", 1, true), "no such method:\n" .. c.text())
+  assert(f:find("SLOW no answer from counter in 1 s", 1, true), "a call's timeout:\n" .. c.text())
+  assert(f:find("TAKEN counter is taken (process", 1, true), "names are owned:\n" .. c.text())
+  assert(f:find("RESERVED muxos.mine is the kernal's", 1, true), "muxos. is the kernal's:\n" .. c.text())
+  assert(f:find("VER 0.", 1, true), "a kernal service:\n" .. c.text())
+  assert(f:find("SIG counter.changed 5 from", 1, true) and f:find("SIG counter.changed 7 from", 1, true),
+    "on() handlers get signals:\n" .. c.text())
+  run("sysbus", 1)
+  f = flat()
+  assert(f:find("counter", 1, true) and f:find("legacy.echo", 1, true) and f:find("muxos.update             (kernal)", 1, true),
+    "sysbus lists the names:\n" .. c.text())
+  run("sysbus call legacy.echo echo hi", 2)
+  assert(flat():find("echo:hi", 1, true), "a .lua program's service, called from the console:\n" .. c.text())
+  run("sysbus call muxos.system who", 1)
+  assert(flat():find('["user"]="root"', 1, true), "muxos.system.who:\n" .. c.text())
+  run("updater", 6)
+  f = flat()
+  assert(f:find("UPD1 install: /opmbad.lua:1:", 1, true) and f:find("nothing was changed", 1, true)
+    and c.files["/opmbad.lua"] == nil, "a file that doesn't compile stops the install:\n" .. c.text())
+  assert(f:find("UPD2 muxos 9.9 installed (1 files)", 1, true) and c.files["/opmtest.lua"] == "return 42",
+    "muxos.update.install writes the files:\n" .. c.text())
+  assert(f:find("UPDV 9.9", 1, true), "...and the installed version:\n" .. c.text())
+  -- A login is a signal; root-only installing (flag update_requires_root).
+  run("useradd bob", 1)
+  run("logout", 2)
+  c.typeLine("bob")
+  c.emu:advance(2)
+  run("updater", 6)
+  f = flat()
+  assert(f:find("UPD2 update: only root can do that (flag update_requires_root)", 1, true),
+    "only root installs:\n" .. c.text())
+  run("logout", 2)
+  c.typeLine("root")
+  c.emu:advance(2)
+  run("attach " .. tostring(W), 2)
+  f = flat()
+  assert(f:find("EV muxos.login bob true", 1, true) and f:find("EV muxos.login root true", 1, true),
+    "the kernal's login signals (heard while away):\n" .. c.text())
+end
+print("  OK -- serve/proxy/call/emit/on/listen, errors and timeouts, a .lua service, the console, muxos.system, muxos.update")
 
 print("ALL OK")

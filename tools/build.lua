@@ -58,6 +58,7 @@ local FILES = {
   {"/vgpu.lua", "kernal/vgpu.lua"},
   {"/terminals.lua", "kernal/terminals.lua"},
   {"/windows.lua", "kernal/windows.lua"},
+  {"/sysbus.lua", "kernal/sysbus.lua"},
   {"/terminal.lua", "kernal/terminal.lua"},
   {"/runtime.lua", "node/runtime.lua"},
 }

@@ -260,6 +260,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `SHAREWINDOW` | `from`, `to`, `id`, `windowId`, `child`, `rect`, `caller` | worker | share `rect` of a window the caller manages with a descendant (no `rect`: take it back) |
 | `RENDERCONFIG` | `from`, `to`, `id`, `windowId`, `options`, `key`, `caller` | worker | a window's render settings (setting them: its owner); to the screen showing it |
 | `DRAWREGION` | `from`, `to`, `id`, `windowId`, `frame`, `cells` or `text`, `x`, `y`, `offset`, `done`, `key`, `caller`, `noReply` | worker | a region of a frame, from a process sharing the window (or its owner); to the screen showing it |
+| `SBUS` | `from`, `to`, `id`, `op`, `caller`, and per op: `name`, `method`, `args`, `timeout` (call); `call`, `ok`, `result`/`error` (reply); `signal`, `args` (emit); `pattern` (listen/unlisten) | worker | the system bus (`op` = own, release, call, reply, emit, listen, unlisten, list): see "The system bus". A call's `RESULT` comes when the service answers: the method's results, packed |
 | `GPUCALL` | `from`, `to`, `id`, `method`, `args`, `key`                  | worker  | a fullscreen program's `gpu` call on a network terminal's screen, with the grant's `key`; `RESULT` is the call's returns |
 | `REQUESTFULLSCREEN` | `from`, `to`, `id`, `caller`                      | worker  | "let me bypass the compositor and INVOKE the real gpu/screen directly" -- its session's screen; `caller` is the asking process, whose end releases the grant. For a terminal's session the answer carries `route = {address, key, port}`: the program's `gpu` calls go there as `GPUCALL` |
 | `RELEASEFULLSCREEN` | `from`, `to`, `id`, `caller`                      | worker  | give that grant back |
@@ -1370,9 +1371,8 @@ ends, the opener hears `{"pipe_closed", child, status, error}`; `close()`
 waits for that. OpenOS's `pipe.buildPipeChain` (its shell's in-process
 pipelines) has no equivalent and says so (test 54).
 
-A kernal system bus (a dbus-like named-service/signal bus) is a
-possible later addition for `.mxe` programs to talk to kernal services
-and each other.
+Unrelated programs talk through the system bus ("The system bus",
+below).
 
 ### App identity and orphan reclaim -- BUILT
 
@@ -1568,6 +1568,33 @@ under the machine's deadline).
 Compiled draw code is cached per window keyed by its source, so an app
 that redraws with the same code and new `args` doesn't recompile each
 time. Any other process is refused (test 28).
+
+### The system bus -- BUILT
+
+Programs talking to each other, and to the kernal, by name: muxos's
+D-Bus (`kernal/sysbus.lua`; the runtime's `sysbus` library is the
+programs' side). Everything goes through the kernal, which knows every
+process: `SBUS` messages with an `op`.
+
+- **Names.** `own` gives the caller a name (dotted words; `muxos.*` are
+  the kernal's own services) until it releases it or ends.
+- **Calls.** `call {name, method, args, timeout}`: the kernal sends the
+  owner `EVENT {"sysbus_call", call, name, method, caller, args}` and
+  holds the caller's request open; the owner answers `reply {call, ok,
+  result | error}`, which becomes the caller's `RESULT`/`ERROR`. The
+  runtime runs a served method in a thread of the service's process,
+  so it answers while busy. A call fails when its timeout passes or
+  its service ends. The kernal's own services run each call in a
+  coroutine (they may wait: an install writes files a tick at a time).
+- **Signals.** `emit {signal, args}` reaches every process `listen`ing
+  for it -- a name, `prefix.*` or `*` -- as `EVENT {"sysbus_signal",
+  signal, sender, args}`; a runtime with an `on()` handler runs it in a
+  thread instead of queuing it. The kernal emits `muxos.login`,
+  `muxos.logout` and `muxos.node`.
+- **The kernal's services.** `muxos.system` and `muxos.update` -- OPM's
+  interface for installing kernal and module files, through the same
+  stage-then-swap install as `update`, with its flag checks. A
+  service's `caller.user` is how it decides who may do what.
 
 ### Window routes and network terminals -- BUILT
 

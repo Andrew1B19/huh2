@@ -247,10 +247,14 @@ local eventQueues = {}
 local MAX_QUEUED_EVENTS = 64
 
 local windowRouted -- below, with the window routes
+local sysbusDispatch -- below, with the system bus
 
 local function queueEvent(id, event)
   if type(id) ~= "number" or type(event) ~= "table" then return end
   if event[1] == "window_route" then event = windowRouted(id, event) end
+  -- A call to a service it serves, a signal it has a handler for: run
+  -- in a thread of its own instead.
+  if (event[1] == "sysbus_call" or event[1] == "sysbus_signal") and sysbusDispatch(id, event) then return end
   local q = eventQueues[id]
   if not q then q = {}; eventQueues[id] = q end
   if #q < MAX_QUEUED_EVENTS then q[#q + 1] = event end
@@ -453,7 +457,7 @@ local RPC_TIMEOUT = 5
 -- one network round trip instead of zero.
 -- Asks the kernal -- or `to`, a screen of a network terminal (on its
 -- `port`), for what's drawn there -- and waits for the answer.
-local function remoteRequest(msgType, extra, to, port)
+local function remoteRequest(msgType, extra, to, port, timeout)
   if not kernalAddr then
     return nil, "kernal address not known yet"
   end
@@ -464,7 +468,7 @@ local function remoteRequest(msgType, extra, to, port)
   -- RPC ids are this node's own counter; the kernal's JOB ids are a
   -- different counter, but only RESULT/ERROR count as replies.
   rpcWaiting[id] = true
-  local w = {rpc = id, deadline = computer.uptime() + RPC_TIMEOUT}
+  local w = {rpc = id, deadline = computer.uptime() + (timeout or RPC_TIMEOUT)}
   while not satisfied(w) do wait(w) end
   rpcWaiting[id] = nil
   local reply = rpcReplies[id]
@@ -567,6 +571,129 @@ local function rememberDraw(id, draw)
     if #list < 16 then list[#list + 1] = draw end
     winDraws[id] = list
   end
+end
+
+-- --- The system bus: programs' side (see kernal/sysbus.lua) ---
+--
+-- A process's services (sysbus.serve) and signal handlers (sysbus.on)
+-- run in threads of its own, one per call or signal, beside whatever
+-- else it's doing.
+local busServers, busHandlers = {}, {} -- job -> name -> methods; job -> {{pattern, fn}...}
+local busThreads = 0
+
+local function busThread(jobId, fn, quiet)
+  busThreads = busThreads + 1
+  local entry = {id = jobId .. "/sysbus" .. busThreads, jobId = jobId, thread = {joined = quiet},
+    co = coroutine.create(fn)}
+  procs[entry.id] = entry
+  procOrder[#procOrder + 1] = entry.id
+end
+
+local function busReply(jobId, call, ok, result)
+  local fields = {op = "reply", call = call, caller = jobId}
+  if ok then fields.result = result else fields.ok, fields.error = false, tostring(result) end
+  return remoteRequest("SBUS", fields)
+end
+
+local function busMatches(pattern, signal)
+  if pattern == "*" or pattern == signal then return true end
+  local prefix = pattern:match("^(.*)%.%*$")
+  return prefix ~= nil and signal:sub(1, #prefix + 1) == prefix .. "."
+end
+
+sysbusDispatch = function(id, event)
+  if event[1] == "sysbus_call" then
+    local methods = busServers[id] and busServers[id][event[3]]
+    if not methods then return false end
+    local call, name, method, caller, args = event[2], event[3], event[4], event[5], event[6] or {n = 0}
+    busThread(id, function()
+      local fn = methods[method]
+      if type(fn) ~= "function" then return busReply(id, call, false, name .. " has no method " .. tostring(method)) end
+      local r = table.pack(pcall(fn, caller, table.unpack(args, 1, args.n or #args)))
+      if r[1] then busReply(id, call, true, table.pack(table.unpack(r, 2, r.n))) else busReply(id, call, false, r[2]) end
+    end, true)
+    return true
+  end
+  local handled = false
+  for _, h in ipairs(busHandlers[id] or {}) do
+    if busMatches(h.pattern, event[2]) then
+      handled = true
+      local args = event[4] or {n = 0}
+      busThread(id, function() h.fn(event[2], event[3], table.unpack(args, 1, args.n or #args)) end)
+    end
+  end
+  return handled
+end
+
+-- The `sysbus` library (an .mxe's built-in, a .lua program's module).
+local function sysbusLib(id)
+  local lib = {timeout = 30}
+  local function req(fields, timeout)
+    fields.caller = id
+    local r, err = remoteRequest("SBUS", fields, nil, nil, timeout)
+    if err ~= nil or r == nil then error(tostring(err), 0) end
+    return r
+  end
+  local function check(n, v, want)
+    if type(v) ~= want then error(string.format("bad argument #%d (%s expected, got %s)", n, want, type(v)), 3) end
+  end
+  -- Names: own one (calls to it come as {"sysbus_call", call, name,
+  -- method, caller, args} events, answered with reply/fail), or serve
+  -- one with a table of methods -- method(caller, ...) returns the
+  -- call's results or raises its error.
+  function lib.own(name) check(1, name, "string") return req({op = "own", name = name}) end
+  function lib.serve(name, methods)
+    check(1, name, "string") check(2, methods, "table")
+    req({op = "own", name = name})
+    busServers[id] = busServers[id] or {}
+    busServers[id][name] = methods
+    return true
+  end
+  function lib.release(name)
+    if busServers[id] then busServers[id][name] = nil end
+    return req({op = "release", name = name})
+  end
+  function lib.reply(call, ...) return busReply(id, call, true, table.pack(...)) end
+  function lib.fail(call, err) return busReply(id, call, false, err) end
+  -- Calls: the method's results, or an error (no such name or method,
+  -- the method's own error, or no answer in lib.timeout seconds).
+  function lib.call(name, method, ...)
+    check(1, name, "string") check(2, method, "string")
+    local t = tonumber(lib.timeout) or 30
+    local r = req({op = "call", name = name, method = method, args = table.pack(...), timeout = t}, t + 5)
+    return table.unpack(r, 1, r.n or #r)
+  end
+  function lib.proxy(name)
+    return setmetatable({}, {__index = function(_, method)
+      return function(...) return lib.call(name, method, ...) end
+    end})
+  end
+  -- Signals: {"sysbus_signal", signal, sender, args} events for what
+  -- this process listens to -- or handler(signal, sender, ...) in a
+  -- thread, for on().
+  function lib.emit(signal, ...) check(1, signal, "string") return req({op = "emit", signal = signal, args = table.pack(...)}) end
+  function lib.listen(pattern) check(1, pattern, "string") return req({op = "listen", pattern = pattern}) end
+  function lib.on(pattern, fn)
+    check(1, pattern, "string") check(2, fn, "function")
+    req({op = "listen", pattern = pattern})
+    busHandlers[id] = busHandlers[id] or {}
+    table.insert(busHandlers[id], {pattern = pattern, fn = fn})
+    return true
+  end
+  function lib.unlisten(pattern)
+    local list = busHandlers[id] or {}
+    for i = #list, 1, -1 do
+      if list[i].pattern == pattern then table.remove(list, i) end
+    end
+    return req({op = "unlisten", pattern = pattern})
+  end
+  -- Every name on the bus: {name, job, user, kernal}...
+  function lib.list() return req({op = "list"}) end
+  -- Serves forever: for a program that only answers calls and signals.
+  function lib.run()
+    while true do wait({deadline = computer.uptime() + 3600}) end
+  end
+  return lib
 end
 
 -- The kernal moved a window: note where, draw it there, and tell the
@@ -1283,6 +1410,7 @@ local BUILTIN_LIBRARIES = {
   --                         -- {char, fg, bg}, to change before drawing
   --   cells = bitmap.runs(grid, cols, rows)
   -- (draw_window and draw_region also take pixels, and encode them here.)
+  sysbus = function(id) return sysbusLib(id) end,
   bitmap = function(id)
     local encoder = bitmapLib(id)
     return {
@@ -2497,6 +2625,7 @@ end
 local legacyPopen -- below, with the legacy environment
 
 local LEGACY_FACES = {
+  sysbus = function(ctx) return sysbusLib(ctx.id) end,
   -- muxos's own library for .lua programs (require("muxos")): the parts
   -- of an .mxe's gmuxapi that make sense for one.
   muxos = function(ctx)
@@ -3107,8 +3236,10 @@ local function finishProc(p, ok, result, migratedState)
     t.done, t.ok, t.result = true, ok, result
     if not ok and result ~= KILLED and not t.joined then
       printTo(p.jobId)("thread error: " .. tostring(result))
-      flushOutput(p.jobId)
     end
+    -- What it printed goes now, not at the process's next yield (which
+    -- may be a long wait away).
+    flushOutput(p.jobId)
     return
   end
   -- The process is over: so are its threads.
@@ -3120,6 +3251,7 @@ local function finishProc(p, ok, result, migratedState)
     end
   end
   local id = p.id
+  busServers[id], busHandlers[id] = nil, nil
   local endHook = jobEndHooks[id]
   jobEndHooks[id] = nil
   if endHook then pcall(endHook, ok, result) end

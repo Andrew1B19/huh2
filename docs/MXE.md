@@ -264,6 +264,33 @@ granted too, transitively, and loaded before it (test 37).
     `"value"`; `--` ends options; `-` and everything else is
     positional.
   - `mux.migratable(save)`, `mux.restored()`: migration (section 6).
+- `sysbus`: the system bus -- programs talking to each other (and to
+  the kernal) by name, wherever they run:
+  - `sysbus.serve(name, methods)`: owns `name`; a call of `method` runs
+    `methods[method](caller, ...)` in a thread of its own (`caller` =
+    `{job, user}`), its results the call's, its error the caller's.
+    `sysbus.run()` serves forever. Lower level: `sysbus.own(name)`, and
+    calls come as `{"sysbus_call", call, name, method, caller, args}`
+    events, answered with `sysbus.reply(call, ...)` or
+    `sysbus.fail(call, err)`. `sysbus.release(name)`. Names are dotted
+    words (`"backup.status"`); `muxos.*` are the kernal's; one owner at
+    a time, until it ends.
+  - `sysbus.call(name, method, ...)` returns the method's results, or
+    raises an error (no such name or method, the method's error, no
+    answer in `sysbus.timeout` seconds -- 30); `sysbus.proxy(name)`
+    makes the calls methods: `proxy.pause()`.
+  - `sysbus.emit(signal, ...)`; `sysbus.on(pattern, fn)` runs
+    `fn(signal, sender, ...)` in a thread for each; or
+    `sysbus.listen(pattern)` and `{"sysbus_signal", signal, sender,
+    args}` from `pull_event`; `sysbus.unlisten(pattern)`. Patterns:
+    a name, `"prefix.*"` or `"*"`. `sender` = `{job, user}` or
+    `{kernal = true}`.
+  - `sysbus.list()`: every name: `{name, job, user, kernal}`.
+  - The kernal's services: `muxos.system` (`version`, `uptime`,
+    `users`, `who`, `nodes`, `reboot`) and `muxos.update` (`version`,
+    `files`, `install(files, version)` -- OPM's interface); its signals:
+    `muxos.login`, `muxos.logout` (user, where), `muxos.node` (address,
+    `"up"`/`"down"`). README "The system bus"; test 59.
 - `bitmap`: pixels into cells, on the program's own node (OC's GPUs
   have no pixels: a "pixel" is half a cell, `"halfblock"`, or a braille
   dot, `"braille"`). `pixels[row][col]` are colors (`0xRRGGBB`, or

@@ -1,19 +1,20 @@
 --[[MUXOS-PAYLOAD 0.1.2
-@@MANIFEST 34
+@@MANIFEST 35
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-86284 /muxos.lua
+90447 /muxos.lua
 30785 /compositor.lua
 33883 /shell.lua
 2663 /bitmap.lua
 3046 /lineedit.lua
 6021 /system.lua
-34860 /session.lua
+34905 /session.lua
 5514 /vgpu.lua
-9254 /terminals.lua
+9272 /terminals.lua
 4883 /windows.lua
+6795 /sysbus.lua
 14661 /terminal.lua
-86105 /runtime.lua
+90366 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 1682 /lib/bit32.lua
 3800 /lib/buffer.lua
@@ -228,7 +229,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 86284 /muxos.lua
+@@ 90447 /muxos.lua
 
 
 
@@ -583,6 +584,7 @@ local function noteNode(addr)
 if not nodes[addr] then
 nodes[addr] = {}
 nodeOrder[#nodeOrder + 1] = addr
+if K.sysbus then K.sysbus.emit("muxos.node", addr, "up") end
 
 
 send({type = "GETCOMPONENTS", from = selfAddr, to = addr})
@@ -593,6 +595,7 @@ node.probedAt = nil
 if node.down then
 node.down = nil
 print("node " .. addr .. " is responding again")
+if K.sysbus then K.sysbus.emit("muxos.node", addr, "up") end
 end
 end
 
@@ -855,7 +858,7 @@ end
 
 local PROGRAM_PATH = {"/bin", "/usr/bin"}
 
-local BUILTIN_MXE_LIBRARIES = {mux = true, http = true, thread = true, modem = true, bitmap = true}
+local BUILTIN_MXE_LIBRARIES = {mux = true, http = true, thread = true, modem = true, bitmap = true, sysbus = true}
 
 local MXE_LIBRARY_DIRS = {"/lib/mxe/", "/usr/lib/mxe/"}
 
@@ -1297,6 +1300,7 @@ local job = jobs[id]
 closeJobFiles(id)
 net.release(id)
 K.dropShares(id)
+K.sysbus.jobEnded(id)
 
 local reader = job.pipeTo and K.liveJob(job.pipeTo)
 if reader then K.deliverEvent(reader, {"pipe_closed", id, status, err}) end
@@ -1342,6 +1346,7 @@ local LIVENESS = {PROBE_AFTER = 3, DOWN_AFTER = 10, lastCheck = -math.huge}
 local function markNodeDown(addr)
 nodes[addr].down = true
 print("node " .. addr .. " stopped responding -- marking it down")
+if K.sysbus then K.sysbus.emit("muxos.node", addr, "down") end
 if fullscreen.node == addr then
 fullscreen.node = nil
 fullscreen.job = nil
@@ -2345,6 +2350,8 @@ elseif msg.type == "WINDOWROUTE" then
 handleWindowRoute(msg)
 elseif msg.type == "PERSIST" then
 handlePersist(msg)
+elseif msg.type == "SBUS" then
+K.sysbus.message(msg, callerJob(msg))
 elseif msg.type == "ISFOREGROUND" then
 
 local caller = callerJob(msg)
@@ -2763,19 +2770,28 @@ print("update: " .. source:sub(1, 8) .. updates.DAT .. ": " .. tostring(err or v
 return
 end
 data = nil
+local _, message = updates.install(files, version)
+print("update: " .. message)
+end
+
+
+
+
+
+
+function updates.install(files, version)
 local needed, staged, kernalBios = 4096, {}, nil
 for _, f in ipairs(files) do
 if not f.path:match("^/eeprom/") then needed = needed + #f.data end
 end
 local free = (tryInvoke(fsAddr, "spaceTotal") or 0) - (tryInvoke(fsAddr, "spaceUsed") or 0)
 if free < needed then
-print(string.format("update: the disk has %d KB free and the update needs %d KB -- nothing was changed",
-free // 1024, needed // 1024))
-return
+return nil, string.format("the disk has %d KB free and the update needs %d KB -- nothing was changed",
+free // 1024, needed // 1024)
 end
 local function abandon(why)
 for _, path in ipairs(staged) do tryInvoke(fsAddr, "remove", path .. ".new") end
-print("update: " .. why .. " -- nothing was changed")
+return nil, why .. " -- nothing was changed"
 end
 for _, f in ipairs(files) do
 if f.path == "/eeprom/kernal.lua" then
@@ -2801,8 +2817,7 @@ end
 for _, path in ipairs(staged) do
 if tryInvoke(fsAddr, "exists", path) then tryInvoke(fsAddr, "remove", path) end
 if not tryInvoke(fsAddr, "rename", path .. ".new", path) then
-print("update: couldn't move " .. path .. " into place -- run update again")
-return
+return nil, "couldn't move " .. path .. " into place -- run update again"
 end
 end
 local h = tryInvoke(fsAddr, "open", "/.muxos-version", "w")
@@ -2817,8 +2832,8 @@ else
 biosNote = "; re-flashing the kernal BIOS FAILED (the old one is still there)"
 end
 end
-print(string.format("update: muxos %s installed (%d files)%s. Type `reboot` to start it, then restart the workers.",
-version, #staged, biosNote))
+return true, string.format("muxos %s installed (%d files)%s. Type `reboot` to start it, then restart the workers.",
+version, #staged, biosNote)
 end
 
 
@@ -2912,6 +2927,8 @@ elseif line == "processes" then
 printProcesses()
 elseif line == "jobs" then
 K.listJobs(S)
+elseif word == "sysbus" then
+K.sysbusCommand(S, line:match("^sysbus%s*(.-)%s*$"))
 elseif word == "attach" then
 K.attachJob(S, tonumber(line:match("^attach%s+(%d+)%s*$")))
 elseif word == "persist" then
@@ -3036,6 +3053,7 @@ PROGRAM_PATH
 K.MUXOS_VERSION, K.selfAddr, K.fullscreen, K.controlJob = MUXOS_VERSION, selfAddr, fullscreen, controlJob
 K.lineedit = loadSibling("lineedit.lua")()
 K.win = loadSibling("windows.lua")(K)
+K.sysbus = loadSibling("sysbus.lua")(K, {send = send, selfAddr = selfAddr})
 K.sessionChunk = loadSibling("session.lua")
 K.nextSession = 0
 
@@ -3178,7 +3196,18 @@ end
 
 
 
+
+function K.where(S)
+return S.kind == "local" and "console" or "terminal " .. tostring(S.address):sub(1, 8)
+end
+
+
+function K.loginStarted(S)
+K.sysbus.emit("muxos.login", S.user, K.where(S))
+end
+
 function K.endLogin(S)
+if S.user then K.sysbus.emit("muxos.logout", S.user, K.where(S)) end
 local ending = system.flag("logout_ends_jobs")
 for id in pairs(runningJobs) do
 local job = jobs[id]
@@ -3282,7 +3311,7 @@ end
 K.MUXOS_COMMANDS = {}
 for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
 .. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
-.. "shutdown logout flags users useradd userdel who jobs persist attach"):gmatch("%S+") do
+.. "shutdown logout flags users useradd userdel who jobs persist attach sysbus"):gmatch("%S+") do
 K.MUXOS_COMMANDS[name] = true
 end
 
@@ -3384,6 +3413,7 @@ print("  update -- install a new muxos from the installer floppy's muxos-install
 print("  wallpaper <file.ppm> | wallpaper none -- the desktop's background image")
 print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job id>")
 print("  jobs | nohup <command> | persist <job id> [on|off] | attach <job id> -- what runs after logout")
+print("  sysbus | sysbus call <name> <method> [args] -- the system bus: programs' named services")
 print("  migrate <job id> [node] | drain|undrain <node>")
 print("  spawn <node> <lua code>")
 print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
@@ -3395,6 +3425,113 @@ print("  bus (every component in the cluster) | components <node> | call <node> 
 print("(<node> is either a [n] index from 'nodes' or a full node address)")
 end
 
+
+
+
+
+
+function K.sysbusCommand(S, args)
+if args == "" then
+for _, t in ipairs(K.sysbus.list()) do
+print(string.format("%-24s %s", t.name, t.kernal and "(kernal)" or ("process " .. tostring(t.job)
+.. " (" .. tostring(t.user) .. ")")))
+end
+return
+end
+local words = {}
+for w in args:gmatch("%S+") do words[#words + 1] = w end
+if words[1] ~= "call" or not words[3] then
+return print("usage: sysbus | sysbus call <name> <method> [args]")
+end
+local callArgs = {n = #words - 3}
+for i = 4, #words do
+local w = words[i]
+if w == "true" or w == "false" then callArgs[i - 3] = w == "true"
+elseif w ~= "nil" then callArgs[i - 3] = tonumber(w) or w end
+end
+local ok, results = K.sysbus.consoleCall(S, words[2], words[3], callArgs)
+if not ok then return print("error: " .. tostring(results)) end
+local out = {}
+for i = 1, results.n or #results do
+local v = results[i]
+out[i] = type(v) == "table" and serialize(v) or tostring(v)
+end
+print(#out > 0 and table.concat(out, "\t") or "(no results)")
+end
+
+local function sysbusUser(ctx, flagName, doing)
+local ok, why = system.allowed(ctx.user, flagName, doing)
+if not ok then error(why, 0) end
+end
+
+K.sysbus.provide("muxos.system", {
+version = function() return MUXOS_VERSION end,
+uptime = function() return computer.uptime() end,
+users = function() return system.users() end,
+
+who = function()
+local list = {}
+for _, S in ipairs(K.sessions) do
+if S.user then list[#list + 1] = {user = S.user, where = K.where(S)} end
+end
+return list
+end,
+
+nodes = function()
+local list = {}
+for _, addr in ipairs(nodeOrder) do
+local n = nodes[addr]
+list[#list + 1] = {address = addr, up = not n.down, load = n.load, free = n.free, running = n.running or 0}
+end
+return list
+end,
+
+
+reboot = function(ctx)
+sysbusUser(ctx, "reboot_requires_root", "reboot")
+K.sysbus.after(1, function() shutdown(true) end)
+return true
+end,
+})
+
+
+K.sysbus.provide("muxos.update", {
+
+version = function()
+local installed = readFile("/.muxos-version")
+return {running = MUXOS_VERSION, installed = installed and installed:match("^%s*(.-)%s*$")}
+end,
+
+files = function()
+local list = {}
+for _, name in ipairs(tryInvoke(fsAddr, "list", "/") or {}) do
+if name:match("%.lua$") then list[#list + 1] = {path = "/" .. name, size = tryInvoke(fsAddr, "size", "/" .. name)} end
+end
+table.sort(list, function(a, b) return a.path < b.path end)
+return list
+end,
+
+
+
+
+install = function(ctx, files, version)
+sysbusUser(ctx, "update_requires_root", "update")
+if type(files) ~= "table" or #files == 0 then error("install(files, version): files is a list of {path, data}", 0) end
+for _, f in ipairs(files) do
+if type(f) ~= "table" or type(f.path) ~= "string" or type(f.data) ~= "string"
+or f.path:sub(1, 1) ~= "/" or f.path:find("..", 1, true) then
+error("install: bad file entry " .. tostring(type(f) == "table" and f.path or f), 0)
+end
+if f.path:match("%.lua$") then
+local ok, err = load(f.data, "=" .. f.path, "t", {})
+if not ok then error("install: " .. tostring(err) .. " -- nothing was changed", 0) end
+end
+end
+local ok, message = updates.install(files, tostring(version or "opm"))
+if not ok then error(message, 0) end
+return message
+end,
+})
 
 
 
@@ -3420,6 +3557,8 @@ end
 
 while true do
 tick(0.05)
+local busOk, busErr = pcall(K.sysbus.resume)
+if not busOk then print("system bus error (continuing): " .. tostring(busErr)) end
 for _, S in ipairs(K.sessions) do
 local ok, err = pcall(S.resume)
 if not ok then print("session error (continuing): " .. tostring(err)) end
@@ -6466,7 +6605,7 @@ end
 
 return M
 
-@@ 34860 /session.lua
+@@ 34905 /session.lua
 
 
 
@@ -7669,6 +7808,7 @@ desktop.refresh()
 desktop.showConsole()
 print("logged in as " .. name .. " (home " .. system.home(name) .. ") -- type 'help' for commands")
 consoleDirty = true
+if K.loginStarted then K.loginStarted(S) end
 end
 
 
@@ -8021,7 +8161,7 @@ end
 
 return M
 
-@@ 9254 /terminals.lua
+@@ 9272 /terminals.lua
 
 
 
@@ -8177,6 +8317,7 @@ if P.user then K.endLogin(P) end
 P.user, P.login = name, K.nextLogin()
 P.shell = K.newShell(P, name)
 reply(P, msg, {login = P.login, cwd = P.cwd(), windows = K.win.ofUser(name)})
+K.loginStarted(P)
 end
 function handlers.TCMD(P, msg)
 if not P.user then return reply(P, msg, nil, "log in first") end
@@ -8544,6 +8685,260 @@ end
 end
 
 return W
+
+@@ 6795 /sysbus.lua
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local K, deps = ...
+local send, selfAddr = deps.send, deps.selfAddr
+
+local B = {names = {}, calls = {}, listeners = {}, kernal = {}, running = {}}
+local DEFAULT_TIMEOUT, MAX_TIMEOUT = 30, 86400
+local nextCall = 0
+
+local function validName(name)
+return type(name) == "string" and #name <= 64 and name:match("^[%w_%-]+[%w_%-%.]*$") ~= nil
+and not name:find("..", 1, true) and name:sub(-1) ~= "."
+end
+
+local function reserved(name)
+return name == "muxos" or name:sub(1, 6) == "muxos."
+end
+
+local function answer(msg, result, err)
+if not msg.id or msg.noReply then return end
+if err ~= nil then
+send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = tostring(err)})
+else
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = result})
+end
+end
+
+local function packed(t)
+if type(t) ~= "table" then return {n = 0} end
+t.n = math.tointeger(t.n) or #t
+return t
+end
+
+
+
+
+
+function B.provide(name, methods)
+B.kernal[name] = methods
+B.names[name] = {kernal = true}
+end
+
+local function finishCall(c, ok, results)
+if c.finished then return end
+c.finished = true
+if c.id then B.calls[c.id] = nil end
+if c.console then
+c.done, c.ok, c.results = true, ok, results
+elseif ok then
+answer(c.msg, packed(results))
+else
+answer(c.msg, nil, results)
+end
+end
+
+local function step(entry)
+local prev = K.current
+K.current = nil
+local ok, res = coroutine.resume(entry.co)
+K.current = prev
+if coroutine.status(entry.co) ~= "dead" then return false end
+K.commands[entry.co] = nil
+if ok then finishCall(entry.call, true, res) else finishCall(entry.call, false, tostring(res)) end
+return true
+end
+
+
+
+local function startCall(c, name, method, args)
+local target = validName(name) and B.names[name]
+local job = target and target.job and K.liveJob(target.job)
+if target and target.job and not job then
+B.names[name], target = nil, nil
+end
+if not target then return finishCall(c, false, "no service named " .. tostring(name)) end
+if type(method) ~= "string" or method == "" then return finishCall(c, false, "no method name") end
+nextCall = nextCall + 1
+c.id, c.name, c.method = nextCall, name, method
+c.deadline = computer.uptime() + c.timeout
+B.calls[c.id] = c
+if target.kernal then
+local fn = B.kernal[name][method]
+if type(fn) ~= "function" then return finishCall(c, false, name .. " has no method " .. method) end
+local ctx = {job = c.caller, user = c.user}
+local co = coroutine.create(function() return table.pack(fn(ctx, table.unpack(args, 1, args.n))) end)
+K.commands[co] = true
+local entry = {co = co, call = c}
+if not step(entry) then B.running[#B.running + 1] = entry end
+else
+c.service = job.id
+K.deliverEvent(job, {"sysbus_call", c.id, name, method, {job = c.caller, user = c.user}, args})
+end
+end
+
+local function matches(pattern, signal)
+if pattern == "*" or pattern == signal then return true end
+local prefix = pattern:match("^(.*)%.%*$")
+return prefix ~= nil and signal:sub(1, #prefix + 1) == prefix .. "."
+end
+
+
+function B.signal(signal, sender, args)
+args = packed(args)
+for jobId, patterns in pairs(B.listeners) do
+local job = K.liveJob(jobId)
+if not job then
+B.listeners[jobId] = nil
+else
+for pattern in pairs(patterns) do
+if matches(pattern, signal) then
+K.deliverEvent(job, {"sysbus_signal", signal, sender, args})
+break
+end
+end
+end
+end
+end
+
+
+function B.emit(signal, ...)
+B.signal(signal, {kernal = true}, table.pack(...))
+end
+
+
+function B.list()
+local list = {}
+for name, t in pairs(B.names) do
+local job = t.job and K.jobs[t.job]
+list[#list + 1] = {name = name, job = t.job, user = job and job.user, kernal = t.kernal or nil}
+end
+table.sort(list, function(a, b) return a.name < b.name end)
+return list
+end
+
+
+function B.message(msg, caller)
+if not caller then return answer(msg, nil, "not called from a running process") end
+local op = msg.op
+if op == "call" then
+local timeout = tonumber(msg.timeout) or DEFAULT_TIMEOUT
+timeout = math.max(0.1, math.min(timeout, MAX_TIMEOUT))
+return startCall({msg = msg, caller = caller.id, user = caller.user, timeout = timeout},
+msg.name, msg.method, packed(msg.args))
+elseif op == "reply" then
+local c = B.calls[msg.call]
+if c and c.service == caller.id then
+if msg.ok == false then finishCall(c, false, tostring(msg.error)) else finishCall(c, true, msg.result) end
+end
+return answer(msg, true)
+elseif op == "emit" then
+if not validName(msg.signal) or reserved(msg.signal) then
+return answer(msg, nil, "bad signal name: " .. tostring(msg.signal))
+end
+B.signal(msg.signal, {job = caller.id, user = caller.user}, msg.args)
+return answer(msg, true)
+elseif op == "listen" or op == "unlisten" then
+local pattern = msg.pattern
+if not (pattern == "*" or validName(pattern) or (type(pattern) == "string" and validName(pattern:match("^(.*)%.%*$")))) then
+return answer(msg, nil, "bad signal pattern: " .. tostring(pattern))
+end
+local set = B.listeners[caller.id] or {}
+B.listeners[caller.id] = set
+set[pattern] = op == "listen" or nil
+return answer(msg, true)
+elseif op == "own" then
+local name = msg.name
+if not validName(name) then return answer(msg, nil, "bad name: " .. tostring(name)) end
+if reserved(name) then return answer(msg, nil, name .. " is the kernal's") end
+local t = B.names[name]
+local holder = t and t.job and K.liveJob(t.job)
+if holder and holder.id ~= caller.id then
+return answer(msg, nil, name .. " is taken (process " .. holder.id .. ")")
+end
+B.names[name] = {job = caller.id}
+return answer(msg, true)
+elseif op == "release" then
+local t = B.names[msg.name]
+if t and t.job == caller.id then B.names[msg.name] = nil end
+return answer(msg, true)
+elseif op == "list" then
+return answer(msg, B.list())
+end
+answer(msg, nil, "unknown system bus operation: " .. tostring(op))
+end
+
+
+
+function B.consoleCall(S, name, method, args)
+local c = {console = true, user = S and S.user, timeout = DEFAULT_TIMEOUT}
+startCall(c, name, method, packed(args))
+while not c.done do K.wait(0.05) end
+return c.ok, c.results
+end
+
+
+function B.jobEnded(id)
+for name, t in pairs(B.names) do
+if t.job == id then B.names[name] = nil end
+end
+B.listeners[id] = nil
+for _, c in pairs(B.calls) do
+if c.service == id then finishCall(c, false, c.name .. " ended before answering") end
+if c.caller == id and not c.console then B.calls[c.id] = nil end
+end
+end
+
+
+
+function B.after(seconds, fn)
+local co = coroutine.create(function()
+local deadline = computer.uptime() + seconds
+while computer.uptime() < deadline do K.wait(0.05) end
+fn()
+end)
+K.commands[co] = true
+B.running[#B.running + 1] = {co = co, call = {finished = true}}
+end
+
+
+function B.resume()
+for i = #B.running, 1, -1 do
+if step(B.running[i]) then table.remove(B.running, i) end
+end
+local now = computer.uptime()
+for _, c in pairs(B.calls) do
+if now > c.deadline then
+finishCall(c, false, "no answer from " .. c.name .. " in " .. c.timeout .. " s")
+end
+end
+end
+
+return B
 
 @@ 14661 /terminal.lua
 
@@ -9047,7 +9442,7 @@ upkeep()
 end
 return reason
 
-@@ 86105 /runtime.lua
+@@ 90366 /runtime.lua
 
 
 
@@ -9297,10 +9692,14 @@ local eventQueues = {}
 local MAX_QUEUED_EVENTS = 64
 
 local windowRouted
+local sysbusDispatch
 
 local function queueEvent(id, event)
 if type(id) ~= "number" or type(event) ~= "table" then return end
 if event[1] == "window_route" then event = windowRouted(id, event) end
+
+
+if (event[1] == "sysbus_call" or event[1] == "sysbus_signal") and sysbusDispatch(id, event) then return end
 local q = eventQueues[id]
 if not q then q = {}; eventQueues[id] = q end
 if #q < MAX_QUEUED_EVENTS then q[#q + 1] = event end
@@ -9503,7 +9902,7 @@ local RPC_TIMEOUT = 5
 
 
 
-local function remoteRequest(msgType, extra, to, port)
+local function remoteRequest(msgType, extra, to, port, timeout)
 if not kernalAddr then
 return nil, "kernal address not known yet"
 end
@@ -9514,7 +9913,7 @@ send(msg, port)
 
 
 rpcWaiting[id] = true
-local w = {rpc = id, deadline = computer.uptime() + RPC_TIMEOUT}
+local w = {rpc = id, deadline = computer.uptime() + (timeout or RPC_TIMEOUT)}
 while not satisfied(w) do wait(w) end
 rpcWaiting[id] = nil
 local reply = rpcReplies[id]
@@ -9617,6 +10016,129 @@ local list = winDraws[id] or {}
 if #list < 16 then list[#list + 1] = draw end
 winDraws[id] = list
 end
+end
+
+
+
+
+
+
+local busServers, busHandlers = {}, {}
+local busThreads = 0
+
+local function busThread(jobId, fn, quiet)
+busThreads = busThreads + 1
+local entry = {id = jobId .. "/sysbus" .. busThreads, jobId = jobId, thread = {joined = quiet},
+co = coroutine.create(fn)}
+procs[entry.id] = entry
+procOrder[#procOrder + 1] = entry.id
+end
+
+local function busReply(jobId, call, ok, result)
+local fields = {op = "reply", call = call, caller = jobId}
+if ok then fields.result = result else fields.ok, fields.error = false, tostring(result) end
+return remoteRequest("SBUS", fields)
+end
+
+local function busMatches(pattern, signal)
+if pattern == "*" or pattern == signal then return true end
+local prefix = pattern:match("^(.*)%.%*$")
+return prefix ~= nil and signal:sub(1, #prefix + 1) == prefix .. "."
+end
+
+sysbusDispatch = function(id, event)
+if event[1] == "sysbus_call" then
+local methods = busServers[id] and busServers[id][event[3]]
+if not methods then return false end
+local call, name, method, caller, args = event[2], event[3], event[4], event[5], event[6] or {n = 0}
+busThread(id, function()
+local fn = methods[method]
+if type(fn) ~= "function" then return busReply(id, call, false, name .. " has no method " .. tostring(method)) end
+local r = table.pack(pcall(fn, caller, table.unpack(args, 1, args.n or #args)))
+if r[1] then busReply(id, call, true, table.pack(table.unpack(r, 2, r.n))) else busReply(id, call, false, r[2]) end
+end, true)
+return true
+end
+local handled = false
+for _, h in ipairs(busHandlers[id] or {}) do
+if busMatches(h.pattern, event[2]) then
+handled = true
+local args = event[4] or {n = 0}
+busThread(id, function() h.fn(event[2], event[3], table.unpack(args, 1, args.n or #args)) end)
+end
+end
+return handled
+end
+
+
+local function sysbusLib(id)
+local lib = {timeout = 30}
+local function req(fields, timeout)
+fields.caller = id
+local r, err = remoteRequest("SBUS", fields, nil, nil, timeout)
+if err ~= nil or r == nil then error(tostring(err), 0) end
+return r
+end
+local function check(n, v, want)
+if type(v) ~= want then error(string.format("bad argument #%d (%s expected, got %s)", n, want, type(v)), 3) end
+end
+
+
+
+
+function lib.own(name) check(1, name, "string") return req({op = "own", name = name}) end
+function lib.serve(name, methods)
+check(1, name, "string") check(2, methods, "table")
+req({op = "own", name = name})
+busServers[id] = busServers[id] or {}
+busServers[id][name] = methods
+return true
+end
+function lib.release(name)
+if busServers[id] then busServers[id][name] = nil end
+return req({op = "release", name = name})
+end
+function lib.reply(call, ...) return busReply(id, call, true, table.pack(...)) end
+function lib.fail(call, err) return busReply(id, call, false, err) end
+
+
+function lib.call(name, method, ...)
+check(1, name, "string") check(2, method, "string")
+local t = tonumber(lib.timeout) or 30
+local r = req({op = "call", name = name, method = method, args = table.pack(...), timeout = t}, t + 5)
+return table.unpack(r, 1, r.n or #r)
+end
+function lib.proxy(name)
+return setmetatable({}, {__index = function(_, method)
+return function(...) return lib.call(name, method, ...) end
+end})
+end
+
+
+
+function lib.emit(signal, ...) check(1, signal, "string") return req({op = "emit", signal = signal, args = table.pack(...)}) end
+function lib.listen(pattern) check(1, pattern, "string") return req({op = "listen", pattern = pattern}) end
+function lib.on(pattern, fn)
+check(1, pattern, "string") check(2, fn, "function")
+req({op = "listen", pattern = pattern})
+busHandlers[id] = busHandlers[id] or {}
+table.insert(busHandlers[id], {pattern = pattern, fn = fn})
+return true
+end
+function lib.unlisten(pattern)
+local list = busHandlers[id] or {}
+for i = #list, 1, -1 do
+if list[i].pattern == pattern then table.remove(list, i) end
+end
+return req({op = "unlisten", pattern = pattern})
+end
+
+function lib.list() return req({op = "list"}) end
+
+function lib.run()
+while true do wait({deadline = computer.uptime() + 3600}) end
+end
+return lib
 end
 
 
@@ -10333,6 +10855,7 @@ end,
 
 
 
+sysbus = function(id) return sysbusLib(id) end,
 bitmap = function(id)
 local encoder = bitmapLib(id)
 return {
@@ -11547,6 +12070,7 @@ end
 local legacyPopen
 
 local LEGACY_FACES = {
+sysbus = function(ctx) return sysbusLib(ctx.id) end,
 
 
 muxos = function(ctx)
@@ -12157,8 +12681,10 @@ local t = p.thread
 t.done, t.ok, t.result = true, ok, result
 if not ok and result ~= KILLED and not t.joined then
 printTo(p.jobId)("thread error: " .. tostring(result))
-flushOutput(p.jobId)
 end
+
+
+flushOutput(p.jobId)
 return
 end
 
@@ -12170,6 +12696,7 @@ other.thread.done, other.thread.ok, other.thread.result = true, false, KILLED
 end
 end
 local id = p.id
+busServers[id], busHandlers[id] = nil, nil
 local endHook = jobEndHooks[id]
 jobEndHooks[id] = nil
 if endHook then pcall(endHook, ok, result) end

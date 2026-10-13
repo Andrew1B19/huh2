@@ -91,6 +91,8 @@ kernal/session.lua     a session: one screen's console, login, shell, compositor
 kernal/vgpu.lua        a GPU in Lua memory, for a terminal whose GPU has no video buffers.
 kernal/windows.lua     the window registry: every program window, its owner and user, and the
                        session showing it (see "Where windows live").
+kernal/sysbus.lua      the system bus: programs' named services, calls and signals, and the
+                       kernal's own services (see "The system bus").
 kernal/terminals.lua   the terminal server: the kernal's side of network terminals' sessions.
 kernal/terminal.lua    the terminal runtime: a terminal's side of its session, run on the
                        terminal (muxterm fetches it, with session/compositor/bitmap/...).
@@ -357,7 +359,8 @@ Errors the Analyzer can show:
   onto the kernal's (`flash -q <file>` in OpenOS).
 - Copy `kernal/muxos.lua`, `compositor.lua`, `shell.lua`, `bitmap.lua`,
   `lineedit.lua`, `system.lua`, `session.lua`, `vgpu.lua`,
-  `windows.lua`, `terminals.lua` and `terminal.lua` (all in `kernal/`) and
+  `windows.lua`, `sysbus.lua`, `terminals.lua` and `terminal.lua` (all in
+  `kernal/`) and
   `node/runtime.lua` to the root of the kernal's disk, and `kernal/lib`
   to `/lib`.
 
@@ -566,9 +569,10 @@ against the code (not just this document):
   (the pipework -- shares, frames, presentation modes -- is built).
 - **The `promote` orphan policy's** requirement that a promoted child
   can run on its own isn't checked; the kernal takes it on trust.
-- **Deferred or undecided by design:** multi-monitor support, a kernal
-  system bus (dbus-like) for `.mxe` programs, and OPM's interface to the
-  kernal (OPM will update the kernal and its modules through it).
+- **OPM's side of updating the kernal:** the kernal's interface for it
+  is built (the `muxos.update` service on the system bus); OPM doesn't
+  use it yet.
+- **Deferred or undecided by design:** multi-monitor support.
 
 **The `.mxe` process model, partially built**: parent/child jobs are
 real now -- `gmuxapi.create_headless_process`/`create_graphics_process`
@@ -773,6 +777,54 @@ at a time and can move:
 
 Tested in `test/emu/integration_test.lua` (tests 56, 58) and
 `test/emu/muxterm_test.lua` (tests 7 and 8).
+
+### The system bus
+
+muxos's D-Bus: programs talking to each other, and to the kernal, by
+name -- whatever node they run on and whoever started them. (Not the
+cluster *component* bus, which is hardware on any node.)
+
+- **Services:** a program owns a name and others call its methods:
+
+  ```lua
+  -- player.mxe (libraries = {"sysbus"})
+  local sysbus = require("sysbus")
+  sysbus.serve("player", {
+    pause = function(caller) paused = true return true end,
+    status = function(caller) return paused and "paused" or "playing" end,
+  })
+  sysbus.run()
+
+  -- anywhere else
+  local player = require("sysbus").proxy("player")
+  player.pause()
+  print(player.status())
+  ```
+
+  Each call runs in a thread of the service's own, so it can answer
+  while doing other work; `caller` is `{job, user}`. A method's error
+  reaches the caller as an error, as does a missing name or method, or
+  no answer in `sysbus.timeout` seconds (30). A name is its owner's
+  until it releases it or ends.
+- **Signals:** `sysbus.emit("backup.done", ...)` reaches every process
+  that listens: `sysbus.on("backup.*", function(signal, sender, ...)
+  end)`, or `sysbus.listen(pattern)` and `{"sysbus_signal", ...}`
+  events from `pull_event`.
+- **The kernal's services** (names under `muxos.` are the kernal's):
+  - `muxos.system`: `version`, `uptime`, `users`, `who`, `nodes`,
+    `reboot` (flag `reboot_requires_root`).
+  - `muxos.update` -- OPM's interface to the kernal: `version`
+    (running and installed), `files` (the kernal's files), and
+    `install(files, version)`: kernal modules, `/lib` files and the
+    kernal BIOS, all or nothing, taking effect at the next reboot
+    (flag `update_requires_root`; every `.lua` file must compile).
+  - Signals: `muxos.login`/`muxos.logout` (user, where) and
+    `muxos.node` (address, `"up"`/`"down"`).
+- `.lua` programs have it too: `require("sysbus")`.
+- At the console, `sysbus` lists the names, and `sysbus call <name>
+  <method> [args]` calls one.
+
+Tested in `test/emu/integration_test.lua` (test 59).
 
 ### The scheduler
 
