@@ -1313,14 +1313,43 @@ local function readOnly(t, name)
   })
 end
 
+-- Programs' own coroutines, as in OpenOS: a wait inside one (sleep,
+-- event.pull, any kernal or component call) passes straight through to
+-- the scheduler and back, instead of surfacing as the coroutine's own
+-- yield to whoever resumed it.
+local PASS_COROUTINE
+do
+  local rawResume, rawYield, status = coroutine.resume, coroutine.yield, coroutine.status
+  local function resume(co, ...)
+    local r = table.pack(rawResume(co, ...))
+    while r[1] and r[2] == WAIT and status(co) == "suspended" do
+      rawYield(WAIT, r[3])
+      r = table.pack(rawResume(co))
+    end
+    return table.unpack(r, 1, r.n)
+  end
+  local function wrap(fn)
+    local co = coroutine.create(fn)
+    return function(...)
+      local r = table.pack(resume(co, ...))
+      if not r[1] then error(r[2], 2) end
+      return table.unpack(r, 2, r.n)
+    end
+  end
+  PASS_COROUTINE = {}
+  for k, v in pairs(coroutine) do PASS_COROUTINE[k] = v end
+  PASS_COROUTINE.resume, PASS_COROUTINE.wrap = resume, wrap
+end
+
 local NATIVE = {}
 for _, k in ipairs({"assert", "error", "ipairs", "next", "pairs", "pcall", "rawequal", "rawget",
     "rawlen", "rawset", "select", "setmetatable", "getmetatable", "tonumber", "tostring", "type", "xpcall"}) do
   NATIVE[k] = _ENV[k]
 end
-for _, lib in ipairs({"string", "table", "math", "utf8", "coroutine"}) do
+for _, lib in ipairs({"string", "table", "math", "utf8"}) do
   if _ENV[lib] then NATIVE[lib] = readOnly(_ENV[lib], lib) end
 end
+NATIVE.coroutine = readOnly(PASS_COROUTINE, "coroutine")
 NATIVE.computer = readOnly({uptime = computer.uptime, address = computer.address}, "computer")
 NATIVE.gpu = gpu
 -- A native process's (and an .mxe's) view of hardware: the whole
@@ -1676,14 +1705,52 @@ local function pipeWait(ctx, timeout)
   if e and not pipeEvent(ctx, e) then ctx.deferred[#ctx.deferred + 1] = e end
 end
 
+-- OpenOS's event.timer callbacks that are due, run (as OpenOS does,
+-- from inside whatever pull or sleep is waiting).
+local function runTimers(ctx)
+  local now, due = computer.uptime(), {}
+  for id, t in pairs(ctx.timers) do
+    if t.after <= now then due[#due + 1] = id end
+  end
+  table.sort(due)
+  for _, id in ipairs(due) do
+    local t = ctx.timers[id]
+    if t then
+      t.times = t.times - 1
+      if t.times <= 0 then ctx.timers[id] = nil else t.after = now + t.interval end
+      local ok, err = pcall(t.callback)
+      if not ok then writeOutput(ctx.id, "timer error: " .. tostring(err) .. "\n") end
+    end
+  end
+end
+
+local function nextTimer(ctx)
+  local soonest
+  for _, t in pairs(ctx.timers) do
+    if not soonest or t.after < soonest then soonest = t.after end
+  end
+  return soonest
+end
+
 local function legacyPull(ctx, timeout)
+  runTimers(ctx)
   local sig = table.remove(ctx.pushed, 1)
   local deadline = timeout and computer.uptime() + timeout
   while not sig do
     local e = table.remove(ctx.deferred, 1)
-      or gmuxapi.pull_event(deadline and math.max(0, deadline - computer.uptime()) or nil)
-    if not e then return nil end
-    if not pipeEvent(ctx, e) then sig = toSignal(e) end
+    if not e then
+      local wake, timer = deadline, nextTimer(ctx)
+      if timer and (not wake or timer < wake) then wake = timer end
+      e = gmuxapi.pull_event(wake and math.max(0, wake - computer.uptime()) or nil)
+      runTimers(ctx)
+      sig = table.remove(ctx.pushed, 1) -- a timer may have pushed one
+    end
+    if e and not pipeEvent(ctx, e) then
+      if sig then table.insert(ctx.pushed, 1, sig) end
+      sig = toSignal(e)
+    elseif not e and not sig and deadline and computer.uptime() >= deadline then
+      return nil
+    end
   end
   -- A user resize of its window is a resolution change, as in gmux.
   if sig[1] == "window_resized" and ctx.vgpu and sig[2] == ctx.windowId then
@@ -2702,6 +2769,25 @@ local LEGACY_FACES = {
       end
       return false
     end
+    -- callback() after `interval` seconds, `times` times (math.huge:
+    -- until cancelled); run from inside the program's pulls and sleeps.
+    function event.timer(interval, callback, times)
+      checkArg(1, interval, "number")
+      checkArg(2, callback, "function")
+      checkArg(3, times, "number", "nil")
+      ctx.timerIds = (ctx.timerIds or 0) + 1
+      ctx.timers[ctx.timerIds] = {interval = interval, callback = callback, times = times or 1,
+        after = computer.uptime() + interval}
+      return ctx.timerIds
+    end
+    function event.cancel(id)
+      checkArg(1, id, "number")
+      if ctx.timers[id] then ctx.timers[id] = nil return true end
+      return false
+    end
+    function event.onError(message)
+      writeOutput(ctx.id, "event error: " .. tostring(message) .. "\n")
+    end
     return setmetatable(event, getmetatable(unavailable("event")))
   end,
   term = function(ctx)
@@ -3045,7 +3131,7 @@ local function newLegacyEnv(id, program)
   env.computer = NATIVE.computer
   local loaded = {}
   local path = program and program.path
-  local ctx = {id = id, env = env, loaded = loaded, pushed = {}, listeners = {}, path = path,
+  local ctx = {id = id, env = env, loaded = loaded, pushed = {}, listeners = {}, timers = {}, path = path,
     deferred = {}, pipes = {}, pipeIn = program and program.pipe and program.pipe:find("w") and {buffer = ""} or nil,
     name = path and path:match("([^/]+)$") or "legacy", screenSize = program and program.screen,
     fsAddress = program and program.fsAddress,
@@ -3134,7 +3220,14 @@ local function newLegacyEnv(id, program)
   }
   local hostOs = _ENV.os or {}
   env.os = {
-    sleep = sleep,
+    -- OpenOS's: a pull loop, so listeners and timers run meanwhile (and
+    -- signals arriving are used up, as there).
+    sleep = function(seconds)
+      checkArg(1, seconds, "number", "nil")
+      flushOutput(id, true)
+      local deadline = computer.uptime() + (seconds or 0)
+      repeat legacyPull(ctx, deadline - computer.uptime()) until computer.uptime() >= deadline
+    end,
     clock = computer.uptime,
     time = hostOs.time or function() return math.floor(computer.uptime()) end,
     date = hostOs.date,
