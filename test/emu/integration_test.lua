@@ -2266,4 +2266,91 @@ print("bits57 " .. cols .. "x" .. rows .. " " .. tostring(ok) .. " " .. tostring
 end
 print("  OK -- bitmap.cells, bitmap.encode + runs, drawn as cells")
 
+print("test 58: what keeps running after logout -- persistent applications, the title-bar toggle, nohup, jobs, attach")
+do
+  local files = {
+    -- Persistent by its own call; its child goes with it. Once detached it
+    -- opens a window and prints: both wait for its user.
+    ["/bin/keeper.mxe"] = [==[--[[mxe
+name = "keeper"
+]]
+gmuxapi.set_persistent(true)
+gmuxapi.create_headless_process({code = "while true do sleep(1) end", name = "kchild"})
+gmuxapi.create_window({title = "keeper", x = 3, y = 2, width = 20, height = 1, code = "gpu.set(1, 1, 'KEEPER')"})
+local opened = false
+while true do
+  local e = gmuxapi.pull_event(60)
+  if e and e[1] == "window_detached" and not opened then
+    opened = true
+    sleep(1)
+    gmuxapi.create_window({title = "late", x = 30, y = 2, width = 20, height = 1, code = "gpu.set(1, 1, 'LATE WINDOW')"})
+    print("printed while away")
+  end
+end
+]==],
+    ["/bin/plain.mxe"] = [==[--[[mxe
+name = "plain"
+]]
+gmuxapi.create_window({title = "plain", x = 3, y = 6, width = 12, height = 1, code = "gpu.set(1, 1, 'PLAIN')"})
+sleep(600)
+]==],
+    ["/bin/legacy.lua"] = 'print("legacy kept " .. tostring(require("muxos").set_persistent()))\nio.read()',
+    ["/bin/napper.mxe"] = '--[[mxe\nname = "napper"\n]]\nsleep(600)',
+    ["/bin/ender.mxe"] = '--[[mxe\nname = "ender"\n]]\nsleep(600)',
+  }
+  local c = newCluster(80, 25, files, 2)
+  -- Its taskbar button gives the console the keyboard (a second touch if
+  -- the first minimized it, as it does the focused window).
+  local function console()
+    local bx = c.cells(1, 25, 80):find(" console ", 1, true)
+    if bx then c.touch(bx + 2, 25) end
+    if bx and not c.text():find("root@muxos:~>", 1, true) then c.touch(bx + 2, 25) end
+  end
+  local function run(line, wait) console() c.typeLine(line) c.emu:advance(wait or 1) end
+  local function idOf(path) return c.text():match("%[(%d+)%] " .. path:gsub("%.", "%%.") .. " started") end
+  local function flat() return (c.text():gsub("\n", "")) end
+  run("keeper &", 2)
+  local K = idOf("/bin/keeper.mxe")
+  run("plain &", 2)
+  local P = idOf("/bin/plain.mxe")
+  assert(K and P and c.text():find("KEEPER", 1, true) and c.text():find("PLAIN", 1, true), "both up:\n" .. c.text())
+  local OFF, ON = utf8.char(0x25C7), utf8.char(0x25C6)
+  local bx, by = c.find(OFF)
+  assert(bx and by == 6 and c.find(ON), "plain's toggle is off, keeper's on:\n" .. c.text())
+  c.touch(bx, by)
+  assert(c.cell(bx, by).char == ON, "the toggle turned plain's persistence on:\n" .. c.text())
+  run("legacy", 2)
+  assert(c.text():find("legacy kept true", 1, true), "a .lua program asks with require('muxos'):\n" .. c.text())
+  run("nohup napper &", 1)
+  local N = idOf("/bin/napper.mxe")
+  assert(N and c.text():find("(kept after logout)", 1, true), "nohup:\n" .. c.text())
+  run("ender &", 1)
+  run("logout", 3)
+  c.typeLine("root")
+  c.emu:advance(3)
+  local text = c.text()
+  assert(not text:find("KEEPER", 1, true) and not text:find("PLAIN", 1, true), "all detached:\n" .. text)
+  run("jobs", 1)
+  local f = flat()
+  local L = f:match("%[(%d+)%] /bin/legacy%.lua") or "?"
+  assert(f:find("[" .. K .. "] /bin/keeper.mxe (+1 child) -- detached, kept after logout, has output", 1, true),
+    "keeper and its child kept, with output waiting:\n" .. c.text())
+  assert(f:find("[" .. P .. "] /bin/plain.mxe -- detached, kept after logout", 1, true), "plain, toggled:\n" .. c.text())
+  assert(f:find("[" .. L .. "] /bin/legacy.lua -- detached, kept after logout", 1, true), "legacy:\n" .. c.text())
+  assert(f:find("[" .. N .. "] /bin/napper.mxe -- detached, kept after logout", 1, true), "napper:\n" .. c.text())
+  assert(not f:find("/bin/ender.mxe", 1, true), "ender ended at logout:\n" .. c.text())
+  run("attach " .. K, 3)
+  text, f = c.text(), flat()
+  assert(text:find("KEEPER", 1, true) and text:find("LATE WINDOW", 1, true), "attach brings its windows, the late one too:\n" .. text)
+  assert(f:find("while you were away:", 1, true) and f:find("printed while away", 1, true)
+    and f:find("attached here (2 windows brought over)", 1, true), "...and its output:\n" .. text)
+  run("persist " .. N .. " off", 1)
+  assert(flat():find("[" .. N .. "] ends at logout", 1, true), "persist off:\n" .. c.text())
+  run("jobs", 1)
+  f = flat()
+  assert(f:find("[" .. K .. "] /bin/keeper.mxe (+1 child) -- here, kept after logout", 1, true)
+    and f:find("[" .. N .. "] /bin/napper.mxe -- detached", 1, true), "jobs after attach:\n" .. c.text())
+end
+print("  OK -- set_persistent/require('muxos')/the toggle/nohup keep applications (children too); attach brings them back")
+
 print("ALL OK")

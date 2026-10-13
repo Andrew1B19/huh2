@@ -653,9 +653,10 @@ ownership, no permission system**. What a user name gives you:
   programs see as `HOME` (with `USER`, and `PWD` the folder they were
   started from).
 - **Your own processes:** `processes` shows whose each one is.
-  `logout` (or `exit`) ends the processes started from that login
-  (flag `logout_ends_jobs`), closes what's left of its windows, clears
-  the console, and goes back to `login:`.
+  `logout` (or `exit`) ends the applications started from that login,
+  except persistent ones (flag `logout_ends_jobs`; see "Where windows
+  live"), closes what's left of its windows, clears the console, and
+  goes back to `login:`.
 
 Users are created explicitly: a name typed at `login:` that isn't a
 user just says `no such user` and asks again -- a typo never makes an
@@ -678,7 +679,7 @@ its default; a bad value from `flags` is refused.
 | `drain_requires_root` | false | only root can `drain`, `undrain` or `migrate` |
 | `useradd_requires_root` | true | only root can `useradd` or `userdel` |
 | `kill_requires_owner` | false | only a process's own user (or root) can `pause`, `resume` or `kill` it |
-| `logout_ends_jobs` | true | logging out ends the processes started from that login |
+| `logout_ends_jobs` | true | logging out ends the applications started from that login, except persistent ones |
 | `scheduler` | load | where new work goes: `load` (lowest load average) or `count` (fewest processes) -- see "The scheduler" |
 | `remote_terminals` | true | network terminals can log in (takes effect at the next boot) |
 | `terminal_port` | 4478 | the network port terminals use, not 4477 (the cluster's) (next boot) |
@@ -740,18 +741,37 @@ A program's window belongs to its process and its user, not to a screen
 (`kernal/windows.lua`, the registry). It's shown by at most one session
 at a time and can move:
 
-- **Persistent programs:** an `.mxe` that calls
-  `gmuxapi.set_persistent(true)` keeps running after its user logs out
-  (or their terminal hangs up); its windows are *detached* -- shown
-  nowhere -- and the program hears `window_detached`. Programs that
-  didn't ask are ended at logout (flag `logout_ends_jobs`).
+- **What keeps running after logout:** logging out (or a terminal
+  hanging up) ends the *applications* started from that login -- each
+  top-level process; its children then go by their orphan policies, as
+  when a parent ends -- except **persistent** ones, which keep running
+  with all their children: an overnight job survives closing the
+  terminal. An application is persistent when
+  - the program asks: `gmuxapi.set_persistent(true)` in an `.mxe`,
+    `require("muxos").set_persistent(true)` in a `.lua` program;
+  - you toggle it on its window's title bar (◇ off, ◆ on, left of
+    minimize), at any time;
+  - you start it with `nohup <program> [args]`, or mark it with
+    `persist <job id> [on|off]` while it runs.
+
+  With flag `logout_ends_jobs` off, nothing ends at logout.
+- **While you're away** a persistent application's windows are
+  *detached* -- shown nowhere -- and it hears `window_detached`. New
+  windows it opens meanwhile open detached too, and its console output
+  is kept (the last 4 KB).
+- **`jobs`** lists your applications, wherever they are: here, at
+  another screen, or detached, with their children, whether they're
+  kept after logout, and whether output is waiting.
+- **`attach <job id>`** brings an application to this session: all its
+  windows, its output since you left, and from then on its output and
+  new windows.
 - **Every session's taskbar lists all of its user's windows**, wherever
   they are: those shown elsewhere, or nowhere, are marked (blue).
-  Touching one brings the window to this screen; the program hears
-  `window_attached` and the window's last drawing is replayed, so it
-  comes back with its content.
+  Touching one brings the window to this screen (and its application,
+  if it was detached); the program hears `window_attached` and the
+  window's last drawing is replayed, so it comes back with its content.
 
-Tested in `test/emu/integration_test.lua` (test 56) and
+Tested in `test/emu/integration_test.lua` (tests 56, 58) and
 `test/emu/muxterm_test.lua` (tests 7 and 8).
 
 ### The scheduler

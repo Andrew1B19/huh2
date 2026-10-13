@@ -20,6 +20,8 @@
 --                            window's {width, height} in cells, or nil, err
 --   display.remove(id)       takes it off the screen
 --   display.status(id, s)    marks it ended ("dead"/"error")
+--   display.persist(id, on)  shows whether its application keeps running
+--                            after logout (the title bar's toggle)
 local K = ...
 local W = {byId = {}}
 
@@ -56,20 +58,34 @@ local function announce(rec)
 end
 
 -- Opens a program's window in session S: `spec` is create_window's
--- options; `owner` the process it belongs to. Returns the record.
+-- options; `owner` the process it belongs to. Returns the record. With
+-- no session (a program whose user logged out) it opens detached: on
+-- that user's taskbars, to be brought to a screen from there.
+local function clampSize(v, default)
+  v = math.tointeger(tonumber(v)) or default
+  return math.max(1, math.min(v, 160))
+end
+
 function W.open(S, spec, owner)
-  if not S or not S.display then return nil, "its session has ended -- no screen to open a window on" end
+  local job = owner and K.jobs[owner]
+  if not (S and S.display) and not job then return nil, "its session has ended -- no screen to open a window on" end
   K.windowIds = K.windowIds + 1
   local id = K.windowIds
-  local job = owner and K.jobs[owner]
   local key = newKey()
   local shown = {}
   for k, v in pairs(spec) do shown[k] = v end
   shown.id, shown.ownerJobId, shown.text, shown.key = id, owner, nil, key
   shown.ownerNode = job and job.node
-  local size, err = S.display.create(shown)
-  if not size then return nil, err end
-  local rec = {id = id, owner = owner, user = job and job.user or S.user, session = S.id,
+  if job then shown.persist = K.isPersistent(job) end
+  local size, err
+  if S and S.display then
+    size, err = S.display.create(shown)
+    if not size then return nil, err end
+  else
+    S = nil
+    size = {width = clampSize(spec.width, 40), height = clampSize(spec.height, 10)}
+  end
+  local rec = {id = id, owner = owner, user = job and job.user or S.user, session = S and S.id,
     title = tostring(spec.title or ("window " .. id)), x = spec.x or 1, y = spec.y or 1,
     width = size.width, height = size.height, resizable = spec.resizable == true,
     decorated = spec.decorated ~= false, key = key, holders = {}}
@@ -106,7 +122,7 @@ function W.attach(rec, S)
   local job = rec.owner and K.jobs[rec.owner]
   local size, err = S.display.create({id = rec.id, title = rec.title, x = rec.x, y = rec.y,
     width = rec.width, height = rec.height, resizable = rec.resizable, decorated = rec.decorated,
-    ownerJobId = rec.owner, ownerNode = job and job.node, key = key,
+    ownerJobId = rec.owner, ownerNode = job and job.node, key = key, persist = job and K.isPersistent(job),
     code = "gpu.setBackground(0x000000) gpu.fill(1, 1, " .. rec.width .. ", " .. rec.height .. ", ' ')"})
   if not size then
     K.windowsChanged(rec.user)
@@ -122,6 +138,12 @@ function W.attach(rec, S)
   announce(rec)
   K.windowsChanged(rec.user)
   return true
+end
+
+-- Its application's persistence changed: the screen showing it says so.
+function W.persistChanged(rec, on)
+  local S = rec.session and K.byId[rec.session]
+  if S and S.display.persist then S.display.persist(rec.id, on) end
 end
 
 -- The window is gone (closed, or its program ended unseen).

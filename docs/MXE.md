@@ -169,16 +169,21 @@ Every `.mxe` sees these globals, read-only. Its own globals are its own.
     session the program was started from -- the kernal's own or a
     network terminal's -- and the program draws to that screen
     directly.
-  - **persistence:** `set_persistent(true)` -- this program keeps
-    running when its user logs out (or their terminal hangs up). Its
-    windows are *detached* (shown nowhere) meanwhile, and every session
-    of that user lists them on its taskbar; touching one there brings
-    the window to that screen. The program hears
-    `{"window_detached", id}` and `{"window_attached", id, w, h}`; on
-    attaching, its last `draw_window`s are replayed, so it comes back
-    drawn (redraw whatever has changed since). `set_persistent(false)`
-    undoes it. Without it, a program is ended at logout (flag
-    `logout_ends_jobs`). Test 56.
+  - **persistence:** `set_persistent(true)` -- this application (the
+    top of this process's tree, with every child) keeps running when
+    its user logs out (or their terminal hangs up); `set_persistent(false)`
+    undoes it, `is_persistent()` asks. The user can also toggle it on
+    the window's title bar, or with `nohup`/`persist`. Its windows are
+    *detached* (shown nowhere) meanwhile -- and new ones it opens
+    meanwhile open detached -- and every session of that user lists
+    them on its taskbar; touching one there brings the window to that
+    screen. The program hears `{"window_detached", id}` and
+    `{"window_attached", id, w, h}`; on attaching, its last
+    `draw_window`s are replayed, so it comes back drawn (redraw
+    whatever has changed since). Its `print` output while detached is
+    kept (the last 4 KB) for `attach`. A non-persistent application is
+    ended at logout (flag `logout_ends_jobs`); its children then go by
+    their orphan policies. Tests 56, 58.
   - **render targets** -- several processes, on several nodes, drawing
     one window frame by frame (the pipework for a rendering library):
     - `share_window(window, child, {x, y, w, h})` -- the window's owner

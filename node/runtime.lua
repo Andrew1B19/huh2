@@ -960,6 +960,9 @@ gmuxapi = {
   set_persistent = function(on)
     return remoteRequest("PERSIST", {on = on ~= false, caller = currentJobId})
   end,
+  is_persistent = function()
+    return remoteRequest("PERSIST", {caller = currentJobId})
+  end,
 
   get_windows = function()
     return remoteRequest("GETWINDOWS", {caller = currentJobId})
@@ -2494,6 +2497,17 @@ end
 local legacyPopen -- below, with the legacy environment
 
 local LEGACY_FACES = {
+  -- muxos's own library for .lua programs (require("muxos")): the parts
+  -- of an .mxe's gmuxapi that make sense for one.
+  muxos = function(ctx)
+    return {
+      version = MUXOS_VERSION,
+      -- Keep running after the user logs out (their windows wait on the
+      -- user's taskbars); false undoes it.
+      set_persistent = function(on) return remoteRequest("PERSIST", {on = on ~= false, caller = ctx.id}) end,
+      is_persistent = function() return remoteRequest("PERSIST", {caller = ctx.id}) end,
+    }
+  end,
   -- OpenOS's pipe library runs programs as coroutines of the caller;
   -- here each is a process of its own, so only popen carries over.
   pipe = function(ctx)

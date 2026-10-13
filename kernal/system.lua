@@ -34,7 +34,7 @@ local FLAGS = {
   {name = "kill_requires_owner", type = "boolean", default = false,
     help = "only a process's own user (or root) can pause, resume or kill it"},
   {name = "logout_ends_jobs", type = "boolean", default = true,
-    help = "logging out ends the processes started from that login"},
+    help = "logging out ends the applications started from that login, except persistent ones"},
   {name = "scheduler", type = "choice", choices = {"load", "count"}, default = "load",
     help = "where new work goes: the worker with the lowest load average, or the fewest processes"},
   {name = "remote_terminals", type = "boolean", default = true, reboot = true,

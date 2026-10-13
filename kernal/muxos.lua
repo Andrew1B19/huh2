@@ -504,8 +504,12 @@ local awaiting = {}
 -- `jobId`) sets these.
 -- The session a process belongs to -- where its windows and output go --
 -- if it's still on.
+-- The session a process prints to and opens windows in: the login it
+-- was started from, while that login lasts (a screen's next login isn't
+-- it). nil once its user has logged out, until it's attached again.
 function K.sessionOf(job)
-  return job and job.session and K.byId[job.session]
+  local S = job and job.session and K.byId[job.session]
+  if S and S.login == job.login then return S end
 end
 
 -- The session showing program window `id` with a compositor here (the
@@ -1649,7 +1653,12 @@ local function handleOutput(msg)
     return
   end
   local S = K.sessionOf(job)
-  if S then S.write(msg.text) end
+  if S then
+    S.write(msg.text)
+  else
+    -- Its user is away: kept (the last 4 KB) for `attach`.
+    job.away = ((job.away or "") .. msg.text):sub(-4096)
+  end
 end
 
 -- gmuxapi.launch: a process launching a program becomes its parent.
@@ -2017,8 +2026,10 @@ local function handlePersist(msg)
     send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "not called from a running process"})
     return
   end
-  caller.persistent = msg.on ~= false or nil
-  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = caller.persistent == true})
+  -- on = nil: only asks.
+  local on = msg.on
+  if on ~= nil then K.setPersistent(caller, on ~= false) end
+  send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = K.isPersistent(caller)})
 end
 
 -- First real slice of the gmux application API, muxos-shaped:
@@ -2031,7 +2042,7 @@ end
 -- GETPROCESS message) returns one job in full.
 local SUMMARY_FIELDS = {"id", "node", "status", "startedAt", "finishedAt", "parent", "appName",
   "orphanPolicy", "rootId", "codePreview", "error", "paused", "kind", "path", "migratable", "migrations",
-  "programName", "programVersion", "user"}
+  "programName", "programVersion", "user", "persistent"}
 
 local function handleGetProcesses(msg)
   local list = {}
@@ -2668,6 +2679,19 @@ function K.runCommand(S, line)
     listNodes()
   elseif line == "processes" then
     printProcesses()
+  elseif line == "jobs" then
+    K.listJobs(S)
+  elseif word == "attach" then
+    K.attachJob(S, tonumber(line:match("^attach%s+(%d+)%s*$")))
+  elseif word == "persist" then
+    local id, onOff = line:match("^persist%s+(%d+)%s*(%a*)%s*$")
+    local job = id and jobs[tonumber(id)]
+    if not job or job.status ~= "running" or (job.user ~= S.user) then
+      print("usage: persist <job id> [on|off] -- one of your running processes")
+    else
+      local on = K.setPersistent(job, onOff ~= "off")
+      print("[" .. K.appRoot(job).id .. "] " .. (on and "keeps running after logout" or "ends at logout"))
+    end
   elseif line:match("^ping%s") then
     local node, countStr = line:match("^ping%s+(%S+)%s*(%S*)$")
     if not node then
@@ -2812,21 +2836,122 @@ end
 
 function K.userWindows(user) return K.win.ofUser(user) end
 
+-- --- Logging out, and what keeps running ---
+--
+-- Persistence belongs to an application: the top of a process tree (a
+-- promoted child is an application of its own). The program asks
+-- (gmuxapi.set_persistent, or the muxos library for a .lua program),
+-- or its user does (the title bar's toggle, `nohup`, `persist`).
+
+function K.appRoot(job)
+  for _ = 1, 64 do
+    local parent = job.parent and jobs[job.parent]
+    if not parent then break end
+    job = parent
+  end
+  return job
+end
+
+function K.isPersistent(job)
+  return K.appRoot(job).persistent == true
+end
+
+-- Sets an application's persistence; its windows' toggles show it.
+function K.setPersistent(job, on)
+  local root = K.appRoot(job)
+  root.persistent = on and true or nil
+  for _, rec in pairs(K.win.byId) do
+    local owner = rec.owner and jobs[rec.owner]
+    if owner and K.appRoot(owner) == root then K.win.persistChanged(rec, on and true or false) end
+  end
+  return on and true or false
+end
+
+-- The title bar's toggle, on window `id` in session S.
+function K.togglePersist(id, S)
+  local rec = K.win.get(id)
+  local job = rec and rec.user == S.user and K.liveJob(rec.owner)
+  if job then K.setPersistent(job, not K.isPersistent(job)) end
+end
+
+-- Binds an application whose user logged out to session S: its output
+-- and new windows come here. `force`: even from a login that's still on.
+function K.rebind(job, S, force)
+  local root = K.appRoot(job)
+  if K.sessionOf(root) and not force then return end
+  for id in pairs(runningJobs) do
+    local j = jobs[id]
+    if K.appRoot(j) == root then j.session, j.login = S.id, S.login end
+  end
+end
+
 -- Brings one of the session's user's windows to its screen.
 function K.attachWindow(id, S)
   local rec = K.win.get(id)
   if not rec or rec.user ~= S.user then return nil, "no such window of yours" end
-  return K.win.attach(rec, S)
+  local ok, err = K.win.attach(rec, S)
+  local owner = ok and K.liveJob(rec.owner)
+  if owner then K.rebind(owner, S) end
+  return ok, err
 end
 
--- A login ends: its processes end (flag logout_ends_jobs) unless they
--- asked to keep running (gmuxapi.set_persistent); windows of those that
--- do are detached, to wait for the user's next session.
+-- `attach <job>`: an application of yours -- its windows, its output
+-- since you left -- to this session.
+function K.attachJob(S, id)
+  local job = jobs[id]
+  if not job or job.status ~= "running" or job.user ~= S.user then
+    return print("attach: no running process " .. tostring(id) .. " of yours")
+  end
+  local root = K.appRoot(job)
+  K.rebind(root, S, true)
+  local moved = 0
+  for _, rec in pairs(K.win.byId) do
+    local owner = rec.owner and jobs[rec.owner]
+    if owner and K.appRoot(owner) == root and rec.session ~= S.id and K.win.attach(rec, S) then moved = moved + 1 end
+  end
+  for _, jid in ipairs(orderedJobIds()) do
+    local j = jobs[jid]
+    if j.away and K.appRoot(j) == root then
+      print("[" .. jid .. "] while you were away:")
+      S.write(j.away:sub(-1) == "\n" and j.away or j.away .. "\n")
+      j.away = nil
+    end
+  end
+  print("[" .. root.id .. "] " .. tostring(root.path or "job") .. " attached here (" .. moved .. " window"
+    .. (moved == 1 and "" or "s") .. " brought over)")
+end
+
+-- `jobs`: your applications, wherever they are.
+function K.listJobs(S)
+  local any = false
+  for _, id in ipairs(orderedJobIds()) do
+    local job = jobs[id]
+    if job.status == "running" and job.user == S.user and not job.parent then
+      local where = K.sessionOf(job)
+      local children = 0
+      for cid in pairs(runningJobs) do
+        if cid ~= id and K.appRoot(jobs[cid]) == job then children = children + 1 end
+      end
+      print(string.format("[%d] %s%s -- %s%s%s", id, tostring(job.path or job.codePreview or "job"),
+        children > 0 and (" (+" .. children .. " child" .. (children == 1 and "" or "ren") .. ")") or "",
+        where == S and "here" or where and (where.kind == "local" and "at the console" or "at terminal "
+          .. tostring(where.address):sub(1, 8)) or "detached",
+        job.persistent and ", kept after logout" or "", job.away and ", has output" or ""))
+      any = true
+    end
+  end
+  if not any then print("no processes of yours running") end
+end
+
+-- A login ends: its applications end (flag logout_ends_jobs) unless
+-- they're persistent; their processes' children go by their orphan
+-- policies, as when a parent ends. Windows of what keeps running are
+-- detached, to wait on the user's taskbars.
 function K.endLogin(S)
   local ending = system.flag("logout_ends_jobs")
   for id in pairs(runningJobs) do
     local job = jobs[id]
-    if job.login == S.login and ending and not job.persistent then
+    if job.login == S.login and ending and not job.parent and not K.isPersistent(job) then
       job.loggedOut = true
       controlJob(id, "KILL", "killed (logged out)")
     end
@@ -2926,7 +3051,7 @@ end
 K.MUXOS_COMMANDS = {}
 for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
     .. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
-    .. "shutdown logout flags users useradd userdel who"):gmatch("%S+") do
+    .. "shutdown logout flags users useradd userdel who jobs persist attach"):gmatch("%S+") do
   K.MUXOS_COMMANDS[name] = true
 end
 
@@ -2963,7 +3088,13 @@ function K.newShell(S, user)
     -- legacy program has its own window, as in gmux, so the console
     -- doesn't wait for it; & runs any program in the background).
     external = function(argv, background)
-      if K.MUXOS_COMMANDS[argv[1]] then
+      -- nohup <program ...>: it keeps running after logout.
+      local keep = argv[1] == "nohup"
+      if keep then
+        table.remove(argv, 1)
+        if not argv[1] then S.print("usage: nohup <program> [args]") return 2 end
+      end
+      if K.MUXOS_COMMANDS[argv[1]] and not keep then
         K.runCommand(S, table.concat(argv, " "))
         return 0
       end
@@ -2973,11 +3104,12 @@ function K.newShell(S, user)
         return 127
       end
       local id, addrOrErr = launchProgram(path, {table.unpack(argv, 2)})
+      if id and keep then K.setPersistent(jobs[id], true) end
       if not id then
         S.print("error: " .. addrOrErr)
         return 1
       elseif background or path:match("%.lua$") then
-        S.print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
+        S.print("[" .. id .. "] " .. path .. " started on " .. addrOrErr .. (keep and " (kept after logout)" or ""))
         return 0
       end
       K.runForeground(S, id)
@@ -3020,6 +3152,7 @@ function K.help()
   print("  update -- install a new muxos from the installer floppy's muxos-installer.dat")
   print("  wallpaper <file.ppm> | wallpaper none -- the desktop's background image")
   print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job id>")
+  print("  jobs | nohup <command> | persist <job id> [on|off] | attach <job id> -- what runs after logout")
   print("  migrate <job id> [node] | drain|undrain <node>")
   print("  spawn <node> <lua code>")
   print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")

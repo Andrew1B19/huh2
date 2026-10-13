@@ -19,4 +19,6 @@ Machine-level modules (`component`, `computer`, `event`, `term`, `unicode`,
 provided by the worker runtime itself, not by files here. A program's
 terminal interprets VT100 escape sequences itself, as OpenOS's tty does
 (`vt100.lua` is here for programs that `require` it directly); `pipe` is
-`popen` only -- each program is a process of its own.
+`popen` only -- each program is a process of its own. `muxos` is muxos's own:
+`require("muxos").set_persistent(on)` / `.is_persistent()` (keep running
+after the user logs out) and `.version`.
