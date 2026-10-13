@@ -255,7 +255,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId`, `resizable`, `decorated` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
 | `GETWINDOWS` | `from`, `to`, `id`, `caller`                            | worker  | "list my user's windows, wherever they are" (gmux API's `get_windows()`) |
 | `WINDOWROUTE` | `from`, `to`, `id`, `windowId`, `caller`                | worker  | where a window the caller owns (or draws a share of) is shown: `{address, key, port, width, height}`, `address` nil while detached; the caller then hears `window_route` events when it moves (see "Window routes") |
-| `PERSIST` | `from`, `to`, `id`, `on`, `caller`                           | worker  | `gmuxapi.set_persistent(on)`: the process survives its user's logout |
+| `PERSIST` | `from`, `to`, `id`, `on`, `caller`                           | worker  | `set_persistent(on)` (gmuxapi, or the `muxos` library of a `.lua` program): the caller's application (its tree's top) survives its user's logout; no `on`: only asks. `RESULT` is whether it does |
 | `DRAWWINDOW` | `from`, `to`, `id`, `windowId`, `code`, `args`, `cells`, `width`, `height`, `bg`, `clear`, `key`, `caller`, `noReply` | worker | redraw a window the calling process owns (`gmuxapi.draw_window`), sent to the screen showing it (its route) with the window's `key`; with code, `width`/`height` different from the window's resize it first (resizable windows); `cells` are runs the worker encoded; `noReply` = sent without waiting, nothing comes back |
 | `SHAREWINDOW` | `from`, `to`, `id`, `windowId`, `child`, `rect`, `caller` | worker | share `rect` of a window the caller manages with a descendant (no `rect`: take it back) |
 | `RENDERCONFIG` | `from`, `to`, `id`, `windowId`, `options`, `key`, `caller` | worker | a window's render settings (setting them: its owner); to the screen showing it |
@@ -1602,6 +1602,17 @@ and owns its processes, and whose display tells the terminal to open,
 remove and mark windows. The full message list is at the top of
 `kernal/terminals.lua`. A terminal or kernal that hears nothing from
 the other for 10 s hangs up; the session then ends as a logout.
+
+**Logout.** A login's end kills its top-level processes that aren't
+persistent; their children go by their orphan policies when the parent
+ends. Persistence is the application's (its tree's top process),
+however it was set (`PERSIST`, the title-bar toggle -- `TPERSIST` from a
+terminal, `display.persist` back to every screen showing one of its
+windows -- `nohup`, `persist`). A process's session is the login it was
+started from, while that login lasts: after it, the process's new
+windows open detached and its output is kept for `attach`, which (like
+bringing one of its windows to a screen) binds the application to the
+new session.
 
 **Fullscreen on a terminal.** `REQUESTFULLSCREEN` from a process in a
 terminal's session grants that terminal's screen: the kernal sends the

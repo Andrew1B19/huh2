@@ -23,10 +23,12 @@
 --   TCMD {line, width} -> {cwd}  output comes meanwhile as TOUT
 --   TAPPS, TSIZE {path}, TREAD {path}, TWRITE {path, data}
 --   TLAUNCH {path, args}, TCONTROL {job, verb}, TCLOSE {window},
---   TGEOM {window, x, y, width, height}, TATTACH {window}, TLOGOUT,
+--   TGEOM {window, x, y, width, height}, TATTACH {window}, TPERSIST {window},
+--   TLOGOUT,
 --   TWINERR {window, error}, TFULLREL, TPING, TBYE
 -- kernal -> terminal: TOUT {text}, TCLEAR, TFG {job, node},
 --   TWINDOW {spec}, TWINREMOVE {window}, TWINSTATUS {window, status},
+--   TWINPERSIST {window, on},
 --   TOWNER {window, job, node}, TSHARE {window, job, rect, node},
 --   TUSERWINDOWS {list}, TJOBEND {job}, TFULL {node, job, key}, TUNFULL,
 --   TPING, TBYE {why},
@@ -64,11 +66,13 @@ local function newProxy(address, info)
       local w, h = math.tointeger(tonumber(spec.width)) or 30, math.tointeger(tonumber(spec.height)) or 10
       sendTo(address, {type = "TWINDOW", spec = {id = spec.id, title = spec.title, x = spec.x, y = spec.y,
         width = w, height = h, resizable = spec.resizable, decorated = spec.decorated, ownerJobId = spec.ownerJobId,
-        ownerNode = spec.ownerNode, key = spec.key, code = spec.code, args = spec.args, cells = spec.cells, bg = spec.bg}})
+        ownerNode = spec.ownerNode, key = spec.key, code = spec.code, args = spec.args, cells = spec.cells, bg = spec.bg,
+        persist = spec.persist}})
       return {width = w, height = h}
     end,
     remove = function(id) sendTo(address, {type = "TWINREMOVE", window = id}) end,
     status = function(id, status) sendTo(address, {type = "TWINSTATUS", window = id, status = status}) end,
+    persist = function(id, on) sendTo(address, {type = "TWINPERSIST", window = id, on = on}) end,
     setOwner = function(id, jobId, node) sendTo(address, {type = "TOWNER", window = id, job = jobId, node = node}) end,
     share = function(id, jobId, rect, node) sendTo(address, {type = "TSHARE", window = id, job = jobId, rect = rect, node = node}) end,
   }
@@ -203,6 +207,9 @@ function handlers.TATTACH(P, msg)
   if not P.user then return end
   local ok, err = K.attachWindow(msg.window, P)
   if not ok then P.print("can't bring window " .. tostring(msg.window) .. " here: " .. tostring(err)) end
+end
+function handlers.TPERSIST(P, msg)
+  if P.user then K.togglePersist(msg.window, P) end
 end
 function handlers.TLOGOUT(P)
   K.endLogin(P)

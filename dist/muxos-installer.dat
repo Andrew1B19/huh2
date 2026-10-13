@@ -2,18 +2,18 @@
 @@MANIFEST 34
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-82377 /muxos.lua
-30258 /compositor.lua
+86284 /muxos.lua
+30785 /compositor.lua
 33883 /shell.lua
 2663 /bitmap.lua
 3046 /lineedit.lua
-5994 /system.lua
-34674 /session.lua
+6021 /system.lua
+34860 /session.lua
 5514 /vgpu.lua
-9045 /terminals.lua
-4365 /windows.lua
-14488 /terminal.lua
-85762 /runtime.lua
+9254 /terminals.lua
+4883 /windows.lua
+14661 /terminal.lua
+86105 /runtime.lua
 2033 /lib/OPENOS_LICENSE
 1682 /lib/bit32.lua
 3800 /lib/buffer.lua
@@ -228,7 +228,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 82377 /muxos.lua
+@@ 86284 /muxos.lua
 
 
 
@@ -735,8 +735,12 @@ local awaiting = {}
 
 
 
+
+
+
 function K.sessionOf(job)
-return job and job.session and K.byId[job.session]
+local S = job and job.session and K.byId[job.session]
+if S and S.login == job.login then return S end
 end
 
 
@@ -1880,7 +1884,12 @@ end
 return
 end
 local S = K.sessionOf(job)
-if S then S.write(msg.text) end
+if S then
+S.write(msg.text)
+else
+
+job.away = ((job.away or "") .. msg.text):sub(-4096)
+end
 end
 
 
@@ -2248,8 +2257,10 @@ if not caller then
 send({type = "ERROR", from = selfAddr, to = msg.from, id = msg.id, error = "not called from a running process"})
 return
 end
-caller.persistent = msg.on ~= false or nil
-send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = caller.persistent == true})
+
+local on = msg.on
+if on ~= nil then K.setPersistent(caller, on ~= false) end
+send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = K.isPersistent(caller)})
 end
 
 
@@ -2262,7 +2273,7 @@ end
 
 local SUMMARY_FIELDS = {"id", "node", "status", "startedAt", "finishedAt", "parent", "appName",
 "orphanPolicy", "rootId", "codePreview", "error", "paused", "kind", "path", "migratable", "migrations",
-"programName", "programVersion", "user"}
+"programName", "programVersion", "user", "persistent"}
 
 local function handleGetProcesses(msg)
 local list = {}
@@ -2899,6 +2910,19 @@ elseif line == "nodes" then
 listNodes()
 elseif line == "processes" then
 printProcesses()
+elseif line == "jobs" then
+K.listJobs(S)
+elseif word == "attach" then
+K.attachJob(S, tonumber(line:match("^attach%s+(%d+)%s*$")))
+elseif word == "persist" then
+local id, onOff = line:match("^persist%s+(%d+)%s*(%a*)%s*$")
+local job = id and jobs[tonumber(id)]
+if not job or job.status ~= "running" or (job.user ~= S.user) then
+print("usage: persist <job id> [on|off] -- one of your running processes")
+else
+local on = K.setPersistent(job, onOff ~= "off")
+print("[" .. K.appRoot(job).id .. "] " .. (on and "keeps running after logout" or "ends at logout"))
+end
 elseif line:match("^ping%s") then
 local node, countStr = line:match("^ping%s+(%S+)%s*(%S*)$")
 if not node then
@@ -3044,11 +3068,112 @@ end
 function K.userWindows(user) return K.win.ofUser(user) end
 
 
+
+
+
+
+
+
+function K.appRoot(job)
+for _ = 1, 64 do
+local parent = job.parent and jobs[job.parent]
+if not parent then break end
+job = parent
+end
+return job
+end
+
+function K.isPersistent(job)
+return K.appRoot(job).persistent == true
+end
+
+
+function K.setPersistent(job, on)
+local root = K.appRoot(job)
+root.persistent = on and true or nil
+for _, rec in pairs(K.win.byId) do
+local owner = rec.owner and jobs[rec.owner]
+if owner and K.appRoot(owner) == root then K.win.persistChanged(rec, on and true or false) end
+end
+return on and true or false
+end
+
+
+function K.togglePersist(id, S)
+local rec = K.win.get(id)
+local job = rec and rec.user == S.user and K.liveJob(rec.owner)
+if job then K.setPersistent(job, not K.isPersistent(job)) end
+end
+
+
+
+function K.rebind(job, S, force)
+local root = K.appRoot(job)
+if K.sessionOf(root) and not force then return end
+for id in pairs(runningJobs) do
+local j = jobs[id]
+if K.appRoot(j) == root then j.session, j.login = S.id, S.login end
+end
+end
+
+
 function K.attachWindow(id, S)
 local rec = K.win.get(id)
 if not rec or rec.user ~= S.user then return nil, "no such window of yours" end
-return K.win.attach(rec, S)
+local ok, err = K.win.attach(rec, S)
+local owner = ok and K.liveJob(rec.owner)
+if owner then K.rebind(owner, S) end
+return ok, err
 end
+
+
+
+function K.attachJob(S, id)
+local job = jobs[id]
+if not job or job.status ~= "running" or job.user ~= S.user then
+return print("attach: no running process " .. tostring(id) .. " of yours")
+end
+local root = K.appRoot(job)
+K.rebind(root, S, true)
+local moved = 0
+for _, rec in pairs(K.win.byId) do
+local owner = rec.owner and jobs[rec.owner]
+if owner and K.appRoot(owner) == root and rec.session ~= S.id and K.win.attach(rec, S) then moved = moved + 1 end
+end
+for _, jid in ipairs(orderedJobIds()) do
+local j = jobs[jid]
+if j.away and K.appRoot(j) == root then
+print("[" .. jid .. "] while you were away:")
+S.write(j.away:sub(-1) == "\n" and j.away or j.away .. "\n")
+j.away = nil
+end
+end
+print("[" .. root.id .. "] " .. tostring(root.path or "job") .. " attached here (" .. moved .. " window"
+.. (moved == 1 and "" or "s") .. " brought over)")
+end
+
+
+function K.listJobs(S)
+local any = false
+for _, id in ipairs(orderedJobIds()) do
+local job = jobs[id]
+if job.status == "running" and job.user == S.user and not job.parent then
+local where = K.sessionOf(job)
+local children = 0
+for cid in pairs(runningJobs) do
+if cid ~= id and K.appRoot(jobs[cid]) == job then children = children + 1 end
+end
+print(string.format("[%d] %s%s -- %s%s%s", id, tostring(job.path or job.codePreview or "job"),
+children > 0 and (" (+" .. children .. " child" .. (children == 1 and "" or "ren") .. ")") or "",
+where == S and "here" or where and (where.kind == "local" and "at the console" or "at terminal "
+.. tostring(where.address):sub(1, 8)) or "detached",
+job.persistent and ", kept after logout" or "", job.away and ", has output" or ""))
+any = true
+end
+end
+if not any then print("no processes of yours running") end
+end
+
 
 
 
@@ -3057,7 +3182,7 @@ function K.endLogin(S)
 local ending = system.flag("logout_ends_jobs")
 for id in pairs(runningJobs) do
 local job = jobs[id]
-if job.login == S.login and ending and not job.persistent then
+if job.login == S.login and ending and not job.parent and not K.isPersistent(job) then
 job.loggedOut = true
 controlJob(id, "KILL", "killed (logged out)")
 end
@@ -3157,7 +3282,7 @@ end
 K.MUXOS_COMMANDS = {}
 for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
 .. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
-.. "shutdown logout flags users useradd userdel who"):gmatch("%S+") do
+.. "shutdown logout flags users useradd userdel who jobs persist attach"):gmatch("%S+") do
 K.MUXOS_COMMANDS[name] = true
 end
 
@@ -3194,7 +3319,13 @@ user = user, home = system.home(user),
 
 
 external = function(argv, background)
-if K.MUXOS_COMMANDS[argv[1]] then
+
+local keep = argv[1] == "nohup"
+if keep then
+table.remove(argv, 1)
+if not argv[1] then S.print("usage: nohup <program> [args]") return 2 end
+end
+if K.MUXOS_COMMANDS[argv[1]] and not keep then
 K.runCommand(S, table.concat(argv, " "))
 return 0
 end
@@ -3204,11 +3335,12 @@ S.print("sh: " .. argv[1] .. ": command not found")
 return 127
 end
 local id, addrOrErr = launchProgram(path, {table.unpack(argv, 2)})
+if id and keep then K.setPersistent(jobs[id], true) end
 if not id then
 S.print("error: " .. addrOrErr)
 return 1
 elseif background or path:match("%.lua$") then
-S.print("[" .. id .. "] " .. path .. " started on " .. addrOrErr)
+S.print("[" .. id .. "] " .. path .. " started on " .. addrOrErr .. (keep and " (kept after logout)" or ""))
 return 0
 end
 K.runForeground(S, id)
@@ -3251,6 +3383,7 @@ print("  users | who | useradd <name> | userdel <name> | flags [<name> [<value>]
 print("  update -- install a new muxos from the installer floppy's muxos-installer.dat")
 print("  wallpaper <file.ppm> | wallpaper none -- the desktop's background image")
 print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job id>")
+print("  jobs | nohup <command> | persist <job id> [on|off] | attach <job id> -- what runs after logout")
 print("  migrate <job id> [node] | drain|undrain <node>")
 print("  spawn <node> <lua code>")
 print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
@@ -3293,7 +3426,7 @@ if not ok then print("session error (continuing): " .. tostring(err)) end
 end
 end
 
-@@ 30258 /compositor.lua
+@@ 30785 /compositor.lua
 
 
 
@@ -3533,6 +3666,10 @@ local GLYPH_CLOSE = utf8.char(0x2716)
 local GLYPH_FOCUSED = utf8.char(0x1F5AE)
 
 
+local GLYPH_PERSIST_ON = utf8.char(0x25C6)
+local GLYPH_PERSIST_OFF = utf8.char(0x25C7)
+
+
 local STATUS_PREFIX = {dead = utf8.char(0x23F9) .. " - ", error = utf8.char(0x274C) .. " - "}
 
 local function titleRows(win)
@@ -3550,11 +3687,17 @@ if win.minimized then return {x = win.x, y = win.y, w = 0, h = 0} end
 return {x = win.x, y = win.y, w = win.width, h = win.height + titleRows(win)}
 end
 
+
+
+local function hasPersist(win)
+return win.persist ~= nil and not win.status
+end
+
 local function titleText(win)
 local text = (STATUS_PREFIX[win.status] or "") .. win.title
 if monochrome and focusedId == win.id then text = GLYPH_FOCUSED .. " " .. text end
 
-return textSlice(text, 1, math.max(0, win.width - 6))
+return textSlice(text, 1, math.max(0, win.width - (hasPersist(win) and 8 or 6)))
 end
 
 local function titleButtons(win)
@@ -3563,6 +3706,7 @@ return {
 {col = w - 5, glyph = win.minimized and GLYPH_RESTORE or GLYPH_MINIMIZE},
 win.resizable and {col = w - 3, glyph = win.maximized and GLYPH_RESTORE or GLYPH_MAXIMIZE} or nil,
 {col = w - 1, glyph = GLYPH_CLOSE},
+hasPersist(win) and {col = w - 7, glyph = win.persist and GLYPH_PERSIST_ON or GLYPH_PERSIST_OFF} or nil,
 }
 end
 
@@ -3976,6 +4120,7 @@ local win = {id = id, title = options.title or ("window " .. id), x = x, y = y,
 width = width, height = height, buffer = buffer, layer = options.layer or 0, dirty = true,
 ownerJobId = options.ownerJobId, drawCache = {}, drawCacheSize = 0,
 decorated = options.decorated ~= false, resizable = options.resizable == true}
+if options.persist ~= nil then win.persist = options.persist == true end
 return registerWindow(win)
 end
 
@@ -4063,6 +4208,14 @@ return ids
 end
 
 
+
+
+function M.setPersist(id, on)
+local win = windows[id]
+if not win or win.persist == on then return end
+win.persist = on == true
+win.dirty = true
+end
 
 function M.setStatus(id, status)
 local win = windows[id]
@@ -6121,7 +6274,7 @@ end,
 KEY = KEY,
 }
 
-@@ 5994 /system.lua
+@@ 6021 /system.lua
 
 
 
@@ -6158,7 +6311,7 @@ help = "only root can add or remove users"},
 {name = "kill_requires_owner", type = "boolean", default = false,
 help = "only a process's own user (or root) can pause, resume or kill it"},
 {name = "logout_ends_jobs", type = "boolean", default = true,
-help = "logging out ends the processes started from that login"},
+help = "logging out ends the applications started from that login, except persistent ones"},
 {name = "scheduler", type = "choice", choices = {"load", "count"}, default = "load",
 help = "where new work goes: the worker with the lowest load average, or the fewest processes"},
 {name = "remote_terminals", type = "boolean", default = true, reboot = true,
@@ -6313,7 +6466,7 @@ end
 
 return M
 
-@@ 34674 /session.lua
+@@ 34860 /session.lua
 
 
 
@@ -6347,6 +6500,7 @@ return {width = win.width, height = win.height}
 end,
 remove = function(id) compositor.close(id) end,
 status = function(id, status) compositor.setStatus(id, status) end,
+persist = function(id, on) compositor.setPersist(id, on) end,
 setOwner = function(id, jobId)
 local win = compositor.getWindow(id)
 if win then win.ownerJobId = jobId end
@@ -7367,6 +7521,8 @@ noteGeometry(win)
 end
 elseif lx == w - 1 or lx == w then
 closeWindow(win)
+elseif (lx == w - 7 or lx == w - 6) and win.persist ~= nil and not win.status then
+K.togglePersist(win.id, S)
 else
 currentGrab = {id = win.id, kind = "move", dx = lx - 1}
 end
@@ -7539,7 +7695,7 @@ local job = w.ownerJobId and jobs[w.ownerJobId]
 if not own and not (job and job.status == "running" and not job.loggedOut) then compositor.close(w.id) end
 end
 if desktop.menu then desktop.toggleMenu() end
-S.user = nil
+S.user, S.login = nil, nil
 shell = nil
 editor = K.lineedit.new()
 for i = #consoleLines, 1, -1 do consoleLines[i] = nil end
@@ -7865,7 +8021,9 @@ end
 
 return M
 
-@@ 9045 /terminals.lua
+@@ 9254 /terminals.lua
+
+
 
 
 
@@ -7932,11 +8090,13 @@ create = function(spec)
 local w, h = math.tointeger(tonumber(spec.width)) or 30, math.tointeger(tonumber(spec.height)) or 10
 sendTo(address, {type = "TWINDOW", spec = {id = spec.id, title = spec.title, x = spec.x, y = spec.y,
 width = w, height = h, resizable = spec.resizable, decorated = spec.decorated, ownerJobId = spec.ownerJobId,
-ownerNode = spec.ownerNode, key = spec.key, code = spec.code, args = spec.args, cells = spec.cells, bg = spec.bg}})
+ownerNode = spec.ownerNode, key = spec.key, code = spec.code, args = spec.args, cells = spec.cells, bg = spec.bg,
+persist = spec.persist}})
 return {width = w, height = h}
 end,
 remove = function(id) sendTo(address, {type = "TWINREMOVE", window = id}) end,
 status = function(id, status) sendTo(address, {type = "TWINSTATUS", window = id, status = status}) end,
+persist = function(id, on) sendTo(address, {type = "TWINPERSIST", window = id, on = on}) end,
 setOwner = function(id, jobId, node) sendTo(address, {type = "TOWNER", window = id, job = jobId, node = node}) end,
 share = function(id, jobId, rect, node) sendTo(address, {type = "TSHARE", window = id, job = jobId, rect = rect, node = node}) end,
 }
@@ -8072,6 +8232,9 @@ if not P.user then return end
 local ok, err = K.attachWindow(msg.window, P)
 if not ok then P.print("can't bring window " .. tostring(msg.window) .. " here: " .. tostring(err)) end
 end
+function handlers.TPERSIST(P, msg)
+if P.user then K.togglePersist(msg.window, P) end
+end
 function handlers.TLOGOUT(P)
 K.endLogin(P)
 P.user, P.shell, P.login = nil, nil, nil
@@ -8174,7 +8337,9 @@ end
 
 return T
 
-@@ 4365 /windows.lua
+@@ 4883 /windows.lua
+
+
 
 
 
@@ -8234,19 +8399,33 @@ end
 
 
 
+
+
+local function clampSize(v, default)
+v = math.tointeger(tonumber(v)) or default
+return math.max(1, math.min(v, 160))
+end
+
 function W.open(S, spec, owner)
-if not S or not S.display then return nil, "its session has ended -- no screen to open a window on" end
+local job = owner and K.jobs[owner]
+if not (S and S.display) and not job then return nil, "its session has ended -- no screen to open a window on" end
 K.windowIds = K.windowIds + 1
 local id = K.windowIds
-local job = owner and K.jobs[owner]
 local key = newKey()
 local shown = {}
 for k, v in pairs(spec) do shown[k] = v end
 shown.id, shown.ownerJobId, shown.text, shown.key = id, owner, nil, key
 shown.ownerNode = job and job.node
-local size, err = S.display.create(shown)
+if job then shown.persist = K.isPersistent(job) end
+local size, err
+if S and S.display then
+size, err = S.display.create(shown)
 if not size then return nil, err end
-local rec = {id = id, owner = owner, user = job and job.user or S.user, session = S.id,
+else
+S = nil
+size = {width = clampSize(spec.width, 40), height = clampSize(spec.height, 10)}
+end
+local rec = {id = id, owner = owner, user = job and job.user or S.user, session = S and S.id,
 title = tostring(spec.title or ("window " .. id)), x = spec.x or 1, y = spec.y or 1,
 width = size.width, height = size.height, resizable = spec.resizable == true,
 decorated = spec.decorated ~= false, key = key, holders = {}}
@@ -8283,7 +8462,7 @@ local key = newKey()
 local job = rec.owner and K.jobs[rec.owner]
 local size, err = S.display.create({id = rec.id, title = rec.title, x = rec.x, y = rec.y,
 width = rec.width, height = rec.height, resizable = rec.resizable, decorated = rec.decorated,
-ownerJobId = rec.owner, ownerNode = job and job.node, key = key,
+ownerJobId = rec.owner, ownerNode = job and job.node, key = key, persist = job and K.isPersistent(job),
 code = "gpu.setBackground(0x000000) gpu.fill(1, 1, " .. rec.width .. ", " .. rec.height .. ", ' ')"})
 if not size then
 K.windowsChanged(rec.user)
@@ -8299,6 +8478,12 @@ if rec.status and S.display.status then S.display.status(rec.id, rec.status) end
 announce(rec)
 K.windowsChanged(rec.user)
 return true
+end
+
+
+function W.persistChanged(rec, on)
+local S = rec.session and K.byId[rec.session]
+if S and S.display.persist then S.display.persist(rec.id, on) end
 end
 
 
@@ -8360,7 +8545,7 @@ end
 
 return W
 
-@@ 14488 /terminal.lua
+@@ 14661 /terminal.lua
 
 
 
@@ -8610,6 +8795,7 @@ if keys[id] then tell("TGEOM", {window = id, x = x, y = y, width = w, height = h
 end
 function K.userWindows() return userWindows end
 function K.attachWindow(id) tell("TATTACH", {window = id}) return true end
+function K.togglePersist(id) if keys[id] then tell("TPERSIST", {window = id}) end end
 function K.endLogin() tell("TLOGOUT") end
 function K.newShell() return nil end
 function K.nextLogin() return K.pendingLogin end
@@ -8747,6 +8933,9 @@ local job = win.ownerJobId and K.jobs[win.ownerJobId]
 if job then job.status = "ended" end
 end
 end
+function fromKernal.TWINPERSIST(msg)
+S.display.persist(msg.window, msg.on == true)
+end
 function fromKernal.TOWNER(msg)
 K.jobs[msg.job] = {id = msg.job, node = msg.node, status = "running"}
 S.display.setOwner(msg.window, msg.job)
@@ -8858,7 +9047,7 @@ upkeep()
 end
 return reason
 
-@@ 85762 /runtime.lua
+@@ 86105 /runtime.lua
 
 
 
@@ -9820,6 +10009,9 @@ end,
 
 set_persistent = function(on)
 return remoteRequest("PERSIST", {on = on ~= false, caller = currentJobId})
+end,
+is_persistent = function()
+return remoteRequest("PERSIST", {caller = currentJobId})
 end,
 
 get_windows = function()
@@ -11355,6 +11547,17 @@ end
 local legacyPopen
 
 local LEGACY_FACES = {
+
+
+muxos = function(ctx)
+return {
+version = MUXOS_VERSION,
+
+
+set_persistent = function(on) return remoteRequest("PERSIST", {on = on ~= false, caller = ctx.id}) end,
+is_persistent = function() return remoteRequest("PERSIST", {caller = ctx.id}) end,
+}
+end,
 
 
 pipe = function(ctx)

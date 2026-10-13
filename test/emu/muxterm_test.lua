@@ -219,6 +219,18 @@ if sentCount(kernal.modemAddr, "DRAWWINDOW") ~= before then fail("...not through
 local direct = false
 for _, e in ipairs(termSent) do if e.type == "EVENT" and isWorker(e.to) then direct = true end end
 if not direct then fail("the key went from the terminal straight to the program's node") end
+-- Its title bar's persistence toggle: on (keeper asked), off and on again
+-- from the terminal -- the kernal keeps the state.
+local ON, OFF = utf8.char(0x25C6), utf8.char(0x25C7)
+local tx = (row(bufs, 3):find(ON, 1, true))
+if not tx then fail("keeper's toggle shows it persistent") end
+tx = utf8.len(row(bufs, 3):sub(1, tx - 1)) + 1
+touch(tx, 3)
+emu:advance(0.5)
+if not row(bufs, 3):find(OFF, 1, true) then fail("the toggle turned it off") end
+touch(tx, 3)
+emu:advance(0.5)
+if not row(bufs, 3):find(ON, 1, true) then fail("...and on again") end
 print("  OK")
 
 print("muxterm 5: fullscreen works on the terminal's screen")

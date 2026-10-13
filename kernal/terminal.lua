@@ -247,6 +247,7 @@ function K.windowGeometry(id, x, y, w, h)
 end
 function K.userWindows() return userWindows end
 function K.attachWindow(id) tell("TATTACH", {window = id}) return true end
+function K.togglePersist(id) if keys[id] then tell("TPERSIST", {window = id}) end end
 function K.endLogin() tell("TLOGOUT") end
 function K.newShell() return nil end -- the shell runs on the kernal
 function K.nextLogin() return K.pendingLogin end
@@ -383,6 +384,9 @@ function fromKernal.TWINSTATUS(msg)
     local job = win.ownerJobId and K.jobs[win.ownerJobId]
     if job then job.status = "ended" end
   end
+end
+function fromKernal.TWINPERSIST(msg)
+  S.display.persist(msg.window, msg.on == true)
 end
 function fromKernal.TOWNER(msg)
   K.jobs[msg.job] = {id = msg.job, node = msg.node, status = "running"}

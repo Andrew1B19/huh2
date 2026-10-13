@@ -235,6 +235,10 @@ local GLYPH_RESTORE = utf8.char(0x20DF)
 local GLYPH_MAXIMIZE = utf8.char(0x2BC5)
 local GLYPH_CLOSE = utf8.char(0x2716)
 local GLYPH_FOCUSED = utf8.char(0x1F5AE) -- marks focus on a 1-bit screen
+-- A program window's persistence toggle (at w-7): filled while its
+-- application keeps running after its user logs out.
+local GLYPH_PERSIST_ON = utf8.char(0x25C6)
+local GLYPH_PERSIST_OFF = utf8.char(0x25C7)
 -- The owner process's state, gmux's process_prefix: the window stays
 -- up after its process ends, marked.
 local STATUS_PREFIX = {dead = utf8.char(0x23F9) .. " - ", error = utf8.char(0x274C) .. " - "}
@@ -254,11 +258,17 @@ local function outerRect(win)
   return {x = win.x, y = win.y, w = win.width, h = win.height + titleRows(win)}
 end
 
+-- The persistence button shows on a program's window (`persist` true
+-- or false; nil: none) while its program runs.
+local function hasPersist(win)
+  return win.persist ~= nil and not win.status
+end
+
 local function titleText(win)
   local text = (STATUS_PREFIX[win.status] or "") .. win.title
   if monochrome and focusedId == win.id then text = GLYPH_FOCUSED .. " " .. text end
   -- Leave the button columns clear.
-  return textSlice(text, 1, math.max(0, win.width - 6))
+  return textSlice(text, 1, math.max(0, win.width - (hasPersist(win) and 8 or 6)))
 end
 
 local function titleButtons(win)
@@ -267,6 +277,7 @@ local function titleButtons(win)
     {col = w - 5, glyph = win.minimized and GLYPH_RESTORE or GLYPH_MINIMIZE},
     win.resizable and {col = w - 3, glyph = win.maximized and GLYPH_RESTORE or GLYPH_MAXIMIZE} or nil,
     {col = w - 1, glyph = GLYPH_CLOSE},
+    hasPersist(win) and {col = w - 7, glyph = win.persist and GLYPH_PERSIST_ON or GLYPH_PERSIST_OFF} or nil,
   }
 end
 
@@ -680,6 +691,7 @@ function M.createWindow(options)
     width = width, height = height, buffer = buffer, layer = options.layer or 0, dirty = true,
     ownerJobId = options.ownerJobId, drawCache = {}, drawCacheSize = 0,
     decorated = options.decorated ~= false, resizable = options.resizable == true}
+  if options.persist ~= nil then win.persist = options.persist == true end
   return registerWindow(win)
 end
 
@@ -768,6 +780,14 @@ end
 
 -- The owner process's state for the title prefix: nil (running),
 -- "dead" or "error".
+-- A program window's persistence button: on, off (true/false).
+function M.setPersist(id, on)
+  local win = windows[id]
+  if not win or win.persist == on then return end
+  win.persist = on == true
+  win.dirty = true
+end
+
 function M.setStatus(id, status)
   local win = windows[id]
   if not win or win.status == status then return end

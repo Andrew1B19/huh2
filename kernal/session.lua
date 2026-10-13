@@ -31,6 +31,7 @@ S.display = {
   end,
   remove = function(id) compositor.close(id) end,
   status = function(id, status) compositor.setStatus(id, status) end,
+  persist = function(id, on) compositor.setPersist(id, on) end,
   setOwner = function(id, jobId)
     local win = compositor.getWindow(id)
     if win then win.ownerJobId = jobId end
@@ -1051,6 +1052,8 @@ local function handleTouch(name, x, y, button)
       end
     elseif lx == w - 1 or lx == w then
       closeWindow(win)
+    elseif (lx == w - 7 or lx == w - 6) and win.persist ~= nil and not win.status then
+      K.togglePersist(win.id, S)
     else
       currentGrab = {id = win.id, kind = "move", dx = lx - 1}
     end
@@ -1223,7 +1226,7 @@ function S.logout()
     if not own and not (job and job.status == "running" and not job.loggedOut) then compositor.close(w.id) end
   end
   if desktop.menu then desktop.toggleMenu() end
-  S.user = nil
+  S.user, S.login = nil, nil
   shell = nil
   editor = K.lineedit.new()
   for i = #consoleLines, 1, -1 do consoleLines[i] = nil end
