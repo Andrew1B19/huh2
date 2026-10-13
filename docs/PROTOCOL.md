@@ -587,7 +587,12 @@ A legacy program's `require` works like OpenOS's, with its own
   - `computer`, with `pullSignal`/`pushSignal` over the process's own
     events;
   - `event`, with `pull` (OpenOS's filter: name pattern plus equal
-    arguments), `pullFiltered`, `push`, `listen` and `ignore`;
+    arguments), `pullFiltered`, `push`, `listen`, `ignore`, `timer`,
+    `cancel` and `onError`. As in OpenOS, listeners and timers run from
+    inside the program's pulls and sleeps (`os.sleep` is a pull loop),
+    so a program that never pulls or sleeps never runs them;
+  - `thread` (OpenOS's, on the runtime's threads), and `sysbus` and
+    `muxos`, muxos's own;
   - `term` (the program's window), `filesystem`, `unicode` (the
     machine's), and a minimal
     `process` and `package` (including OpenOS's `package.delay`);
@@ -609,6 +614,13 @@ A legacy program's `require` works like OpenOS's, with its own
   `text`, `sides`, `colors`, `keyboard`, `transforms` and their
   `core/full_*` halves, unchanged, MIT). Expanding the legacy userland
   is installing files there, no OS change needed.
+
+**Coroutines, as in OpenOS.** A program's own coroutines can wait: a
+`sleep`, `event.pull`, or any kernal or component call inside one
+passes straight through to the scheduler and back (the `coroutine`
+library's `resume` and `wrap` forward the runtime's wait yields),
+instead of surfacing as that coroutine's yield to whoever resumed it.
+The same holds for `.mxe` programs. Test 60.
 
 The launcher ships every module the program requires by a literal name,
 and the modules those require, up to 32, with the `JOB`

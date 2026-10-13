@@ -2473,4 +2473,64 @@ print("UPDV " .. update.version().installed)
 end
 print("  OK -- serve/proxy/call/emit/on/listen, errors and timeouts, a .lua service, the console, muxos.system, muxos.update")
 
+print("test 60: OpenOS concurrency -- event timers, listeners during sleep, waits inside a program's own coroutines")
+do
+  local conc = [==[
+local event = require("event")
+local thread = require("thread")
+local ticks, once = 0, 0
+local id = event.timer(0.2, function() ticks = ticks + 1 end, math.huge)
+event.timer(0.1, function() once = once + 1 end)
+os.sleep(1.5)
+print("TICKS " .. tostring(ticks >= 5) .. " ONCE " .. once)
+print("CANCEL " .. tostring(event.cancel(id)) .. " " .. tostring(event.cancel(id)))
+local co = coroutine.create(function(a)
+  os.sleep(0.2)
+  local b = coroutine.yield(a + 1)
+  event.push("ping", b)
+  local _, v = event.pull(1, "ping")
+  return v * 10
+end)
+local ok1, r1 = coroutine.resume(co, 1)
+local ok2, r2 = coroutine.resume(co, 5)
+print("CO " .. tostring(ok1) .. " " .. tostring(r1) .. " " .. tostring(ok2) .. " " .. tostring(r2) .. " " .. coroutine.status(co))
+local gen = coroutine.wrap(function() for i = 1, 3 do os.sleep(0.05) coroutine.yield(i) end end)
+print("WRAP " .. gen() .. gen() .. gen())
+local heard = 0
+event.listen("beep", function() heard = heard + 1 end)
+event.push("beep") event.push("beep")
+os.sleep(0.2)
+print("HEARD " .. heard)
+local t = thread.create(function() os.sleep(0.3) return "x" end)
+thread.waitForAll({t})
+print("THREAD " .. t:status())
+print("FILE " .. tostring(io.open("/etc/kernal.cfg") ~= nil))
+io.read()
+]==]
+  local mxe = [==[--[[mxe
+name = "mxeco"
+]]
+local gen = coroutine.wrap(function() sleep(0.1) coroutine.yield("a") sleep(0.1) return "b" end)
+local first = gen()
+print("MXECO " .. first .. gen())
+]==]
+  local c = newCluster(80, 25, {["/bin/conc.lua"] = conc, ["/bin/mxeco.mxe"] = mxe}, 1)
+  c.typeLine("conc")
+  c.emu:advance(5)
+  local text = c.text()
+  for _, want in ipairs({"TICKS true ONCE 1", "CANCEL true false", "CO true 2 true 50 dead", "WRAP 123", "HEARD 2",
+      "THREAD dead"}) do
+    assert(text:find(want, 1, true), want .. ":\n" .. text)
+  end
+  c.typeLine("")
+  c.emu:advance(1)
+  local bx = c.cells(1, 25, 80):find(" console ", 1, true)
+  if bx then c.touch(bx + 2, 25) end
+  if bx and not c.text():find("@muxos:~>", 1, true) then c.touch(bx + 2, 25) end
+  c.typeLine("mxeco")
+  c.emu:advance(2)
+  assert(c.text():find("MXECO ab", 1, true), "an .mxe's coroutine waits inside, too:\n" .. c.text())
+end
+print("  OK -- event.timer/cancel, sleep runs listeners and timers, coroutines wait through to the scheduler")
+
 print("ALL OK")
