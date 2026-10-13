@@ -68,7 +68,7 @@ gpu.set(5, 5, "FULL SCREEN " .. w .. "x" .. h)
 sleep(3)
 gmuxapi.release_fullscreen()
 ]==]}
-for _, f in ipairs({"muxos", "compositor", "shell", "bitmap", "lineedit", "system", "session", "vgpu", "terminals", "windows", "terminal"}) do
+for _, f in ipairs({"muxos", "compositor", "shell", "bitmap", "lineedit", "system", "session", "vgpu", "terminals", "windows", "terminal", "sysbus"}) do
   kfiles["/" .. f .. ".lua"] = readFile(REPO_ROOT .. "/kernal/" .. f .. ".lua")
 end
 emu:addEeprom(kernal, readFile(REPO_ROOT .. "/kernal/bios.lua"), emu:addFilesystem(kernal, kfiles))

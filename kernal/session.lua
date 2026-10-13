@@ -1200,6 +1200,7 @@ function S.startSession(name)
   desktop.showConsole()
   print("logged in as " .. name .. " (home " .. system.home(name) .. ") -- type 'help' for commands")
   consoleDirty = true
+  if K.loginStarted then K.loginStarted(S) end
 end
 
 -- At the login: prompt, a typed line is a user name.

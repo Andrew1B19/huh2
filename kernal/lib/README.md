@@ -21,4 +21,5 @@ terminal interprets VT100 escape sequences itself, as OpenOS's tty does
 (`vt100.lua` is here for programs that `require` it directly); `pipe` is
 `popen` only -- each program is a process of its own. `muxos` is muxos's own:
 `require("muxos").set_persistent(on)` / `.is_persistent()` (keep running
-after the user logs out) and `.version`.
+after the user logs out) and `.version`; `sysbus` is the system bus, as
+`.mxe` programs have it (docs/MXE.md).

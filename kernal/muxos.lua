@@ -352,6 +352,7 @@ local function noteNode(addr)
   if not nodes[addr] then
     nodes[addr] = {}
     nodeOrder[#nodeOrder + 1] = addr
+    if K.sysbus then K.sysbus.emit("muxos.node", addr, "up") end
     -- Its components join the cluster bus (it also reports them itself
     -- when it boots; this covers one that was running before us).
     send({type = "GETCOMPONENTS", from = selfAddr, to = addr})
@@ -362,6 +363,7 @@ local function noteNode(addr)
   if node.down then
     node.down = nil
     print("node " .. addr .. " is responding again")
+    if K.sysbus then K.sysbus.emit("muxos.node", addr, "up") end
   end
 end
 
@@ -624,7 +626,7 @@ end
 -- the program. Either way, the scheduler places it.
 local PROGRAM_PATH = {"/bin", "/usr/bin"}
 -- Libraries built into the worker runtime rather than shipped from disk.
-local BUILTIN_MXE_LIBRARIES = {mux = true, http = true, thread = true, modem = true, bitmap = true}
+local BUILTIN_MXE_LIBRARIES = {mux = true, http = true, thread = true, modem = true, bitmap = true, sysbus = true}
 -- Searched in order (docs/MXE.md section 5).
 local MXE_LIBRARY_DIRS = {"/lib/mxe/", "/usr/lib/mxe/"}
 
@@ -1066,6 +1068,7 @@ local function finishJob(id, status, result, err)
   closeJobFiles(id)
   net.release(id)
   K.dropShares(id)
+  K.sysbus.jobEnded(id)
   -- The end of a pipe: its reader hears it.
   local reader = job.pipeTo and K.liveJob(job.pipeTo)
   if reader then K.deliverEvent(reader, {"pipe_closed", id, status, err}) end
@@ -1111,6 +1114,7 @@ local LIVENESS = {PROBE_AFTER = 3, DOWN_AFTER = 10, lastCheck = -math.huge}
 local function markNodeDown(addr)
   nodes[addr].down = true
   print("node " .. addr .. " stopped responding -- marking it down")
+  if K.sysbus then K.sysbus.emit("muxos.node", addr, "down") end
   if fullscreen.node == addr then
     fullscreen.node = nil
     fullscreen.job = nil
@@ -2114,6 +2118,8 @@ local function handleModemMessage(from, port, data)
     handleWindowRoute(msg)
   elseif msg.type == "PERSIST" then
     handlePersist(msg)
+  elseif msg.type == "SBUS" then
+    K.sysbus.message(msg, callerJob(msg))
   elseif msg.type == "ISFOREGROUND" then
     -- readLine (docs/MXE.md): only the console's foreground program reads typed lines.
     local caller = callerJob(msg)
@@ -2532,19 +2538,28 @@ function updates.run()
     return
   end
   data = nil
+  local _, message = updates.install(files, version)
+  print("update: " .. message)
+end
+
+-- Installs `files` ({path, data}...; /eeprom/kernal.lua is the kernal
+-- BIOS) as muxos `version`: all written beside the old ones first, then
+-- swapped in. Returns true, what was done -- or nil, why (and nothing
+-- was changed, unless it says otherwise). `update` (from the installer
+-- floppy) and the muxos.update service (OPM) both install this way.
+function updates.install(files, version)
   local needed, staged, kernalBios = 4096, {}, nil
   for _, f in ipairs(files) do
     if not f.path:match("^/eeprom/") then needed = needed + #f.data end
   end
   local free = (tryInvoke(fsAddr, "spaceTotal") or 0) - (tryInvoke(fsAddr, "spaceUsed") or 0)
   if free < needed then
-    print(string.format("update: the disk has %d KB free and the update needs %d KB -- nothing was changed",
-      free // 1024, needed // 1024))
-    return
+    return nil, string.format("the disk has %d KB free and the update needs %d KB -- nothing was changed",
+      free // 1024, needed // 1024)
   end
   local function abandon(why)
     for _, path in ipairs(staged) do tryInvoke(fsAddr, "remove", path .. ".new") end
-    print("update: " .. why .. " -- nothing was changed")
+    return nil, why .. " -- nothing was changed"
   end
   for _, f in ipairs(files) do
     if f.path == "/eeprom/kernal.lua" then
@@ -2570,8 +2585,7 @@ function updates.run()
   for _, path in ipairs(staged) do
     if tryInvoke(fsAddr, "exists", path) then tryInvoke(fsAddr, "remove", path) end
     if not tryInvoke(fsAddr, "rename", path .. ".new", path) then
-      print("update: couldn't move " .. path .. " into place -- run update again")
-      return
+      return nil, "couldn't move " .. path .. " into place -- run update again"
     end
   end
   local h = tryInvoke(fsAddr, "open", "/.muxos-version", "w")
@@ -2586,8 +2600,8 @@ function updates.run()
       biosNote = "; re-flashing the kernal BIOS FAILED (the old one is still there)"
     end
   end
-  print(string.format("update: muxos %s installed (%d files)%s. Type `reboot` to start it, then restart the workers.",
-    version, #staged, biosNote))
+  return true, string.format("muxos %s installed (%d files)%s. Type `reboot` to start it, then restart the workers.",
+    version, #staged, biosNote)
 end
 
 -- `flags`: lists them; `flags <name>` shows one; `flags <name> <value>`
@@ -2681,6 +2695,8 @@ function K.runCommand(S, line)
     printProcesses()
   elseif line == "jobs" then
     K.listJobs(S)
+  elseif word == "sysbus" then
+    K.sysbusCommand(S, line:match("^sysbus%s*(.-)%s*$"))
   elseif word == "attach" then
     K.attachJob(S, tonumber(line:match("^attach%s+(%d+)%s*$")))
   elseif word == "persist" then
@@ -2805,6 +2821,7 @@ K.resolveProgram, K.readManifest, K.launchProgram, K.PROGRAM_PATH = resolveProgr
 K.MUXOS_VERSION, K.selfAddr, K.fullscreen, K.controlJob = MUXOS_VERSION, selfAddr, fullscreen, controlJob
 K.lineedit = loadSibling("lineedit.lua")()
 K.win = loadSibling("windows.lua")(K)
+K.sysbus = loadSibling("sysbus.lua")(K, {send = send, selfAddr = selfAddr})
 K.sessionChunk = loadSibling("session.lua")
 K.nextSession = 0
 
@@ -2947,7 +2964,18 @@ end
 -- they're persistent; their processes' children go by their orphan
 -- policies, as when a parent ends. Windows of what keeps running are
 -- detached, to wait on the user's taskbars.
+-- Where session S is, for people: "console", "terminal 1a2b3c4d".
+function K.where(S)
+  return S.kind == "local" and "console" or "terminal " .. tostring(S.address):sub(1, 8)
+end
+
+-- A login started (session S): the system bus hears it.
+function K.loginStarted(S)
+  K.sysbus.emit("muxos.login", S.user, K.where(S))
+end
+
 function K.endLogin(S)
+  if S.user then K.sysbus.emit("muxos.logout", S.user, K.where(S)) end
   local ending = system.flag("logout_ends_jobs")
   for id in pairs(runningJobs) do
     local job = jobs[id]
@@ -3051,7 +3079,7 @@ end
 K.MUXOS_COMMANDS = {}
 for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
     .. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
-    .. "shutdown logout flags users useradd userdel who jobs persist attach"):gmatch("%S+") do
+    .. "shutdown logout flags users useradd userdel who jobs persist attach sysbus"):gmatch("%S+") do
   K.MUXOS_COMMANDS[name] = true
 end
 
@@ -3153,6 +3181,7 @@ function K.help()
   print("  wallpaper <file.ppm> | wallpaper none -- the desktop's background image")
   print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job id>")
   print("  jobs | nohup <command> | persist <job id> [on|off] | attach <job id> -- what runs after logout")
+  print("  sysbus | sysbus call <name> <method> [args] -- the system bus: programs' named services")
   print("  migrate <job id> [node] | drain|undrain <node>")
   print("  spawn <node> <lua code>")
   print("  window <title> <x> <y> <width> <height> <lua code drawing into `gpu`> | windows")
@@ -3164,6 +3193,113 @@ function K.help()
   print("(<node> is either a [n] index from 'nodes' or a full node address)")
 end
 
+
+-- --- The kernal's services on the system bus (kernal/sysbus.lua) ---
+
+-- `sysbus`: the names on the bus; `sysbus call <name> <method> [args]`
+-- calls one (args: numbers, true/false/nil, or strings).
+function K.sysbusCommand(S, args)
+  if args == "" then
+    for _, t in ipairs(K.sysbus.list()) do
+      print(string.format("%-24s %s", t.name, t.kernal and "(kernal)" or ("process " .. tostring(t.job)
+        .. " (" .. tostring(t.user) .. ")")))
+    end
+    return
+  end
+  local words = {}
+  for w in args:gmatch("%S+") do words[#words + 1] = w end
+  if words[1] ~= "call" or not words[3] then
+    return print("usage: sysbus | sysbus call <name> <method> [args]")
+  end
+  local callArgs = {n = #words - 3}
+  for i = 4, #words do
+    local w = words[i]
+    if w == "true" or w == "false" then callArgs[i - 3] = w == "true"
+    elseif w ~= "nil" then callArgs[i - 3] = tonumber(w) or w end
+  end
+  local ok, results = K.sysbus.consoleCall(S, words[2], words[3], callArgs)
+  if not ok then return print("error: " .. tostring(results)) end
+  local out = {}
+  for i = 1, results.n or #results do
+    local v = results[i]
+    out[i] = type(v) == "table" and serialize(v) or tostring(v)
+  end
+  print(#out > 0 and table.concat(out, "\t") or "(no results)")
+end
+
+local function sysbusUser(ctx, flagName, doing)
+  local ok, why = system.allowed(ctx.user, flagName, doing)
+  if not ok then error(why, 0) end
+end
+
+K.sysbus.provide("muxos.system", {
+  version = function() return MUXOS_VERSION end,
+  uptime = function() return computer.uptime() end,
+  users = function() return system.users() end,
+  -- Who's logged in where: {user, where}...
+  who = function()
+    local list = {}
+    for _, S in ipairs(K.sessions) do
+      if S.user then list[#list + 1] = {user = S.user, where = K.where(S)} end
+    end
+    return list
+  end,
+  -- The workers: {address, up, load, free, running}...
+  nodes = function()
+    local list = {}
+    for _, addr in ipairs(nodeOrder) do
+      local n = nodes[addr]
+      list[#list + 1] = {address = addr, up = not n.down, load = n.load, free = n.free, running = n.running or 0}
+    end
+    return list
+  end,
+  -- Restarts the whole machine (flag reboot_requires_root), a second
+  -- after answering.
+  reboot = function(ctx)
+    sysbusUser(ctx, "reboot_requires_root", "reboot")
+    K.sysbus.after(1, function() shutdown(true) end)
+    return true
+  end,
+})
+
+-- OPM's interface to the kernal: installing kernal and module files.
+K.sysbus.provide("muxos.update", {
+  -- {running = this kernal's version, installed = what's on its disk}
+  version = function()
+    local installed = readFile("/.muxos-version")
+    return {running = MUXOS_VERSION, installed = installed and installed:match("^%s*(.-)%s*$")}
+  end,
+  -- The kernal's files on its disk: {path, size}...
+  files = function()
+    local list = {}
+    for _, name in ipairs(tryInvoke(fsAddr, "list", "/") or {}) do
+      if name:match("%.lua$") then list[#list + 1] = {path = "/" .. name, size = tryInvoke(fsAddr, "size", "/" .. name)} end
+    end
+    table.sort(list, function(a, b) return a.path < b.path end)
+    return list
+  end,
+  -- Installs files ({path, data}...: kernal modules, /lib files, the
+  -- kernal BIOS as /eeprom/kernal.lua) as muxos `version`, all or
+  -- nothing; takes effect at the next reboot (muxos.system.reboot).
+  -- Flag update_requires_root. Every .lua file must compile.
+  install = function(ctx, files, version)
+    sysbusUser(ctx, "update_requires_root", "update")
+    if type(files) ~= "table" or #files == 0 then error("install(files, version): files is a list of {path, data}", 0) end
+    for _, f in ipairs(files) do
+      if type(f) ~= "table" or type(f.path) ~= "string" or type(f.data) ~= "string"
+          or f.path:sub(1, 1) ~= "/" or f.path:find("..", 1, true) then
+        error("install: bad file entry " .. tostring(type(f) == "table" and f.path or f), 0)
+      end
+      if f.path:match("%.lua$") then
+        local ok, err = load(f.data, "=" .. f.path, "t", {})
+        if not ok then error("install: " .. tostring(err) .. " -- nothing was changed", 0) end
+      end
+    end
+    local ok, message = updates.install(files, tostring(version or "opm"))
+    if not ok then error(message, 0) end
+    return message
+  end,
+})
 
 -- The kernal's own screen is the local session's; network terminals get
 -- sessions of their own (kernal/terminals.lua).
@@ -3189,6 +3325,8 @@ end
 
 while true do
   tick(0.05) -- ~1 tick between idle maintenance passes
+  local busOk, busErr = pcall(K.sysbus.resume)
+  if not busOk then print("system bus error (continuing): " .. tostring(busErr)) end
   for _, S in ipairs(K.sessions) do
     local ok, err = pcall(S.resume)
     if not ok then print("session error (continuing): " .. tostring(err)) end

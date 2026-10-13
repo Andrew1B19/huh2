@@ -153,6 +153,7 @@ function handlers.TLOGIN(P, msg)
   P.user, P.login = name, K.nextLogin()
   P.shell = K.newShell(P, name)
   reply(P, msg, {login = P.login, cwd = P.cwd(), windows = K.win.ofUser(name)})
+  K.loginStarted(P)
 end
 function handlers.TCMD(P, msg)
   if not P.user then return reply(P, msg, nil, "log in first") end
