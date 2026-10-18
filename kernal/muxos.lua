@@ -589,7 +589,6 @@ local function dispatchJob(code, args, targetAddr, parent, appName, orphanPolicy
   if parent and jobs[id].orphanPolicy == "orphan" then
     registerOrphanCandidate(appName, id)
   end
-  -- `window`: a graphics process's own window, which it draws into.
   -- `window`: a graphics process's own window (a registry record), which
   -- it draws into.
   local route

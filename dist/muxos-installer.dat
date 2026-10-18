@@ -2,7 +2,7 @@
 @@MANIFEST 35
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-90447 /muxos.lua
+90446 /muxos.lua
 30785 /compositor.lua
 33883 /shell.lua
 2663 /bitmap.lua
@@ -229,7 +229,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 90447 /muxos.lua
+@@ 90446 /muxos.lua
 
 
 
@@ -821,7 +821,6 @@ end
 if parent and jobs[id].orphanPolicy == "orphan" then
 registerOrphanCandidate(appName, id)
 end
-
 
 
 local route
