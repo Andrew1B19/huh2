@@ -1,4 +1,4 @@
--- muxos terminal runtime: a network terminal's side of a muxos session.
+-- munix terminal runtime: a network terminal's side of a munix session.
 -- muxterm (apps/muxterm.lua, an OpenOS program) fetches this file from
 -- the kernal -- with the session, compositor and encoder code it runs --
 -- so a terminal always runs the kernal's own version of them.
@@ -164,7 +164,7 @@ end
 
 -- --- The kernal's side, as the session sees it (K) ---
 
-local K = {selfAddr = kernalAddr, MUXOS_VERSION = ctx.version, jobs = {}, fullscreen = {},
+local K = {selfAddr = kernalAddr, MUNIX_VERSION = ctx.version, jobs = {}, fullscreen = {},
   commands = setmetatable({}, {__mode = "k"}), loadSibling = loadFile}
 K.lineedit = loadFile("lineedit.lua")()
 K.system = {home = function(name) return name == "root" and "/root" or "/home/" .. name end}

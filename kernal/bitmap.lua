@@ -1,4 +1,4 @@
--- muxos bitmap encoder: turns a pixel grid into character-cell runs,
+-- munix bitmap encoder: turns a pixel grid into character-cell runs,
 -- since OC's GPU hardware has no pixel API at all (confirmed:
 -- get/set/copy/fill/bitblt all operate on a TextBuffer -- codepoint +
 -- fg + bg per cell -- see docs/PROTOCOL.md). Two sub-cell techniques:
@@ -34,8 +34,8 @@
 -- called for elsewhere in this project.
 --
 -- Loaded via kernal/compositor.lua's loadSibling("bitmap.lua") (itself
--- passed down from kernal/muxos.lua) rather than dofile()/require() --
--- muxos replaces OpenOS on the kernal entirely, so neither exists; see
+-- passed down from kernal/munix.lua) rather than dofile()/require() --
+-- munix replaces OpenOS on the kernal entirely, so neither exists; see
 -- compositor.lua's own header for the full reasoning.
 
 local M = {}

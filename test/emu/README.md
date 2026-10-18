@@ -12,7 +12,7 @@ broadcast-only Network Card, a filesystem component, an EEPROM
 component, and a Tier-3 GPU/screen pair.
 
 `integration_test.lua` boots the REAL, unmodified repo files --
-`kernal/bios.lua`, `kernal/muxos.lua`, `kernal/compositor.lua`,
+`kernal/bios.lua`, `kernal/munix.lua`, `kernal/compositor.lua`,
 `kernal/bitmap.lua`, `node/bios.lua`, `node/runtime.lua` -- as 1 kernal
 + 3 workers, and drives the kernal's REPL the way a human would:
 injecting `key_down` signals and reading back what actually lands on
@@ -39,7 +39,7 @@ isolation, so nothing exercises two real subsystems writing to the same
 simulated screen or coroutine concurrently):
 
 1. **`kernal/compositor.lua`'s `flush()` used to wipe the kernal's own
-   text console.** The console (`kernal/muxos.lua`'s `termWrite`) writes
+   text console.** The console (`kernal/munix.lua`'s `termWrite`) writes
    directly to the real screen (buffer 0) between flushes, since it
    isn't a compositor window. `flush()` used to blit its OWN
    separately-tracked frame buffer onto buffer 0 wholesale -- which is

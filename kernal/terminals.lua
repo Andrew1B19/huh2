@@ -1,4 +1,4 @@
--- muxos terminal server: the kernal's side of network terminals.
+-- munix terminal server: the kernal's side of network terminals.
 --
 -- A terminal (muxterm, an OpenOS program) runs its session itself --
 -- console, desktop, taskbar, windows, its own compositor on its own GPU
@@ -11,7 +11,7 @@
 -- terminal, with their windows' keys; nothing of a terminal's screen
 -- passes through here.
 --
--- Loaded by kernal/muxos.lua:
+-- Loaded by kernal/munix.lua:
 --   loadSibling("terminals.lua")(K, {modem, send})
 --
 -- On the terminal port (flag terminal_port, 4478; framed as the cluster
@@ -236,11 +236,11 @@ end
 function T.message(from, msg)
   if msg.type == "TERMHELLO" then
     if not system.flag("remote_terminals") then
-      return sendTo(from, {type = "TBYE", why = "this muxos doesn't take terminals (flag remote_terminals)"})
+      return sendTo(from, {type = "TBYE", why = "this munix doesn't take terminals (flag remote_terminals)"})
     end
     local files = {}
     for _, name in ipairs(FILES) do files[name] = K.readFile("/" .. name) end
-    return sendTo(from, {type = "TCODE", files = files, version = K.MUXOS_VERSION})
+    return sendTo(from, {type = "TCODE", files = files, version = K.MUNIX_VERSION})
   elseif msg.type == "TREADY" then
     local old = T.byAddress[from]
     if old then hangUp(old, "restarted") end

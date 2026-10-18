@@ -1,7 +1,7 @@
-# opm for muxos
+# opm for Munix
 
-The muxos port of opm, the Open Computers Pull Manager (LewisHost.Net
-`oc-programs/ocpull`), as an `.mxe` program. It ships with muxos: the
+The Munix port of opm, the Open Computers Pull Manager (LewisHost.Net
+`oc-programs/ocpull`), as an `.mxe` program. It ships with munix: the
 installer puts `opm.mxe` in `/bin` and `opm_core.lua` in `/lib/mxe`.
 
 - `opm_core.lua` is opm's pure logic, vendored unchanged from
@@ -18,7 +18,7 @@ except:
   (what opmf does on OpenOS).
 - `opm update` with no argument reinstalls opm from the catalog's
   `opm-mxe` package, into `/bin` and `/lib/mxe`.
-- `opm hook` is gone: the muxos console has no tab completion.
+- `opm hook` is gone: the Munix console has no tab completion.
 
 Installed OpenOS packages (`.lua`) run as legacy programs. Their files go
 under `/usr` by default, which the launcher (`/usr/bin`) and legacy
@@ -26,6 +26,6 @@ under `/usr` by default, which the launcher (`/usr/bin`) and legacy
 
 ## Making `opm update` work
 
-Copy this repository into oc-programs as `muxos/`, and merge the
+Copy this repository into oc-programs as `munix/`, and merge the
 `opm-mxe` entry from `dist/programs.cfg` into the catalog's
-`programs.cfg`. That file also has the `muxos-installer` entry.
+`programs.cfg`. That file also has the `munix-installer` entry.

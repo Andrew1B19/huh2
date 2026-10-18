@@ -1,8 +1,8 @@
---[[MUXOS-PAYLOAD 0.1.2
+--[[MUNIX-PAYLOAD 0.1.2
 @@MANIFEST 35
 3862 /eeprom/kernal.lua
 2720 /eeprom/worker.lua
-90446 /muxos.lua
+90605 /munix.lua
 30785 /compositor.lua
 33883 /shell.lua
 2663 /bitmap.lua
@@ -36,7 +36,7 @@
 6034 /bin/opm.mxe
 4098 /lib/mxe/opm_core.lua
 @@ 3862 /eeprom/kernal.lua
--- muxos kernal BIOS; see docs/PROTOCOL.md.
+-- munix kernal BIOS; see docs/PROTOCOL.md.
 local invoke = component.invoke
 local function call(a, m, ...)
   local r = table.pack(pcall(invoke, a, m, ...))
@@ -60,7 +60,7 @@ if gpu and screen then call(gpu, "fill", 1, 1, 160, 50, " ") end
 local function stop(text)
   say(text)
   local disk
-  local d = {"muxos BIOS dump", table.concat(lines, "\n"), "",
+  local d = {"munix BIOS dump", table.concat(lines, "\n"), "",
     "uptime " .. computer.uptime() .. "  memory " .. computer.freeMemory() .. "/" .. computer.totalMemory()
     .. "  energy " .. computer.energy() .. "/" .. computer.maxEnergy(), "eeprom data " .. tostring(call(eeprom, "getData"))}
   for a, t in list() do
@@ -73,11 +73,11 @@ local function stop(text)
     end
     d[#d + 1] = x
   end
-  local h = disk and call(disk, "open", "/muxos-boot-dump.txt", "w")
+  local h = disk and call(disk, "open", "/munix-boot-dump.txt", "w")
   if h then
     call(disk, "write", h, table.concat(d, "\n") .. "\n")
     call(disk, "close", h)
-    say("Dump: " .. disk:sub(1, 8) .. "/muxos-boot-dump.txt")
+    say("Dump: " .. disk:sub(1, 8) .. "/munix-boot-dump.txt")
   end
   error(table.concat(lines, "\n"), 0)
 end
@@ -105,11 +105,11 @@ end
 
 local init
 local remembered = call(eeprom, "getData")
-if remembered and remembered ~= "" then init = try(remembered, "/muxos.lua") end
+if remembered and remembered ~= "" then init = try(remembered, "/munix.lua") end
 if not init then
   call(eeprom, "setData", "")
   for a in list("filesystem") do
-    init = try(a, "/muxos.lua")
+    init = try(a, "/munix.lua")
     if init then
       call(eeprom, "setData", a)
       break
@@ -123,15 +123,15 @@ end
 
 -- The installer (it handles its own crashes), retried for 5 s: a rack's
 -- drive can attach late.
-say("muxos: no system; looking for the installer floppy...")
+say("munix: no system; looking for the installer floppy...")
 local wait = computer.uptime() + 5
 repeat
   problems = {}
   for a in list("filesystem") do
-    local installer = try(a, "/muxos-installer.lua")
+    local installer = try(a, "/munix-installer.lua")
     if installer then
       computer.beep(800, 0.2)
-      return installer(a, "/muxos-installer.lua")
+      return installer(a, "/munix-installer.lua")
     end
   end
   computer.pullSignal(1)
@@ -229,7 +229,7 @@ if not chunk then
 end
 chunk(kernalAddr)
 
-@@ 90446 /muxos.lua
+@@ 90605 /munix.lua
 
 
 
@@ -264,7 +264,7 @@ chunk(kernalAddr)
 
 
 local PORT = 4477
-local MUXOS_VERSION = "0.1.2"
+local MUNIX_VERSION = "0.1.2"
 local TIMEOUT = 5
 
 
@@ -584,7 +584,7 @@ local function noteNode(addr)
 if not nodes[addr] then
 nodes[addr] = {}
 nodeOrder[#nodeOrder + 1] = addr
-if K.sysbus then K.sysbus.emit("muxos.node", addr, "up") end
+if K.sysbus then K.sysbus.emit("munix.node", addr, "up") end
 
 
 send({type = "GETCOMPONENTS", from = selfAddr, to = addr})
@@ -595,7 +595,7 @@ node.probedAt = nil
 if node.down then
 node.down = nil
 print("node " .. addr .. " is responding again")
-if K.sysbus then K.sysbus.emit("muxos.node", addr, "up") end
+if K.sysbus then K.sysbus.emit("munix.node", addr, "up") end
 end
 end
 
@@ -898,7 +898,8 @@ if not chunk then return nil, "bad .mxe header: " .. tostring(err) end
 local co = coroutine.create(chunk)
 local ok, runErr = coroutine.resume(co)
 if not ok then return nil, "bad .mxe header: " .. tostring(runErr) end
-return {muxos = env.muxos, libraries = env.libraries, requires = env.requires, name = env.name,
+
+return {munix = env.munix or env.muxos, libraries = env.libraries, requires = env.requires, name = env.name,
 version = env.version, description = env.description, author = env.author,
 icon = env.icon, icon_color = env.icon_color}
 end
@@ -1053,9 +1054,9 @@ local program = {path = path, kind = path:match("%.mxe$") and "mxe" or "legacy",
 if program.kind == "mxe" then
 local manifest, manifestErr = readManifest(source)
 if not manifest then return nil, manifestErr end
-local response = {muxos = MUXOS_VERSION, requested = manifest.muxos, libraries = {},
-versionMatch = manifest.muxos == nil or sameVersion(manifest.muxos, MUXOS_VERSION),
-compatible = compatibleVersion(manifest.muxos, MUXOS_VERSION), components = {}}
+local response = {munix = MUNIX_VERSION, requested = manifest.munix, libraries = {},
+versionMatch = manifest.munix == nil or sameVersion(manifest.munix, MUNIX_VERSION),
+compatible = compatibleVersion(manifest.munix, MUNIX_VERSION), components = {}}
 for _, field in ipairs({"name", "version", "description", "author"}) do
 if type(manifest[field]) == "string" then response[field] = manifest[field] end
 end
@@ -1235,7 +1236,7 @@ end
 if op ~= "send" or port ~= nil then
 if math.type(port) ~= "integer" or port < 1 or port > 65535 then return nil, "bad port: " .. tostring(port) end
 if port == PORT then return nil, "port " .. PORT .. " is the cluster's own" end
-if K.terminals and port == K.terminals.PORT then return nil, "port " .. port .. " is muxos's terminal port" end
+if K.terminals and port == K.terminals.PORT then return nil, "port " .. port .. " is munix's terminal port" end
 end
 if op == "open" then
 local owners = net.ports[port] or {}
@@ -1345,7 +1346,7 @@ local LIVENESS = {PROBE_AFTER = 3, DOWN_AFTER = 10, lastCheck = -math.huge}
 local function markNodeDown(addr)
 nodes[addr].down = true
 print("node " .. addr .. " stopped responding -- marking it down")
-if K.sysbus then K.sysbus.emit("muxos.node", addr, "down") end
+if K.sysbus then K.sysbus.emit("munix.node", addr, "down") end
 if fullscreen.node == addr then
 fullscreen.node = nil
 fullscreen.job = nil
@@ -1927,8 +1928,8 @@ return
 end
 
 
-local path = msg.name == "muxos:bitmap" and "/bitmap.lua" or resolveModule(msg.name)
-local source = path and (msg.name == "muxos:bitmap" and readFile(path) or readModuleFile(path))
+local path = msg.name == "munix:bitmap" and "/bitmap.lua" or resolveModule(msg.name)
+local source = path and (msg.name == "munix:bitmap" and readFile(path) or readModuleFile(path))
 if source then
 send({type = "RESULT", from = selfAddr, to = msg.from, id = msg.id, result = {path = path, source = source}})
 else
@@ -2705,7 +2706,7 @@ end
 
 
 
-local updates = {DAT = "/muxos-installer.dat", CHUNK = 8192}
+local updates = {DAT = "/munix-installer.dat", CHUNK = 8192}
 
 
 
@@ -2727,8 +2728,8 @@ end
 
 
 function updates.parse(data)
-local version, pos = data:match("^%-%-%[=*%[MUXOS%-PAYLOAD ([^\n]+)\n()")
-if not version then return nil, "not a muxos installer data file" end
+local version, pos = data:match("^%-%-%[=*%[MUNIX%-PAYLOAD ([^\n]+)\n()")
+if not version then return nil, "not a munix installer data file" end
 if version:sub(-1) == "\r" then return nil, "its line endings were converted to CRLF -- copy it again as-is" end
 local count
 count, pos = data:match("^@@MANIFEST (%d+)\n()", pos)
@@ -2819,19 +2820,19 @@ if not tryInvoke(fsAddr, "rename", path .. ".new", path) then
 return nil, "couldn't move " .. path .. " into place -- run update again"
 end
 end
-local h = tryInvoke(fsAddr, "open", "/.muxos-version", "w")
+local h = tryInvoke(fsAddr, "open", "/.munix-version", "w")
 if h then tryInvoke(fsAddr, "write", h, version .. "\n") tryInvoke(fsAddr, "close", h) end
 local biosNote = ""
 if kernalBios and eepromAddr and tryInvoke(eepromAddr, "get") ~= kernalBios then
 tryInvoke(eepromAddr, "set", kernalBios)
 if tryInvoke(eepromAddr, "get") == kernalBios then
-tryInvoke(eepromAddr, "setLabel", "muxos kernal")
+tryInvoke(eepromAddr, "setLabel", "munix kernal")
 biosNote = "; the kernal BIOS was re-flashed"
 else
 biosNote = "; re-flashing the kernal BIOS FAILED (the old one is still there)"
 end
 end
-return true, string.format("muxos %s installed (%d files)%s. Type `reboot` to start it, then restart the workers.",
+return true, string.format("munix %s installed (%d files)%s. Type `reboot` to start it, then restart the workers.",
 version, #staged, biosNote)
 end
 
@@ -3049,7 +3050,7 @@ K.system, K.jobs, K.runningJobs = system, jobs, runningJobs
 K.readFile, K.tryInvoke, K.fsAddr, K.loadSibling = readFile, tryInvoke, fsAddr, loadSibling
 K.resolveProgram, K.readManifest, K.launchProgram, K.PROGRAM_PATH = resolveProgram, readManifest, launchProgram,
 PROGRAM_PATH
-K.MUXOS_VERSION, K.selfAddr, K.fullscreen, K.controlJob = MUXOS_VERSION, selfAddr, fullscreen, controlJob
+K.MUNIX_VERSION, K.selfAddr, K.fullscreen, K.controlJob = MUNIX_VERSION, selfAddr, fullscreen, controlJob
 K.lineedit = loadSibling("lineedit.lua")()
 K.win = loadSibling("windows.lua")(K)
 K.sysbus = loadSibling("sysbus.lua")(K, {send = send, selfAddr = selfAddr})
@@ -3202,11 +3203,11 @@ end
 
 
 function K.loginStarted(S)
-K.sysbus.emit("muxos.login", S.user, K.where(S))
+K.sysbus.emit("munix.login", S.user, K.where(S))
 end
 
 function K.endLogin(S)
-if S.user then K.sysbus.emit("muxos.logout", S.user, K.where(S)) end
+if S.user then K.sysbus.emit("munix.logout", S.user, K.where(S)) end
 local ending = system.flag("logout_ends_jobs")
 for id in pairs(runningJobs) do
 local job = jobs[id]
@@ -3307,11 +3308,11 @@ end
 
 
 
-K.MUXOS_COMMANDS = {}
+K.MUNIX_COMMANDS = {}
 for name in ("discover nodes processes ping run runall spawn window windows console comp focus bitdemo "
 .. "bus components call pause resume kill migrate drain undrain update reboot quit exit wallpaper "
 .. "shutdown logout flags users useradd userdel who jobs persist attach sysbus"):gmatch("%S+") do
-K.MUXOS_COMMANDS[name] = true
+K.MUNIX_COMMANDS[name] = true
 end
 
 
@@ -3340,7 +3341,7 @@ local deadline = computer.uptime() + seconds
 while computer.uptime() < deadline do K.wait(deadline - computer.uptime()) end
 end,
 help = function() K.help() end,
-info = {version = MUXOS_VERSION, address = selfAddr or computer.address(), uptime = computer.uptime,
+info = {version = MUNIX_VERSION, address = selfAddr or computer.address(), uptime = computer.uptime,
 memory = function() return computer.freeMemory(), computer.totalMemory() end},
 user = user, home = system.home(user),
 
@@ -3353,7 +3354,7 @@ if keep then
 table.remove(argv, 1)
 if not argv[1] then S.print("usage: nohup <program> [args]") return 2 end
 end
-if K.MUXOS_COMMANDS[argv[1]] and not keep then
+if K.MUNIX_COMMANDS[argv[1]] and not keep then
 K.runCommand(S, table.concat(argv, " "))
 return 0
 end
@@ -3405,10 +3406,10 @@ end
 
 
 function K.help()
-print("muxos commands:")
+print("munix commands:")
 print("  discover | nodes | ping <node> [count] | logout | shutdown | reboot")
 print("  users | who | useradd <name> | userdel <name> | flags [<name> [<value>]] -- users and kernal flags")
-print("  update -- install a new muxos from the installer floppy's muxos-installer.dat")
+print("  update -- install a new munix from the installer floppy's munix-installer.dat")
 print("  wallpaper <file.ppm> | wallpaper none -- the desktop's background image")
 print("  run <lua code> | runall <lua code> | processes | pause|resume|kill <job id>")
 print("  jobs | nohup <command> | persist <job id> [on|off] | attach <job id> -- what runs after logout")
@@ -3463,8 +3464,8 @@ local ok, why = system.allowed(ctx.user, flagName, doing)
 if not ok then error(why, 0) end
 end
 
-K.sysbus.provide("muxos.system", {
-version = function() return MUXOS_VERSION end,
+K.sysbus.provide("munix.system", {
+version = function() return MUNIX_VERSION end,
 uptime = function() return computer.uptime() end,
 users = function() return system.users() end,
 
@@ -3494,11 +3495,11 @@ end,
 })
 
 
-K.sysbus.provide("muxos.update", {
+K.sysbus.provide("munix.update", {
 
 version = function()
-local installed = readFile("/.muxos-version")
-return {running = MUXOS_VERSION, installed = installed and installed:match("^%s*(.-)%s*$")}
+local installed = readFile("/.munix-version")
+return {running = MUNIX_VERSION, installed = installed and installed:match("^%s*(.-)%s*$")}
 end,
 
 files = function()
@@ -3534,9 +3535,16 @@ end,
 
 
 
+
+for _, old in ipairs({"/muxos.lua", "/.muxos-version"}) do
+if tryInvoke(fsAddr, "exists", old) then tryInvoke(fsAddr, "remove", old) end
+end
+
+
+
 if gpu and screenAddr then K.console = K.newSession({gpu = gpu, kind = "local"}) end
 K.terminals = loadSibling("terminals.lua")(K, {modem = modem, send = send})
-print("muxos kernal -- " .. selfAddr)
+print("munix kernal -- " .. selfAddr)
 K.help()
 if K.shellFactory then
 print("shell: ls cd cat cp mv rm mkdir grep ... with | > >> < ; && || -- type 'help'")
@@ -4178,7 +4186,7 @@ if not gpu then return nil, "kernal has no gpu component" end
 
 
 
-if not gpu.allocateBuffer then return nil, "kernal's gpu does not support buffers -- muxos requires Tier 3" end
+if not gpu.allocateBuffer then return nil, "kernal's gpu does not support buffers -- munix requires Tier 3" end
 if not ensureFrameBuffer(gpu) then return nil, "could not allocate the frame buffer" end
 
 local width, height, cells, cellCols, cellRows
@@ -4935,7 +4943,7 @@ local ctx = ...
 local M = {}
 
 local env = {HOME = ctx.home or "/home", PATH = "/bin:/usr/bin", PWD = "/", SHELL = "/bin/sh",
-USER = ctx.user or "root", TERM = "muxos"}
+USER = ctx.user or "root", TERM = "munix"}
 local exported = {HOME = true, PATH = true, PWD = true, SHELL = true, USER = true, TERM = true}
 local lastStatus = 0
 
@@ -5935,9 +5943,9 @@ io.out(string.format("up %d:%02d:%02d\n", t // 3600, t // 60 % 60, t % 60))
 end)
 define("uname", "uname [-a]", function(args, io)
 if args[1] == "-a" then
-io.out("muxos " .. ctx.info.address:sub(1, 8) .. " " .. ctx.info.version .. " OpenComputers\n")
+io.out("munix " .. ctx.info.address:sub(1, 8) .. " " .. ctx.info.version .. " OpenComputers\n")
 else
-io.out("muxos\n")
+io.out("munix\n")
 end
 end)
 define("hostname", "hostname", function(_, io) io.out(ctx.info.address:sub(1, 8) .. "\n") end)
@@ -6736,7 +6744,7 @@ cwd = "~"
 elseif cwd:sub(1, #home + 1) == home .. "/" then
 cwd = "~" .. cwd:sub(#home + 1)
 end
-return user .. "@muxos:" .. cwd .. "> "
+return user .. "@munix:" .. cwd .. "> "
 end
 
 
@@ -7457,7 +7465,7 @@ clock = string.format("%d:%02d", t // 3600, t // 60 % 60)
 end
 clock = " " .. clock .. " "
 local placed, buttons = {}, {}
-local start = desktop.mono and "[muxos]" or " \u{2261} muxos "
+local start = desktop.mono and "[munix]" or " \u{2261} munix "
 placed[#placed + 1] = {1, start, desktop.mono and 0xFFFFFF or 0x000000, desktop.mono and 0x000000 or C.accent}
 buttons[#buttons + 1] = {from = 1, to = utf8.len(start), start = true}
 local x, limit = utf8.len(start) + 2, termW - #clock
@@ -7792,7 +7800,7 @@ local fullscreen = K.fullscreen
 if S.kind == "local" and fullscreen.node then fullscreen.node, fullscreen.job = nil, nil end
 compositor.setExclusive("console")
 if consoleWin then compositor.setFocus(consoleWin.id) end
-print("muxos " .. K.MUXOS_VERSION .. " -- " .. tostring(K.selfAddr)
+print("munix " .. K.MUNIX_VERSION .. " -- " .. tostring(K.selfAddr)
 .. (S.kind == "terminal" and (" (terminal " .. tostring(S.address):sub(1, 8) .. ")") or ""))
 print("Log in with your user name (no password).")
 scrollOffset, consoleDirty = 0, true
@@ -8399,11 +8407,11 @@ end
 function T.message(from, msg)
 if msg.type == "TERMHELLO" then
 if not system.flag("remote_terminals") then
-return sendTo(from, {type = "TBYE", why = "this muxos doesn't take terminals (flag remote_terminals)"})
+return sendTo(from, {type = "TBYE", why = "this munix doesn't take terminals (flag remote_terminals)"})
 end
 local files = {}
 for _, name in ipairs(FILES) do files[name] = K.readFile("/" .. name) end
-return sendTo(from, {type = "TCODE", files = files, version = K.MUXOS_VERSION})
+return sendTo(from, {type = "TCODE", files = files, version = K.MUNIX_VERSION})
 elseif msg.type == "TREADY" then
 local old = T.byAddress[from]
 if old then hangUp(old, "restarted") end
@@ -8721,7 +8729,7 @@ and not name:find("..", 1, true) and name:sub(-1) ~= "."
 end
 
 local function reserved(name)
-return name == "muxos" or name:sub(1, 6) == "muxos."
+return name == "munix" or name:sub(1, 6) == "munix."
 end
 
 local function answer(msg, result, err)
@@ -9106,7 +9114,7 @@ end
 
 
 
-local K = {selfAddr = kernalAddr, MUXOS_VERSION = ctx.version, jobs = {}, fullscreen = {},
+local K = {selfAddr = kernalAddr, MUNIX_VERSION = ctx.version, jobs = {}, fullscreen = {},
 commands = setmetatable({}, {__mode = "k"}), loadSibling = loadFile}
 K.lineedit = loadFile("lineedit.lua")()
 K.system = {home = function(name) return name == "root" and "/root" or "/home/" .. name end}
@@ -9458,7 +9466,7 @@ return reason
 
 
 local PORT = 4477
-local MUXOS_VERSION = "0.1.2"
+local MUNIX_VERSION = "0.1.2"
 
 
 
@@ -9975,7 +9983,7 @@ end
 local bitmapModule
 local function bitmapLib(caller)
 if not bitmapModule then
-local r, err = remoteRequest("GETMODULE", {name = "muxos:bitmap", caller = caller})
+local r, err = remoteRequest("GETMODULE", {name = "munix:bitmap", caller = caller})
 if not r then error("the bitmap encoder: " .. tostring(err), 0) end
 bitmapModule = assert(load(r.source, "=bitmap.lua"))()
 end
@@ -10803,7 +10811,7 @@ NATIVE.component = readOnly(newBusComponentFace(nil), "component")
 NATIVE.gmuxapi = readOnly(gmuxapi, "gmuxapi")
 NATIVE.yield = yield
 NATIVE.sleep = sleep
-NATIVE.muxos = readOnly({version = MUXOS_VERSION}, "muxos")
+NATIVE.munix = readOnly({version = MUNIX_VERSION}, "munix")
 
 local function printTo(id)
 return function(...)
@@ -12139,9 +12147,9 @@ local LEGACY_FACES = {
 sysbus = function(ctx) return sysbusLib(ctx.id) end,
 
 
-muxos = function(ctx)
+munix = function(ctx)
 return {
-version = MUXOS_VERSION,
+version = MUNIX_VERSION,
 
 
 set_persistent = function(on) return remoteRequest("PERSIST", {on = on ~= false, caller = ctx.id}) end,
@@ -12153,7 +12161,7 @@ end,
 pipe = function(ctx)
 local function unsupported(name)
 return function()
-error("pipe." .. name .. ": muxos runs every program as a process of its own; use pipe.popen or io.popen", 2)
+error("pipe." .. name .. ": munix runs every program as a process of its own; use pipe.popen or io.popen", 2)
 end
 end
 return {
@@ -15129,10 +15137,10 @@ return vt100
 
 @@ 6034 /bin/opm.mxe
 --[[mxe
-muxos = "0.1.0"
+munix = "0.1.0"
 name = "opm"
 version = "0.5.0"
-description = "Open Computers Pull Manager, the muxos port"
+description = "Open Computers Pull Manager, the munix port"
 author = "LewisHost.Net"
 libraries = {"mux", "http", "opm_core"}
 requires = {"internet"}
@@ -15275,21 +15283,21 @@ for _, own in ipairs({"opmf.lua", "opm_core.lua"}) do
 local ok, body = pcall(src.get, "ocpull/" .. own)
 if ok then write(concat(dir, own), body) end
 end
-print("bundle ready: on muxos run  opm --from=" .. dir .. " pull " .. name)
+print("bundle ready: on munix run  opm --from=" .. dir .. " pull " .. name)
 end
 
 local ok, err = pcall(function()
 local cmd = args[1]
 if not cmd then print(USAGE) return end
 if cmd == "hook" then
-print("opm hook: the muxos console has no tab completion")
+print("opm hook: the munix console has no tab completion")
 return
 end
 local src = opts.from and dir_source(opts.from) or http_source(opts.base or DEFAULT_BASE)
 local cfg = load_cfg(src)
 if cmd == "update" and not args[2] then
 if not cfg[SELF_PACKAGE] then
-error("the catalog has no " .. SELF_PACKAGE .. " package (muxos's opm/ directory) to update from", 0)
+error("the catalog has no " .. SELF_PACKAGE .. " package (munix's opm/ directory) to update from", 0)
 end
 pull(src, cfg, SELF_PACKAGE, "/")
 print("opm updated")

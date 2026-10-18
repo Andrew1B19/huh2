@@ -1,4 +1,4 @@
--- muxos virtual GPU: an OpenComputers tier-3 GPU in plain Lua memory,
+-- munix virtual GPU: an OpenComputers tier-3 GPU in plain Lua memory,
 -- for a session whose screen isn't the kernal's own -- a network
 -- terminal's. The compositor draws into it exactly as it draws into the
 -- real GPU (the same calls: buffers, set/fill/copy/bitblt, colors), and

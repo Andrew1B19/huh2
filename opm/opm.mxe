@@ -1,20 +1,20 @@
 --[[mxe
-muxos = "0.1.0"
+munix = "0.1.0"
 name = "opm"
 version = "0.5.0"
-description = "Open Computers Pull Manager, the muxos port"
+description = "Open Computers Pull Manager, the munix port"
 author = "LewisHost.Net"
 libraries = {"mux", "http", "opm_core"}
 requires = {"internet"}
 ]]
--- opm for muxos: installs oppm-style packages from the LewisHost.Net Gitea
+-- opm for munix: installs oppm-style packages from the LewisHost.Net Gitea
 -- monorepo, like OpenOS's opm 0.4.0 (ocpull/opm.lua), whose logic it shares
--- unchanged (opm_core). What's different on muxos:
+-- unchanged (opm_core). What's different on munix:
 --   * files go to the kernal's disk through `fs`; HTTP goes through the `http`
 --     library, over whichever internet card the cluster has;
 --   * --from=DIR installs offline from an `opm bundle` directory (opmf's job);
 --   * `opm update` (no argument) reinstalls opm from the catalog's "opm-mxe"
---     package; `opm hook` is gone (the muxos console has no tab completion).
+--     package; `opm hook` is gone (the munix console has no tab completion).
 local mux = require("mux")
 local http = require("http")
 local core = require("opm_core")
@@ -145,21 +145,21 @@ local function bundle(src, cfg, name, dir)
     local ok, body = pcall(src.get, "ocpull/" .. own)
     if ok then write(concat(dir, own), body) end
   end
-  print("bundle ready: on muxos run  opm --from=" .. dir .. " pull " .. name)
+  print("bundle ready: on munix run  opm --from=" .. dir .. " pull " .. name)
 end
 
 local ok, err = pcall(function()
   local cmd = args[1]
   if not cmd then print(USAGE) return end
   if cmd == "hook" then
-    print("opm hook: the muxos console has no tab completion")
+    print("opm hook: the munix console has no tab completion")
     return
   end
   local src = opts.from and dir_source(opts.from) or http_source(opts.base or DEFAULT_BASE)
   local cfg = load_cfg(src)
   if cmd == "update" and not args[2] then
     if not cfg[SELF_PACKAGE] then
-      error("the catalog has no " .. SELF_PACKAGE .. " package (muxos's opm/ directory) to update from", 0)
+      error("the catalog has no " .. SELF_PACKAGE .. " package (munix's opm/ directory) to update from", 0)
     end
     pull(src, cfg, SELF_PACKAGE, "/")
     print("opm updated")

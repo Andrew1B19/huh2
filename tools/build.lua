@@ -1,7 +1,7 @@
--- Builds the muxos installer. Run from anywhere with plain Lua 5.3:
+-- Builds the munix installer. Run from anywhere with plain Lua 5.3:
 --
---   lua5.3 tools/build.lua               dist/muxos-installer.lua (the program)
---                                        + dist/muxos-installer.dat (its files)
+--   lua5.3 tools/build.lua               dist/munix-installer.lua (the program)
+--                                        + dist/munix-installer.dat (its files)
 --                                        + dist/floppy/init.lua (boots it)
 --   lua5.3 tools/build.lua --out <file>  the same pair elsewhere (<file>.lua
 --                                        and, next to it, the .dat)
@@ -48,7 +48,7 @@ end
 local FILES = {
   {"/eeprom/kernal.lua", "kernal/bios.lua"},
   {"/eeprom/worker.lua", "node/bios.lua"},
-  {"/muxos.lua", "kernal/muxos.lua"},
+  {"/munix.lua", "kernal/munix.lua"},
   {"/compositor.lua", "kernal/compositor.lua"},
   {"/shell.lua", "kernal/shell.lua"},
   {"/bitmap.lua", "kernal/bitmap.lua"},
@@ -65,7 +65,7 @@ local FILES = {
 for _, rel in ipairs(listDir("kernal/lib")) do
   if rel ~= "README.md" then FILES[#FILES + 1] = {"/lib/" .. rel, "kernal/lib/" .. rel} end
 end
--- OPM, the package manager, ships with muxos.
+-- OPM, the package manager, ships with munix.
 FILES[#FILES + 1] = {"/bin/opm.mxe", "opm/opm.mxe"}
 FILES[#FILES + 1] = {"/lib/mxe/opm_core.lua", "opm/opm_core.lua"}
 
@@ -102,15 +102,15 @@ local function build()
     local e = b and text:find("\nend\n", b, true)
     return e and text:sub(a, e)
   end
-  local kernalCodec, runtimeCodec = codec(readFile("kernal/muxos.lua")), codec(readFile("node/runtime.lua"))
+  local kernalCodec, runtimeCodec = codec(readFile("kernal/munix.lua")), codec(readFile("node/runtime.lua"))
   if not kernalCodec or kernalCodec ~= runtimeCodec then
-    errors[#errors + 1] = "the wire codec (serialize/deserialize) differs between kernal/muxos.lua and node/runtime.lua"
+    errors[#errors + 1] = "the wire codec (serialize/deserialize) differs between kernal/munix.lua and node/runtime.lua"
   end
   if kernalCodec ~= codec(readFile("kernal/terminal.lua")) then
-    errors[#errors + 1] = "the wire codec (serialize/deserialize) differs between kernal/muxos.lua and kernal/terminal.lua"
+    errors[#errors + 1] = "the wire codec (serialize/deserialize) differs between kernal/munix.lua and kernal/terminal.lua"
   end
-  local version = readFile("kernal/muxos.lua"):match('local MUXOS_VERSION = "([^"]+)"')
-  local runtimeVersion = readFile("node/runtime.lua"):match('local MUXOS_VERSION = "([^"]+)"')
+  local version = readFile("kernal/munix.lua"):match('local MUNIX_VERSION = "([^"]+)"')
+  local runtimeVersion = readFile("node/runtime.lua"):match('local MUNIX_VERSION = "([^"]+)"')
   if not version or version ~= runtimeVersion then
     errors[#errors + 1] = "kernal version " .. tostring(version) .. " ~= runtime version " .. tostring(runtimeVersion)
   end
@@ -139,12 +139,12 @@ local function build()
 end
 
 -- The payload: every file the installer installs, in the data file next
--- to it (muxos-installer.dat). Kept out of the program itself so OpenOS --
+-- to it (munix-installer.dat). Kept out of the program itself so OpenOS --
 -- and the kernal BIOS, booting bare -- only load a small program: loading
 -- runs at floppy speed, and a 300 KB program took tens of seconds to
 -- start. The installer reads the data file as it needs it.
 local function payload(b)
-  local out = {"--[[MUXOS-PAYLOAD " .. b.version .. "\n", "@@MANIFEST " .. #FILES .. "\n"}
+  local out = {"--[[MUNIX-PAYLOAD " .. b.version .. "\n", "@@MANIFEST " .. #FILES .. "\n"}
   for i, entry in ipairs(FILES) do out[#out + 1] = #b.contents[i] .. " " .. entry[1] .. "\n" end
   for i, entry in ipairs(FILES) do
     out[#out + 1] = "@@ " .. #b.contents[i] .. " " .. entry[1] .. "\n"
@@ -155,7 +155,7 @@ local function payload(b)
   return table.concat(out)
 end
 
-local out = ROOT .. "/dist/muxos-installer.lua"
+local out = ROOT .. "/dist/munix-installer.lua"
 local i = 1
 while arg[i] do
   if arg[i] == "--out" then out = arg[i + 1] i = i + 2
@@ -186,5 +186,5 @@ os.execute('mkdir -p "' .. (out:match("^(.*)/[^/]*$") or ".") .. '/floppy"')
 writeFile(out, b.installer)
 writeFile(initOut, b.init)
 writeFile(dat, data)
-print(string.format("muxos %s: %s (%.1f KB) + %s (%d files, %.1f KB) + %s", b.version, out, #b.installer / 1024,
+print(string.format("munix %s: %s (%.1f KB) + %s (%d files, %.1f KB) + %s", b.version, out, #b.installer / 1024,
   dat, #FILES, #data / 1024, initOut))

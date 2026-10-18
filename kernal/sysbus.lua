@@ -1,11 +1,11 @@
--- muxos system bus: programs (and the kernal) talking to each other by
--- name -- muxos's D-Bus. Not the cluster *component* bus (hardware on
+-- munix system bus: programs (and the kernal) talking to each other by
+-- name -- munix's D-Bus. Not the cluster *component* bus (hardware on
 -- any node); this one is for software.
 --
 -- - Names: a process owns a name ("player", "backup.status") while it
 --   runs; others call its methods by that name, wherever it runs and
---   whoever started it. Names under "muxos." are the kernal's own
---   services (muxos.system, muxos.update -- OPM's interface).
+--   whoever started it. Names under "munix." are the kernal's own
+--   services (munix.system, munix.update -- OPM's interface).
 -- - Calls: the kernal routes a call to the name's owner as an event
 --   ({"sysbus_call", call, name, method, caller, args}) and its answer
 --   (op "reply") back to the caller. A call not answered in its timeout
@@ -13,12 +13,12 @@
 -- - Signals: a process emits a signal ("backup.done"); every process
 --   listening for it (or a pattern: "backup.*", "*") gets
 --   {"sysbus_signal", signal, sender, args}. The kernal emits
---   muxos.login/muxos.logout {user, where} and muxos.node {address,
+--   munix.login/munix.logout {user, where} and munix.node {address,
 --   "up"/"down"}.
 -- `caller`/`sender` are {job, user} ({kernal = true} for the kernal);
 -- `args` are packed lists ({n = ...}) of plain data.
 --
--- Loaded by kernal/muxos.lua: loadSibling("sysbus.lua")(K, {send, selfAddr}).
+-- Loaded by kernal/munix.lua: loadSibling("sysbus.lua")(K, {send, selfAddr}).
 -- The worker runtime's `sysbus` library is the programs' side (node/runtime.lua).
 local K, deps = ...
 local send, selfAddr = deps.send, deps.selfAddr
@@ -33,7 +33,7 @@ local function validName(name)
 end
 
 local function reserved(name)
-  return name == "muxos" or name:sub(1, 6) == "muxos."
+  return name == "munix" or name:sub(1, 6) == "munix."
 end
 
 local function answer(msg, result, err)

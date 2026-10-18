@@ -1,4 +1,4 @@
--- muxos system settings: kernal flags (/etc/kernal.cfg) and users
+-- munix system settings: kernal flags (/etc/kernal.cfg) and users
 -- (/etc/users). Loaded by the kernal with its disk helpers:
 --   loadSibling("system.lua")({read = readFile, write = writeFile, mkdir = makeDirectory})
 --

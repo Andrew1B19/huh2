@@ -1,18 +1,18 @@
 # The `.mxe` program format -- specification
 
-Status: **muxos 0.1.0, built**. Everything here is implemented and
+Status: **Munix 0.1.0, built**. Everything here is implemented and
 tested (tests named; `test/emu/integration_test.lua`). OPM (`opm/`) is
 the reference program written against it.
 
-This is the contract for programs written for muxos itself. OpenOS
-programs (`.lua`) don't need any of it: muxos runs them in an OpenOS
+This is the contract for programs written for Munix itself. OpenOS
+programs (`.lua`) don't need any of it: Munix runs them in an OpenOS
 environment, gmux-style (see docs/PROTOCOL.md, "Running OpenOS
 programs").
 
 ## 1. What an `.mxe` is
 
 An `.mxe` is a Lua 5.3 source file with the `.mxe` extension. The
-extension tells the launcher to run it as a native muxos program rather
+extension tells the launcher to run it as a native Munix program rather
 than an OpenOS one. It isn't a security boundary: nothing is gated on it
 (docs/PROTOCOL.md, "`.mxe`: a native-app marker").
 
@@ -33,7 +33,7 @@ Native means:
 
 ```lua
 --[[mxe
-muxos = "0.1.0"
+munix = "0.1.0"
 name = "hello"
 version = "1.0"
 description = "says hello"
@@ -57,7 +57,7 @@ Header fields (all optional):
 
 | field | type | meaning |
 |---|---|---|
-| `muxos` | string | the muxos version the program was written for (section 3) |
+| `munix` | string | the Munix version the program was written for (section 3) |
 | `libraries` | list of strings | libraries it wants beyond the native API (section 5) |
 | `requires` | list of strings | component types it uses; reported, never enforced (section 3) |
 | `name`, `version`, `description`, `author` | strings | its identity, for package managers and process listings |
@@ -86,8 +86,8 @@ the global `launch`:
 
 | `launch.` | meaning |
 |---|---|
-| `muxos` | the running muxos version |
-| `requested` | the program's `muxos` field (or nil) |
+| `munix` | the running Munix version |
+| `requested` | the program's `munix` field (or nil) |
 | `compatible` | the running version satisfies the requested one (below) |
 | `versionMatch` | exactly the same version (or none requested) |
 | `libraries` | name -> true (granted) or false (not found / failed to load), dependencies included |
@@ -129,7 +129,7 @@ Every `.mxe` sees these globals, read-only. Its own globals are its own.
   nil and `"not in the foreground at the console"`.
 - `yield()`: let the node do other work (see "Cooperation").
   `sleep(seconds)` waits without losing events.
-- `muxos.version`, and `computer.uptime()`, `computer.address()`.
+- `munix.version`, and `computer.uptime()`, `computer.address()`.
 - `fs`: the OS filesystem, the kernal's disk (the same one legacy
   programs and gmux apps use). Paths are absolute.
 
@@ -147,7 +147,7 @@ Every `.mxe` sees these globals, read-only. Its own globals are its own.
   Streams are buffered: reads fetch 16 KB per network round trip, and
   writes go out past 4 KB or on flush/seek/close. Files a process leaves
   open are closed when it ends (test 37).
-- `gmuxapi`, the gmux application API, muxos-shaped:
+- `gmuxapi`, the gmux application API, munix-shaped:
   - **processes:** `get_processes()`, `get_process(id)`,
     `create_headless_process{code, name, orphan_policy, args, node}`,
     `create_graphics_process{...}` (like the headless one, plus a
@@ -273,7 +273,7 @@ granted too, transitively, and loaded before it (test 37).
     calls come as `{"sysbus_call", call, name, method, caller, args}`
     events, answered with `sysbus.reply(call, ...)` or
     `sysbus.fail(call, err)`. `sysbus.release(name)`. Names are dotted
-    words (`"backup.status"`); `muxos.*` are the kernal's; one owner at
+    words (`"backup.status"`); `munix.*` are the kernal's; one owner at
     a time, until it ends.
   - `sysbus.call(name, method, ...)` returns the method's results, or
     raises an error (no such name or method, the method's error, no
@@ -286,10 +286,10 @@ granted too, transitively, and loaded before it (test 37).
     a name, `"prefix.*"` or `"*"`. `sender` = `{job, user}` or
     `{kernal = true}`.
   - `sysbus.list()`: every name: `{name, job, user, kernal}`.
-  - The kernal's services: `muxos.system` (`version`, `uptime`,
-    `users`, `who`, `nodes`, `reboot`) and `muxos.update` (`version`,
+  - The kernal's services: `munix.system` (`version`, `uptime`,
+    `users`, `who`, `nodes`, `reboot`) and `munix.update` (`version`,
     `files`, `install(files, version)` -- OPM's interface); its signals:
-    `muxos.login`, `muxos.logout` (user, where), `muxos.node` (address,
+    `munix.login`, `munix.logout` (user, where), `munix.node` (address,
     `"up"`/`"down"`). README "The system bus"; test 59.
 - `bitmap`: pixels into cells, on the program's own node (OC's GPUs
   have no pixels: a "pixel" is half a cell, `"halfblock"`, or a braille
@@ -366,7 +366,7 @@ returns the saved table. The state must be plain data. Without
 ## 7. Packages and OPM
 
 Where things live:
-- programs on `/bin` (shipped with muxos) or `/usr/bin` (installed);
+- programs on `/bin` (shipped with Munix) or `/usr/bin` (installed);
 - `.mxe` libraries in `/lib/mxe` or `/usr/lib/mxe`;
 - OpenOS libraries for legacy programs in `/lib` or `/usr/lib`.
 
@@ -380,5 +380,5 @@ from the LewisHost.Net catalog into `/usr` by default:
 - `opm update`, which reinstalls OPM from the catalog's `opm-mxe`
   package.
 
-A package for muxos is an oppm entry whose files land in those places.
+A package for Munix is an oppm entry whose files land in those places.
 Its `.mxe` programs should fill in `name` and `version` (test 38).

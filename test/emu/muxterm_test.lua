@@ -1,6 +1,6 @@
--- muxterm, the network terminal, end to end: a muxos cluster (kernal +
+-- muxterm, the network terminal, end to end: a munix cluster (kernal +
 -- worker) and a separate computer running REAL OpenOS with apps/muxterm.lua,
--- all on one network. The terminal gets a muxos session of its own --
+-- all on one network. The terminal gets a munix session of its own --
 -- login, console, programs, windows, composited on the terminal itself
 -- -- while the kernal's own screen keeps its own. Programs draw to the
 -- terminal and get its input directly (the packets are watched), hold
@@ -32,7 +32,7 @@ end
 local emu = Emulator.new()
 emu.timeout = 5
 
--- The muxos cluster.
+-- The munix cluster.
 local kernal = emu:newNode("kernal")
 emu:addModem(kernal)
 local _, kscreen, kbufs = emu:addGpuScreen(kernal, 60, 20)
@@ -68,7 +68,7 @@ gpu.set(5, 5, "FULL SCREEN " .. w .. "x" .. h)
 sleep(3)
 gmuxapi.release_fullscreen()
 ]==]}
-for _, f in ipairs({"muxos", "compositor", "shell", "bitmap", "lineedit", "system", "session", "vgpu", "terminals", "windows", "terminal", "sysbus"}) do
+for _, f in ipairs({"munix", "compositor", "shell", "bitmap", "lineedit", "system", "session", "vgpu", "terminals", "windows", "terminal", "sysbus"}) do
   kfiles["/" .. f .. ".lua"] = readFile(REPO_ROOT .. "/kernal/" .. f .. ".lua")
 end
 emu:addEeprom(kernal, readFile(REPO_ROOT .. "/kernal/bios.lua"), emu:addFilesystem(kernal, kfiles))
@@ -179,9 +179,9 @@ if not waitFor(terminal, "/home #", 30) then fail("OpenOS didn't reach its shell
 print("muxterm 1: it connects and gets a login of its own")
 typeLine("muxterm")
 if not waitFor(terminal, "login: _", 20) then fail("no login screen on the terminal") end
-if not console():find("root@muxos:~> _", 1, true) then fail("the kernal's own console isn't affected") end
+if not console():find("root@munix:~> _", 1, true) then fail("the kernal's own console isn't affected") end
 typeLine("root")
-if not waitFor(terminal, "root@muxos:~> _", 10) then fail("logging in at the terminal") end
+if not waitFor(terminal, "root@munix:~> _", 10) then fail("logging in at the terminal") end
 print("  OK")
 
 print("muxterm 2: commands run in the terminal's session, its programs open windows there")
@@ -252,7 +252,7 @@ emu:advance(2)
 for ch in ("who"):gmatch(".") do kkey(ch:byte()) end
 kkey(13, 0x1C)
 emu:advance(2)
-local after = console():match("who\n(.-)root@muxos") or ""
+local after = console():match("who\n(.-)root@munix") or ""
 if after:find("terminal", 1, true) then fail("the terminal's session ended") end
 print("  OK")
 
@@ -268,7 +268,7 @@ print("muxterm 8: a new terminal login lists it too, and takes it back")
 typeLine("muxterm")
 if not waitFor(terminal, "login: _", 20) then fail("reconnecting") end
 typeLine("root")
-if not waitFor(terminal, "root@muxos:~> _", 10) then fail("logging in again") end
+if not waitFor(terminal, "root@munix:~> _", 10) then fail("logging in again") end
 emu:advance(1)
 local tx = row(bufs, 22):find("keeper", 1, true)
 if not tx then fail("keeper on the terminal's taskbar") end

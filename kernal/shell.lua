@@ -1,8 +1,8 @@
--- muxos shell: POSIX-style commands at the kernal console.
+-- munix shell: POSIX-style commands at the kernal console.
 --
--- Loaded by kernal/muxos.lua with loadSibling, like the compositor, and
+-- Loaded by kernal/munix.lua with loadSibling, like the compositor, and
 -- handed what it needs from the kernal as its one argument (see `ctx`
--- below). Everything the console doesn't recognize as one of muxos's own
+-- below). Everything the console doesn't recognize as one of munix's own
 -- commands comes here.
 --
 -- What it does, to a reasonable degree of POSIX sh:
@@ -15,7 +15,7 @@
 -- Paths: "/" is the kernal's disk, /tmp its tmpfs, and every other disk
 -- (the installer floppy, say) is /mnt/<first characters of its address>,
 -- as in OpenOS. Anything not built in is a program (/bin, /usr/bin: .mxe
--- or legacy .lua) or a muxos console command, run as before; their output
+-- or legacy .lua) or a munix console command, run as before; their output
 -- goes to the console, so it can't be piped or redirected.
 --
 -- Not done: command substitution, here-documents, functions, control
@@ -35,14 +35,14 @@ local ctx = ...
 --   sleep(seconds)                 waits, keeping the kernal responsive
 --   info                           {version, address, uptime(), memory()}
 --   user, home                     who is logged in, and their home folder
---   help()                         prints the muxos commands (for `help`)
+--   help()                         prints the munix commands (for `help`)
 -- }
 -- One shell per login: a new login gets a fresh one (its own variables
 -- and working directory).
 local M = {}
 
 local env = {HOME = ctx.home or "/home", PATH = "/bin:/usr/bin", PWD = "/", SHELL = "/bin/sh",
-  USER = ctx.user or "root", TERM = "muxos"}
+  USER = ctx.user or "root", TERM = "munix"}
 local exported = {HOME = true, PATH = true, PWD = true, SHELL = true, USER = true, TERM = true}
 local lastStatus = 0
 
@@ -1042,9 +1042,9 @@ define("uptime", "uptime", function(_, io)
 end)
 define("uname", "uname [-a]", function(args, io)
   if args[1] == "-a" then
-    io.out("muxos " .. ctx.info.address:sub(1, 8) .. " " .. ctx.info.version .. " OpenComputers\n")
+    io.out("munix " .. ctx.info.address:sub(1, 8) .. " " .. ctx.info.version .. " OpenComputers\n")
   else
-    io.out("muxos\n")
+    io.out("munix\n")
   end
 end)
 define("hostname", "hostname", function(_, io) io.out(ctx.info.address:sub(1, 8) .. "\n") end)

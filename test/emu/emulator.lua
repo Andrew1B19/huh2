@@ -30,7 +30,7 @@
 -- raw computer/component/system/unicode APIs underneath, resuming
 -- machine.lua's main loop with signals and honoring what it yields
 -- (a sleep timeout, a shutdown boolean, an indirect component call).
--- So muxos's EEPROM code runs inside the real sandbox: wrapped
+-- So munix's EEPROM code runs inside the real sandbox: wrapped
 -- coroutine.yield/resume, the Lua-side computer.pullSignal, no
 -- debug.sethook, no eris, and the real "too long without yielding"
 -- deadline (measured in host CPU time via os.clock; `emu.timeout`
@@ -521,7 +521,7 @@ function Emulator:addGpuScreen(node, screenW, screenH)
       local buf = buffers[active]
       -- Snapshot first -- source and destination regions can overlap
       -- (this is exactly how a scroll-up is implemented in
-      -- kernal/muxos.lua's own termWrite/scrollUp).
+      -- kernal/munix.lua's own termWrite/scrollUp).
       local snapshot = {}
       for row = y, y + h - 1 do
         snapshot[row] = {}
