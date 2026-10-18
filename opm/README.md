@@ -19,6 +19,10 @@ except:
 - `opm update` with no argument reinstalls opm from the catalog's
   `opm-mxe` package, into `/bin` and `/lib/mxe`.
 - `opm hook` is gone: the Munix console has no tab completion.
+- `opm system` shows the Munix version running and installed; `opm
+  system update [--force] [--reboot]` installs the catalog's
+  `munix-installer` release through the kernal's `munix.update` service
+  (root only, by default). It works with `--from=DIR` too.
 
 Installed OpenOS packages (`.lua`) run as legacy programs. Their files go
 under `/usr` by default, which the launcher (`/usr/bin`) and legacy

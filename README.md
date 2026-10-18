@@ -277,6 +277,15 @@ EEPROMs**.
 (From OpenOS, `munix-installer.lua kernal` with the kernal's disk in
 that computer also upgrades in place.)
 
+**With opm, over the network:** `opm system` shows the version running
+and installed; `opm system update` fetches the catalog's
+`munix-installer` release and has the kernal install it (the
+`munix.update` service on the system bus: the same all-or-nothing
+install, BIOS included, root only by the same flag). It skips a version
+that's already installed unless `--force`; `--reboot` restarts the
+kernal afterwards. Offline: `opm bundle munix-installer <dir>` where
+there's a network, then `opm --from=<dir> system update`.
+
 **From muxos** (Munix's name before): an installed muxos's own `update`
 looks for the old file name and can't read the new data file, so
 upgrade with the installer instead: boot the computer from the new
