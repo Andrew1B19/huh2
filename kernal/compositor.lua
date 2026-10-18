@@ -1,10 +1,10 @@
--- muxos compositor. This is, BY CONSTRUCTION, the only file in this
+-- munix compositor. This is, BY CONSTRUCTION, the only file in this
 -- entire project that ever makes a real gpu.* call. "Only the display
 -- node actually needs to make those budgeted calls for real" (see
 -- docs/PROTOCOL.md's call-budget section: every GPU method is a
 -- per-tick-budgeted `direct` call in OC's own source) -- centralizing
 -- every real draw call here, instead of leaving them scattered across
--- muxos.lua, is what makes that true rather than just asserted.
+-- munix.lua, is what makes that true rather than just asserted.
 --
 -- The z-order/occlusion-culling/dirty-tracking model below is adapted
 -- from gmux's real one (gmux/lib/gmux/frontend/graphics.lua's Block/
@@ -16,33 +16,33 @@
 -- flush", set once by createWindow rather than polled continuously).
 -- Window decorations (title bar, minimize/maximize/close, title-drag
 -- moving, corner resizing) are copied from gmux's windows.lua -- see
--- "Decorations" below; muxos.lua turns touch signals into calls here.
+-- "Decorations" below; munix.lua turns touch signals into calls here.
 -- What this gives: allocate a GPU buffer per window, let code
 -- draw into it, composite every dirty, unoccluded window into one
 -- persistent frame buffer, and flip that onto the real screen with a
--- SINGLE bitblt -- at most once per flush() call, which muxos.lua calls
+-- SINGLE bitblt -- at most once per flush() call, which munix.lua calls
 -- at most once per tick from its background dispatcher thread, not once
 -- per window. This is the actual implementation of "only the display
 -- node makes those budgeted calls for real, and batches them
 -- responsibly" rather than each window touching the real screen on its
 -- own.
 --
--- muxos replaces OpenOS on the kernal entirely -- there is no
+-- munix replaces OpenOS on the kernal entirely -- there is no
 -- require(), no dofile(), no debug.getinfo-based script path (this
--- whole file is loaded from a plain string by kernal/muxos.lua's own
+-- whole file is loaded from a plain string by kernal/munix.lua's own
 -- loadSibling(), under a synthetic chunk name, not a real path). The
 -- native `component` global (list/type/slot/methods/invoke/doc, see
 -- ComponentAPI.scala) is already visible here with no require needed
 -- -- it's a real Lua global, not something sandboxed per-module.
 --
--- `loadSibling`, the one piece of context muxos.lua passes in as this
+-- `loadSibling`, the one piece of context munix.lua passes in as this
 -- chunk's own `...`, is how this file reads bitmap.lua off the same
--- boot filesystem muxos.lua itself was loaded from -- same mechanism,
+-- boot filesystem munix.lua itself was loaded from -- same mechanism,
 -- duplicated rather than shared (same "both sides keep their own copy"
 -- reasoning as the wire-protocol serializer in node/runtime.lua and
--- kernal/muxos.lua).
+-- kernal/munix.lua).
 --
--- Each session has its own compositor: muxos.lua loads this file once
+-- Each session has its own compositor: munix.lua loads this file once
 -- per session, with `options`:
 --   gpu     the gpu to draw with (default: the kernal's own) -- a
 --           network terminal's session passes a kernal/vgpu.lua one
@@ -59,7 +59,7 @@ local bitmap = loadSibling("bitmap.lua")()
 -- the real primitive (component.invoke) so the rest of this file can
 -- keep writing gpu.set(...)/gpu.allocateBuffer(...) instead of
 -- component.invoke(addr, "set", ...) everywhere. Duplicated from
--- kernal/muxos.lua's own copy for the same "no shared module to
+-- kernal/munix.lua's own copy for the same "no shared module to
 -- require" reason as everywhere else in this project.
 local function componentProxy(address)
   return setmetatable({address = address}, {
@@ -88,7 +88,7 @@ local nextWindowId = 1
 -- focus, instead of through a virtual keyboard component). This is
 -- ONLY the tracking half: which window is focused, and which job (if
 -- any) owns it. Nothing actually forwards a key_down signal anywhere
--- yet -- kernal/muxos.lua's handleKeyDown still only ever feeds the
+-- yet -- kernal/munix.lua's handleKeyDown still only ever feeds the
 -- kernal's own REPL input buffer. That wiring is the next step, not
 -- this one, and needs this tracking to already exist first.
 local focusedId = nil
@@ -118,7 +118,7 @@ end
 
 -- Resolved once: flush() runs every tick, and a fresh component.list
 -- plus a new proxy each time is pure overhead for a component that
--- doesn't change while muxos is running.
+-- doesn't change while munix is running.
 local cachedGpu = nil
 local function kernalGpu()
   if not cachedGpu then cachedGpu = options.gpu or primaryComponent("gpu") end
@@ -572,7 +572,7 @@ local function drawCells(gpu, rows, ox, oy, area)
   end
 end
 
--- Muxos-shaped create_window (also standing in for gmux's separate
+-- Munix-shaped create_window (also standing in for gmux's separate
 -- create_window_buffer -- see docs/PROTOCOL.md for why those two
 -- collapse into one call here). Allocates a GPU buffer, draws into it,
 -- and marks the window dirty -- it does NOT touch the real screen
@@ -606,12 +606,12 @@ end
 function M.createWindow(options)
   local gpu = kernalGpu()
   if not gpu then return nil, "kernal has no gpu component" end
-  -- muxos assumes a Tier 3 GPU + a minimum of 1 Tier 3 screen on the
+  -- munix assumes a Tier 3 GPU + a minimum of 1 Tier 3 screen on the
   -- kernal, always -- this isn't a guess at the installed tier, it's a
   -- stated hardware requirement. Still checked cheaply at runtime so a
   -- misconfigured kernal fails with a clear message instead of a
   -- confusing one.
-  if not gpu.allocateBuffer then return nil, "kernal's gpu does not support buffers -- muxos requires Tier 3" end
+  if not gpu.allocateBuffer then return nil, "kernal's gpu does not support buffers -- munix requires Tier 3" end
   if not ensureFrameBuffer(gpu) then return nil, "could not allocate the frame buffer" end
 
   local width, height, cells, cellCols, cellRows
@@ -723,7 +723,7 @@ end
 -- Explicit focus change -- there's no mouse/click anywhere in this
 -- project (no pointer component is wired up at all), so this is the
 -- only way focus can move until some other input gesture is designed.
--- Exposed mainly for kernal/muxos.lua's own `focus <id>` REPL command,
+-- Exposed mainly for kernal/munix.lua's own `focus <id>` REPL command,
 -- a manual stand-in for whatever gesture eventually does this for
 -- real. Returns false + an error for an id that doesn't exist, rather
 -- than silently leaving the old focus in place or focusing nothing.

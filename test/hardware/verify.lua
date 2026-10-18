@@ -1,5 +1,5 @@
--- Hardware verification suite for muxos: run it on REAL OpenComputers
--- hardware to confirm the sandbox behavior muxos depends on. Every
+-- Hardware verification suite for munix: run it on REAL OpenComputers
+-- hardware to confirm the sandbox behavior munix depends on. Every
 -- check here also runs in test/emu's emulator, which boots the mod's own
 -- machine.lua -- so a difference between the two is exactly what this
 -- is for.
@@ -19,9 +19,9 @@ local function check(name, fn)
   results[#results + 1] = {name = name, ok = ok, detail = detail}
 end
 
--- --- 1. The API surface muxos uses ---
+-- --- 1. The API surface munix uses ---
 
-check("component and computer APIs muxos uses exist", function()
+check("component and computer APIs munix uses exist", function()
   for _, name in ipairs({"list", "invoke", "type"}) do
     assert(type(component[name]) == "function", "no component." .. name)
   end
@@ -50,9 +50,9 @@ check("computer.pullSignal(timeout) returns after the timeout with no signal", f
 end)
 
 check("computer.pushSignal round-trips through computer.pullSignal", function()
-  computer.pushSignal("muxos_verify", 42)
+  computer.pushSignal("munix_verify", 42)
   local name, value = computer.pullSignal(1)
-  assert(name == "muxos_verify" and value == 42, "got " .. tostring(name) .. ", " .. tostring(value))
+  assert(name == "munix_verify" and value == 42, "got " .. tostring(name) .. ", " .. tostring(value))
   return "ok"
 end)
 
@@ -70,18 +70,18 @@ end)
 check("a coroutine that never yields is ended by the deadline, not the machine", function()
   local co = coroutine.create(function() while true do end end)
   local ok, err = coroutine.resume(co)
-  computer.pullSignal(0) -- yield to the machine promptly afterwards, as muxos does
+  computer.pullSignal(0) -- yield to the machine promptly afterwards, as munix does
   assert(not ok, "the runaway coroutine was not stopped")
   assert(tostring(err):find("too long without yielding", 1, true), "unexpected error: " .. tostring(err))
   return "ok -- " .. tostring(err)
 end)
 
--- --- 4. What muxos does NOT depend on (informational) ---
+-- --- 4. What munix does NOT depend on (informational) ---
 
 check("debug.sethook / eris availability (informational)", function()
   return "debug.sethook: " .. (debug and debug.sethook and "present" or "absent") ..
     ", eris: " .. (eris and "present" or "absent") ..
-    " -- muxos uses neither; semi-live migration can't be built on eris unless it's present"
+    " -- munix uses neither; semi-live migration can't be built on eris unless it's present"
 end)
 
 -- --- 5. GPU/screen smoke test (only if present -- see the reporter
@@ -104,7 +104,7 @@ check("gpu/screen basic smoke test (allocateBuffer/set/fill/bitblt)", function()
     component.invoke(gpuAddr, "freeBuffer", buf)
     return "ok, resolution " .. w .. "x" .. h .. ", Tier 3 buffer operations all succeeded"
   end
-  return "ok, resolution " .. w .. "x" .. h .. " (no allocateBuffer -- not Tier 3, muxos requires Tier 3)"
+  return "ok, resolution " .. w .. "x" .. h .. " (no allocateBuffer -- not Tier 3, munix requires Tier 3)"
 end)
 
 -- --- 6. Modem smoke test (open/broadcast don't error -- a real
@@ -143,7 +143,7 @@ local function report()
       component.invoke(gpuAddr, "set", 1, row, text:sub(1, w))
       row = row + 1
     end
-    writeLine("muxos hardware verification -- " .. #results .. " checks, " .. failCount .. " failed")
+    writeLine("munix hardware verification -- " .. #results .. " checks, " .. failCount .. " failed")
     for _, r in ipairs(results) do
       writeLine((r.ok and "PASS " or "FAIL ") .. r.name)
       writeLine("  " .. tostring(r.detail))

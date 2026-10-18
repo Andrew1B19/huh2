@@ -30,16 +30,16 @@
 
 
 local VERSION = "0.1.2"
-local DAT_SIZE = 398695
-local INIT_LUA = "-- The muxos installer floppy's boot file, installed as /init.lua at the\
--- floppy's root next to muxos-installer.lua. Any BIOS that boots /init.lua\
+local DAT_SIZE = 398854
+local INIT_LUA = "-- The munix installer floppy's boot file, installed as /init.lua at the\
+-- floppy's root next to munix-installer.lua. Any BIOS that boots /init.lua\
 -- runs it -- the stock OpenComputers Lua BIOS every computer starts with\
 -- -- so an empty computer boots this floppy straight into the installer,\
--- with no OpenOS and no muxos BIOS. (The muxos kernal BIOS finds\
--- /muxos-installer.lua itself.) Installing flashes the kernal BIOS.\
+-- with no OpenOS and no munix BIOS. (The munix kernal BIOS finds\
+-- /munix-installer.lua itself.) Installing flashes the kernal BIOS.\
 -- If it can't start the installer it stops with why; the installer\
 -- handles (and dumps) its own crashes.\
-local invoke, path = component.invoke, \"/muxos-installer.lua\"\
+local invoke, path = component.invoke, \"/munix-installer.lua\"\
 local function call(a, m, ...)\
   local r = table.pack(pcall(invoke, a, m, ...))\
   if r[1] then return table.unpack(r, 2, r.n) end\
@@ -60,19 +60,19 @@ if not (address and has(address)) then\
     if has(a) then address = a break end\
   end\
 end\
-if not address then fail(\"muxos installer: \" .. path .. \" isn't on any disk -- copy it next to this init.lua\") end\
+if not address then fail(\"munix installer: \" .. path .. \" isn't on any disk -- copy it next to this init.lua\") end\
 local handle, why = call(address, \"open\", path)\
-if not handle then fail(\"muxos installer: can't open \" .. path .. \": \" .. tostring(why)) end\
+if not handle then fail(\"munix installer: can't open \" .. path .. \": \" .. tostring(why)) end\
 local chunks = {}\
 repeat\
   local data, why = call(address, \"read\", handle, math.maxinteger or math.huge)\
-  if not data and why then fail(\"muxos installer: reading \" .. path .. \" failed: \" .. tostring(why)) end\
+  if not data and why then fail(\"munix installer: reading \" .. path .. \" failed: \" .. tostring(why)) end\
   chunks[#chunks + 1] = data\
 until not data\
 call(address, \"close\", handle)\
 local installer, err = load(table.concat(chunks), \"=\" .. path)\
 chunks = nil\
-if not installer then fail(\"muxos installer didn't load: \" .. tostring(err)) end\
+if not installer then fail(\"munix installer didn't load: \" .. tostring(err)) end\
 return installer(address, path)\
 "
 local CHUNK = 8192
@@ -316,19 +316,19 @@ consumed = consumed + #(line or "") + 1
 if not line then
 f.close()
 if not first then return nil, "it's there, but empty" end
-return nil, "it's there, but isn't a muxos data file (it starts: "
+return nil, "it's there, but isn't a munix data file (it starts: "
 .. string.format("%q", (first or ""):sub(1, 40)) .. ")"
 end
-if line:match("^%-%-%[=*%[MUXOS%-PAYLOAD") then
+if line:match("^%-%-%[=*%[MUNIX%-PAYLOAD") then
 if line:sub(-1) == "\r" then
 f.close()
 return nil, "the installer's data file had its line endings converted to CRLF, which breaks it -- "
 .. "download it again as-is (raw, not through a converting checkout)"
 end
-local version = line:match("^%-%-%[=*%[MUXOS%-PAYLOAD (%S+)")
+local version = line:match("^%-%-%[=*%[MUNIX%-PAYLOAD (%S+)")
 if VERSION ~= "dev" and version and version ~= VERSION then
 f.close()
-return nil, "it's the data file for muxos " .. version .. ", but this installer is " .. VERSION
+return nil, "it's the data file for munix " .. version .. ", but this installer is " .. VERSION
 .. " -- get both files again, together"
 end
 break
@@ -385,7 +385,7 @@ return payload
 end
 
 local medium, mediumErr = findMedium()
-local DAT_NAME = "muxos-installer.dat"
+local DAT_NAME = "munix-installer.dat"
 
 
 
@@ -447,7 +447,7 @@ if payload then break end
 end
 end
 if payload then return payload end
-return nil, "can't find " .. DAT_NAME .. " (it goes next to muxos-installer.lua; the two files go together). Looked at:\n"
+return nil, "can't find " .. DAT_NAME .. " (it goes next to munix-installer.lua; the two files go together). Looked at:\n"
 .. table.concat(tried, "\n")
 end
 
@@ -503,7 +503,7 @@ say(string.format("  %d) %s  %s  %s free", i, d.address:sub(1, 8), d.label ~= ""
 human(d.free)))
 end
 if #disks == 1 and assumeYes then return disks[1] end
-local pick = pickNumber("Install muxos on which disk? ", #disks)
+local pick = pickNumber("Install munix on which disk? ", #disks)
 if not pick then return nil, "no disk chosen" end
 return disks[pick]
 end
@@ -517,7 +517,7 @@ else
 local gpu = component.proxy(gpuAddr)
 local ok, depth = pcall(gpu.maxDepth)
 if not ok or depth < 8 or not gpu.allocateBuffer then
-warnings[#warnings + 1] = "the GPU isn't tier 3: muxos's compositor needs a tier 3 GPU (video buffers)"
+warnings[#warnings + 1] = "the GPU isn't tier 3: munix's compositor needs a tier 3 GPU (video buffers)"
 end
 end
 if not component.list("screen")() then warnings[#warnings + 1] = "no screen attached" end
@@ -563,11 +563,14 @@ return nil, "not enough space on " .. disk.address:sub(1, 8) .. ": " .. human(ne
 end
 
 for _, w in ipairs(hardwareWarnings()) do say("warning: " .. w) end
-local previous = readText(target, "/.muxos-version")
-say(previous and ("Upgrading muxos " .. previous:match("^%s*(.-)%s*$") .. " to " .. VERSION)
-or ("Installing muxos " .. VERSION))
+
+local previous = readText(target, "/.munix-version")
+local oldName = not previous and readText(target, "/.muxos-version")
+previous = previous or oldName
+say(previous and ("Upgrading " .. (oldName and "muxos " or "munix ") .. previous:match("^%s*(.-)%s*$")
+.. " to " .. (oldName and "munix " or "") .. VERSION) or ("Installing munix " .. VERSION))
 say("Target: " .. disk.address .. (disk.label ~= "" and (" (" .. disk.label .. ")") or ""))
-say("This also flashes this computer's EEPROM with the muxos kernal BIOS.")
+say("This also flashes this computer's EEPROM with the munix kernal BIOS.")
 if not confirm("Continue?") then return nil, "cancelled" end
 
 local staged, kernalBios = {}, nil
@@ -612,13 +615,17 @@ for _, path in ipairs(staged) do
 if target.exists(path) then target.remove(path) end
 if not target.rename(path .. ".new", path) then return nil, "couldn't move " .. path .. " into place" end
 end
-writeText(target, "/.muxos-version", VERSION .. "\n")
+writeText(target, "/.munix-version", VERSION .. "\n")
+
+for _, old in ipairs({"/muxos.lua", "/.muxos-version"}) do
+if target.exists(old) then target.remove(old) end
+end
 for _, dir in ipairs({"/bin", "/usr/bin", "/usr/lib", "/lib/mxe"}) do target.makeDirectory(dir) end
 
-local flashed, flashErr = flash(kernalBios, "muxos kernal", disk.address)
+local flashed, flashErr = flash(kernalBios, "munix kernal", disk.address)
 if not flashed then return nil, "files installed, but flashing the EEPROM failed: " .. flashErr end
 say("Flashed the kernal BIOS (boots from " .. disk.address:sub(1, 8) .. ").")
-say("muxos " .. VERSION .. " is installed.")
+say("munix " .. VERSION .. " is installed.")
 return true
 end
 
@@ -629,8 +636,8 @@ end
 
 
 local BIOSES = {
-worker = {path = "/eeprom/worker.lua", label = "muxos worker", name = "worker"},
-kernal = {path = "/eeprom/kernal.lua", label = "muxos kernal", name = "kernal"},
+worker = {path = "/eeprom/worker.lua", label = "munix worker", name = "worker"},
+kernal = {path = "/eeprom/kernal.lua", label = "munix kernal", name = "kernal"},
 }
 
 
@@ -655,10 +662,10 @@ local code = eeprom.get() or ""
 local label = eeprom.getLabel and eeprom.getLabel() or ""
 if code == "" then return "blank -- nothing on it (a computer says \"no bios found\")" end
 for name, image in pairs(images) do
-if code == image then return "the muxos " .. name .. " BIOS, this version (" .. #code .. " bytes)" end
+if code == image then return "the munix " .. name .. " BIOS, this version (" .. #code .. " bytes)" end
 end
-if label:match("^muxos ") then
-return "a " .. label .. " BIOS from a different muxos version (" .. #code .. " bytes) -- reflash it"
+if label:match("^munix ") or label:match("^muxos ") then
+return "a " .. label .. " BIOS from a different munix version (" .. #code .. " bytes) -- reflash it"
 end
 return "something else: \"" .. label .. "\", " .. #code .. " bytes"
 end
@@ -681,7 +688,7 @@ local function flashEeproms(payload, bios)
 local images = readBioses(payload)
 local code = images[bios.name]
 if not code then return nil, "the " .. bios.name .. " BIOS is missing from the installer" end
-say("Flashes the muxos " .. bios.name .. " BIOS (" .. #code .. " bytes) onto EEPROMs, one after another:")
+say("Flashes the munix " .. bios.name .. " BIOS (" .. #code .. " bytes) onto EEPROMs, one after another:")
 say("put an EEPROM in this computer, flash it, swap in the next.")
 say(bare and "Put the kernal BIOS EEPROM back in when you're done."
 or "Put this computer's own EEPROM back when you're done.")
@@ -695,7 +702,7 @@ elseif eeprom.address == last then
 say("That's the EEPROM that was just flashed -- swap in the next one.")
 else
 say("EEPROM " .. eeprom.address:sub(1, 8) .. " now holds " .. describeEeprom(eeprom, images) .. ".")
-if confirm("Flash it as a muxos " .. bios.name .. "?", true) then
+if confirm("Flash it as a munix " .. bios.name .. "?", true) then
 local addr, err = flash(code, bios.label, "")
 if addr then
 count, last = count + 1, addr
@@ -789,8 +796,8 @@ end
 local target = disk.fs
 local files = {
 {"/init.lua", #INIT_LUA},
-{"/muxos-installer.lua", #program},
-{"/muxos-installer.dat", DAT_SIZE or payload.fs.size(payload.path)},
+{"/munix-installer.lua", #program},
+{"/munix-installer.dat", DAT_SIZE or payload.fs.size(payload.path)},
 }
 local needed, freed = 0, 0
 for _, f in ipairs(files) do
@@ -804,9 +811,9 @@ end
 for _, f in ipairs(files) do target.remove(f[1]) end
 say("Writing the installer to " .. disk.address:sub(1, 8) .. "...")
 writeText(target, "/init.lua", INIT_LUA)
-writeText(target, "/muxos-installer.lua", program)
+writeText(target, "/munix-installer.lua", program)
 local from = assert(payload.fs.open(payload.path, "r"))
-local to = assert(target.open("/muxos-installer.dat", "w"))
+local to = assert(target.open("/munix-installer.dat", "w"))
 while true do
 local data = payload.fs.read(from, CHUNK)
 if not data then break end
@@ -814,19 +821,19 @@ local ok, err = target.write(to, data)
 if not ok then
 payload.fs.close(from)
 target.close(to)
-return nil, "writing muxos-installer.dat failed: " .. tostring(err)
+return nil, "writing munix-installer.dat failed: " .. tostring(err)
 end
 breathe()
 end
 payload.fs.close(from)
 target.close(to)
-if readText(target, "/init.lua") ~= INIT_LUA or readText(target, "/muxos-installer.lua") ~= program then
+if readText(target, "/init.lua") ~= INIT_LUA or readText(target, "/munix-installer.lua") ~= program then
 return nil, "the files didn't read back the same (is the disk full or read-only?)"
 end
-local check, err = bundledPayload(target, "/muxos-installer.dat")
-if not check then return nil, "muxos-installer.dat didn't read back right: " .. tostring(err) end
+local check, err = bundledPayload(target, "/munix-installer.dat")
+if not check then return nil, "munix-installer.dat didn't read back right: " .. tostring(err) end
 say("Done: " .. disk.address:sub(1, 8) .. (disk.where ~= "" and " (" .. disk.where .. ")" or "")
-.. " now boots into the muxos installer, under the stock Lua BIOS or the muxos kernal BIOS.")
+.. " now boots into the munix installer, under the stock Lua BIOS or the munix kernal BIOS.")
 return true
 end
 
@@ -838,11 +845,11 @@ local function placementWarnings()
 if bare or not medium or medium.address ~= rootAddress() then return end
 say("Note: this installer is on this computer's own disk, not a floppy. To make the")
 say("installer floppy, put a floppy in and choose 'make an installer floppy' (or run")
-say("muxos-installer.lua floppy).")
+say("munix-installer.lua floppy).")
 local ok, init = pcall(readText, medium.fs, "/init.lua")
 if INIT_LUA and ok and init == INIT_LUA then
 say("Warning: this disk's /init.lua is the installer floppy's, so this computer will")
-say("boot into the muxos installer instead of OpenOS. Reinstall OpenOS onto it (boot")
+say("boot into the munix installer instead of OpenOS. Reinstall OpenOS onto it (boot")
 say("the OpenOS floppy and run `install`) or delete /init.lua and copy OpenOS's back.")
 end
 end
@@ -854,8 +861,8 @@ local ok, failure
 if mode == "kernal" then
 ok, failure = installKernal(payload)
 if ok then
-if options.reboot or (not assumeYes and confirm("Reboot into muxos now?", bare)) then computer.shutdown(true) end
-say("Reboot this computer to start muxos. Workers boot from the network once flashed.")
+if options.reboot or (not assumeYes and confirm("Reboot into munix now?", bare)) then computer.shutdown(true) end
+say("Reboot this computer to start munix. Workers boot from the network once flashed.")
 if bare then say("(The EEPROM now boots the installed disk first; the floppy can stay in.)") end
 end
 elseif mode == "worker" then
@@ -872,7 +879,7 @@ return ok
 end
 
 local function main()
-local title = "muxos " .. VERSION .. " installer"
+local title = "munix " .. VERSION .. " installer"
 .. (bare and " (booted from " .. tostring(medium and medium.address or "?"):sub(1, 8) .. ")" or "")
 say(title)
 local payload, err = findPayload()
@@ -886,7 +893,7 @@ if mode then
 local known = false
 for _, m in ipairs(MODES) do known = known or m == mode end
 if not known then
-say("usage: muxos-installer.lua [kernal|worker|bios|check|floppy] [--disk=<address|label>] [--yes] [--count=<n>] [--reboot]")
+say("usage: munix-installer.lua [kernal|worker|bios|check|floppy] [--disk=<address|label>] [--yes] [--count=<n>] [--reboot]")
 return 1
 end
 return run(mode, payload) and 0 or 1
@@ -915,7 +922,7 @@ end
 
 local function crashDump(err)
 local function try(f, ...) local ok, a, b = pcall(f, ...) if ok then return a, b end end
-local d = {"muxos installer crash dump (" .. VERSION .. ")", err, "",
+local d = {"munix installer crash dump (" .. VERSION .. ")", err, "",
 "uptime " .. computer.uptime() .. "  memory " .. computer.freeMemory() .. "/" .. computer.totalMemory()
 .. "  energy " .. computer.energy() .. "/" .. computer.maxEnergy()}
 local tmp, disk = computer.tmpAddress and computer.tmpAddress()
@@ -931,11 +938,11 @@ if not disk and address ~= tmp and try(fs.isReadOnly) == false then disk = fs en
 end
 d[#d + 1] = line
 end
-local handle = disk and try(disk.open, "/muxos-boot-dump.txt", "w")
+local handle = disk and try(disk.open, "/munix-boot-dump.txt", "w")
 if not handle then return nil end
 try(disk.write, handle, table.concat(d, "\n") .. "\n")
 try(disk.close, handle)
-return disk.address:sub(1, 8) .. "/muxos-boot-dump.txt"
+return disk.address:sub(1, 8) .. "/munix-boot-dump.txt"
 end
 
 

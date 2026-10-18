@@ -13,7 +13,7 @@ PORT = 4477
    "Boot protocol" below for why). See "Boot protocol" below.
 2. **Runtime protocol** -- everything in the Message types table below.
    Spoken by `node/runtime.lua` (what `bios.lua` fetches and runs) and
-   `kernal/muxos.lua`. Every message is a Lua table, turned into text
+   `kernal/munix.lua`. Every message is a Lua table, turned into text
    with a small serializer (a Lua table constructor: the array part
    positionally, everything else as `[key]=value`; good enough for
    nil/boolean/number/string/table -- no functions, no userdata) --
@@ -42,7 +42,7 @@ PORT = 4477
 
 The runtime-protocol serializer (and the chunking/reassembly logic
 around it) is implemented twice, once per side, on purpose: neither
-`node/runtime.lua` nor `kernal/muxos.lua` can `require` another file
+`node/runtime.lua` nor `kernal/munix.lua` can `require` another file
 (the former for the same EEPROM-era reasons as before, even though it
 now arrives over the network instead of being flashed; the latter to
 stay a single deployable file), so there is no shared module to
@@ -71,7 +71,7 @@ nothing about the real wire protocol yet -- it just needs to get
 
 1. Worker broadcasts `BOOT <its own address>`.
 2. Kernal's `serveBoot()` reads `runtime.lua` off its own disk (a sibling
-   file of `muxos.lua`, cached after the first read) and sends it to that
+   file of `munix.lua`, cached after the first read) and sends it to that
    worker as
    a sequence of `CODE <i>/<n> <chunk>` messages (`BOOT_CHUNK_SIZE` =
    7000 bytes each, comfortably under `maxNetworkPacketSize` even with
@@ -95,20 +95,20 @@ for a worker to fall back to on its own.
 
 ## The kernal is bare-metal
 
-muxos **replaces** OpenOS on the kernal; it does not run under one.
+Munix **replaces** OpenOS on the kernal; it does not run under one.
 `kernal/bios.lua` is the kernal's entire EEPROM image, and
-`kernal/muxos.lua` is what it loads and runs directly off the boot
+`kernal/munix.lua` is what it loads and runs directly off the boot
 filesystem -- there is no OpenOS `/init.lua` anywhere in this picture,
 the same way a worker never has one.
 
 The kernal BIOS boots, in order: the disk the EEPROM remembers, any disk
-with `/muxos.lua`, then any disk with `/muxos-installer.lua` at its root.
+with `/munix.lua`, then any disk with `/munix-installer.lua` at its root.
 That last one is the installer floppy. (The floppy also has an
 `/init.lua`, so the stock Lua BIOS boots it the same way: an empty
-computer needs no muxos BIOS to start installing.) The BIOS runs it as
+computer needs no Munix BIOS to start installing.) The BIOS runs it as
 `installer(diskAddress, path)` with no OpenOS. The installer detects that
 it's bare (no `require`), draws its own console on the GPU, reads its
-payload (`muxos-installer.dat`, next to it) through the floppy's
+payload (`munix-installer.dat`, next to it) through the floppy's
 filesystem component, and points the EEPROM
 at the disk it installs to. So an empty computer needs nothing but the
 kernal BIOS and the floppy, and an installed system always wins over a
@@ -118,14 +118,14 @@ The kernal BIOS follows the mod's own stock `bios.lua`: the boot disk's
 address lives in the EEPROM's data, it binds the GPU to the screen, and
 it reads files through the filesystem component. It runs in the mod's
 sandbox (machine.lua), so what OpenOS would add (event, io, ...) isn't
-there; kernal/muxos.lua builds what it needs itself.
+there; kernal/munix.lua builds what it needs itself.
 
 The BIOS keeps to finding, loading and starting a system. While it
 looks for the installer floppy it shows one line, and it keeps looking
 for 5 seconds, rescanning on each signal, since a rack's drive can
 attach just after power-on. If nothing boots, it lists every disk the
 computer can see, with its label and root files (crude output: one
-`gpu.set` per line), writes `/muxos-boot-dump.txt` (the error, memory,
+`gpu.set` per line), writes `/munix-boot-dump.txt` (the error, memory,
 energy, every component, each disk's label, size and root listing) to
 the first writable disk, and stops with the same text as its error.
 OpenComputers' own crash screen and the Analyzer show it.
@@ -161,12 +161,12 @@ plus the stock EEPROM image the mod itself ships,
   is wrong for EEPROM code: the mod's own `machine.lua` runs the EEPROM
   inside a sandbox that DOES provide `computer.pullSignal` and
   `computer.shutdown`, and wraps `coroutine.yield`, so a bare
-  `coroutine.yield(timeout)` loses its timeout there. muxos now uses
+  `coroutine.yield(timeout)` loses its timeout there. Munix now uses
   `computer.pullSignal`/`computer.shutdown`.
 
-### What muxos.lua builds itself, in place of each OpenOS piece
+### What munix.lua builds itself, in place of each OpenOS piece
 
-| OpenOS provided | muxos.lua now builds | 
+| OpenOS provided | munix.lua now builds | 
 |---|---|
 | `computer.pullSignal(timeout)` | provided by the sandbox -- used directly |
 | `computer.shutdown(reboot)` | provided by the sandbox -- used directly |
@@ -193,28 +193,28 @@ on the screen directly. See "The console" below.
 
 ## The real sandbox
 
-All EEPROM code -- and so all of muxos, since the EEPROM loads it --
+All EEPROM code -- and so all of Munix, since the EEPROM loads it --
 runs inside the mod's own `machine.lua` sandbox, not on raw Lua. Read
 from the mod's source (`assets/opencomputers/lua/machine.lua`) and now
 exercised directly: `test/emu`'s emulator boots every node through that
 very file (vendored unmodified in `test/emu/oc/`, MIT), playing the
-Java host underneath. What it means for muxos:
+Java host underneath. What it means for munix:
 
 - **`computer.pullSignal(timeout)` and `computer.shutdown(reboot)` exist**
-  (defined in Lua by `machine.lua`) and are what muxos uses to wait and
+  (defined in Lua by `machine.lua`) and are what Munix uses to wait and
   to power off.
 - **`coroutine.yield` is wrapped**: it yields `(nil, ...)` as a *user*
   yield, which the sandbox's `coroutine.resume` hands back to the
   resumer; only `computer.pullSignal` and friends yield to the machine.
-  A bare `coroutine.yield(timeout)` at the top level -- what muxos used
+  A bare `coroutine.yield(timeout)` at the top level -- what Munix used
   to do -- loses its timeout: the wait only ends when some signal
   arrives, and `coroutine.yield(true)` doesn't shut down.
 - **`debug` has only `getinfo`, `traceback`, `getlocal`, `getupvalue`**
-  -- no `debug.sethook`. Every instruction budget muxos had would have
+  -- no `debug.sethook`. Every instruction budget Munix had would have
   crashed on its first use; the machine's own deadline replaces them
   (see "JOB code and the non-yielding timeout").
 - **No `eris`** -- see "Transparent migration".
-- **No `print`** -- muxos never relied on the native one.
+- **No `print`** -- Munix never relied on the native one.
 
 The emulator used to run boot code directly against raw Lua, which hid
 all of this (the same kind of gap as the modem-address bug). Running
@@ -238,7 +238,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `BUSLIST` | `from`, `to`, `id`, `caller`                              | worker  | a process listing the cluster bus: address -> {type, node, methods} |
 | `BUSINVOKE` | `from`, `to`, `id`, `address`, `method`, `args`, `caller` | worker | a process calling a component on another node: the kernal calls its own, or relays an `INVOKE` to the owning worker and passes its answer back |
 | `VALUECALL` | `from`, `to`, `id`, `node`, `value`, `method`, `args`, `caller` | either | a method call on a value a component call returned (an internet request handle, ...), which stays on `node`; the kernal relays it there |
-| `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, muxos-shaped) -- summaries: no source, no result |
+| `GETPROCESSES` | `from`, `to`, `id`                                   | worker  | "list every job you know about" (gmux API's `get_processes()`, munix-shaped) -- summaries: no source, no result |
 | `GETPROCESS` | `from`, `to`, `id`, `jobId`                            | worker  | one job's full record (`gmuxapi.get_process(id)`) |
 | `CONTROL` | `from`, `to`, `id`, `jobId`, `verb`, `caller`                | worker  | pause/resume/kill one of the caller's own descendants (`gmuxapi.pause_process`/`resume_process`/`kill_process`) |
 | `EVENT`   | `from`, `to`, `jobId`, `event`                                | kernal, or a terminal showing the process's window | an input event for a process on that node, read with `gmuxapi.pull_event` |
@@ -255,7 +255,7 @@ these on real hardware, and passes in the emulated sandbox (test 30).
 | `CREATEWINDOW` | `from`, `to`, `id`, `title`, `x`, `y`, `width`, `height`, `code`, `pixels`, `mode`, `bg`, `ownerJobId`, `resizable`, `decorated` | worker | "allocate a gpu buffer, draw into it (`code`, or a `pixels` bitmap -- see "Character cells, not pixels" below), blit it to your screen" (gmux API's `create_window`/`create_window_buffer`). `ownerJobId` is optional -- see "Window-focus tracking" below |
 | `GETWINDOWS` | `from`, `to`, `id`, `caller`                            | worker  | "list my user's windows, wherever they are" (gmux API's `get_windows()`) |
 | `WINDOWROUTE` | `from`, `to`, `id`, `windowId`, `caller`                | worker  | where a window the caller owns (or draws a share of) is shown: `{address, key, port, width, height}`, `address` nil while detached; the caller then hears `window_route` events when it moves (see "Window routes") |
-| `PERSIST` | `from`, `to`, `id`, `on`, `caller`                           | worker  | `set_persistent(on)` (gmuxapi, or the `muxos` library of a `.lua` program): the caller's application (its tree's top) survives its user's logout; no `on`: only asks. `RESULT` is whether it does |
+| `PERSIST` | `from`, `to`, `id`, `on`, `caller`                           | worker  | `set_persistent(on)` (gmuxapi, or the `munix` library of a `.lua` program): the caller's application (its tree's top) survives its user's logout; no `on`: only asks. `RESULT` is whether it does |
 | `DRAWWINDOW` | `from`, `to`, `id`, `windowId`, `code`, `args`, `cells`, `width`, `height`, `bg`, `clear`, `key`, `caller`, `noReply` | worker | redraw a window the calling process owns (`gmuxapi.draw_window`), sent to the screen showing it (its route) with the window's `key`; with code, `width`/`height` different from the window's resize it first (resizable windows); `cells` are runs the worker encoded; `noReply` = sent without waiting, nothing comes back |
 | `SHAREWINDOW` | `from`, `to`, `id`, `windowId`, `child`, `rect`, `caller` | worker | share `rect` of a window the caller manages with a descendant (no `rect`: take it back) |
 | `RENDERCONFIG` | `from`, `to`, `id`, `windowId`, `options`, `key`, `caller` | worker | a window's render settings (setting them: its owner); to the screen showing it |
@@ -319,7 +319,7 @@ zero-hop component call across the machine boundary in this mod.
 
 **Both message types are symmetric** -- either side can send them, and
 whichever side receives one services it against its *own* components
-(`kernal/muxos.lua`'s `handleList`/`handleInvoke` mirror
+(`kernal/munix.lua`'s `handleList`/`handleInvoke` mirror
 `node/runtime.lua`'s handling exactly). This is what lets a worker fall
 back to the kernal's hardware when it has none of its own:
 `node/runtime.lua`'s `gpu` face
@@ -343,10 +343,10 @@ Every GPU method is a per-tick-budgeted `direct` call in OC's own source
 make those budgeted calls for real" is the actual design principle, and
 `kernal/compositor.lua` is what makes that true **structurally**, not
 just by convention: it's the only file, anywhere in this project, that
-calls a real `gpu.*` method. `kernal/muxos.lua`'s `handleCreateWindow`/
+calls a real `gpu.*` method. `kernal/munix.lua`'s `handleCreateWindow`/
 `handleGetWindows` are thin wire plumbing around
 `compositor.createWindow()`/`compositor.listWindows()`; nothing else in
-`muxos.lua` touches `component.gpu` directly any more.
+`munix.lua` touches `component.gpu` directly any more.
 
 **How it actually composites, adapted from gmux's real desktop**
 (`gmux/lib/gmux/frontend/graphics.lua`'s `Block`/`get_boxes`/
@@ -422,11 +422,11 @@ the console becomes the compositor's exclusive owner, focused, drawing
 straight onto the real screen. The `comp` command (or another press)
 returns to normal compositing (test 10). Ctrl+Alt+C was OpenOS's own
 process-interrupt shortcut (`lib/event.lua` checks it on every signal
-pull); muxos has no OpenOS underneath, so there's nothing to conflict
+pull); Munix has no OpenOS underneath, so there's nothing to conflict
 with any more and the combo is reclaimed for this.
 
 **GPU stays on the kernal -- a current hard requirement, not just the
-usual case**: today, every real `gpu.*` call anywhere in muxos happens
+usual case**: today, every real `gpu.*` call anywhere in Munix happens
 on the kernal, full stop -- `kernal/compositor.lua` is the only file
 that touches one, and there is no code path, configuration, or plan to
 run it anywhere else right now. If the display component ever moves to
@@ -466,28 +466,28 @@ reworked later but isn't a blocker to build against today.
 
 ## OpenOS compatibility: how permissive "close to native" actually means
 
-muxos runs legacy OpenOS programs by making them see something that
+Munix runs legacy OpenOS programs by making them see something that
 looks, as closely as practical, like gmux's own environment --
-"permissive" here means *in the legacy program's favor*: muxos does not
+"permissive" here means *in the legacy program's favor*: Munix does not
 make design sacrifices of its own to get closer to native OpenOS
 behavior. A legacy program invokes OpenOS APIs the same way it always
-has; muxos's job is to make those calls work as correctly as it
+has; Munix's job is to make those calls work as correctly as it
 reasonably can from underneath (effectively presenting itself as gmux to
 anything written against gmux's conventions), not to compromise how
-muxos itself is built in order to satisfy them. Programs written
-against muxos's own extended surface -- the `gmuxapi` translation layer
-above, plus whatever further kernel API muxos adds beyond gmux's -- get
-first-class access to the hardware and scheduling muxos actually
+Munix itself is built in order to satisfy them. Programs written
+against Munix's own extended surface -- the `gmuxapi` translation layer
+above, plus whatever further kernel API Munix adds beyond gmux's -- get
+first-class access to the hardware and scheduling Munix actually
 provides (per-node dispatch, the compositor, multithreading awareness);
 legacy OpenOS programs get the best-effort compatibility shim, not equal
 footing.
 
 ### Running OpenOS programs (decided; libraries and virtual components built)
 
-This isn't a separate translation layer sitting on top of muxos. muxos
+This isn't a separate translation layer sitting on top of Munix. Munix
 itself understands OpenOS programs and runs them as a native ability of
 the OS -- it just also has a much wider API, for much more direct
-calls, for programs written specifically for muxos. (A loose analogy:
+calls, for programs written specifically for Munix. (A loose analogy:
 Windows 95 running DOS programs, except this is the reverse kind of
 implementation -- the new OS natively absorbing the old one's programs.)
 
@@ -495,7 +495,7 @@ What that involves, as decided in the design discussion (recorded late
 -- it was agreed but never written down):
 
 - **A heavily modified OpenOS, not a from-scratch rewrite.** OpenOS's
-  libraries get modified for muxos case by case: some are
+  libraries get modified for Munix case by case: some are
   straightforward, some need real reimplementation, and whatever
   doesn't need rewriting from scratch isn't. The approach follows how
   gmux does it where that works.
@@ -505,7 +505,7 @@ What that involves, as decided in the design discussion (recorded late
   OS -- the same pattern as the worker's `gpu` face today.
 - **Legacy programs see virtual components, gmux-style.** A legacy
   program is pointed at a virtual GPU/screen (and keyboard, modem,
-  ...) exactly as gmux does it, plus muxos's additions. gmux's own
+  ...) exactly as gmux does it, plus Munix's additions. gmux's own
   virtual components (`gmux/lib/gmux/backend/virtual_components/`) get
   forked and built into the OS for this.
 - **The front end comes from gmux.** The window/interaction side
@@ -516,13 +516,13 @@ What that involves, as decided in the design discussion (recorded late
 
 ## `.mxe`: a native-app marker, not a security boundary
 
-muxos programs written to take advantage of its own API (rather than
+Munix programs written to take advantage of its own API (rather than
 just making legacy OpenOS calls through the compatibility shim above)
 are distinguished from ordinary `.lua` OpenOS programs by their own file
 extension, `.mxe`. The kernal's loader uses this purely as a dispatch
 signal: a `.mxe` program is launched with lower GPU-call overhead, is
 assumed to be multithreading-aware, and otherwise gets treated close to
-how gmux treats a native app, unless/until muxos reimplements that part
+how gmux treats a native app, unless/until Munix reimplements that part
 differently -- while a `.lua` program goes through the OpenOS-
 compatibility path described above. **This is a calling-convention
 switch, not an access-control mechanism**: nothing stops a program from
@@ -559,19 +559,19 @@ the scheduler places it.
   - gmux-style virtual components as its `component` (see "Legacy
     virtual components").
 
-  Nothing muxos-specific (no `gmuxapi`).
+  Nothing munix-specific (no `gmuxapi`).
 - **`.mxe`** declares what it expects in a header at the top of the file:
 
   ```lua
   --[[mxe
-  muxos = "0.1.0"
+  munix = "0.1.0"
   libraries = {"name", ...}
   ]]
   ```
 
   The header is evaluated as data (empty environment, small instruction
   budget). The program gets the launcher's response as the global
-  `launch`: `muxos` (the actual version), `requested`, `versionMatch`
+  `launch`: `munix` (the actual version), `requested`, `versionMatch`
   (a mismatch never stops it from running), `libraries` (name ->
   found or not) and `errors`. Libraries live at `/lib/mxe/<name>.lua` or `/usr/lib/mxe/<name>.lua` on
   the kernal's disk, are shipped with the program, load into its own
@@ -592,7 +592,7 @@ A legacy program's `require` works like OpenOS's, with its own
     inside the program's pulls and sleeps (`os.sleep` is a pull loop),
     so a program that never pulls or sleeps never runs them;
   - `thread` (OpenOS's, on the runtime's threads), and `sysbus` and
-    `muxos`, muxos's own;
+    `munix`, munix's own;
   - `term` (the program's window), `filesystem`, `unicode` (the
     machine's), and a minimal
     `process` and `package` (including OpenOS's `package.delay`);
@@ -635,7 +635,7 @@ the disk). The kernal caches module sources and re-reads a file only when its
 A legacy program sees what gmux gives one: its own virtual gpu, screen
 and keyboard (`gmux/lib/gmux/backend/virtual_components/`, with the same
 addresses), and nothing else. gmux's virtual gpu draws into real gpu
-buffers on the machine it runs on. A worker has no gpu, so muxos's
+buffers on the machine it runs on. A worker has no gpu, so Munix's
 keeps the screen and its buffers as cell grids in the worker's memory,
 behind gmux's API:
 
@@ -672,7 +672,7 @@ The original design point: four computers on one component bus, each
 seeing the others' components. OpenComputers gives every computer
 (every rack server too) its own isolated component bus, and the only
 link between computers is network messages (see "Why there's a
-"remote component" layer at all" above). So muxos emulates one bus over the network.
+"remote component" layer at all" above). So Munix emulates one bus over the network.
 
 **Registry.** Each worker reports its components to the kernal
 (`COMPONENTS`) at boot, when the kernal first sees it
@@ -740,7 +740,7 @@ handle used remotely, and a legacy program fetching through OpenOS's
 
 A gmux app uses the OS's own filesystem; gmux's virtual filesystem
 component is only for its simulator. Likewise a legacy program uses the
-kernal's disk, the muxos filesystem:
+kernal's disk, the Munix filesystem:
 
 - OpenOS's `filesystem` library: `exists`, `isDirectory`, `size`,
   `lastModified`, `list`, `makeDirectory`, `remove`, `rename`, `copy`,
@@ -765,12 +765,12 @@ reads input, when it ends, or past 1 KB. Test 29 covers all of the
 above.
 
 **Package manager**: OPM (currently an OpenOS package manager) will be
-expanded into muxos's native package manager and track installed
+expanded into Munix's native package manager and track installed
 packages. The kernal only needs to provide a way for OPM to talk to it.
 
 ## Hardware requirements
 
-muxos always assumes a **Tier 3 GPU**, with a **minimum of one Tier 3
+Munix always assumes a **Tier 3 GPU**, with a **minimum of one Tier 3
 screen**, on the kernal. This isn't a guess at commonly-installed
 hardware or a tier the code happens to degrade gracefully without --
 it's a stated requirement: `kernal/compositor.lua` checks for
@@ -794,10 +794,10 @@ graphical multiplexer. Its application-facing API is
 the window system share one Lua process table, so `api.get_processes()`
 just reads `backend.process.processes` directly.
 
-That assumption doesn't hold for muxos: a "process" is a job on some
+That assumption doesn't hold for munix: a "process" is a job on some
 other physical node, so **the kernal is the only place that actually
 knows about all of them** (it's already the scheduler -- `jobs` in
-`kernal/muxos.lua` is the real answer `get_processes()` needs, not a
+`kernal/munix.lua` is the real answer `get_processes()` needs, not a
 per-worker guess). `node/runtime.lua`'s `gmuxapi.get_processes()` is
 therefore always a remote call (`GETPROCESSES`), never local-first like
 `gpu` -- there's no local component that could answer it. `handleGetProcesses`
@@ -808,7 +808,7 @@ list (serializable as-is: ids, node addresses, status, code, result).
 versions take `options.main` (a function) or `options.main_path` (a
 `dofile` path) and return a process handle immediately, without waiting
 for it to finish. Neither a function value nor a local file path can
-cross the network, so muxos's version takes `options.code` (a Lua
+cross the network, so Munix's version takes `options.code` (a Lua
 source string, the same convention `JOB` already uses) instead -- the
 one deliberate shape difference from the real API. `handleSpawn` reuses
 `dispatchJob()` (the same dispatch-and-record logic `submit()` itself
@@ -821,17 +821,17 @@ additionally asks for a window (below) sized to `options.width`/
 `options.height`, but **does not** wire the spawned job's own `gpu` face
 to that window's buffer -- the job still draws to the kernal's primary
 screen directly. gmux's version gives the process a genuinely private
-vgpu/vscreen; muxos's doesn't have that per-job isolated surface yet.
+vgpu/vscreen; Munix's doesn't have that per-job isolated surface yet.
 
 **`create_window`/`create_window_buffer`** (`CREATEWINDOW`): gmux draws
 into a window via a `func(gpu)` callback -- a function value, which
-can't cross the network either. muxos's `create_window` takes
+can't cross the network either. Munix's `create_window` takes
 `options.code` instead (run ON the kernal, with a `gpu` local already
 pointed at the allocated buffer -- `compositor.lua`'s `drawIntoBuffer`),
 and this single call stands in for both of gmux's -- there's no
 meaningful distinction between "draw once into a buffer"
 (`create_window_buffer`) and "bind a live source" (`create_window`) when
-drawing is already a one-shot remote call by construction, so muxos
+drawing is already a one-shot remote call by construction, so Munix
 doesn't expose two separate functions for it.
 
 `kernal/compositor.lua` does adapt real pieces of gmux's actual desktop
@@ -853,7 +853,7 @@ A window also never redraws itself; "updating" one means calling
 
 **`get_backend`/`get_graphics`/`get_process`/`show_error`**: not
 translated at all. The first two return gmux's own backend/graphics
-modules directly, which don't exist in muxos's model (they're
+modules directly, which don't exist in Munix's model (they're
 same-process internals, not something a remote job could hold a
 reference to); `get_process`/`show_error` are plausible small
 additions but haven't been done.
@@ -919,10 +919,10 @@ could survive without.
   is what it fetches and runs.
 - The kernal has no OpenOS either, as of the bare-metal rewrite (see
   "The kernal is bare-metal" below) -- `kernal/bios.lua` *is* its entire
-  firmware, and `kernal/muxos.lua` is what it loads and runs directly
+  firmware, and `kernal/munix.lua` is what it loads and runs directly
   off its own disk, with `compositor.lua`/`bitmap.lua`/`runtime.lua`
   installed alongside it at the filesystem's root (not on any worker).
-  muxos REPLACES OpenOS on the kernal; it is not a program that runs
+  Munix REPLACES OpenOS on the kernal; it is not a program that runs
   under one.
 
 ## EEPROM size
@@ -941,7 +941,7 @@ doesn't apply to it.
 The kernal has the exact same split now that it's bare-metal too (see
 "The kernal is bare-metal" below): `kernal/bios.lua` is bound by the
 same 4096-byte limit and sits comfortably under it at **2833 bytes**;
-`kernal/muxos.lua` carries everything else and is read off the boot
+`kernal/munix.lua` carries everything else and is read off the boot
 filesystem directly (not fetched over a network, since the kernal
 already has its own disk) rather than flashed, so `eepromSize` doesn't
 apply to it either.
@@ -964,7 +964,7 @@ framebuffer API anywhere in OC's GPU/screen hardware. gmux's own desktop
 is character-mode for exactly this reason -- there's no lower level to
 drop to.
 
-The intended direction for muxos is a **hybrid** desktop: character-mode
+The intended direction for Munix is a **hybrid** desktop: character-mode
 windows work the same way (this is what's built), but the compositor
 should also be able to composite bitmap-ish content -- a toolbar, icons,
 a desktop background image -- and support dedicated "bit windows." Given
@@ -1030,7 +1030,7 @@ exactly. Fixed by making `options.width`/`options.height` REQUIRED
 buffer size, when `options.pixels` is given) rather than inferred,
 with a clear error if omitted.
 
-`kernal/muxos.lua`'s `bitdemo <halfblock|braille> <x> <y>` REPL command
+`kernal/munix.lua`'s `bitdemo <halfblock|braille> <x> <y>` REPL command
 exists because typing a pixel grid by hand at a text prompt isn't
 practical -- it generates a small filled-diamond test pattern (red
 center, blue ring, transparent corners) so there's a way to see the
@@ -1150,7 +1150,7 @@ duration either way.
   in its own coroutine, so a job that never yields is ended with "too
   long without yielding", comes back as an ordinary `ERROR`, and the
   worker survives because its main loop yields to the machine promptly
-  afterwards (test 6). There is no tighter muxos-side budget: the
+  afterwards (test 6). There is no tighter munix-side budget: the
   sandbox has no `debug.sethook`, and a Lua 5.3 hook can't yield anyway,
   so forced preemption isn't possible.
 - **Workers multitask.** Each process is a coroutine, and the node's
@@ -1190,7 +1190,7 @@ two genuine bugs within the first session of building it, neither of
 which any isolated unit mock could have caught:
 
 1. **`kernal/compositor.lua`'s `flush()` used to wipe the kernal's own
-   text console.** The console (`termWrite` in `kernal/muxos.lua`)
+   text console.** The console (`termWrite` in `kernal/munix.lua`)
    writes directly to the real screen (buffer 0) between flushes, since
    it isn't a compositor window. `flush()` used to blit its own
    separately-tracked frame buffer onto buffer 0 wholesale -- mostly
@@ -1268,7 +1268,7 @@ already returned before this, nothing new needed there.
 
 **The kernal never loses visibility.** Every job -- parent or child,
 top-level or several levels deep -- lives in the SAME single global
-`jobs` table `kernal/muxos.lua` already had, with `parent`/`appName`/
+`jobs` table `kernal/munix.lua` already had, with `parent`/`appName`/
 `orphanPolicy` fields added to each entry. A separate per-parent table
 was considered and rejected: the scheduler needs one true view of
 total system load to ever do real balancing, and splitting job
@@ -1372,7 +1372,7 @@ terminal understands OpenOS's VT100 escape sequences (colors, reverse,
 cursor movement, erasing, save/restore, wrap on/off; test 54).
 
 **Pipes (`io.popen`, `pipe.popen`) -- BUILT.** OpenOS runs a popen'd
-program as a coroutine of its caller; muxos runs it as a process of its
+program as a coroutine of its caller; Munix runs it as a process of its
 own, launched with a pipe (`LAUNCH`'s `pipe` = `"r"`/`"w"`): for `"r"`,
 its output reaches the opener as `{"pipe_data", child, text}` events
 instead of a window; for `"w"`, `PIPEWRITE {child, text, close}` from the
@@ -1548,7 +1548,7 @@ new node; one that doesn't simply isn't migrated.
 **Why not the original design: sandboxed code can't reach `eris`.** The mod opens the ERIS
 library in the Lua state for its own use (saving machines when a world
 saves), but `machine.lua`'s sandbox -- which EEPROM code, and so all of
-muxos, runs in -- doesn't expose it. Confirmed by reading the mod's
+Munix, runs in -- doesn't expose it. Confirmed by reading the mod's
 `machine.lua` and by `test/hardware/verify.lua`, which reports it absent
 in the emulated sandbox. So this can't be built as designed; the opt-in `mux` version
 above replaces it.
@@ -1583,12 +1583,12 @@ time. Any other process is refused (test 28).
 
 ### The system bus -- BUILT
 
-Programs talking to each other, and to the kernal, by name: muxos's
+Programs talking to each other, and to the kernal, by name: Munix's
 D-Bus (`kernal/sysbus.lua`; the runtime's `sysbus` library is the
 programs' side). Everything goes through the kernal, which knows every
 process: `SBUS` messages with an `op`.
 
-- **Names.** `own` gives the caller a name (dotted words; `muxos.*` are
+- **Names.** `own` gives the caller a name (dotted words; `munix.*` are
   the kernal's own services) until it releases it or ends.
 - **Calls.** `call {name, method, args, timeout}`: the kernal sends the
   owner `EVENT {"sysbus_call", call, name, method, caller, args}` and
@@ -1601,9 +1601,9 @@ process: `SBUS` messages with an `op`.
 - **Signals.** `emit {signal, args}` reaches every process `listen`ing
   for it -- a name, `prefix.*` or `*` -- as `EVENT {"sysbus_signal",
   signal, sender, args}`; a runtime with an `on()` handler runs it in a
-  thread instead of queuing it. The kernal emits `muxos.login`,
-  `muxos.logout` and `muxos.node`.
-- **The kernal's services.** `muxos.system` and `muxos.update` -- OPM's
+  thread instead of queuing it. The kernal emits `munix.login`,
+  `munix.logout` and `munix.node`.
+- **The kernal's services.** `munix.system` and `munix.update` -- OPM's
   interface for installing kernal and module files, through the same
   stage-then-swap install as `update`, with its flag checks. A
   service's `caller.user` is how it decides who may do what.
@@ -1735,7 +1735,7 @@ buffer of its own. It has two sizes:
   exclusive owner -- the same mode a fullscreen node uses -- and draws
   straight onto the real screen at full resolution.
 
-So the frame buffer is the only full-screen buffer muxos allocates, and
+So the frame buffer is the only full-screen buffer Munix allocates, and
 the console allocates none (test 20 checks both). Output is kept as
 logical lines -- the last 500 lines of output -- and wrapped only when
 rendered, at whichever width the console
@@ -1821,6 +1821,6 @@ The config numbers in OC's `application.conf` (`maxNetworkPacketSize`,
 are documented and confirmed. What is *not* confirmed from available docs
 is whether a Rack's internal bus between its 4 Server slots applies that
 same Switch-style relay delay, or is instantaneous. Rather than guess,
-`muxos.lua`'s `ping <node> [count]` REPL command times real PING/PONG
+`munix.lua`'s `ping <node> [count]` REPL command times real PING/PONG
 round trips so this can be measured directly on actual hardware instead
 of assumed from source.

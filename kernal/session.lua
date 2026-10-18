@@ -1,4 +1,4 @@
--- muxos session: one person at one screen -- the kernal's own (the
+-- munix session: one person at one screen -- the kernal's own (the
 -- local console) or a network terminal's (muxterm). Everything a
 -- session is lives here, one instance per session: its console (output,
 -- scrollback, line editor, shell), its login, its compositor (windows,
@@ -7,9 +7,9 @@
 -- session's is the kernal's real GPU, a terminal's is a kernal/vgpu.lua
 -- one whose changes are sent to the terminal.
 --
--- Loaded by kernal/muxos.lua once per session:
+-- Loaded by kernal/munix.lua once per session:
 --   loadSibling("session.lua")(K, opts)
--- K is the kernal's side (jobs, processes, commands -- see muxos.lua's
+-- K is the kernal's side (jobs, processes, commands -- see munix.lua's
 -- `K`); opts = {id, gpu, kind = "local" | "terminal", address (a
 -- terminal's)}. Returns the session, S.
 local K, opts = ...
@@ -119,7 +119,7 @@ local function wrapLine(line, width)
 end
 
 -- The console's prompt: `login: ` while nobody is logged in, otherwise
--- user@muxos:<working directory, ~ for home>.
+-- user@munix:<working directory, ~ for home>.
 function S.prompt()
   local user = S.user
   if not user then return "login: " end
@@ -129,7 +129,7 @@ function S.prompt()
   elseif cwd:sub(1, #home + 1) == home .. "/" then
     cwd = "~" .. cwd:sub(#home + 1)
   end
-  return user .. "@muxos:" .. cwd .. "> "
+  return user .. "@munix:" .. cwd .. "> "
 end
 
 -- The line being typed, and where its cursor is: a character index into
@@ -405,7 +405,7 @@ local startCommand -- below
 
 local function handleKeyDown(char, code)
   heldKeys[code] = true
-  -- Ctrl+Alt+C was OpenOS's own interrupt shortcut; muxos has no OpenOS
+  -- Ctrl+Alt+C was OpenOS's own interrupt shortcut; munix has no OpenOS
   -- underneath, so it's reclaimed as the kernal's console interrupt.
   if code == KEYS.C and isControlDown() and isAltDown() then
     -- Key repeat sends more key_downs while it's held; only the first
@@ -850,7 +850,7 @@ function desktop.bar.render(list)
   end
   clock = " " .. clock .. " "
   local placed, buttons = {}, {}
-  local start = desktop.mono and "[muxos]" or " \u{2261} muxos "
+  local start = desktop.mono and "[munix]" or " \u{2261} munix "
   placed[#placed + 1] = {1, start, desktop.mono and 0xFFFFFF or 0x000000, desktop.mono and 0x000000 or C.accent}
   buttons[#buttons + 1] = {from = 1, to = utf8.len(start), start = true}
   local x, limit = utf8.len(start) + 2, termW - #clock
@@ -1185,7 +1185,7 @@ function S.showLogin()
   if S.kind == "local" and fullscreen.node then fullscreen.node, fullscreen.job = nil, nil end
   compositor.setExclusive("console")
   if consoleWin then compositor.setFocus(consoleWin.id) end
-  print("muxos " .. K.MUXOS_VERSION .. " -- " .. tostring(K.selfAddr)
+  print("munix " .. K.MUNIX_VERSION .. " -- " .. tostring(K.selfAddr)
     .. (S.kind == "terminal" and (" (terminal " .. tostring(S.address):sub(1, 8) .. ")") or ""))
   print("Log in with your user name (no password).")
   scrollOffset, consoleDirty = 0, true

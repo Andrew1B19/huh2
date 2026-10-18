@@ -1,15 +1,15 @@
--- muxterm: a network terminal for muxos, for any OpenOS computer with a
--- screen, a keyboard and a network card on the muxos cluster's network.
--- You get a muxos session of your own on this screen -- login, console,
+-- muxterm: a network terminal for munix, for any OpenOS computer with a
+-- screen, a keyboard and a network card on the munix cluster's network.
+-- You get a munix session of your own on this screen -- login, console,
 -- desktop, taskbar, windows -- composited here, on this computer's GPU;
 -- programs you run draw their windows straight to it.
 --
 --   muxterm [kernal address] [port]
 --
 -- Without an address it finds the kernal by broadcasting. The port is
--- muxos's terminal port (its terminal_port flag; 4478 by default).
+-- munix's terminal port (its terminal_port flag; 4478 by default).
 -- Ctrl+Alt+D disconnects (logging out). Every other key, Ctrl+Alt+C
--- included, goes to muxos.
+-- included, goes to munix.
 --
 -- This is only the bootstrap: it fetches the terminal's code from the
 -- kernal (kernal/terminal.lua, with the session, compositor and encoder
@@ -32,7 +32,7 @@ for _, k in ipairs(screen and component.invoke(screen, "getKeyboards") or {}) do
 local wasOpen = modem.isOpen(PORT)
 if not wasOpen and not modem.open(PORT) then io.stderr:write("muxterm: can't open port " .. PORT .. "\n") return 1 end
 
--- Ctrl+Alt+C is muxos's: OpenOS mustn't end this program over it (its
+-- Ctrl+Alt+C is munix's: OpenOS mustn't end this program over it (its
 -- event library signals the running process).
 local processData = require("process").info().data
 local signal = processData.signal
@@ -57,7 +57,7 @@ local function hello()
   if kernal then modem.send(kernal, PORT, frame(msg)) else modem.broadcast(PORT, frame(msg)) end
 end
 
-print("muxterm: connecting to " .. (kernal or "the muxos kernal on this network") .. " on port " .. PORT .. "...")
+print("muxterm: connecting to " .. (kernal or "the munix kernal on this network") .. " on port " .. PORT .. "...")
 local parts, code = {}, nil
 local giveUp, nextHello = computer.uptime() + 15, 0
 while not code and computer.uptime() < giveUp do
@@ -89,7 +89,7 @@ while not code and computer.uptime() < giveUp do
   end
 end
 if not code then
-  restore("muxterm: no muxos kernal answered (is it on this network, with flag remote_terminals on?)")
+  restore("muxterm: no munix kernal answered (is it on this network, with flag remote_terminals on?)")
   return 1
 end
 

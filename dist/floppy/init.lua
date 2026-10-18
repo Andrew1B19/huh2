@@ -1,12 +1,12 @@
--- The muxos installer floppy's boot file, installed as /init.lua at the
--- floppy's root next to muxos-installer.lua. Any BIOS that boots /init.lua
+-- The munix installer floppy's boot file, installed as /init.lua at the
+-- floppy's root next to munix-installer.lua. Any BIOS that boots /init.lua
 -- runs it -- the stock OpenComputers Lua BIOS every computer starts with
 -- -- so an empty computer boots this floppy straight into the installer,
--- with no OpenOS and no muxos BIOS. (The muxos kernal BIOS finds
--- /muxos-installer.lua itself.) Installing flashes the kernal BIOS.
+-- with no OpenOS and no munix BIOS. (The munix kernal BIOS finds
+-- /munix-installer.lua itself.) Installing flashes the kernal BIOS.
 -- If it can't start the installer it stops with why; the installer
 -- handles (and dumps) its own crashes.
-local invoke, path = component.invoke, "/muxos-installer.lua"
+local invoke, path = component.invoke, "/munix-installer.lua"
 local function call(a, m, ...)
   local r = table.pack(pcall(invoke, a, m, ...))
   if r[1] then return table.unpack(r, 2, r.n) end
@@ -27,17 +27,17 @@ if not (address and has(address)) then
     if has(a) then address = a break end
   end
 end
-if not address then fail("muxos installer: " .. path .. " isn't on any disk -- copy it next to this init.lua") end
+if not address then fail("munix installer: " .. path .. " isn't on any disk -- copy it next to this init.lua") end
 local handle, why = call(address, "open", path)
-if not handle then fail("muxos installer: can't open " .. path .. ": " .. tostring(why)) end
+if not handle then fail("munix installer: can't open " .. path .. ": " .. tostring(why)) end
 local chunks = {}
 repeat
   local data, why = call(address, "read", handle, math.maxinteger or math.huge)
-  if not data and why then fail("muxos installer: reading " .. path .. " failed: " .. tostring(why)) end
+  if not data and why then fail("munix installer: reading " .. path .. " failed: " .. tostring(why)) end
   chunks[#chunks + 1] = data
 until not data
 call(address, "close", handle)
 local installer, err = load(table.concat(chunks), "=" .. path)
 chunks = nil
-if not installer then fail("muxos installer didn't load: " .. tostring(err)) end
+if not installer then fail("munix installer didn't load: " .. tostring(err)) end
 return installer(address, path)

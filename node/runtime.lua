@@ -1,5 +1,5 @@
 -- Worker runtime for huh2. NOT flashed anywhere -- this lives on the
--- KERNAL's filesystem (as a sibling file of kernal/muxos.lua) and gets
+-- KERNAL's filesystem (as a sibling file of kernal/munix.lua) and gets
 -- served, as plain source text, to each worker over the modem at boot
 -- (node/bios.lua, the actual EEPROM image, is just the tiny stub that
 -- fetches this and `load()`s it into RAM). There is still no disk and no
@@ -9,12 +9,12 @@
 -- EEPROM's 4096-byte eepromSize limit.
 --
 -- Wire format: see docs/PROTOCOL.md. The serializer below is duplicated in
--- kernal/muxos.lua on purpose -- this file can't `require` anything any
+-- kernal/munix.lua on purpose -- this file can't `require` anything any
 -- more than bios.lua could, so both sides keep their own copy in sync by
 -- hand.
 
 local PORT = 4477
-local MUXOS_VERSION = "0.1.2"
+local MUNIX_VERSION = "0.1.2"
 
 -- node/bios.lua passes this in: the address of whoever's CODE chunks
 -- actually completed the boot handshake -- the ONE place a worker ever
@@ -145,7 +145,7 @@ end
 component.invoke(modemAddr, "open", PORT)
 
 -- The network card's address, not computer.address() -- see
--- kernal/muxos.lua's selfAddr for why identity has to be the card.
+-- kernal/munix.lua's selfAddr for why identity has to be the card.
 local nodeId = modemAddr
 
 -- Every message over the modem is chunked, not just boot's CODE --
@@ -531,7 +531,7 @@ end
 local bitmapModule
 local function bitmapLib(caller)
   if not bitmapModule then
-    local r, err = remoteRequest("GETMODULE", {name = "muxos:bitmap", caller = caller})
+    local r, err = remoteRequest("GETMODULE", {name = "munix:bitmap", caller = caller})
     if not r then error("the bitmap encoder: " .. tostring(err), 0) end
     bitmapModule = assert(load(r.source, "=bitmap.lua"))()
   end
@@ -953,7 +953,7 @@ local function newBusComponentFace(extra)
   end})
 end
 
--- Muxos-shaped gmux application API. Every one of these is necessarily
+-- Munix-shaped gmux application API. Every one of these is necessarily
 -- a remote call to the kernal, never local-first like `gpu` -- a
 -- "process" is a job on some other physical node and a "window" lives on
 -- the kernal's own real screen, so no worker could ever answer either
@@ -961,7 +961,7 @@ end
 -- different from gmux's real api.lua and why.
 gmuxapi = {
   -- gmux's api.get_processes() reads one local process table; here the
-  -- kernal's own scheduler (kernal/muxos.lua's `jobs`) is the only thing
+  -- kernal's own scheduler (kernal/munix.lua's `jobs`) is the only thing
   -- that actually knows about every job across every node.
   -- Summaries only (no source or result); get_process(id) for one job
   -- in full.
@@ -1183,7 +1183,7 @@ gmuxapi = {
   -- because its apps already share the host process's real gpu/screen
   -- directly. Added here because `gpu`'s remote fallback (above) and
   -- the kernal's generic INVOKE bridge both go through the compositor's
-  -- gatekeeping now (kernal/compositor.lua, kernal/muxos.lua's
+  -- gatekeeping now (kernal/compositor.lua, kernal/munix.lua's
   -- handleInvoke): direct gpu/screen access from a worker is blocked by
   -- default, and this is how a node gets let through it, for the one
   -- legitimate case where bypassing the compositor's buffer/blit
@@ -1359,7 +1359,7 @@ NATIVE.component = readOnly(newBusComponentFace(nil), "component")
 NATIVE.gmuxapi = readOnly(gmuxapi, "gmuxapi")
 NATIVE.yield = yield
 NATIVE.sleep = sleep
-NATIVE.muxos = readOnly({version = MUXOS_VERSION}, "muxos")
+NATIVE.munix = readOnly({version = MUNIX_VERSION}, "munix")
 
 local function printTo(id)
   return function(...)
@@ -1638,7 +1638,7 @@ local function newMxeEnv(id, program, restored)
 end
 
 -- A .lua program: the OpenOS environment -- the standard libraries,
--- print/io/os, checkArg, and OpenOS's `require`; nothing muxos-specific
+-- print/io/os, checkArg, and OpenOS's `require`; nothing munix-specific
 -- (no gmuxapi; parent/child processes are an .mxe concept).
 --
 -- `require` works like OpenOS's, with a per-process package.loaded.
@@ -1664,7 +1664,7 @@ local VGPU_ADDRESS = "virtual0-gpu0-0000-0000-component000"
 local VSCREEN_ADDRESS = "virtual0-scre-en00-0000-component000"
 local VKEYBOARD_ADDRESS = "virtual0-keyb-oard-0000-component000"
 
--- A muxos event ({name, ...}) in OpenOS's signal shape.
+-- A munix event ({name, ...}) in OpenOS's signal shape.
 local function toSignal(e)
   local name = e[1]
   if name == "key_down" or name == "key_up" then
@@ -2394,7 +2394,7 @@ end
 -- --- Legacy filesystem ---
 --
 -- Like a gmux app, a legacy program uses the OS's own filesystem: the
--- kernal's disk, through FS requests (kernal/muxos.lua's handleFs). The
+-- kernal's disk, through FS requests (kernal/munix.lua's handleFs). The
 -- `filesystem` face is OpenOS's API (paths are from the root);
 -- io.open/io.lines/loadfile/dofile resolve relative paths against PWD,
 -- as OpenOS's shell does. Files are buffered here: reads fetch
@@ -2658,7 +2658,7 @@ do
   end
   NATIVE.fs = readOnly(api, "fs")
 
-  -- The console echoes what's typed (kernal/muxos.lua's feedForeground);
+  -- The console echoes what's typed (kernal/munix.lua's feedForeground);
   -- this collects it up to Enter.
   NATIVE.readLine = function(prompt)
     local id = currentJobId
@@ -2693,11 +2693,11 @@ local legacyPopen -- below, with the legacy environment
 
 local LEGACY_FACES = {
   sysbus = function(ctx) return sysbusLib(ctx.id) end,
-  -- muxos's own library for .lua programs (require("muxos")): the parts
+  -- munix's own library for .lua programs (require("munix")): the parts
   -- of an .mxe's gmuxapi that make sense for one.
-  muxos = function(ctx)
+  munix = function(ctx)
     return {
-      version = MUXOS_VERSION,
+      version = MUNIX_VERSION,
       -- Keep running after the user logs out (their windows wait on the
       -- user's taskbars); false undoes it.
       set_persistent = function(on) return remoteRequest("PERSIST", {on = on ~= false, caller = ctx.id}) end,
@@ -2709,7 +2709,7 @@ local LEGACY_FACES = {
   pipe = function(ctx)
     local function unsupported(name)
       return function()
-        error("pipe." .. name .. ": muxos runs every program as a process of its own; use pipe.popen or io.popen", 2)
+        error("pipe." .. name .. ": munix runs every program as a process of its own; use pipe.popen or io.popen", 2)
       end
     end
     return {
@@ -2999,7 +2999,7 @@ local LEGACY_FACES = {
 
 -- --- Pipes: io.popen / pipe.popen for legacy programs ---
 --
--- OpenOS runs a popen'd program as a coroutine of the caller; muxos runs
+-- OpenOS runs a popen'd program as a coroutine of the caller; munix runs
 -- it as a process of its own (anywhere in the cluster), launched with a
 -- pipe: for "r", its output comes to the opener as {"pipe_data", id,
 -- text} events instead of going to a window; for "w", what the opener

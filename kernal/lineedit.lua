@@ -1,4 +1,4 @@
--- muxos line editor: the console's command line. One editor per
+-- munix line editor: the console's command line. One editor per
 -- console (a session's terminal gets its own), so it keeps no state of
 -- its own outside the object new() returns.
 --

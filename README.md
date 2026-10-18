@@ -1,4 +1,4 @@
-# muxos
+# Munix
 
 A custom OS stack, built from the ground up, for an OpenComputers rack
 running 4 Server blades on one shared component bus. It's a multi-core
@@ -6,14 +6,14 @@ system OS: the 3 worker nodes' custom firmware are its cores/threads, and
 the kernal is the scheduler/front-end.
 
 - **Kernal (main node)** -- `kernal/bios.lua` is its entire EEPROM image
-  (mirroring the mod's own stock bios.lua, adapted to load `/muxos.lua`
-  instead of OpenOS's `/init.lua`), and `kernal/muxos.lua` is its
+  (mirroring the mod's own stock bios.lua, adapted to load `/munix.lua`
+  instead of OpenOS's `/init.lua`), and `kernal/munix.lua` is its
   "init" -- not a program running under OpenOS, a REPLACEMENT for it.
   There is no OpenOS anywhere on the kernal: no `require`, no `io`,
   no `event`/`thread`/`keyboard` libraries. It runs in the mod's own
   `machine.lua` sandbox (see docs/PROTOCOL.md's "The real sandbox"),
   which provides `component`, `computer` (including
-  `computer.pullSignal`) and the standard libraries, so `muxos.lua`
+  `computer.pullSignal`) and the standard libraries, so `munix.lua`
   builds the rest itself instead of assuming OpenOS is there to
   provide it -- the same bare-metal
   discipline `node/bios.lua`/`node/runtime.lua` always had to follow,
@@ -30,7 +30,7 @@ the kernal is the scheduler/front-end.
   enforced structurally rather than by convention, and it batches them:
   every window composites into a persistent frame buffer, with at most
   one real screen write per flush, called once per iteration of
-  muxos.lua's own event loop. The kernal also holds `node/runtime.lua`
+  munix.lua's own event loop. The kernal also holds `node/runtime.lua`
   on its own disk and serves it to workers at boot (see below) -- it's
   the authoritative source for what a worker runs.
 - **Workers (thread nodes)** -- no OS, no disk, on purpose. `node/bios.lua` is
@@ -57,12 +57,12 @@ session/framing protocol for remote attach). `gmux/` (MIT, from
 its backend from -- vendored specifically for its **application-facing
 API** (`gmux/lib/gmux/frontend/api.lua`, called by apps as
 `component.gmuxapi.*`: `create_window`, `get_processes`, etc.), which
-smux's backend-only fork never carried. muxos is its own implementation
+smux's backend-only fork never carried. Munix is its own implementation
 of equivalent capability, built for a different substrate: physically
 separate firmware nodes over a network, not coroutines multiplexed
 inside one OpenOS process table. Neither runs on a worker node; nothing
 here calls into their code directly -- `node/runtime.lua`'s `gmuxapi`
-table is muxos's own implementation of (a growing subset of) gmux's API
+table is Munix's own implementation of (a growing subset of) gmux's API
 shape, not gmux's code. See docs/PROTOCOL.md for what's translated so far
 and what isn't yet.
 
@@ -70,15 +70,15 @@ and what isn't yet.
 
 ```
 kernal/bios.lua       the kernal's own EEPROM image: mirrors the mod's stock bios.lua, loads
-                       and runs /muxos.lua directly off the boot filesystem -- muxos REPLACES
+                       and runs /munix.lua directly off the boot filesystem -- munix REPLACES
                        OpenOS on the kernal, there's no OpenOS /init.lua in this picture.
-kernal/muxos.lua      kernal "init": boot-serving + discovery + load-balanced job dispatch +
+kernal/munix.lua      kernal "init": boot-serving + discovery + load-balanced job dispatch +
                        job registry (jobs) + the kernal's commands and sessions, all built
                        on the sandbox's component/computer APIs, no OpenOS libraries.
 kernal/compositor.lua  the only file that touches the real gpu for window content: window
                        registry, Z-order, occlusion culling, dirty tracking, a persistent
                        frame buffer, draw-code execution, blit-to-screen. Read off the boot
-                       filesystem by muxos.lua's loadSibling(), not require()/dofile().
+                       filesystem by munix.lua's loadSibling(), not require()/dofile().
 kernal/shell.lua       the console's POSIX-style shell: ls, cd, cat, cp, grep, ... with pipes,
                        redirection, variables and globs (see "The shell").
 kernal/bitmap.lua      half-block/braille pixel-grid encoder for "bit windows" -- OC's gpu
@@ -104,8 +104,8 @@ tools/build.lua        builds it, with everything it installs, into dist/ (see "
 tools/strip.lua        strips comments and indentation from the files the installer ships,
                        keeping every line break (line numbers in errors stay the repo's);
                        the build checks each stripped file compiles to the same code.
-dist/muxos-installer.lua  the built installer program, and
-dist/muxos-installer.dat  its data file (everything it installs); the two go together.
+dist/munix-installer.lua  the built installer program, and
+dist/munix-installer.dat  its data file (everything it installs); the two go together.
 test/emu/install_test.lua runs that installer on emulated hardware and boots the result.
 test/emu/openos_test.lua  runs it under real OpenOS (fetched on first run) and flashes an EEPROM.
 kernal/lib/            OpenOS libraries for legacy programs (vendored unchanged, MIT),
@@ -113,9 +113,9 @@ kernal/lib/            OpenOS libraries for legacy programs (vendored unchanged,
 node/bios.lua         worker EEPROM image: tiny network-boot stub, fetches node/runtime.lua
 node/runtime.lua       worker's real runtime, served by the kernal (installed as its sibling,
                        NOT flashed anywhere) -- job execution, remote-component bridge, gpu
-                       face, gmuxapi (muxos's own, gmux-API-shaped)
-docs/MXE.md           the .mxe program format: the spec programs written for muxos target
-opm/                  OPM, the package manager, ported to .mxe (ships with muxos)
+                       face, gmuxapi (munix's own, gmux-API-shaped)
+docs/MXE.md           the .mxe program format: the spec programs written for munix target
+opm/                  OPM, the package manager, ported to .mxe (ships with munix)
 docs/PROTOCOL.md      shared wire format: the boot handshake + the main message protocol +
                        the gmux API translation + the bare-metal kernal design
 test/emu/              a 4-node (1 kernal + 3 workers) test environment, emulating this
@@ -123,7 +123,7 @@ test/emu/              a 4-node (1 kernal + 3 workers) test environment, emulati
                        (needs LÖVE2D, not installable headless here). Boots the REAL,
                        unmodified repo files and drives the kernal's REPL like a human would.
 test/hardware/         verify.lua (+ its bios.lua loader) -- a suite for REAL OpenComputers
-                       hardware confirming the sandbox behavior muxos depends on; it
+                       hardware confirming the sandbox behavior munix depends on; it
                        also passes inside test/emu's emulated sandbox (test 30).
 smux/                 reference only (see above): a real, standalone OpenOS multiplexer,
                        forked from gmux's backend. Not run on any node in this project.
@@ -131,22 +131,22 @@ gmux/                 reference only (see above): the real graphical multiplexer
                        for its application API shape. Not run on any node in this project.
 ```
 
-All four kernal-side files (`bios.lua`, `muxos.lua`, `compositor.lua`,
+All four kernal-side files (`bios.lua`, `munix.lua`, `compositor.lua`,
 `bitmap.lua`) plus `runtime.lua` need to sit together at the ROOT of the
 kernal's boot filesystem (`/bios.lua` flashed to the EEPROM, the rest as
 plain files) -- fixed, hardcoded root paths now, not resolved relative
 to wherever the install happens to live the way a normal OpenOS install
 could, since there's no real filesystem path to resolve a sibling
-directory from any more (`muxos.lua` is loaded from a plain string under
-a synthetic chunk name, not `@/muxos.lua`).
+directory from any more (`munix.lua` is loaded from a plain string under
+a synthetic chunk name, not `@/munix.lua`).
 
 ### smux's one external dependency
 
 `smux/gertinet.lua` (its GERTi transport) requires `hmi/proto.lua`, a
 shared wire codec from the monorepo smux was extracted from. `hmi` is
-its own separate program, not a dependency of muxos -- `smux/` itself
+its own separate program, not a dependency of Munix -- `smux/` itself
 is reference-only (see above), so this is just an inherited gap in the
-reference material's own test suite, not something muxos needs to
+reference material's own test suite, not something Munix needs to
 resolve. `smux/test/test_gertinet.lua` fails on `require` as a result;
 everything else (33 of smux's own tests: framing, session, job_console,
 serve, the installer) passes standalone.
@@ -168,17 +168,17 @@ serve, the installer) passes standalone.
 The installer floppy boots by itself. It has an `/init.lua`, which is
 what the stock Lua BIOS (the EEPROM every computer comes with) boots. So
 an empty computer with its stock EEPROM and the floppy in starts
-straight into the installer, with no OpenOS. Installing muxos flashes
-the muxos kernal BIOS over the stock one.
+straight into the installer, with no OpenOS. Installing Munix flashes
+the Munix kernal BIOS over the stock one.
 
 The kernal BIOS boots, in order:
 
 1. the disk it remembers;
-2. any disk with `/muxos.lua` (an installed muxos);
-3. any disk with `/muxos-installer.lua` at its root (the installer
+2. any disk with `/munix.lua` (an installed Munix);
+3. any disk with `/munix-installer.lua` at its root (the installer
    floppy, for reinstalling or flashing workers).
 
-Once muxos is installed it boots first, so the floppy can stay in.
+Once Munix is installed it boots first, so the floppy can stay in.
 
 The installer also runs as an ordinary program on OpenOS, with the same
 menu.
@@ -188,8 +188,8 @@ menu.
 The installer is three files, and all go at the root of the floppy:
 
 - `init.lua`, which boots it (under 1 KB);
-- `muxos-installer.lua`, the program (about 26 KB);
-- `muxos-installer.dat`, everything it installs (about 290 KB).
+- `munix-installer.lua`, the program (about 26 KB);
+- `munix-installer.dat`, everything it installs (about 290 KB).
 
 Only ever put them on a floppy: an `/init.lua` on a computer's own disk
 would replace what boots it.
@@ -202,8 +202,8 @@ short.
 The sure way, on an OpenOS computer with a floppy in one of its drives:
 
 ```
-opm pull muxos-installer /home/muxos
-/home/muxos/muxos-installer.lua floppy
+opm pull munix-installer /home/munix
+/home/munix/munix-installer.lua floppy
 ```
 
 `floppy` mode lists every disk with its `/mnt` path, label and size,
@@ -216,12 +216,12 @@ own disk.)
 
 Other ways, if you'd rather put the files there yourself:
 
-- **With opm:** `opm pull muxos-installer <floppy>`, when you're sure
+- **With opm:** `opm pull munix-installer <floppy>`, when you're sure
   which `/mnt` name is the floppy (`df` shows each disk's size; a floppy
   is 512 KB). The catalog entries are in `dist/programs.cfg`: copy this
-  repository into oc-programs as `muxos/` and merge them in.
+  repository into oc-programs as `munix/` and merge them in.
 - **With an internet card:** `wget` `dist/floppy/init.lua`,
-  `dist/muxos-installer.lua` and `dist/muxos-installer.dat` from the
+  `dist/munix-installer.lua` and `dist/munix-installer.dat` from the
   repository's raw URLs onto a floppy's root.
 - **By copying:** put those three files at the root of the floppy's
   folder in your world save,
@@ -242,29 +242,29 @@ floppy and the installer starts; choose **1) install the kernal**. It:
   own disk isn't offered);
 - checks the space and warns about missing hardware (tier 3 GPU, screen,
   network card);
-- writes muxos and the OpenOS libraries for legacy programs. Each file
+- writes Munix and the OpenOS libraries for legacy programs. Each file
   goes in as `<name>.new` and they're all swapped in at the end, so a
   disk that fills up mid-install changes nothing;
-- flashes the muxos kernal BIOS onto this computer's EEPROM, pointed at
+- flashes the Munix kernal BIOS onto this computer's EEPROM, pointed at
   that disk.
 
-Reboot and muxos starts, at `login:`. Type `root` (there are no
+Reboot and Munix starts, at `login:`. Type `root` (there are no
 passwords); `useradd <name>` adds more users -- see "Users and kernal
 flags" below.
 
 ### Updating
 
 Put the new installer files on the floppy (all three, as in step 1),
-put it in a drive the kernal can see, and at the muxos console type:
+put it in a drive the kernal can see, and at the Munix console type:
 
 ```
-root@muxos:~> update
-root@muxos:~> reboot
+root@munix:~> update
+root@munix:~> reboot
 ```
 
 Only root can update (the `update_requires_root` flag).
 
-`update` reads `muxos-installer.dat` from the floppy (a floppy is slow:
+`update` reads `munix-installer.dat` from the floppy (a floppy is slow:
 about 10 seconds), checks it against its own manifest, and installs its
 files onto the kernal's disk -- each written as `<name>.new` and only
 swapped in once all are written, so a damaged file or a full disk
@@ -274,8 +274,17 @@ After `reboot`, restart the workers so they fetch the new runtime. A
 worker BIOS change (rare) still needs the installer's **2) flash worker
 EEPROMs**.
 
-(From OpenOS, `muxos-installer.lua kernal` with the kernal's disk in
+(From OpenOS, `munix-installer.lua kernal` with the kernal's disk in
 that computer also upgrades in place.)
+
+**From muxos** (Munix's name before): an installed muxos's own `update`
+looks for the old file name and can't read the new data file, so
+upgrade with the installer instead: boot the computer from the new
+installer floppy (or run `munix-installer.lua kernal` from OpenOS) and
+choose **1) install the kernal**. It keeps your files, says "Upgrading
+muxos ... to munix ...", removes the old `/muxos.lua`, and flashes the
+new kernal BIOS. `.mxe` programs that declare `muxos = "..."` in their
+header still work.
 
 ### 3. Flash the worker EEPROMs
 
@@ -283,8 +292,8 @@ From the installer's menu, **2) flash worker EEPROMs**, on any computer
 that boots the floppy with its stock EEPROM, or on OpenOS:
 
 ```
-/mnt/<floppy>/muxos-installer.lua worker   the three worker EEPROMs
-/mnt/<floppy>/muxos-installer.lua bios     kernal BIOS EEPROMs (optional)
+/mnt/<floppy>/munix-installer.lua worker   the three worker EEPROMs
+/mnt/<floppy>/munix-installer.lua bios     kernal BIOS EEPROMs (optional)
 ```
 
 Each mode flashes the EEPROM in that computer, then asks you to swap in
@@ -315,17 +324,17 @@ every 5 seconds.
 | Worker: one low, long beep, then nothing | Its BIOS ran, but it has no network card. |
 | Worker: one short high beep | It got the runtime from the kernal, but couldn't load it. |
 | **Two beeps and a flashing red light** (any computer) | OpenComputers itself: the machine crashed. Shift-right-click the case with an **Analyzer** to read the error. |
-| Kernal: one short high beep | Normal: muxos is starting. |
-| Kernal: one short medium beep | Normal: no muxos installed, so it's starting the installer floppy. |
-| Kernal: **two beeps, flashing red**, and the screen says "Nothing to boot" | The muxos kernal BIOS found nothing to boot. Under that line it lists every disk the computer can see, its label, and its files. It waits 5 seconds first, for a drive that attaches just after power-on. To find the floppy in the list, match addresses: on OpenOS the floppy is mounted at `/mnt/` plus the first three characters of its address (`/mnt/800` is a disk whose address starts with `800`). If the floppy isn't listed, the computer can't see it: a case needs a floppy slot (tier 3) or a Disk Drive block next to it; a rack server needs the rack's disk drive connected to it. If it's listed without `muxos-installer.lua`, the files aren't on it. |
+| Kernal: one short high beep | Normal: Munix is starting. |
+| Kernal: one short medium beep | Normal: no Munix installed, so it's starting the installer floppy. |
+| Kernal: **two beeps, flashing red**, and the screen says "Nothing to boot" | The Munix kernal BIOS found nothing to boot. Under that line it lists every disk the computer can see, its label, and its files. It waits 5 seconds first, for a drive that attaches just after power-on. To find the floppy in the list, match addresses: on OpenOS the floppy is mounted at `/mnt/` plus the first three characters of its address (`/mnt/800` is a disk whose address starts with `800`). If the floppy isn't listed, the computer can't see it: a case needs a floppy slot (tier 3) or a Disk Drive block next to it; a rack server needs the rack's disk drive connected to it. If it's listed without `munix-installer.lua`, the files aren't on it. |
 | Installer: "error: ..." and "Press Enter to restart." | The installer crashed; it shows the error with its traceback, and where it wrote its dump. |
 
-Both write a dump to `/muxos-boot-dump.txt`: the kernal BIOS when it
+Both write a dump to `/munix-boot-dump.txt`: the kernal BIOS when it
 finds nothing to boot, and the installer when it crashes. It goes on the
 installer floppy (or, failing that, any writable disk) and holds the
 error (with its traceback, for a crash), memory, energy, every component
 the computer sees, and each disk's label, size and root listing. Read it
-on an OpenOS computer (`cat /mnt/<floppy>/muxos-boot-dump.txt`) or from
+on an OpenOS computer (`cat /mnt/<floppy>/munix-boot-dump.txt`) or from
 the floppy's folder in the world save, and include it when reporting a
 problem.
 
@@ -333,16 +342,16 @@ Errors the Analyzer can show:
 
 - **"no bios found; install a configured EEPROM"**: that computer's
   EEPROM is empty (or missing). It was never flashed. Run the installer's
-  **check** mode (`muxos-installer.lua check`, or menu option 4) with
+  **check** mode (`munix-installer.lua check`, or menu option 4) with
   the EEPROM in an OpenOS computer. It says whether the EEPROM is blank,
-  holds this version's muxos worker or kernal BIOS, or holds something
+  holds this version's Munix worker or kernal BIOS, or holds something
   else. Re-flash it with `worker` or `bios`. When flashing, just pressing
   Enter means yes. The installer re-reads every EEPROM it writes and only
   says "Flashed" if every byte matches.
-- **"can't find muxos-installer.dat ... Looked at: ..."** (on screen,
+- **"can't find munix-installer.dat ... Looked at: ..."** (on screen,
   from the installer): the installer looks next to itself, then at the
   root of every disk, and lists each place with why it didn't do: "not
-  there", a file that isn't a muxos data file, or one from another
+  there", a file that isn't a Munix data file, or one from another
   version, or one that's cut short (with its size, the size it should
   be, and the disk's free space). Put both files from the same build at
   the root of a floppy with room for them. A copy that runs out of space
@@ -357,39 +366,39 @@ Errors the Analyzer can show:
 
 - Flash `node/bios.lua` onto each worker's EEPROM and `kernal/bios.lua`
   onto the kernal's (`flash -q <file>` in OpenOS).
-- Copy `kernal/muxos.lua`, `compositor.lua`, `shell.lua`, `bitmap.lua`,
+- Copy `kernal/munix.lua`, `compositor.lua`, `shell.lua`, `bitmap.lua`,
   `lineedit.lua`, `system.lua`, `session.lua`, `vgpu.lua`,
   `windows.lua`, `sysbus.lua`, `terminals.lua` and `terminal.lua` (all in
   `kernal/`) and
   `node/runtime.lua` to the root of the kernal's disk, and `kernal/lib`
   to `/lib`.
 
-The kernal BIOS boots the first disk with `/muxos.lua` on it. Workers
+The kernal BIOS boots the first disk with `/munix.lua` on it. Workers
 never need a disk: they fetch `runtime.lua` from the kernal at boot.
 
 It discovers workers automatically, then drops into a prompt:
 
 ```
-root@muxos:~> discover
-root@muxos:~> nodes
-root@muxos:~> ping 1
-root@muxos:~> ping 1 10
-root@muxos:~> run return 1 + 1
-root@muxos:~> runall return computer.address()
-root@muxos:~> processes
-root@muxos:~> spawn 1 return 42
-root@muxos:~> window hello 5 5 20 5 gpu.set(1,1,"hi from the kernal")
-root@muxos:~> windows
-root@muxos:~> comp                   (back to the desktop from console mode)
-root@muxos:~> console 80 20
-root@muxos:~> hello world            (runs /bin/hello.mxe or /bin/hello.lua)
-root@muxos:~> hello world &          (in the background)
-root@muxos:~> pause 12 / resume 12 / kill 12
-root@muxos:~> bitdemo halfblock 5 5
-root@muxos:~> bitdemo braille 30 5
-root@muxos:~> components 1
-root@muxos:~> call 1 <component addr> getResolution
-root@muxos:~> quit
+root@munix:~> discover
+root@munix:~> nodes
+root@munix:~> ping 1
+root@munix:~> ping 1 10
+root@munix:~> run return 1 + 1
+root@munix:~> runall return computer.address()
+root@munix:~> processes
+root@munix:~> spawn 1 return 42
+root@munix:~> window hello 5 5 20 5 gpu.set(1,1,"hi from the kernal")
+root@munix:~> windows
+root@munix:~> comp                   (back to the desktop from console mode)
+root@munix:~> console 80 20
+root@munix:~> hello world            (runs /bin/hello.mxe or /bin/hello.lua)
+root@munix:~> hello world &          (in the background)
+root@munix:~> pause 12 / resume 12 / kill 12
+root@munix:~> bitdemo halfblock 5 5
+root@munix:~> bitdemo braille 30 5
+root@munix:~> components 1
+root@munix:~> call 1 <component addr> getResolution
+root@munix:~> quit
 ```
 
 `processes` shows the kernal's own job registry (`jobs`) -- every job
@@ -462,7 +471,7 @@ type (`gpu`). The old gap here (the kernal only serviced an incoming
 request while something was actively polling, not while the REPL was
 blocked at its prompt) is resolved now by routing every wait -- the
 REPL idling at its prompt included -- through the same `tick()`
-primitive, since muxos is bare-metal and there's no OpenOS thread
+primitive, since Munix is bare-metal and there's no OpenOS thread
 library to run a separate background poller on any more; see
 docs/PROTOCOL.md for the full design.
 
@@ -479,7 +488,7 @@ the program holding it ends or its node goes down (or by pressing
 Ctrl+Alt+C). See docs/PROTOCOL.md's
 "The compositor" section.
 
-`node/runtime.lua`'s `gmuxapi` table is muxos's translation of gmux's
+`node/runtime.lua`'s `gmuxapi` table is Munix's translation of gmux's
 actual *application* API (`component.gmuxapi.*` in gmux itself -- see
 `gmux/lib/gmux/frontend/api.lua`) for a networked substrate rather than
 gmux's one-process-table assumption. All five pieces built so far are
@@ -544,7 +553,7 @@ translated pieces of gmux's application API (`get_processes`,
 pixel-grid encoders, both verified dot-by-dot and run-length-batched
 into the fewest `gpu.set` calls possible, slotted into the same
 window/compositor pipeline as character-mode windows) + the kernal
-itself now fully bare-metal (`kernal/bios.lua` + a `muxos.lua` built
+itself now fully bare-metal (`kernal/bios.lua` + a `munix.lua` built
 entirely on native primitives, with its own minimal text console and
 keyboard-modifier tracking replacing OpenOS's io/keyboard libraries) +
 protection against OC's real non-yielding timeout for dispatched `JOB`
@@ -570,7 +579,7 @@ against the code (not just this document):
 - **The `promote` orphan policy's** requirement that a promoted child
   can run on its own isn't checked; the kernal takes it on trust.
 - **OPM's side of updating the kernal:** the kernal's interface for it
-  is built (the `muxos.update` service on the system bus); OPM doesn't
+  is built (the `munix.update` service on the system bus); OPM doesn't
   use it yet.
 - **Deferred or undecided by design:** multi-monitor support.
 
@@ -616,7 +625,7 @@ too. Keys, wheel and touch input go to the focused window's process
 
 The console is a POSIX-style shell (`kernal/shell.lua`), to a
 reasonable degree of `sh`. The prompt shows who's logged in and the
-working directory, `~` for home (`root@muxos:~> `). Each login gets a
+working directory, `~` for home (`root@munix:~> `). Each login gets a
 fresh shell: its own variables, starting in its home folder.
 
 - **Syntax:** `'...'` and `"..."` quoting and `\` escapes; `$VAR`,
@@ -637,7 +646,7 @@ fresh shell: its own variables, starting in its home folder.
   disk, the installer floppy included, is `/mnt/<first characters of its
   address>`, as in OpenOS.
 - **Everything else** is a program on `$PATH` (`/bin`, `/usr/bin`: `.mxe`
-  or legacy `.lua`) or one of muxos's own commands (`nodes`, `run`,
+  or legacy `.lua`) or one of Munix's own commands (`nodes`, `run`,
   `update`, ...), which mix into shell lines (`nodes; ls`). A program's
   output goes to the console, so it can't be piped or redirected.
 - **Not done:** command substitution, here-documents, functions and
@@ -648,7 +657,7 @@ Tested in `test/emu/integration_test.lua`, test 41.
 
 ### Users and kernal flags
 
-muxos is multi-user the way a small Unix machine is: you log in at the
+Munix is multi-user the way a small Unix machine is: you log in at the
 console with a user name, and that's all -- **no passwords, no file
 ownership, no permission system**. What a user name gives you:
 
@@ -694,14 +703,14 @@ The `*_requires_root` flags aren't security -- anyone can log in as root
 ### Network terminals
 
 Any OpenOS computer with a screen, a keyboard and a network card on the
-cluster's network can be a muxos terminal: install **muxterm** (its own
+cluster's network can be a Munix terminal: install **muxterm** (its own
 package: `oppm install muxterm`, or copy `apps/muxterm.lua` to
 `/usr/bin`) and run `muxterm` (`muxterm <kernal address> [port]` to name
-the kernal). It finds the kernal, and you get a muxos session of your
+the kernal). It finds the kernal, and you get a Munix session of your
 own on that screen: `login:`, then a console, a desktop, a taskbar and
 windows, sized to that screen. Programs you start there show their
 windows and output there. **Ctrl+Alt+D** disconnects, which logs out;
-every other key, Ctrl+Alt+C included, goes to muxos.
+every other key, Ctrl+Alt+C included, goes to Munix.
 
 Internally the kernal's own screen and a terminal are the same thing --
 a *session* (`kernal/session.lua`), one per screen, each with its own
@@ -752,7 +761,7 @@ at a time and can move:
   with all their children: an overnight job survives closing the
   terminal. An application is persistent when
   - the program asks: `gmuxapi.set_persistent(true)` in an `.mxe`,
-    `require("muxos").set_persistent(true)` in a `.lua` program;
+    `require("munix").set_persistent(true)` in a `.lua` program;
   - you toggle it on its window's title bar (◇ off, ◆ on, left of
     minimize), at any time;
   - you start it with `nohup <program> [args]`, or mark it with
@@ -780,7 +789,7 @@ Tested in `test/emu/integration_test.lua` (tests 56, 58) and
 
 ### The system bus
 
-muxos's D-Bus: programs talking to each other, and to the kernal, by
+Munix's D-Bus: programs talking to each other, and to the kernal, by
 name -- whatever node they run on and whoever started them. (Not the
 cluster *component* bus, which is hardware on any node.)
 
@@ -810,16 +819,16 @@ cluster *component* bus, which is hardware on any node.)
   that listens: `sysbus.on("backup.*", function(signal, sender, ...)
   end)`, or `sysbus.listen(pattern)` and `{"sysbus_signal", ...}`
   events from `pull_event`.
-- **The kernal's services** (names under `muxos.` are the kernal's):
-  - `muxos.system`: `version`, `uptime`, `users`, `who`, `nodes`,
+- **The kernal's services** (names under `munix.` are the kernal's):
+  - `munix.system`: `version`, `uptime`, `users`, `who`, `nodes`,
     `reboot` (flag `reboot_requires_root`).
-  - `muxos.update` -- OPM's interface to the kernal: `version`
+  - `munix.update` -- OPM's interface to the kernal: `version`
     (running and installed), `files` (the kernal's files), and
     `install(files, version)`: kernal modules, `/lib` files and the
     kernal BIOS, all or nothing, taking effect at the next reboot
     (flag `update_requires_root`; every `.lua` file must compile).
-  - Signals: `muxos.login`/`muxos.logout` (user, where) and
-    `muxos.node` (address, `"up"`/`"down"`).
+  - Signals: `munix.login`/`munix.logout` (user, where) and
+    `munix.node` (address, `"up"`/`"down"`).
 - `.lua` programs have it too: `require("sysbus")`.
 - At the console, `sysbus` lists the names, and `sysbus call <name>
   <method> [args]` calls one.
@@ -867,7 +876,7 @@ strip. Tested in test 53.
   have a `<name>.icon` file next to it (art, optionally after a
   `#RRGGBB` line). See docs/MXE.md.
 - **Taskbar:** the bottom row, above every window. It has a start button
-  (**≡ muxos**), whose menu lists every app, which is handy when windows
+  (**≡ Munix**), whose menu lists every app, which is handy when windows
   cover the icons. It has a button per window: touching one restores and
   raises it, or minimizes it if it's already the focused window on top.
   A minimized window is hidden entirely; its button is how it comes
@@ -878,10 +887,10 @@ strip. Tested in test 53.
   stretched to the screen as half-block cells. It's kept across reboots
   in `/etc/wallpaper`; `wallpaper none` goes back to the plain desktop,
   and `wallpaper` alone says which is set (test 49).
-- **`demo`** (the `muxos-demo` package, with its own icon): muxos's test
-  program. It's not part of the installer. On muxos, `opm pull
-  muxos-demo` installs it as `/usr/bin/demo.mxe`. Or pull it to a floppy
-  from OpenOS and, in muxos, `cp /mnt/<floppy>/bin/demo.mxe /usr/bin/`.
+- **`demo`** (the `munix-demo` package, with its own icon): Munix's test
+  program. It's not part of the installer. On Munix, `opm pull
+  munix-demo` installs it as `/usr/bin/demo.mxe`. Or pull it to a floppy
+  from OpenOS and, in Munix, `cp /mnt/<floppy>/bin/demo.mxe /usr/bin/`.
   - Four threads run at once: an image thread, a braille-graphics thread,
     a status thread, and the main thread waiting for `q`.
   - It computes a Mandelbrot image in strips, each in a child process
@@ -894,7 +903,7 @@ strip. Tested in test 53.
     worker computed each strip.
   - `demo [strips]`; press `q` in one of its windows to end (test 44).
 
-muxos starts on a desktop, as gmux does: a background with a column of
+Munix starts on a desktop, as gmux does: a background with a column of
 app icons at the top left -- the console, and every program in `/bin`
 and `/usr/bin`. Touching an icon starts that program (a legacy `.lua`
 program opens in its own terminal window); the console icon brings the
@@ -939,10 +948,10 @@ so this is emulated over the network. The display, network cards and
 firmware stay off it. `bus` at the console lists it. Test 36.
 
 **`.mxe` spec and OPM -- BUILT.** docs/MXE.md is the contract for
-programs written for muxos: header fields, version compatibility,
+programs written for munix: header fields, version compatibility,
 libraries (`/lib/mxe`, `/usr/lib/mxe`, with dependencies), and the native
 API (`fs`, `readLine`, `gmuxapi`, `component`, the `mux` and `http`
-libraries). OPM is ported to it (`opm/`) and ships with muxos:
+libraries). OPM is ported to it (`opm/`) and ships with munix:
 `opm pull <package>`. Tests 37-38.
 
 **Migration and draining -- BUILT.** An `.mxe` that lists the built-in
@@ -966,6 +975,6 @@ handles their process can redraw (`gmuxapi.draw_window`), and keyboard
 input goes to the process owning the focused window
 (`gmuxapi.pull_event`). Programs launch OpenOS-shell style by name
 from the console (foreground, or background with `&`) or via
-`gmuxapi.launch`: `.mxe` headers declare the muxos version and
+`gmuxapi.launch`: `.mxe` headers declare the Munix version and
 libraries they want and get a response; `.lua` programs get an
 OpenOS environment with console I/O. Verified in tests 27-29.

@@ -68,8 +68,8 @@ sm.isTouchModeInverted = function() return false end
 local hdd = emu:addFilesystem(node, tree(assets .. "/loot/openos"))
 node.tmpAddress = emu:addFilesystem(node, {})
 local floppy = emu:addFilesystem(node, {
-  ["/muxos-installer.lua"] = readFile(REPO_ROOT .. "/dist/muxos-installer.lua"),
-  ["/muxos-installer.dat"] = readFile(REPO_ROOT .. "/dist/muxos-installer.dat"),
+  ["/munix-installer.lua"] = readFile(REPO_ROOT .. "/dist/munix-installer.lua"),
+  ["/munix-installer.dat"] = readFile(REPO_ROOT .. "/dist/munix-installer.dat"),
 }, "floppy") -- so OpenOS mounts it at /mnt/flo
 local blank = emu:addFilesystem(node, {["/notes.txt"] = "mine"}, "blank", 512 * 1024) -- at /mnt/bla
 local eeprom = emu:addEeprom(node, readFile(assets .. "/lua/bios.lua"), hdd)
@@ -111,7 +111,7 @@ print("openos 2: worker mode prompts quickly, and Enter flashes the EEPROM for r
 local fsm = node.components[floppy].methods
 local reads, realRead = 0, fsm.read
 fsm.read = function(...) reads = reads + 1 return realRead(...) end
-typeLine("/mnt/*/muxos-installer.lua worker")
+typeLine("/mnt/*/munix-installer.lua worker")
 if not waitFor("[Y/n]") then fail("no flash prompt") end
 -- Floppy reads are the slowest kind (about 1.5 per game tick on a tier 3
 -- CPU, 0.5 on tier 1): everything before the first prompt must be few.
@@ -122,14 +122,14 @@ if not waitFor("checked byte for byte") then fail("it didn't flash") end
 typeLine("q")
 if not waitFor("1 worker EEPROM(s) flashed.") then fail("no summary") end
 local em = node.components[eeprom].methods
-if em.get() ~= readFile(REPO_ROOT .. "/node/bios.lua") or em.getLabel() ~= "muxos worker" then
+if em.get() ~= readFile(REPO_ROOT .. "/node/bios.lua") or em.getLabel() ~= "munix worker" then
   fail("the EEPROM doesn't hold the worker BIOS")
 end
 print("  OK (" .. promptReads .. " floppy reads before the prompt)")
 
 print("openos 3: check mode identifies it")
-typeLine("/mnt/*/muxos-installer.lua check")
-if not waitFor("the muxos worker BIOS, this version") then fail("check didn't recognize the worker BIOS") end
+typeLine("/mnt/*/munix-installer.lua check")
+if not waitFor("the munix worker BIOS, this version") then fail("check didn't recognize the worker BIOS") end
 typeLine("q")
 if not waitFor("/home #") then fail("check didn't finish") end
 print("  OK")
@@ -140,15 +140,15 @@ print("  OK")
 print("openos 4: it finds its data file however it's started")
 local mnt = "/mnt/flo"
 for _, start in ipairs({
-  {"lua " .. mnt .. "/muxos-installer.lua check"},
-  {"cd " .. mnt, "./muxos-installer.lua check"},
-  {"cd " .. mnt, "lua muxos-installer.lua check"},
-  {"cd " .. mnt, mnt .. "/muxos-installer.lua check"},
+  {"lua " .. mnt .. "/munix-installer.lua check"},
+  {"cd " .. mnt, "./munix-installer.lua check"},
+  {"cd " .. mnt, "lua munix-installer.lua check"},
+  {"cd " .. mnt, mnt .. "/munix-installer.lua check"},
 }) do
   typeLine("clear")
   emu:advance(0.5)
   for _, line in ipairs(start) do typeLine(line) emu:advance(0.5) end
-  if not waitFor("the muxos worker BIOS, this version") then fail("`" .. table.concat(start, "; ") .. "` didn't work") end
+  if not waitFor("the munix worker BIOS, this version") then fail("`" .. table.concat(start, "; ") .. "` didn't work") end
   typeLine("q")
   emu:advance(0.5)
   typeLine("cd /home")
@@ -158,7 +158,7 @@ print("  OK")
 
 -- The floppy boots on its own: an empty computer with nothing but the
 -- stock Lua BIOS (what every computer starts with) and the floppy.
-print("openos 5: the stock Lua BIOS boots the floppy into the installer, which installs muxos")
+print("openos 5: the stock Lua BIOS boots the floppy into the installer, which installs munix")
 do
   local bare = emu:newNode("bare")
   emu:addModem(bare)
@@ -167,8 +167,8 @@ do
   local hddAddr = emu:addFilesystem(bare, hdd)
   emu:addFilesystem(bare, {
     ["/init.lua"] = readFile(REPO_ROOT .. "/dist/floppy/init.lua"),
-    ["/muxos-installer.lua"] = readFile(REPO_ROOT .. "/dist/muxos-installer.lua"),
-    ["/muxos-installer.dat"] = readFile(REPO_ROOT .. "/dist/muxos-installer.dat"),
+    ["/munix-installer.lua"] = readFile(REPO_ROOT .. "/dist/munix-installer.lua"),
+    ["/munix-installer.dat"] = readFile(REPO_ROOT .. "/dist/munix-installer.dat"),
   })
   local bareEeprom = emu:addEeprom(bare, readFile(assets .. "/lua/bios.lua"))
   local function text()
@@ -190,12 +190,12 @@ do
   end
   emu:boot(bare)
   emu:advance(3)
-  if not text():find("muxos 0.1.2 installer (booted from", 1, true) then error("the floppy didn't boot:\n" .. text(), 0) end
+  if not text():find("munix 0.1.2 installer (booted from", 1, true) then error("the floppy didn't boot:\n" .. text(), 0) end
   answer("1")
   answer("1")
   answer("y")
   emu:advance(5)
-  if not text():find("muxos 0.1.2 is installed.", 1, true) then error("it didn't install:\n" .. text(), 0) end
+  if not text():find("munix 0.1.2 is installed.", 1, true) then error("it didn't install:\n" .. text(), 0) end
   local em = bare.components[bareEeprom].methods
   if em.get() ~= readFile(REPO_ROOT .. "/kernal/bios.lua") or em.getData() ~= hddAddr then
     error("the kernal BIOS wasn't flashed over the stock one, pointing at the disk", 0)
@@ -203,7 +203,7 @@ do
   answer("y")
   emu:boot(bare)
   emu:advance(3)
-  if not text():find("login: _", 1, true) then error("muxos didn't boot from the disk to its login:\n" .. text(), 0) end
+  if not text():find("login: _", 1, true) then error("munix didn't boot from the disk to its login:\n" .. text(), 0) end
 end
 print("  OK")
 
@@ -214,14 +214,14 @@ print("openos 7: floppy mode writes a bootable installer floppy, and never offer
 do
   typeLine("clear")
   emu:advance(0.5)
-  typeLine("/mnt/flo/muxos-installer.lua floppy")
+  typeLine("/mnt/flo/munix-installer.lua floppy")
   if not waitFor("Write the installer floppy to which disk?") then fail("no disk prompt") end
   local listing = screen()
   if listing:find(hdd:sub(1, 8), 1, true) then fail("it offered this computer's own OpenOS disk") end
   local line = listing:match("(%d+)%) " .. blank:sub(1, 8):gsub("%-", "%%-") .. "[^\n]*<%- floppy")
   if not line then fail("the blank floppy isn't listed as a floppy") end
   typeLine(line)
-  if not waitFor("now boots into the muxos installer", 30) then fail("it didn't write the floppy") end
+  if not waitFor("now boots into the munix installer", 30) then fail("it didn't write the floppy") end
   if not waitFor("/home #") then fail("floppy mode didn't finish") end
   local fsm = node.components[blank].methods
   local h = fsm.open("/notes.txt")
@@ -239,15 +239,15 @@ do
   emu:addFilesystem(bare, {}) -- its hard disk
   emu:addFilesystem(bare, {
     ["/init.lua"] = grab("/init.lua"),
-    ["/muxos-installer.lua"] = grab("/muxos-installer.lua"),
-    ["/muxos-installer.dat"] = grab("/muxos-installer.dat"),
+    ["/munix-installer.lua"] = grab("/munix-installer.lua"),
+    ["/munix-installer.dat"] = grab("/munix-installer.dat"),
   })
   emu:addEeprom(bare, readFile(assets .. "/lua/bios.lua"))
   emu:boot(bare)
   emu:advance(3)
   local row, chars = bareBufs[0].cells[1] or {}, {}
   for x = 1, 80 do chars[x] = (row[x] and row[x].char) or " " end
-  if not table.concat(chars):find("muxos 0.1.2 installer (booted from", 1, true) then
+  if not table.concat(chars):find("munix 0.1.2 installer (booted from", 1, true) then
     error("the floppy floppy-mode wrote doesn't boot: " .. table.concat(chars), 0)
   end
 end
@@ -257,10 +257,10 @@ print("openos 8: an installer on this computer's own OpenOS disk says so")
 do
   typeLine("clear")
   emu:advance(0.5)
-  typeLine("cp /mnt/flo/muxos-installer.lua /mnt/flo/muxos-installer.dat /home/")
+  typeLine("cp /mnt/flo/munix-installer.lua /mnt/flo/munix-installer.dat /home/")
   if not waitFor("/home #") then fail("cp didn't finish") end
   emu:advance(2)
-  typeLine("/home/muxos-installer.lua check")
+  typeLine("/home/munix-installer.lua check")
   if not waitFor("Note: this installer is on this computer's own disk, not a floppy") then fail("no note") end
   typeLine("q")
   if not waitFor("/home #") then fail("check didn't finish") end
@@ -275,8 +275,8 @@ do
   local _, bareScreen, bareBufs = emu:addGpuScreen(bare, 100, 30)
   local floppyFiles = {
     ["/init.lua"] = readFile(REPO_ROOT .. "/dist/floppy/init.lua"),
-    ["/muxos-installer.lua"] = readFile(REPO_ROOT .. "/dist/muxos-installer.lua"),
-    ["/muxos-installer.dat"] = readFile(REPO_ROOT .. "/dist/muxos-installer.dat"),
+    ["/munix-installer.lua"] = readFile(REPO_ROOT .. "/dist/munix-installer.lua"),
+    ["/munix-installer.dat"] = readFile(REPO_ROOT .. "/dist/munix-installer.dat"),
   }
   emu:addFilesystem(bare, floppyFiles, nil, 512 * 1024)
   local bareEeprom = emu:addEeprom(bare, readFile(assets .. "/lua/bios.lua"))
@@ -297,25 +297,25 @@ do
   if not (text:find("EEPROM on fire", 1, true) and text:find("Dump: ", 1, true)) then
     error("the crash isn't on the console:\n" .. text, 0)
   end
-  local dump = floppyFiles["/muxos-boot-dump.txt"] or ""
-  if not (dump:find("muxos installer crash dump", 1, true) and dump:find("stack traceback", 1, true)) then
+  local dump = floppyFiles["/munix-boot-dump.txt"] or ""
+  if not (dump:find("munix installer crash dump", 1, true) and dump:find("stack traceback", 1, true)) then
     error("no dump on the floppy:\n" .. dump, 0)
   end
 end
 print("  OK")
 
--- The muxos kernal BIOS runs the installer itself, on a computer that
+-- The munix kernal BIOS runs the installer itself, on a computer that
 -- also has an OpenOS disk, a tmpfs, and an EEPROM still pointing at that
 -- disk -- with or without the floppy's /init.lua.
-print("openos 6: the muxos kernal BIOS boots the installer floppy next to an OpenOS disk")
+print("openos 6: the munix kernal BIOS boots the installer floppy next to an OpenOS disk")
 for _, withInit in ipairs({true, false}) do
   local k = emu:newNode("kern")
   local _, _, kbufs = emu:addGpuScreen(k, 80, 25)
   local osHdd = emu:addFilesystem(k, tree(assets .. "/loot/openos"))
   k.tmpAddress = emu:addFilesystem(k, {})
   local files = {
-    ["/muxos-installer.lua"] = readFile(REPO_ROOT .. "/dist/muxos-installer.lua"),
-    ["/muxos-installer.dat"] = readFile(REPO_ROOT .. "/dist/muxos-installer.dat"),
+    ["/munix-installer.lua"] = readFile(REPO_ROOT .. "/dist/munix-installer.lua"),
+    ["/munix-installer.dat"] = readFile(REPO_ROOT .. "/dist/munix-installer.dat"),
   }
   if withInit then files["/init.lua"] = readFile(REPO_ROOT .. "/dist/floppy/init.lua") end
   emu:addFilesystem(k, files, "floppy")
@@ -324,7 +324,7 @@ for _, withInit in ipairs({true, false}) do
   emu:advance(3)
   local row, chars = kbufs[0].cells[1] or {}, {}
   for x = 1, 80 do chars[x] = (row[x] and row[x].char) or " " end
-  if not table.concat(chars):find("muxos 0.1.2 installer (booted from floppy", 1, true) or k.status ~= "running" then
+  if not table.concat(chars):find("munix 0.1.2 installer (booted from floppy", 1, true) or k.status ~= "running" then
     error("the kernal BIOS didn't start the installer (" .. (withInit and "with" or "without") .. " /init.lua)", 0)
   end
 end

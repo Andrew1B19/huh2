@@ -1,21 +1,21 @@
 # Real-hardware verification suite
 
 `verify.lua` checks, on real OpenComputers hardware, the sandbox
-behavior muxos depends on:
+behavior Munix depends on:
 
-- the `component`/`computer` APIs muxos calls exist, including
+- the `component`/`computer` APIs Munix calls exist, including
   `computer.pullSignal` and `computer.shutdown`;
 - the Lua 5.3 library profile (`utf8`, `math.type`);
 - `computer.pullSignal(timeout)` really times out, and
   `computer.pushSignal` round-trips through it;
 - a nested coroutine's `coroutine.yield` comes back to its resumer
-  (muxos's job model);
+  (Munix's job model);
 - a coroutine that never yields is ended by the machine's "too long
-  without yielding" deadline while the machine itself survives (muxos's
+  without yielding" deadline while the machine itself survives (Munix's
   only protection against a runaway job -- takes `system.timeout()`,
   5s by default);
 - whether `debug.sethook` and `eris` are reachable (informational --
-  muxos uses neither, but semi-live migration can't be built on `eris`
+  Munix uses neither, but semi-live migration can't be built on `eris`
   unless it is);
 - a GPU/screen and modem smoke test, if present.
 
@@ -39,8 +39,8 @@ low tones if anything failed.
 ## History
 
 An earlier version of this suite checked `debug.sethook` count hooks
-and `eris` persistence, which muxos then depended on. Running it inside
+and `eris` persistence, which Munix then depended on. Running it inside
 the real sandbox showed 7 of its 14 checks would fail on real hardware
 -- neither is exposed to EEPROM code -- and it was too big to flash to
 an EEPROM as its instructions said. Both dependencies are gone from
-muxos now (see docs/PROTOCOL.md's "The real sandbox").
+Munix now (see docs/PROTOCOL.md's "The real sandbox").

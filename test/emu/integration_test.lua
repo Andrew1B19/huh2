@@ -1,5 +1,5 @@
 -- End-to-end integration test: boots the REAL, unmodified repo files
--- (kernal/bios.lua, kernal/muxos.lua, kernal/compositor.lua,
+-- (kernal/bios.lua, kernal/munix.lua, kernal/compositor.lua,
 -- kernal/bitmap.lua, node/bios.lua, node/runtime.lua) under
 -- test/emu/emulator.lua's faithful simulation of the native OC
 -- primitives, as 1 kernal + 3 worker nodes, and drives the kernal's
@@ -24,7 +24,7 @@ end
 local Emulator = dofile(REPO_ROOT .. "/test/emu/emulator.lua")
 
 local kernalBiosSrc = readFile(REPO_ROOT .. "/kernal/bios.lua")
-local muxosSrc = readFile(REPO_ROOT .. "/kernal/muxos.lua")
+local munixSrc = readFile(REPO_ROOT .. "/kernal/munix.lua")
 local compositorSrc = readFile(REPO_ROOT .. "/kernal/compositor.lua")
 local bitmapSrc = readFile(REPO_ROOT .. "/kernal/bitmap.lua")
 local runtimeSrc = readFile(REPO_ROOT .. "/node/runtime.lua")
@@ -41,7 +41,7 @@ emu:addModem(kernal)
 emu:addEeprom(kernal, kernalBiosSrc)
 local gpuAddr, screenAddr, screenBuffers = emu:addGpuScreen(kernal, 50, 30)
 local kernalFiles = {
-  ["/muxos.lua"] = muxosSrc,
+  ["/munix.lua"] = munixSrc,
   ["/compositor.lua"] = compositorSrc,
   ["/shell.lua"] = readFile(REPO_ROOT .. "/kernal/shell.lua"),
   ["/bitmap.lua"] = bitmapSrc,
@@ -57,7 +57,7 @@ local kernalFiles = {
   ["/runtime.lua"] = runtimeSrc,
   -- Sample programs for the launcher (test 29).
   ["/bin/hello.mxe"] = [==[--[[mxe
-muxos = "0.1.2"
+munix = "0.1.2"
 libraries = {"greeting", "nosuchlib"}
 ]]
 local greeting = require("greeting")
@@ -66,12 +66,12 @@ print(greeting.say("mxe") .. " v=" .. tostring(launch.versionMatch) .. " g=" .. 
 ]==],
   ["/lib/mxe/greeting.lua"] = [==[return {say = function(name) return "hello " .. name end}]==],
   ["/bin/old.mxe"] = [==[--[[mxe
-muxos = "9.9"
+munix = "9.9"
 ]]
-print("old-runs v=" .. tostring(launch.versionMatch) .. " want=" .. tostring(launch.requested) .. " have=" .. launch.muxos)
+print("old-runs v=" .. tostring(launch.versionMatch) .. " want=" .. tostring(launch.requested) .. " have=" .. launch.munix)
 ]==],
   ["/bin/counter.mxe"] = [==[--[[mxe
-muxos = "0.1.0"
+munix = "0.1.0"
 libraries = {"mux"}
 ]]
 local mux = require("mux")
@@ -118,7 +118,7 @@ libraries = {"baselib"}
 return {value = require("baselib").v .. "+top"}]==],
   ["/lib/mxe/baselib.lua"] = [==[return {v = "base"}]==],
   ["/bin/spec.mxe"] = [==[--[[mxe
-muxos = "0.1.0"
+munix = "0.1.0"
 name = "spec"
 version = "2.0"
 libraries = {"mux", "http", "toplib"}
@@ -295,7 +295,7 @@ emu:advance(3)
 
 -- Matches against the screen with row breaks removed, not the raw
 -- per-row rendering: the console has no word-wrap (a flat fixed-width
--- character wrap only -- see kernal/muxos.lua's termWrite), so a long
+-- character wrap only -- see kernal/munix.lua's termWrite), so a long
 -- word can legitimately split across two rows (confirmed for real: an
 -- early version of this test's own "force-releasing fullscreen grant"
 -- check failed this exact way, wrapping to "...gran" / "t held...").
@@ -324,14 +324,14 @@ local function typeLine(text)
 end
 
 print("test 1: kernal booted and discovered all 3 workers")
-assertScreenContains("root@muxos:~>", "prompt visible")
+assertScreenContains("root@munix:~>", "prompt visible")
 -- The startup banner itself may have already scrolled off a short
 -- console by now -- that's correct behavior (confirmed: this is a real
--- fixed-height scrolling console, see kernal/muxos.lua's termWrite),
+-- fixed-height scrolling console, see kernal/munix.lua's termWrite),
 -- not something to assert on. All 3 workers should still be visible in
 -- the post-boot discover(1) + listNodes() output, though.
 -- Nodes are identified by their network card's address (see
--- kernal/muxos.lua's selfAddr), so check for each worker's own card.
+-- kernal/munix.lua's selfAddr), so check for each worker's own card.
 do
   local screen = renderScreen()
   for i, w in ipairs(workers) do
@@ -514,7 +514,7 @@ print("test 12: parent/child jobs -- orphan/promote/kill policies, applied for r
 -- A single job (dispatched via `run`, so it's a plain top-level job
 -- with no parent of its own) spawns THREE children with the three
 -- different orphan policies, then returns their ids. Once this `run`
--- job itself completes, kernal/muxos.lua's
+-- job itself completes, kernal/munix.lua's
 -- applyOrphanPolicyForChildrenOf fires for real -- this is the actual
 -- mechanism from docs/PROTOCOL.md's ".mxe process model", not a mock
 -- of it.
@@ -871,7 +871,7 @@ for _ = 1, 15 do
   emu:injectSignal(kernal, "key_down", screenAddr, 8, KEY_BACK_CODE, "tester"); emu:step()
 end
 emu:advance(0.2)
-if not screenHas("root@muxos:~> " .. ("x"):rep(45) .. "_") or screenHas(("x"):rep(46)) then
+if not screenHas("root@munix:~> " .. ("x"):rep(45) .. "_") or screenHas(("x"):rep(46)) then
   dumpScreenOnFailure("wrapped backspace")
   error("the wrapped input line did not shrink to 45 characters")
 end
@@ -1027,7 +1027,7 @@ do
   -- so it's marked ended, and the title is cut short of the buttons),
   -- row 2 its body.
   local titleRow, bodyRow = renderScreen():match("^([^\n]*)\n([^\n]*)")
-  if titleRow:sub(1, #"\u{23F9} - kb") ~= "\u{23F9} - kb" or not titleRow:find("\u{2716}", 1, true) or bodyRow:sub(1, 4) ~= "hi28" or screenHas("root@muxos:~> hi28") then
+  if titleRow:sub(1, #"\u{23F9} - kb") ~= "\u{23F9} - kb" or not titleRow:find("\u{2716}", 1, true) or bodyRow:sub(1, 4) ~= "hi28" or screenHas("root@munix:~> hi28") then
     dumpScreenOnFailure("keyboard delivery")
     error("typed keys didn't reach the focused process and its window")
   end
@@ -1257,7 +1257,7 @@ emu:advance(1)
 assertScreenContains(string.format("%-14s %s  on kernal", "internet", internetAddr), "the kernal's internet card is on the bus")
 assertScreenContains(string.format("%-14s %s  on %s", "redstone", redstoneAddr, w1), "worker 1's redstone card is on the bus")
 do
-  local after = screenAfter("root@muxos:~> bus")
+  local after = screenAfter("root@munix:~> bus")
   assert(not after:find("gpu ", 1, true) and not after:find("modem ", 1, true) and not after:find("eeprom ", 1, true),
     "the display, network cards and firmware stay off the bus")
 end
@@ -1331,7 +1331,7 @@ assert(kernalFiles["/home/x/bin/demo.lua"] == webFiles[GITEA .. "demo/demo.lua"]
 typeLine("opm " .. base .. " update")
 emu:advance(3)
 assertScreenContains("no opm-mxe package", "self-update needs the opm-mxe package in the catalog")
-print("  OK -- opm installs, updates and bundles packages on muxos")
+print("  OK -- opm installs, updates and bundles packages on munix")
 
 print("test 39: a worker runs its processes side by side")
 for i = 1, 3 do
@@ -1397,10 +1397,10 @@ do
   dtouch(80 - 1, 1) -- close the program's window
   local cx, cy = iconOf("console")
   dtouch(cx, cy)
-  assert(text():find("root@muxos:~> _", 1, true), "the console icon brings the console back:\n" .. text())
+  assert(text():find("root@munix:~> _", 1, true), "the console icon brings the console back:\n" .. text())
   -- Its close button minimizes it rather than losing it.
   dtouch(80 - 1, 12)
-  assert(not text():find("root@muxos:~> _", 1, true) and text():find("console", 1, true), "closing the console minimizes it:\n" .. text())
+  assert(not text():find("root@munix:~> _", 1, true) and text():find("console", 1, true), "closing the console minimizes it:\n" .. text())
 end
 print("  OK -- icons for the console and every program; touching one starts it; the console minimizes")
 
@@ -1417,7 +1417,7 @@ do
   sh("cd /home && mkdir -p t41/sub && cd t41")
   sh("pwd > where.txt")
   assert(file("/home/t41/where.txt") == "/home/t41\n", "cd, mkdir -p, && and pwd: " .. tostring(file("/home/t41/where.txt")))
-  assertScreenContains("root@muxos:/home/t41> ", "the prompt shows the working directory")
+  assertScreenContains("root@munix:/home/t41> ", "the prompt shows the working directory")
   sh("echo one > a.txt; echo two >> a.txt; echo 'three  spaced' >> a.txt")
   assert(file("/home/t41/a.txt") == "one\ntwo\nthree  spaced\n", "> and >> and quoting: " .. tostring(file("/home/t41/a.txt")))
   sh("cat a.txt | grep t | sort -r | tee sorted.txt | wc -l > count.txt")
@@ -1448,11 +1448,11 @@ do
   sh("ls /mnt/flo")
   assertScreenContains("out.txt     readme.txt", "ls in aligned columns")
   sh("nodes; echo after-nodes")
-  assertScreenContains("after-nodes", "a muxos command inside a shell line")
+  assertScreenContains("after-nodes", "a munix command inside a shell line")
   sh("cd /home && rm -r t41 && cd ~")
   assert(not file("/home/t41/where.txt"), "rm -r cleaned up")
 end
-print("  OK -- the core utilities, pipes, redirection, variables, globs, &&/||, /mnt, and muxos commands mixed in")
+print("  OK -- the core utilities, pipes, redirection, variables, globs, &&/||, /mnt, and munix commands mixed in")
 
 print("test 42: threads in an .mxe -- concurrent, joinable, killable; errors reported")
 kernalFiles["/bin/threads.mxe"] = [==[--[[mxe
@@ -1547,12 +1547,12 @@ do
   }, 1)
   -- The taskbar: the bottom row, a start button, the console's button.
   local bar = c.cells(1, 25, 80)
-  assert(bar:find("muxos", 1, true) and bar:find("console", 1, true), "the taskbar:\n" .. bar)
+  assert(bar:find("munix", 1, true) and bar:find("console", 1, true), "the taskbar:\n" .. bar)
   local bx = bar:find(" console ", 1, true)
   -- Minimize the console from its taskbar button (it's focused and on
   -- top), uncovering the icons; then bring it back the same way.
   c.touch(bx + 2, 25)
-  assert(not c.text():find("root@muxos:~> _", 1, true), "the console's button minimized it:\n" .. c.text())
+  assert(not c.text():find("root@munix:~> _", 1, true), "the console's button minimized it:\n" .. c.text())
   local fx, fy = c.find("( o.o )")
   assert(fx, "an .mxe header's icon is drawn:\n" .. c.text())
   assert(c.cell(fx, fy).fg == 0xFFFF44, "...in its icon_color")
@@ -1561,7 +1561,7 @@ do
   local dx, dy = c.find("/-------\\")
   assert(dx and c.cell(dx, dy).fg == 0xFF8844, "programs without one get gmux's icon, in gmux's colors")
   c.touch(bx + 2, 25)
-  assert(c.text():find("root@muxos:~> _", 1, true), "...and the button restored it:\n" .. c.text())
+  assert(c.text():find("root@munix:~> _", 1, true), "...and the button restored it:\n" .. c.text())
   -- The start menu lists the apps; touching one starts it.
   c.touch(3, 25)
   local mx, my = c.find("sidecar")
@@ -1841,7 +1841,7 @@ do
   local function prompt() -- the last prompt on screen: the live line
     for y = 25, 1, -1 do
       local row = c.cells(1, y, 80)
-      local at = row:find("root@muxos:~> ", 1, true)
+      local at = row:find("root@munix:~> ", 1, true)
       if at then
         local x = utf8.len(row:sub(1, at - 1)) + 1
         return (c.cells(x + 14, y, 40):gsub("%s+$", "")), x, y
@@ -1903,10 +1903,10 @@ do
   -- It draws over the whole screen, then ends without releasing.
   c.typeLine('spawn 1 gmuxapi.request_fullscreen() gpu.fill(1, 1, 80, 25, " ") gpu.set(1, 1, "GRABBED") sleep(2)')
   c.emu:advance(1)
-  assert(c.text():find("GRABBED", 1, true) and not c.text():find("root@muxos:~>", 1, true),
+  assert(c.text():find("GRABBED", 1, true) and not c.text():find("root@munix:~>", 1, true),
     "while it holds the grant, the screen is its:\n" .. c.text())
   c.emu:advance(3)
-  assert(c.text():find("root@muxos:~>", 1, true), "it ended without releasing: the desktop and console are back:\n" .. c.text())
+  assert(c.text():find("root@munix:~>", 1, true), "it ended without releasing: the desktop and console are back:\n" .. c.text())
   c.typeLine('run local g, e = gmuxapi.request_fullscreen() local r = gmuxapi.release_fullscreen() return tostring(g ~= nil) .. "/" .. tostring(r ~= nil)')
   c.emu:advance(2)
   assert(c.text():find("true/true", 1, true), "and the grant is free for the next program:\n" .. c.text())
@@ -1927,7 +1927,7 @@ do
   run("alice")
   assert(has("no such user: alice") and has("login: _"), "an unknown name doesn't log in, or create a user")
   run("root")
-  assert(has("root@muxos:~> _"), "root logs in, at home:\n" .. c.text())
+  assert(has("root@munix:~> _"), "root logs in, at home:\n" .. c.text())
   run("useradd Bad!")
   assert(has("useradd: a user name is lowercase"), "a bad user name is refused")
   run("useradd alice")
@@ -1949,7 +1949,7 @@ do
   run("logout")
   assert(has("login: _") and not has("useradd"), "logout: back to login, the console cleared:\n" .. c.text())
   run("alice")
-  assert(has("alice@muxos:~> _"), "alice logs in:\n" .. c.text())
+  assert(has("alice@munix:~> _"), "alice logs in:\n" .. c.text())
   run("pwd; whoami")
   assert(has("/home/alice") and has("\nalice"), "her home and name:\n" .. c.text())
   run("whereami", 2)
@@ -2112,7 +2112,7 @@ local all = h2:read("a")
 h2:close()
 local _, chain = pcall(pipe.buildPipeChain, {})
 print("popen " .. table.concat(lines, ",") .. " " .. tostring(ok) .. " " .. tostring(how) .. " " .. tostring(code)
-  .. " w=" .. tostring(wok) .. " pipe=" .. all:gsub("\n", "/") .. " chain=" .. tostring(chain):match("muxos runs every program") )
+  .. " w=" .. tostring(wok) .. " pipe=" .. all:gsub("\n", "/") .. " chain=" .. tostring(chain):match("munix runs every program") )
 io.read()
 ]==]
   local c = newCluster(80, 25, libs, 3)
@@ -2142,7 +2142,7 @@ io.read()
     if c.text():find("popen line", 1, true) then break end
     c.emu:advance(0.5)
   end
-  assert(c.text():gsub("\n", ""):find("popen line 1,line 2,line 3 true exit 0 w=true pipe=line 1/line 2/ chain=muxos runs every program", 1, true),
+  assert(c.text():gsub("\n", ""):find("popen line 1,line 2,line 3 true exit 0 w=true pipe=line 1/line 2/ chain=munix runs every program", 1, true),
     "io.popen reads a program's output; pipe.popen too; buildPipeChain says why not:\n" .. c.text())
   assert(c.files["/home/sink.txt"] == "ALPHA\nBETA\n", "io.popen(..., \"w\") feeds a program's input: " .. tostring(c.files["/home/sink.txt"]))
 end
@@ -2295,7 +2295,7 @@ name = "plain"
 gmuxapi.create_window({title = "plain", x = 3, y = 6, width = 12, height = 1, code = "gpu.set(1, 1, 'PLAIN')"})
 sleep(600)
 ]==],
-    ["/bin/legacy.lua"] = 'print("legacy kept " .. tostring(require("muxos").set_persistent()))\nio.read()',
+    ["/bin/legacy.lua"] = 'print("legacy kept " .. tostring(require("munix").set_persistent()))\nio.read()',
     ["/bin/napper.mxe"] = '--[[mxe\nname = "napper"\n]]\nsleep(600)',
     ["/bin/ender.mxe"] = '--[[mxe\nname = "ender"\n]]\nsleep(600)',
   }
@@ -2305,7 +2305,7 @@ sleep(600)
   local function console()
     local bx = c.cells(1, 25, 80):find(" console ", 1, true)
     if bx then c.touch(bx + 2, 25) end
-    if bx and not c.text():find("root@muxos:~>", 1, true) then c.touch(bx + 2, 25) end
+    if bx and not c.text():find("root@munix:~>", 1, true) then c.touch(bx + 2, 25) end
   end
   local function run(line, wait) console() c.typeLine(line) c.emu:advance(wait or 1) end
   local function idOf(path) return c.text():match("%[(%d+)%] " .. path:gsub("%.", "%%.") .. " started") end
@@ -2321,7 +2321,7 @@ sleep(600)
   c.touch(bx, by)
   assert(c.cell(bx, by).char == ON, "the toggle turned plain's persistence on:\n" .. c.text())
   run("legacy", 2)
-  assert(c.text():find("legacy kept true", 1, true), "a .lua program asks with require('muxos'):\n" .. c.text())
+  assert(c.text():find("legacy kept true", 1, true), "a .lua program asks with require('munix'):\n" .. c.text())
   run("nohup napper &", 1)
   local N = idOf("/bin/napper.mxe")
   assert(N and c.text():find("(kept after logout)", 1, true), "nohup:\n" .. c.text())
@@ -2352,9 +2352,9 @@ sleep(600)
   assert(f:find("[" .. K .. "] /bin/keeper.mxe (+1 child) -- here, kept after logout", 1, true)
     and f:find("[" .. N .. "] /bin/napper.mxe -- detached", 1, true), "jobs after attach:\n" .. c.text())
 end
-print("  OK -- set_persistent/require('muxos')/the toggle/nohup keep applications (children too); attach brings them back")
+print("  OK -- set_persistent/require('munix')/the toggle/nohup keep applications (children too); attach brings them back")
 
-print("test 59: the system bus -- named services, calls, signals, the kernal's services (OPM's muxos.update)")
+print("test 59: the system bus -- named services, calls, signals, the kernal's services (OPM's munix.update)")
 do
   local files = {
     ["/bin/counter.mxe"] = [==[--[[mxe
@@ -2378,7 +2378,7 @@ libraries = {"sysbus"}
 local sysbus = require("sysbus")
 gmuxapi.set_persistent(true)
 sysbus.on("counter.*", function(signal, sender, total) print("SIG " .. signal .. " " .. total .. " from " .. sender.job) end)
-sysbus.listen("muxos.login")
+sysbus.listen("munix.login")
 while true do
   local e = gmuxapi.pull_event(60)
   if e and e[1] == "sysbus_signal" then print("EV " .. e[2] .. " " .. tostring(e[4][1]) .. " " .. tostring(e[3].kernal)) end
@@ -2398,8 +2398,8 @@ print("NOMETHOD " .. tostring(select(2, pcall(c.nope))))
 sysbus.timeout = 1
 print("SLOW " .. tostring(select(2, pcall(c.slow))))
 print("TAKEN " .. tostring(select(2, pcall(sysbus.own, "counter"))))
-print("RESERVED " .. tostring(select(2, pcall(sysbus.own, "muxos.mine"))))
-print("VER " .. sysbus.call("muxos.system", "version"))
+print("RESERVED " .. tostring(select(2, pcall(sysbus.own, "munix.mine"))))
+print("VER " .. sysbus.call("munix.system", "version"))
 ]==],
     ["/bin/legsvc.lua"] = 'local bus = require("sysbus")\nbus.serve("legacy.echo", {echo = function(caller, s) return "echo:" .. s end})\nbus.run()',
     ["/bin/updater.mxe"] = [==[--[[mxe
@@ -2407,7 +2407,7 @@ name = "updater"
 libraries = {"sysbus"}
 ]]
 local sysbus = require("sysbus")
-local update = sysbus.proxy("muxos.update")
+local update = sysbus.proxy("munix.update")
 sysbus.timeout = 20
 print("UPD1 " .. tostring(select(2, pcall(update.install, {{path = "/opmbad.lua", data = "return ("}}, "9.8"))))
 print("UPD2 " .. tostring(select(2, pcall(update.install, {{path = "/opmtest.lua", data = "return 42"}}, "9.9"))))
@@ -2418,7 +2418,7 @@ print("UPDV " .. update.version().installed)
   local function console()
     local bx = c.cells(1, 25, 80):find(" console ", 1, true)
     if bx then c.touch(bx + 2, 25) end
-    if bx and not c.text():find("@muxos:~>", 1, true) then c.touch(bx + 2, 25) end
+    if bx and not c.text():find("@munix:~>", 1, true) then c.touch(bx + 2, 25) end
   end
   local function run(line, wait) console() c.typeLine(line) c.emu:advance(wait or 1) end
   local function flat() return (c.text():gsub("\n", "")) end
@@ -2435,24 +2435,24 @@ print("UPDV " .. update.version().installed)
   assert(f:find("NOMETHOD counter has no method nope", 1, true), "no such method:\n" .. c.text())
   assert(f:find("SLOW no answer from counter in 1 s", 1, true), "a call's timeout:\n" .. c.text())
   assert(f:find("TAKEN counter is taken (process", 1, true), "names are owned:\n" .. c.text())
-  assert(f:find("RESERVED muxos.mine is the kernal's", 1, true), "muxos. is the kernal's:\n" .. c.text())
+  assert(f:find("RESERVED munix.mine is the kernal's", 1, true), "munix. is the kernal's:\n" .. c.text())
   assert(f:find("VER 0.", 1, true), "a kernal service:\n" .. c.text())
   assert(f:find("SIG counter.changed 5 from", 1, true) and f:find("SIG counter.changed 7 from", 1, true),
     "on() handlers get signals:\n" .. c.text())
   run("sysbus", 1)
   f = flat()
-  assert(f:find("counter", 1, true) and f:find("legacy.echo", 1, true) and f:find("muxos.update             (kernal)", 1, true),
+  assert(f:find("counter", 1, true) and f:find("legacy.echo", 1, true) and f:find("munix.update             (kernal)", 1, true),
     "sysbus lists the names:\n" .. c.text())
   run("sysbus call legacy.echo echo hi", 2)
   assert(flat():find("echo:hi", 1, true), "a .lua program's service, called from the console:\n" .. c.text())
-  run("sysbus call muxos.system who", 1)
-  assert(flat():find('["user"]="root"', 1, true), "muxos.system.who:\n" .. c.text())
+  run("sysbus call munix.system who", 1)
+  assert(flat():find('["user"]="root"', 1, true), "munix.system.who:\n" .. c.text())
   run("updater", 6)
   f = flat()
   assert(f:find("UPD1 install: /opmbad.lua:1:", 1, true) and f:find("nothing was changed", 1, true)
     and c.files["/opmbad.lua"] == nil, "a file that doesn't compile stops the install:\n" .. c.text())
-  assert(f:find("UPD2 muxos 9.9 installed (1 files)", 1, true) and c.files["/opmtest.lua"] == "return 42",
-    "muxos.update.install writes the files:\n" .. c.text())
+  assert(f:find("UPD2 munix 9.9 installed (1 files)", 1, true) and c.files["/opmtest.lua"] == "return 42",
+    "munix.update.install writes the files:\n" .. c.text())
   assert(f:find("UPDV 9.9", 1, true), "...and the installed version:\n" .. c.text())
   -- A login is a signal; root-only installing (flag update_requires_root).
   run("useradd bob", 1)
@@ -2468,10 +2468,10 @@ print("UPDV " .. update.version().installed)
   c.emu:advance(2)
   run("attach " .. tostring(W), 2)
   f = flat()
-  assert(f:find("EV muxos.login bob true", 1, true) and f:find("EV muxos.login root true", 1, true),
+  assert(f:find("EV munix.login bob true", 1, true) and f:find("EV munix.login root true", 1, true),
     "the kernal's login signals (heard while away):\n" .. c.text())
 end
-print("  OK -- serve/proxy/call/emit/on/listen, errors and timeouts, a .lua service, the console, muxos.system, muxos.update")
+print("  OK -- serve/proxy/call/emit/on/listen, errors and timeouts, a .lua service, the console, munix.system, munix.update")
 
 print("test 60: OpenOS concurrency -- event timers, listeners during sleep, waits inside a program's own coroutines")
 do
@@ -2526,7 +2526,7 @@ print("MXECO " .. first .. gen())
   c.emu:advance(1)
   local bx = c.cells(1, 25, 80):find(" console ", 1, true)
   if bx then c.touch(bx + 2, 25) end
-  if bx and not c.text():find("@muxos:~>", 1, true) then c.touch(bx + 2, 25) end
+  if bx and not c.text():find("@munix:~>", 1, true) then c.touch(bx + 2, 25) end
   c.typeLine("mxeco")
   c.emu:advance(2)
   assert(c.text():find("MXECO ab", 1, true), "an .mxe's coroutine waits inside, too:\n" .. c.text())

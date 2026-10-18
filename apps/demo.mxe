@@ -1,9 +1,9 @@
 --[[mxe
-muxos = "0.1.2"
+munix = "0.1.2"
 name = "demo"
 version = "1.0"
-description = "muxos demo: threads, child processes on the workers, color and braille graphics"
-author = "muxos"
+description = "munix demo: threads, child processes on the workers, color and braille graphics"
+author = "munix"
 libraries = {"thread"}
 icon = {
   "  .:::.  ",
@@ -13,7 +13,7 @@ icon = {
 }
 icon_color = {0xFF44FF, 0x44FFFF, 0x44FF44, 0xFFFF44}
 ]]
--- The muxos demo -- a test program for the things muxos does that OpenOS
+-- The munix demo -- a test program for the things munix does that OpenOS
 -- doesn't:
 --   * threads within one process (the `thread` library): four run at
 --     once, each waiting on its own timers and kernal calls;
@@ -127,7 +127,7 @@ end
 
 local imageThread = thread.create(function()
   -- The strips, in waves: a job tree may run as many children at once as
-  -- there are live workers (muxos's fan-out cap). Each wave is one frame
+  -- there are live workers (munix's fan-out cap). Each wave is one frame
   -- of the image window, split between its strips' processes: each gets
   -- a share of the window and draws its strip there itself.
   gmuxapi.render_config(imageWin, {mode = "split", deadline = 5})

@@ -1,4 +1,4 @@
--- muxos kernal BIOS; see docs/PROTOCOL.md.
+-- munix kernal BIOS; see docs/PROTOCOL.md.
 local invoke = component.invoke
 local function call(a, m, ...)
   local r = table.pack(pcall(invoke, a, m, ...))
@@ -22,7 +22,7 @@ if gpu and screen then call(gpu, "fill", 1, 1, 160, 50, " ") end
 local function stop(text)
   say(text)
   local disk
-  local d = {"muxos BIOS dump", table.concat(lines, "\n"), "",
+  local d = {"munix BIOS dump", table.concat(lines, "\n"), "",
     "uptime " .. computer.uptime() .. "  memory " .. computer.freeMemory() .. "/" .. computer.totalMemory()
     .. "  energy " .. computer.energy() .. "/" .. computer.maxEnergy(), "eeprom data " .. tostring(call(eeprom, "getData"))}
   for a, t in list() do
@@ -35,11 +35,11 @@ local function stop(text)
     end
     d[#d + 1] = x
   end
-  local h = disk and call(disk, "open", "/muxos-boot-dump.txt", "w")
+  local h = disk and call(disk, "open", "/munix-boot-dump.txt", "w")
   if h then
     call(disk, "write", h, table.concat(d, "\n") .. "\n")
     call(disk, "close", h)
-    say("Dump: " .. disk:sub(1, 8) .. "/muxos-boot-dump.txt")
+    say("Dump: " .. disk:sub(1, 8) .. "/munix-boot-dump.txt")
   end
   error(table.concat(lines, "\n"), 0)
 end
@@ -67,11 +67,11 @@ end
 
 local init
 local remembered = call(eeprom, "getData")
-if remembered and remembered ~= "" then init = try(remembered, "/muxos.lua") end
+if remembered and remembered ~= "" then init = try(remembered, "/munix.lua") end
 if not init then
   call(eeprom, "setData", "")
   for a in list("filesystem") do
-    init = try(a, "/muxos.lua")
+    init = try(a, "/munix.lua")
     if init then
       call(eeprom, "setData", a)
       break
@@ -85,15 +85,15 @@ end
 
 -- The installer (it handles its own crashes), retried for 5 s: a rack's
 -- drive can attach late.
-say("muxos: no system; looking for the installer floppy...")
+say("munix: no system; looking for the installer floppy...")
 local wait = computer.uptime() + 5
 repeat
   problems = {}
   for a in list("filesystem") do
-    local installer = try(a, "/muxos-installer.lua")
+    local installer = try(a, "/munix-installer.lua")
     if installer then
       computer.beep(800, 0.2)
-      return installer(a, "/muxos-installer.lua")
+      return installer(a, "/munix-installer.lua")
     end
   end
   computer.pullSignal(1)

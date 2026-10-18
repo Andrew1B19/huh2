@@ -1,4 +1,4 @@
--- muxos window registry: every program window, wherever it's shown.
+-- munix window registry: every program window, wherever it's shown.
 --
 -- A program's window belongs to its process and its user, not to a
 -- screen. It's shown by (attached to) at most one session at a time --
@@ -13,7 +13,7 @@
 -- regions, ancestors that asked) hears {"window_route", id, address,
 -- key, width, height} when it moves -- address nil while detached.
 --
--- Loaded by kernal/muxos.lua: loadSibling("windows.lua")(K).
+-- Loaded by kernal/munix.lua: loadSibling("windows.lua")(K).
 -- A session's display (S.display) does the showing:
 --   display.address          where its windows are drawn (a node address)
 --   display.create(spec)     makes window spec.id there; returns the
