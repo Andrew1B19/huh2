@@ -30,7 +30,7 @@
 
 
 local VERSION = "0.1.2"
-local DAT_SIZE = 398854
+local DAT_SIZE = 401705
 local INIT_LUA = "-- The munix installer floppy's boot file, installed as /init.lua at the\
 -- floppy's root next to munix-installer.lua. Any BIOS that boots /init.lua\
 -- runs it -- the stock OpenComputers Lua BIOS every computer starts with\

@@ -33,7 +33,7 @@
 1517 /lib/transforms.lua
 501 /lib/uuid.lua
 2417 /lib/vt100.lua
-6034 /bin/opm.mxe
+8885 /bin/opm.mxe
 4098 /lib/mxe/opm_core.lua
 @@ 3862 /eeprom/kernal.lua
 -- munix kernal BIOS; see docs/PROTOCOL.md.
@@ -15135,16 +15135,18 @@ end
 
 return vt100
 
-@@ 6034 /bin/opm.mxe
+@@ 8885 /bin/opm.mxe
 --[[mxe
 munix = "0.1.0"
 name = "opm"
 version = "0.5.0"
 description = "Open Computers Pull Manager, the munix port"
 author = "LewisHost.Net"
-libraries = {"mux", "http", "opm_core"}
+libraries = {"mux", "http", "opm_core", "sysbus"}
 requires = {"internet"}
 ]]
+
+
 
 
 
@@ -15159,6 +15161,7 @@ local core = require("opm_core")
 
 local DEFAULT_BASE = "http://192.168.1.131:3001/LewisHost.Net/oc-programs/raw/branch/main/"
 local SELF_PACKAGE = "opm-mxe"
+local SYSTEM_PACKAGE = "munix-installer"
 local CACHE = "/etc/opm.cache"
 local INSTALLED = "/etc/opm.installed"
 local args, opts = mux.parseArgs(...)
@@ -15170,6 +15173,9 @@ opm [--base=URL] bundle <package> <dir>   a package and its dependencies, for of
 opm update                                reinstall opm itself (the catalog's opm-mxe)
 opm [--base=URL] update -a                re-pull every package installed here, at its target
 opm [--base=URL] update <package>         re-pull one package, at its recorded target
+opm system                                the munix version running and installed
+opm [--base=URL] system update [--force] [--reboot]
+                                          install the catalog's munix (root, by default)
 opm --from=DIR ...                        use a bundle in DIR instead of the network
 
 <package> and its dependencies go under target (default /usr). File destinations
@@ -15286,6 +15292,75 @@ end
 print("bundle ready: on munix run  opm --from=" .. dir .. " pull " .. name)
 end
 
+
+
+
+
+local function parse_payload(data)
+local kind, version, pos = data:match("^%-%-%[=*%[(%u+)%-PAYLOAD ([^\n]+)\n()")
+if not (kind == "MUNIX" or kind == "MUXOS") then error("not a munix installer data file", 0) end
+local count
+count, pos = data:match("^@@MANIFEST (%d+)\n()", pos)
+if not count then error("the data file is damaged (no manifest)", 0) end
+for _ = 1, tonumber(count) do
+pos = data:match("^[^\n]*\n()", pos)
+if not pos then error("the data file is damaged (manifest)", 0) end
+end
+local files = {}
+for _ = 1, tonumber(count) do
+local size, path, at = data:match("^@@ (%d+) ([^\n]+)\n()", pos)
+if not size then error("the data file is damaged (cut short?)", 0) end
+files[#files + 1] = {path = path, data = data:sub(at, at + tonumber(size) - 1)}
+pos = at + tonumber(size) + 1
+end
+if data:sub(pos, pos + 5) ~= "@@END\n" then error("the data file is damaged (no end marker)", 0) end
+return files, version
+end
+
+
+
+local function update_service()
+local sysbus = require("sysbus")
+for _, name in ipairs({"munix.update", "muxos.update"}) do
+local ok, v = pcall(sysbus.call, name, "version")
+if ok then return sysbus.proxy(name), v, name:match("^(%a+)") end
+end
+error("this kernal has no update service (it's older than the system bus): "
+.. "upgrade it once with the installer floppy", 0)
+end
+
+local function system(src, cfg)
+local service, v, prefix = update_service()
+local installed = v.installed or v.running
+if args[2] ~= "update" then
+print("running   munix " .. tostring(v.running))
+print("installed munix " .. tostring(installed))
+print("opm system update installs the catalog's (" .. SYSTEM_PACKAGE .. ")")
+return
+end
+local pkg = cfg[SYSTEM_PACKAGE]
+if not pkg then error("the catalog has no " .. SYSTEM_PACKAGE .. " package", 0) end
+local datPath
+for path in pairs(pkg.files or {}) do
+if path:match("%.dat$") then datPath = path end
+end
+if not datPath then error(SYSTEM_PACKAGE .. " has no data file (.dat)", 0) end
+
+local files, version = parse_payload(src.get(datPath:match("^[^/]+/(.+)$") or datPath))
+if version == installed and not opts.force then
+print("munix " .. version .. " is already installed (--force installs it again)")
+return
+end
+print("installing munix " .. version .. " (" .. #files .. " files; was " .. tostring(installed) .. ")...")
+local sysbus = require("sysbus")
+sysbus.timeout = 600
+print(service.install(files, version))
+if opts.reboot then
+print("rebooting...")
+sysbus.call(prefix .. ".system", "reboot")
+end
+end
+
 local ok, err = pcall(function()
 local cmd = args[1]
 if not cmd then print(USAGE) return end
@@ -15294,8 +15369,11 @@ print("opm hook: the munix console has no tab completion")
 return
 end
 local src = opts.from and dir_source(opts.from) or http_source(opts.base or DEFAULT_BASE)
+if cmd == "system" and args[2] ~= "update" then return system(src, nil) end
 local cfg = load_cfg(src)
-if cmd == "update" and not args[2] then
+if cmd == "system" then
+system(src, cfg)
+elseif cmd == "update" and not args[2] then
 if not cfg[SELF_PACKAGE] then
 error("the catalog has no " .. SELF_PACKAGE .. " package (munix's opm/ directory) to update from", 0)
 end

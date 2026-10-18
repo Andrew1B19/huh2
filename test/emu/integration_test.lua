@@ -247,7 +247,12 @@ local webFiles = {
   ["demo"] = { files = { ["master/demo/demo.lua"] = "/bin", ["master/demo/demolib.lua"] = "/lib" },
                dependencies = { ["demodep"] = "/" }, name = "Demo", description = "a demo program" },
   ["demodep"] = { files = { ["master/demodep/extra.lua"] = "/lib" }, name = "demodep", description = "its dependency" },
+  ["munix-installer"] = { files = { ["master/munix/dist/munix-installer.lua"] = "/",
+    ["master/munix/dist/munix-installer.dat"] = "/" }, name = "munix-installer", description = "the munix installer" },
 }]],
+  -- A munix release for `opm system update`: one file, version 9.7.
+  [GITEA .. "munix/dist/munix-installer.dat"] = "--[[MUNIX-PAYLOAD 9.7\n@@MANIFEST 1\n8 /opmsys.lua\n"
+    .. "@@ 8 /opmsys.lua\nreturn 7\n@@END\n",
   [GITEA .. "demo/demo.lua"] = 'local VERSION = "1.2"\nprint("demo says " .. require("demolib").msg .. " " .. require("extra").v)\n',
   [GITEA .. "demo/demolib.lua"] = 'return {msg = "hi"}',
   [GITEA .. "demodep/extra.lua"] = 'return {v = "dep"}',
@@ -1331,7 +1336,20 @@ assert(kernalFiles["/home/x/bin/demo.lua"] == webFiles[GITEA .. "demo/demo.lua"]
 typeLine("opm " .. base .. " update")
 emu:advance(3)
 assertScreenContains("no opm-mxe package", "self-update needs the opm-mxe package in the catalog")
-print("  OK -- opm installs, updates and bundles packages on munix")
+-- opm system: munix itself, installed by the kernal (munix.update).
+typeLine("opm system")
+emu:advance(2)
+assertScreenContains("running   munix 0.", "opm system shows the version running")
+typeLine("opm " .. base .. " system update")
+emu:advance(6)
+assertScreenContains("installing munix 9.7 (1 files", "opm fetched and read the catalog's release")
+assertScreenContains("munix 9.7 installed (1 files)", "the kernal installed it")
+assert(kernalFiles["/opmsys.lua"] == "return 7" and kernalFiles["/.munix-version"] == "9.7\n",
+  "the release's files are on the kernal's disk")
+typeLine("opm " .. base .. " system update")
+emu:advance(4)
+assertScreenContains("munix 9.7 is already installed", "the same version isn't installed twice")
+print("  OK -- opm installs, updates and bundles packages on munix, and updates munix itself")
 
 print("test 39: a worker runs its processes side by side")
 for i = 1, 3 do
